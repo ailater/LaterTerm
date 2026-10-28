@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/laterterm-app", "crates/laterterm-termview"]
+members = ["crates/laterterm-app", "crates/laterterm-config", "crates/laterterm-termview"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,6 +14,8 @@ alacritty_terminal = "0.25.1"
 portable-pty = "0.9"
 anyhow = "1"
 parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 ropey = "1"
 flume = "0.12"
 arboard = { version = "3", features = ["wayland-data-control"] }

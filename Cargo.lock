@@ -2975,9 +2975,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gpui",
+ "laterterm-config",
  "laterterm-termview",
  "parking_lot",
  "portable-pty",
+]
+
+[[package]]
+name = "laterterm-config"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "toml 0.8.23",
 ]
 
 [[package]]

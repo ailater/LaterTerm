@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 gpui.workspace = true
 laterterm-termview = { path = "../laterterm-termview" }
+laterterm-config = { path = "../laterterm-config" }
 anyhow.workspace = true
 portable-pty.workspace = true
 parking_lot.workspace = true

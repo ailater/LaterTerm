@@ -6,7 +6,8 @@
 
 - `crates/laterterm-app` — 主程序二进制 `laterterm`
 - `crates/laterterm-termview` — GPUI 终端网格视图（**内化自 zortax/gpui-terminal 0.1.0**，上游停更，由本仓库接管；改动需保持 MIT OR Apache-2.0 许可头）
-- 后续里程碑再增：`laterterm-core`（TerminalSession 会话抽象/编码/trzsz）、`laterterm-local`、`laterterm-ssh`（russh）、`laterterm-config`、`laterterm-secrets`
+- `crates/laterterm-config` — 设置持久化（TOML，`~/.config/laterterm/settings.toml`；主题热加载待做）
+- 后续里程碑再增：`laterterm-core`（TerminalSession 会话抽象/编码/trzsz）、`laterterm-local`、`laterterm-ssh`（russh）、`laterterm-secrets`
 
 ## 命令
 

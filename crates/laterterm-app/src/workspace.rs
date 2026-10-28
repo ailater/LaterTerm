@@ -3,6 +3,7 @@ use gpui::{
     MouseButton, MouseDownEvent, ParentElement, Render, Styled, Window, div,
     prelude::FluentBuilder, px, rgb,
 };
+use laterterm_config::{Appearance, Settings};
 use laterterm_termview::{ColorPalette, TerminalConfig, TerminalView};
 use parking_lot::Mutex;
 use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
@@ -11,27 +12,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const TITLEBAR_HEIGHT: f32 = 34.0;
 const PANEL_WIDTH: f32 = 220.0;
-
-#[derive(Clone, Debug)]
-struct TerminalSettings {
-    font_family: String,
-    font_size: f32,
-    line_height: f32,
-    padding: f32,
-    scrollback: usize,
-}
-
-impl Default for TerminalSettings {
-    fn default() -> Self {
-        Self {
-            font_family: "JetBrainsMono Nerd Font".into(),
-            font_size: 13.0,
-            line_height: 1.0,
-            padding: 8.0,
-            scrollback: 100_000,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsPage {
@@ -117,18 +97,17 @@ pub struct WorkspaceView {
     right_panel: bool,
     settings_open: bool,
     settings_page: SettingsPage,
-    terminal_settings: TerminalSettings,
+    settings: Settings,
 }
 
 impl WorkspaceView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let weak_workspace = cx.weak_entity();
-        let terminal_settings = TerminalSettings::default();
+        let settings = Settings::load_or_default();
         let first_id = TabId(1);
-        let (terminal, session) =
-            create_local_terminal(first_id, weak_workspace, cx, &terminal_settings);
+        let (terminal, session) = create_local_terminal(first_id, weak_workspace, cx, &settings.appearance);
         Self {
-            terminal_settings,
+            settings,
             settings_page: SettingsPage::Appearance,
             tabs: vec![TerminalTab {
                 id: first_id,
@@ -162,7 +141,7 @@ impl WorkspaceView {
         let id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
         let (terminal, session) =
-            create_local_terminal(id, cx.weak_entity(), cx, &self.terminal_settings);
+            create_local_terminal(id, cx.weak_entity(), cx, &self.settings.appearance);
         self.tabs.push(TerminalTab {
             id,
             title: format!("终端 {}", id.0),
@@ -272,19 +251,20 @@ impl WorkspaceView {
         _event: &MouseDownEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
-        change: impl FnOnce(&mut TerminalSettings),
+        change: impl FnOnce(&mut Appearance),
     ) {
         cx.stop_propagation();
-        change(&mut self.terminal_settings);
-        let settings = self.terminal_settings.clone();
+        change(&mut self.settings.appearance);
+        self.settings.save();
+        let appearance = self.settings.appearance.clone();
         for tab in &self.tabs {
             tab.terminal.update(cx, |terminal, cx| {
                 let mut config = terminal.config().clone();
-                config.font_family = settings.font_family.clone();
-                config.font_size = px(settings.font_size);
-                config.line_height_multiplier = settings.line_height;
-                config.padding = Edges::all(px(settings.padding));
-                config.scrollback = settings.scrollback;
+                config.font_family = appearance.font_family.clone();
+                config.font_size = px(appearance.font_size);
+                config.line_height_multiplier = appearance.line_height;
+                config.padding = Edges::all(px(appearance.padding));
+                config.scrollback = appearance.scrollback;
                 terminal.update_config(config, cx);
             });
         }
@@ -297,8 +277,8 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.change_setting(event, window, cx, |settings| {
-            *settings = TerminalSettings::default()
+        self.change_setting(event, window, cx, |appearance| {
+            *appearance = Appearance::default()
         });
     }
 
@@ -745,20 +725,39 @@ fn settings_content(
         SettingsPage::Appearance => settings_panel(workspace, cx),
         SettingsPage::Shortcuts => div()
             .pt_4()
-            .text_color(rgb(0xA9B1D6))
-            .child("Ctrl+T  新建标签")
-            .child("Ctrl+W  关闭标签"),
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(section_title("标签"))
+            .child(
+                setting_card()
+                    .child(shortcut_row("新建标签", "Ctrl+T"))
+                    .child(shortcut_row("关闭标签", "Ctrl+W")),
+            ),
         SettingsPage::Terminal => div()
             .pt_4()
-            .text_color(rgb(0xA9B1D6))
-            .child("本地 Shell")
-            .child("TERM=xterm-256color")
-            .child("支持鼠标滚动查看历史"),
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(section_title("本地会话"))
+            .child(
+                setting_card()
+                    .child(info_row("Shell", "$SHELL / bash"))
+                    .child(info_row("TERM", "xterm-256color"))
+                    .child(info_row("COLORTERM", "truecolor"))
+                    .child(info_row("滚动", "自然滚动，支持历史回看")),
+            ),
         SettingsPage::Servers => div()
             .pt_4()
-            .text_color(rgb(0xA9B1D6))
-            .child("本地 Shell")
-            .child("SSH 服务器将在远程模块接入后可用"),
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(section_title("连接"))
+            .child(
+                setting_card()
+                    .child(info_row("本地 Shell", "已内置"))
+                    .child(info_row("SSH", "远程模块接入后可用")),
+            ),
     };
     div()
         .flex_1()
@@ -771,107 +770,225 @@ fn settings_content(
 }
 
 fn settings_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
-    let settings = workspace.terminal_settings.clone();
+    let settings = workspace.settings.appearance.clone();
     div()
-        .pt_3()
+        .pt_4()
         .flex()
         .flex_col()
-        .gap_2()
-        .text_color(rgb(0xA9B1D6))
-        .child(div().child(format!("字号: {:.0}px", settings.font_size)))
+        .gap_3()
+        .child(section_title("终端外观"))
         .child(
-            div()
-                .flex()
-                .gap_1()
-                .child(button(
-                    "−",
-                    cx.listener(|this, event, window, cx| {
-                        this.change_setting(event, window, cx, |s| {
-                            s.font_size = (s.font_size - 1.0).max(8.0)
-                        });
-                    }),
+            setting_card()
+                .child(setting_row(
+                    "字号",
+                    value_chip(&format!("{:.0} px", settings.font_size)),
+                    stepper_controls(
+                        cx,
+                        |s: &mut Appearance| s.font_size = (s.font_size - 1.0).max(8.0),
+                        |s: &mut Appearance| s.font_size = (s.font_size + 1.0).min(32.0),
+                    ),
                 ))
-                .child(button(
-                    "+",
-                    cx.listener(|this, event, window, cx| {
-                        this.change_setting(event, window, cx, |s| {
-                            s.font_size = (s.font_size + 1.0).min(32.0)
-                        });
-                    }),
+                .child(setting_row(
+                    "行高",
+                    value_chip(&format!("{:.1}", settings.line_height)),
+                    stepper_controls(
+                        cx,
+                        |s: &mut Appearance| {
+                            s.line_height = ((s.line_height - 0.1) * 10.0).round() / 10.0;
+                            s.line_height = s.line_height.clamp(0.8, 2.0);
+                        },
+                        |s: &mut Appearance| {
+                            s.line_height = ((s.line_height + 0.1) * 10.0).round() / 10.0;
+                            s.line_height = s.line_height.clamp(0.8, 2.0);
+                        },
+                    ),
+                ))
+                .child(setting_row(
+                    "内边距",
+                    value_chip(&format!("{:.0} px", settings.padding)),
+                    stepper_controls(
+                        cx,
+                        |s: &mut Appearance| s.padding = (s.padding - 1.0).max(0.0),
+                        |s: &mut Appearance| s.padding = (s.padding + 1.0).min(24.0),
+                    ),
                 )),
         )
-        .child(div().child(format!("行高: {:.1}", settings.line_height)))
+        .child(section_title("滚动与主题"))
         .child(
-            div()
-                .flex()
-                .gap_1()
-                .child(button(
-                    "−",
-                    cx.listener(|this, event, window, cx| {
-                        this.change_setting(event, window, cx, |s| {
-                            s.line_height = (s.line_height - 0.1).max(0.8)
-                        });
-                    }),
-                ))
-                .child(button(
-                    "+",
-                    cx.listener(|this, event, window, cx| {
-                        this.change_setting(event, window, cx, |s| {
-                            s.line_height = (s.line_height + 0.1).min(2.0)
-                        });
-                    }),
-                )),
+            setting_card()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .py_2()
+                        .child(div().w(px(64.0)).text_color(rgb(0xA9B1D6)).child("回滚"))
+                        .child(
+                            div()
+                                .flex()
+                                .gap_1()
+                                .child(scrollback_controls(cx, &settings)),
+                        ),
+                )
+                .child(setting_row("主题", value_chip("Tokyo Night"), div())),
         )
-        .child(div().child(format!("内边距: {:.0}px", settings.padding)))
-        .child(
-            div()
-                .flex()
-                .gap_1()
-                .child(button(
-                    "−",
-                    cx.listener(|this, event, window, cx| {
-                        this.change_setting(event, window, cx, |s| {
-                            s.padding = (s.padding - 1.0).max(0.0)
-                        });
-                    }),
-                ))
-                .child(button(
-                    "+",
-                    cx.listener(|this, event, window, cx| {
-                        this.change_setting(event, window, cx, |s| {
-                            s.padding = (s.padding + 1.0).min(24.0)
-                        });
-                    }),
-                )),
-        )
-        .child(div().child(format!("回滚: {} 行", settings.scrollback)))
-        .child(
-            div()
-                .flex()
-                .gap_1()
-                .child(button(
-                    "10k",
-                    cx.listener(|this, event, window, cx| {
-                        this.change_setting(event, window, cx, |s| s.scrollback = 10_000);
-                    }),
-                ))
-                .child(button(
-                    "50k",
-                    cx.listener(|this, event, window, cx| {
-                        this.change_setting(event, window, cx, |s| s.scrollback = 50_000);
-                    }),
-                ))
-                .child(button(
-                    "100k",
-                    cx.listener(|this, event, window, cx| {
-                        this.change_setting(event, window, cx, |s| s.scrollback = 100_000);
-                    }),
-                )),
-        )
-        .child(button(
+        .child(setting_button(
             "恢复默认",
+            false,
             cx.listener(WorkspaceView::reset_settings),
         ))
+}
+
+fn stepper_controls(
+    cx: &mut Context<WorkspaceView>,
+    decrease: impl Fn(&mut Appearance) + Clone + 'static,
+    increase: impl Fn(&mut Appearance) + Clone + 'static,
+) -> gpui::Div {
+    div()
+        .flex()
+        .gap_1()
+        .child(setting_button(
+            "−",
+            false,
+            cx.listener(move |this, event, window, cx| {
+                this.change_setting(event, window, cx, decrease.clone());
+            }),
+        ))
+        .child(setting_button(
+            "+",
+            false,
+            cx.listener(move |this, event, window, cx| {
+                this.change_setting(event, window, cx, increase.clone());
+            }),
+        ))
+}
+
+fn scrollback_controls(cx: &mut Context<WorkspaceView>, settings: &Appearance) -> gpui::Div {
+    div().flex().gap_1().children(
+        [(10_000usize, "10k"), (50_000, "50k"), (100_000, "100k")]
+            .into_iter()
+            .map(|(value, label)| {
+                let selected = settings.scrollback == value;
+                setting_button(
+                    label,
+                    selected,
+                    cx.listener(move |this, event, window, cx| {
+                        this.change_setting(event, window, cx, move |s| s.scrollback = value);
+                    }),
+                )
+            }),
+    )
+}
+
+fn shortcut_row(label: &str, keys: &str) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .py_2()
+        .text_color(rgb(0xA9B1D6))
+        .child(label.to_string())
+        .child(value_chip(keys))
+}
+
+fn info_row(label: &str, value: &str) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .py_2()
+        .text_color(rgb(0xA9B1D6))
+        .child(label.to_string())
+        .child(value.to_string())
+}
+
+fn section_title(text: &str) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(div().w(px(3.0)).h(px(14.0)).bg(rgb(0x7AA2F7)).rounded_sm())
+        .child(div().text_color(rgb(0xC0CAF5)).child(text.to_string()))
+}
+
+fn setting_card() -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .p_3()
+        .gap_1()
+        .bg(rgb(0x252637))
+        .border_1()
+        .border_color(rgb(0x343750))
+        .rounded_md()
+}
+
+fn setting_row(label: &str, chip: gpui::Div, controls: gpui::Div) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .py_2()
+        .child(
+            div()
+                .w(px(64.0))
+                .text_color(rgb(0xA9B1D6))
+                .child(label.to_string()),
+        )
+        .child(chip)
+        .child(controls)
+}
+
+fn value_chip(text: &str) -> gpui::Div {
+    div()
+        .min_w(px(64.0))
+        .h(px(30.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .px_3()
+        .bg(rgb(0x1A1B26))
+        .border_1()
+        .border_color(rgb(0x343750))
+        .rounded_sm()
+        .text_color(rgb(0xC0CAF5))
+        .child(text.to_string())
+}
+
+fn setting_button(
+    label: &'static str,
+    selected: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Div {
+    let bg = if selected {
+        rgb(0x2E4A6B)
+    } else {
+        rgb(0x252637)
+    };
+    let text = if selected {
+        rgb(0x7DCEFF)
+    } else {
+        rgb(0xA9B1D6)
+    };
+    div()
+        .h(px(30.0))
+        .min_w(px(36.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .px_3()
+        .bg(bg)
+        .border_1()
+        .border_color(if selected {
+            rgb(0x7AA2F7)
+        } else {
+            rgb(0x343750)
+        })
+        .rounded_sm()
+        .text_color(text)
+        .hover(|this| this.bg(rgb(0x303150)))
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(label)
 }
 
 fn button(
@@ -902,7 +1019,7 @@ fn create_local_terminal(
     id: TabId,
     workspace: gpui::WeakEntity<WorkspaceView>,
     cx: &mut Context<WorkspaceView>,
-    settings: &TerminalSettings,
+    settings: &Appearance,
 ) -> (Entity<TerminalView>, Arc<SessionControl>) {
     let pty_system = native_pty_system();
     let pair = pty_system
