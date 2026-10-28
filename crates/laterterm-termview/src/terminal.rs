@@ -45,11 +45,85 @@
 //! [`process_bytes`]: TerminalState::process_bytes
 
 use crate::event::GpuiEventProxy;
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Grid};
+use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use parking_lot::Mutex;
 use std::sync::Arc;
+
+/// 回滚搜索命中。
+///
+/// `line` 是「历史 + 屏幕」自顶向下的绝对行号（0 = 最老的历史行），
+/// 与渲染时的 `Line(line.0 + history_size)` 对应；`column`/`len` 为网格列，
+/// 宽字符按实际占用的列数计。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub line: usize,
+    pub column: usize,
+    pub len: usize,
+}
+
+/// 大小写不敏感的逐字符子串搜索（避免 UTF-8 字节索引在中文场景错位）。
+fn search_grid(grid: &Grid<Cell>, needle: &[char]) -> Vec<SearchMatch> {
+    let total_lines = grid.total_lines();
+    let history = total_lines - grid.screen_lines();
+    let columns = grid.columns();
+    let mut matches = Vec::new();
+    for absolute in 0..total_lines {
+        let line = Line(absolute as i32 - history as i32);
+        // 行文本 + 每个字符所在列（宽字符续列跳过，由首列代表）
+        let mut text: Vec<char> = Vec::with_capacity(columns);
+        let mut char_columns: Vec<usize> = Vec::with_capacity(columns);
+        for column in 0..columns {
+            let cell = &grid[AlacPoint::new(line, Column(column))];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            text.push(cell.c);
+            char_columns.push(column);
+        }
+        // 小写化可能一对多展开（如 'İ' → "i̇"），列映射必须与字符同步构建
+        let mut haystack: Vec<char> = Vec::with_capacity(text.len());
+        let mut haystack_columns: Vec<usize> = Vec::with_capacity(text.len());
+        for (index, c) in text.iter().enumerate() {
+            for lower in c.to_lowercase() {
+                haystack.push(lower);
+                haystack_columns.push(char_columns[index]);
+            }
+        }
+        if haystack.len() < needle.len() {
+            continue;
+        }
+        let mut start = 0;
+        while start + needle.len() <= haystack.len() {
+            if haystack[start..start + needle.len()] == *needle {
+                let first = haystack_columns[start];
+                let last = haystack_columns[start + needle.len() - 1];
+                // 末字符可能占两列（宽字符），按其实际占宽计算命中列跨度
+                let last_width = if grid[AlacPoint::new(line, Column(last))]
+                    .flags
+                    .contains(Flags::WIDE_CHAR)
+                {
+                    2
+                } else {
+                    1
+                };
+                matches.push(SearchMatch {
+                    line: absolute,
+                    column: first,
+                    len: last + last_width - first,
+                });
+                start += needle.len();
+            } else {
+                start += 1;
+            }
+        }
+    }
+    matches
+}
+
 
 /// Simple dimensions implementation for terminal initialization.
 struct TermDimensions {
@@ -282,6 +356,34 @@ impl TerminalState {
         *term.mode()
     }
 
+    /// 大小写不敏感地搜索整个回滚缓冲与可见屏幕。
+    ///
+    /// 命中按从最老历史行到屏幕底行的顺序返回；`SearchMatch::line` 使用
+    /// 「历史+屏幕」自顶向下的绝对行号（0 = 最老一行），列号与列宽均为
+    /// 网格列（宽字符占两列），可直接换算为像素坐标。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use std::sync::mpsc::channel;
+    /// # use gpui_terminal::event::GpuiEventProxy;
+    /// # use gpui_terminal::terminal::TerminalState;
+    /// # let (tx, rx) = channel();
+    /// # let event_proxy = GpuiEventProxy::new(tx);
+    /// # let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+    /// terminal.process_bytes(b"hello world\r\n");
+    /// let matches = terminal.search("WORLD");
+    /// assert_eq!(matches.len(), 1);
+    /// assert_eq!(matches[0].column, 6);
+    /// ```
+    pub fn search(&self, query: &str) -> Vec<SearchMatch> {
+        let needle: Vec<char> = query.to_lowercase().chars().collect();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        self.with_term(|term| search_grid(term.grid(), &needle))
+    }
+
     /// Execute a function with read access to the terminal.
     ///
     /// This method provides safe read access to the underlying `Term` structure.
@@ -459,6 +561,88 @@ mod tests {
             term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
         });
         terminal.with_term(|term| assert_eq!(term.grid().display_offset(), 0));
+    }
+
+    #[test]
+    fn test_search_visible_line_and_column() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        terminal.process_bytes(b"hello world\r\n");
+
+        let matches = terminal.search("WORLD");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].column, 6);
+        assert_eq!(matches[0].len, 5);
+
+        // 空查询无命中
+        assert!(terminal.search("").is_empty());
+        assert!(terminal.search("zzz").is_empty());
+    }
+
+    #[test]
+    fn test_search_scrollback_ordering() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        for line in 0..40 {
+            terminal.process_bytes(format!("line-{line}\r\n").as_bytes());
+        }
+
+        let matches = terminal.search("line-3");
+        // 回滚容量 32：line-3 已被挤出历史，只剩 line-30..line-39 共 10 处，
+        // 自顶向下（最老在前）排列
+        assert_eq!(matches.len(), 10);
+        let texts: Vec<String> = matches
+            .iter()
+            .map(|m| {
+                terminal.with_term(|term| {
+                    let grid = term.grid();
+                    let history = grid.total_lines() - grid.screen_lines();
+                    (0..5)
+                        .map(|offset| {
+                            grid[AlacPoint::new(
+                                Line(m.line as i32 - history as i32),
+                                Column(m.column + offset),
+                            )]
+                            .c
+                            .to_string()
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        // 第一个命中应是最早输出的 line-3，其后是 line-30 起步的十个
+        assert_eq!(texts[0], "line-");
+        assert!(matches.windows(2).all(|w| w[0].line <= w[1].line));
+    }
+
+    #[test]
+    fn test_search_cjk_text() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        terminal.process_bytes("中文搜索测试\r\n第二行 中文\n".as_bytes());
+
+        let matches = terminal.search("中文");
+        assert_eq!(matches.len(), 2);
+        // 每个汉字占两列：第二行命中从列 4 开始（"第二行 " = 3 汉字 6 列 + 1 空格）
+        assert_eq!(matches[1].column, 7);
+        assert_eq!(matches[1].len, 4);
+    }
+
+    #[test]
+    fn test_search_matches_on_same_line() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        terminal.process_bytes(b"ab ab ab\n");
+
+        let matches = terminal.search("ab");
+        assert_eq!(matches.len(), 3);
+        assert_eq!(matches[0].column, 0);
+        assert_eq!(matches[1].column, 3);
+        assert_eq!(matches[2].column, 6);
     }
 
     #[test]

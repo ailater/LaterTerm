@@ -800,6 +800,12 @@ fn settings_content(
                 setting_card()
                     .child(shortcut_row("新建标签", "Ctrl+T"))
                     .child(shortcut_row("关闭标签", "Ctrl+W")),
+            )
+            .child(section_title("终端"))
+            .child(
+                setting_card()
+                    .child(shortcut_row("搜索回滚", "Ctrl+Shift+F"))
+                    .child(shortcut_row("下一个 / 上一个", "Enter / Shift+Enter")),
             ),
         SettingsPage::Terminal => div()
             .pt_4()

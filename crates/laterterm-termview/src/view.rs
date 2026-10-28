@@ -52,6 +52,7 @@ use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
+use alacritty_terminal::grid::Dimensions;
 use gpui::{Edges, ElementInputHandler, EntityInputHandler, UTF16Selection, *};
 use std::io::{Read, Write};
 use std::ops::Range;
@@ -415,6 +416,17 @@ pub struct TerminalView {
 
     /// Text currently being composed by the system input method.
     marked_text: String,
+
+    /// 回滚搜索状态；打开时终端按键被拦截为搜索输入，不再写入 PTY。
+    search: Option<SearchState>,
+}
+
+/// 搜索栏状态。
+struct SearchState {
+    query: String,
+    matches: Vec<crate::terminal::SearchMatch>,
+    /// 当前命中的下标（在 matches 中循环移动）。
+    current: usize,
 }
 
 impl TerminalView {
@@ -537,6 +549,7 @@ impl TerminalView {
             clipboard_store_callback: None,
             exit_callback: None,
             marked_text: String::new(),
+            search: None,
         }
     }
 
@@ -720,7 +733,7 @@ impl TerminalView {
     /// Converts GPUI keystrokes to terminal escape sequences and writes them
     /// to the stdin writer. If a key handler is set and returns true, the event
     /// is consumed and not sent to the terminal.
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         // Check if key handler wants to consume this event
         if let Some(ref handler) = self.key_handler
             && handler(event)
@@ -729,6 +742,38 @@ impl TerminalView {
         }
 
         let keystroke = &event.keystroke;
+
+        // Ctrl+Shift+F 打开回滚搜索
+        if keystroke.modifiers.control
+            && keystroke.modifiers.shift
+            && keystroke.key.eq_ignore_ascii_case("f")
+        {
+            self.open_search(cx);
+            return;
+        }
+
+        // 搜索打开时拦截所有按键，一律不透传 PTY
+        if self.search.is_some() {
+            match keystroke.key.as_str() {
+                "escape" => self.close_search(cx),
+                "enter" | "return" => {
+                    if keystroke.modifiers.shift {
+                        self.search_select_prev(cx);
+                    } else {
+                        self.search_select_next(cx);
+                    }
+                }
+                "backspace" => self.search_backspace(cx),
+                "up" => self.search_select_prev(cx),
+                "down" => self.search_select_next(cx),
+                _ => {
+                    // 可打印字符走 InputHandler 提交路径追加查询；
+                    // 其余组合键（Ctrl+C 等）在搜索态直接吞掉。
+                }
+            }
+            return;
+        }
+
         let is_plain_text = !keystroke.modifiers.control
             && !keystroke.modifiers.alt
             && (keystroke.key_char.is_some() || keystroke.key.len() == 1);
@@ -914,6 +959,98 @@ impl TerminalView {
         }
     }
 
+    /// 打开回滚搜索（Ctrl+Shift+F），终端保持焦点但按键转为搜索输入。
+    pub fn open_search(&mut self, cx: &mut Context<Self>) {
+        if self.search.is_none() {
+            self.search = Some(SearchState {
+                query: String::new(),
+                matches: Vec::new(),
+                current: 0,
+            });
+            cx.notify();
+        }
+    }
+
+    /// 关闭搜索并恢复终端输入。
+    pub fn close_search(&mut self, cx: &mut Context<Self>) {
+        if self.search.take().is_some() {
+            self.marked_text.clear();
+            cx.notify();
+        }
+    }
+
+    /// 搜索查询追加分本（来自 InputHandler 提交或按键）。
+    fn search_push_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        if let Some(search) = &mut self.search {
+            search.query.push_str(text);
+            self.refresh_search(cx);
+        }
+    }
+
+    /// 删除查询的最后一个字符。
+    fn search_backspace(&mut self, cx: &mut Context<Self>) {
+        if let Some(search) = &mut self.search
+            && search.query.pop().is_some()
+        {
+            self.refresh_search(cx);
+        }
+    }
+
+    /// 查询变化后重新执行搜索并跳到首个命中。
+    fn refresh_search(&mut self, cx: &mut Context<Self>) {
+        if let Some(search) = &mut self.search {
+            let matches = self.state.search(&search.query);
+            search.matches = matches;
+            search.current = 0;
+            self.scroll_to_current_match();
+        }
+        cx.notify();
+    }
+
+    /// 跳到下一个命中（回环）。
+    fn search_select_next(&mut self, cx: &mut Context<Self>) {
+        if let Some(search) = &mut self.search
+            && !search.matches.is_empty()
+        {
+            search.current = (search.current + 1) % search.matches.len();
+            self.scroll_to_current_match();
+            cx.notify();
+        }
+    }
+
+    /// 跳到上一个命中（回环）。
+    fn search_select_prev(&mut self, cx: &mut Context<Self>) {
+        if let Some(search) = &mut self.search
+            && !search.matches.is_empty()
+        {
+            search.current = (search.current + search.matches.len() - 1) % search.matches.len();
+            self.scroll_to_current_match();
+            cx.notify();
+        }
+    }
+
+    /// 滚动网格使当前命中大致落在视口上部三分之一处。
+    fn scroll_to_current_match(&mut self) {
+        let Some(match_) = self
+            .search
+            .as_ref()
+            .and_then(|search| search.matches.get(search.current).copied())
+        else {
+            return;
+        };
+        self.state.with_term_mut(|term| {
+            let grid = term.grid();
+            let history = grid.total_lines() - grid.screen_lines();
+            let desired = history as i64 + (grid.screen_lines() as i64 / 3)
+                - match_.line as i64;
+            let desired = desired.clamp(0, history as i64) as i32;
+            let delta = desired - grid.display_offset() as i32;
+            if delta != 0 {
+                term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
+            }
+        });
+    }
+
     /// Get the current terminal configuration.
     ///
     /// # Returns
@@ -1039,6 +1176,11 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 搜索打开时输入提交文本转为搜索查询（IME 提交与物理键盘共用此路径）
+        if self.search.is_some() {
+            self.search_push_text(text, cx);
+            return;
+        }
         self.marked_text.clear();
         let mut writer = self.stdin_writer.lock();
         if let Err(error) = writer
@@ -1104,8 +1246,44 @@ impl Render for TerminalView {
         let focus_handle = self.focus_handle.clone();
         let entity = cx.entity();
         let padding = self.config.padding;
+        // 搜索快照：canvas 闭包在绘制阶段执行，不能借用 self
+        let search_open = self.search.is_some();
+        let current_match = self
+            .search
+            .as_ref()
+            .and_then(|search| search.matches.get(search.current).copied());
+        let search_bar = self.search.as_ref().map(|search| {
+            let counter = if search.query.is_empty() {
+                "0/0".to_string()
+            } else if search.matches.is_empty() {
+                "无命中".to_string()
+            } else {
+                format!("{}/{}", search.current + 1, search.matches.len())
+            };
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(30.0))
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .bg(gpui::black().opacity(0.8))
+                .text_size(px(12.0))
+                .text_color(rgb(0xC0CAF5))
+                .child(div().text_color(rgb(0x7DCFFF)).child("搜索"))
+                .child(div().child(format!("{}▏", search.query)))
+                .child(div().ml_auto().text_color(rgb(0xE0AF68)).child(counter))
+                .child(
+                    div()
+                        .text_color(rgb(0x565A78))
+                        .child("Enter↓ Shift+Enter↑ Esc 关闭"),
+                )
+        });
 
-        div()
+        let root = div()
             .size_full()
             .bg(rgb(0x1e1e1e))
             .track_focus(&self.focus_handle)
@@ -1191,10 +1369,45 @@ impl Render for TerminalView {
 
                         // Paint the terminal with measured dimensions
                         measured_renderer.paint(bounds, padding, &term, window, cx);
+
+                        // 当前搜索命中的高亮覆盖层（网格坐标锚定，随滚动移动）
+                        if search_open
+                            && let Some(match_) = current_match
+                        {
+                            let grid = term.grid();
+                            let history = grid.total_lines() - grid.screen_lines();
+                            let display_offset = grid.display_offset() as i64;
+                            let row = match_.line as i64 + display_offset - history as i64;
+                            if row >= 0 && (row as usize) < grid.screen_lines() {
+                                let origin_x = bounds.origin.x + padding.left;
+                                let origin_y = bounds.origin.y + padding.top;
+                                let x = origin_x + measured_renderer.cell_width * match_.column as f32;
+                                let y = origin_y + measured_renderer.cell_height * row as f32;
+                                window.paint_quad(gpui::quad(
+                                    Bounds {
+                                        origin: Point { x, y },
+                                        size: Size {
+                                            width: measured_renderer.cell_width * match_.len as f32,
+                                            height: measured_renderer.cell_height,
+                                        },
+                                    },
+                                    px(0.0),
+                                    gpui::Hsla::from(gpui::rgb(0xE0AF68)).opacity(0.35),
+                                    Edges::<Pixels>::default(),
+                                    gpui::transparent_black(),
+                                    gpui::BorderStyle::default(),
+                                ));
+                            }
+                        }
                     },
                 )
                 .size_full(),
-            )
+            );
+        if let Some(bar) = search_bar {
+            root.child(bar)
+        } else {
+            root
+        }
     }
 }
 
