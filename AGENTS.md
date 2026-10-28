@@ -27,5 +27,7 @@ cargo clippy --fix   # lint
 
 ## 当前阶段
 
-M0：单窗口 + 本地 shell + 网格渲染。验收标准：vim / htop / tmux 无残影、
-中文 IME 预编辑正常、4K 缩放不糊。路线图见 README 与 docs/architecture.md。
+M1（交互完善）：M0 骨架已完成；配置持久化、主题热加载、设置面板已落地。
+剩余任务按序：TerminalSession trait 抽出（laterterm-core）→ 中文 IME 预编辑 →
+分屏树 → 回滚搜索 → 字体配置面。验收：拔掉原终端用一整天无不适，
+IME/搜索/分屏在 4K 缩放下不糊不跳。明细见 docs/roadmap.md。

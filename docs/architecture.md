@@ -32,6 +32,6 @@ laterterm-app       main 二进制                                              
 
 ## 里程碑
 
-M0 骨架（本阶段）→ M1 多标签/IME/主题 → M2 快捷命令+OTP → M3 SSH/跳板机/SFTP/GBK → M4 三平台打包。
+M0 骨架 ✅ → M1 交互完善（本阶段，主题热加载/设置已落地）→ M2 快捷命令+OTP → M3 SSH/跳板机/SFTP/GBK → M4 三平台打包。任务明细见 roadmap.md。
 
 深度终端迁移：`command-config.conf` / `server-config.conf` 格式已逆向（见 ~/.config/deepin/deepin-terminal），M3 提供一键导入。
