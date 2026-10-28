@@ -17,3 +17,5 @@ laterterm-config = { path = "../laterterm-config" }
 anyhow.workspace = true
 portable-pty.workspace = true
 parking_lot.workspace = true
+flume.workspace = true
+notify = "8"

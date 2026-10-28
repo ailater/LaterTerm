@@ -10,6 +10,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod theme;
+
+pub use theme::{DEFAULT_THEME, Theme, ThemeRegistry, themes_dir};
+
 pub const APP_DIR: &str = "laterterm";
 pub const SETTINGS_FILE: &str = "settings.toml";
 
@@ -29,6 +33,7 @@ pub struct Appearance {
     pub line_height: f32,
     pub padding: f32,
     pub scrollback: usize,
+    pub theme: String,
 }
 
 impl Default for Appearance {
@@ -39,6 +44,7 @@ impl Default for Appearance {
             line_height: 1.0,
             padding: 8.0,
             scrollback: 100_000,
+            theme: DEFAULT_THEME.into(),
         }
     }
 }
@@ -48,7 +54,6 @@ impl Settings {
     pub fn default_path() -> Option<PathBuf> {
         Some(config_dir()?.join(APP_DIR).join(SETTINGS_FILE))
     }
-
     /// 从指定路径加载设置；文件不存在时返回默认值（首次运行）。
     ///
     /// 解析失败会向上抛错，由调用方决定回退策略——避免把用户手改坏的
@@ -106,6 +111,16 @@ impl Settings {
             eprintln!("{error:#}");
         }
     }
+
+    /// 首次运行时生成默认配置文件，方便用户发现并手改。
+    ///
+    /// 返回是否真正创建（文件已存在则不动，坏文件也不会被覆盖）。
+    pub fn ensure_settings_file(&self) -> bool {
+        match Self::default_path() {
+            Some(path) if !path.exists() => self.save_to(&path).is_ok(),
+            _ => false,
+        }
+    }
 }
 
 impl Appearance {
@@ -118,7 +133,16 @@ impl Appearance {
         if self.font_family.trim().is_empty() {
             self.font_family = Self::default().font_family;
         }
+        self.theme = self.theme.trim().to_string();
+        if self.theme.is_empty() {
+            self.theme = DEFAULT_THEME.into();
+        }
     }
+}
+
+/// 应用配置目录（`<配置目录>/laterterm`），用于文件监听等。
+pub fn app_config_dir() -> Option<PathBuf> {
+    Some(config_dir()?.join(APP_DIR))
 }
 
 /// 平台配置目录（Linux 优先，遵循 XDG）。

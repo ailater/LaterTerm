@@ -1,10 +1,11 @@
 use gpui::{
-    App, AppContext, Context, Edges, Entity, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, ParentElement, Render, Styled, Window, div,
-    prelude::FluentBuilder, px, rgb,
+    App, AppContext, AsyncApp, Context, Edges, Entity, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, Styled, WeakEntity, Window,
+    div, prelude::FluentBuilder, px, rgb,
 };
-use laterterm_config::{Appearance, Settings};
+use laterterm_config::{Appearance, Settings, Theme, ThemeRegistry, app_config_dir};
 use laterterm_termview::{ColorPalette, TerminalConfig, TerminalView};
+use notify::Watcher;
 use parking_lot::Mutex;
 use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
 use std::sync::Arc;
@@ -98,16 +99,22 @@ pub struct WorkspaceView {
     settings_open: bool,
     settings_page: SettingsPage,
     settings: Settings,
+    themes: ThemeRegistry,
 }
 
 impl WorkspaceView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let weak_workspace = cx.weak_entity();
         let settings = Settings::load_or_default();
+        settings.ensure_settings_file();
+        let themes = ThemeRegistry::load();
         let first_id = TabId(1);
-        let (terminal, session) = create_local_terminal(first_id, weak_workspace, cx, &settings.appearance);
-        Self {
+        let theme = themes.resolve(&settings.appearance.theme).clone();
+        let (terminal, session) =
+            create_local_terminal(first_id, weak_workspace, cx, &settings.appearance, &theme);
+        let view = Self {
             settings,
+            themes,
             settings_page: SettingsPage::Appearance,
             tabs: vec![TerminalTab {
                 id: first_id,
@@ -121,7 +128,9 @@ impl WorkspaceView {
             left_panel: false,
             right_panel: false,
             settings_open: false,
-        }
+        };
+        Self::watch_config_files(cx);
+        view
     }
 
     fn active_tab_id(&self) -> TabId {
@@ -140,8 +149,9 @@ impl WorkspaceView {
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
+        let theme = self.themes.resolve(&self.settings.appearance.theme).clone();
         let (terminal, session) =
-            create_local_terminal(id, cx.weak_entity(), cx, &self.settings.appearance);
+            create_local_terminal(id, cx.weak_entity(), cx, &self.settings.appearance, &theme);
         self.tabs.push(TerminalTab {
             id,
             title: format!("终端 {}", id.0),
@@ -256,7 +266,13 @@ impl WorkspaceView {
         cx.stop_propagation();
         change(&mut self.settings.appearance);
         self.settings.save();
+        self.apply_appearance(cx);
+    }
+
+    /// 把当前设置（外观五项 + 主题）应用到所有标签，不重建终端。
+    fn apply_appearance(&mut self, cx: &mut Context<Self>) {
         let appearance = self.settings.appearance.clone();
+        let palette = palette_for(self.themes.resolve(&appearance.theme));
         for tab in &self.tabs {
             tab.terminal.update(cx, |terminal, cx| {
                 let mut config = terminal.config().clone();
@@ -265,10 +281,61 @@ impl WorkspaceView {
                 config.line_height_multiplier = appearance.line_height;
                 config.padding = Edges::all(px(appearance.padding));
                 config.scrollback = appearance.scrollback;
+                config.colors = palette.clone();
                 terminal.update_config(config, cx);
             });
         }
         cx.notify();
+    }
+
+    /// 配置目录被外部修改后的热加载入口：重读设置与主题注册表，
+    /// 有实际变化才重应用（自身保存触发的回声事件在这里被等值比较吸收）。
+    fn reload_from_disk(&mut self, cx: &mut Context<Self>) {
+        // 编辑中途的半截文件解析失败时保持现状，等下一次事件重试
+        let settings = Settings::default_path()
+            .and_then(|path| Settings::load(&path).ok())
+            .unwrap_or_else(|| self.settings.clone());
+        let themes = ThemeRegistry::load();
+        if settings != self.settings || themes != self.themes {
+            self.settings = settings;
+            self.themes = themes;
+            self.apply_appearance(cx);
+        }
+    }
+
+    /// 监听配置目录（settings.toml 与 themes/）实现主题/设置热加载。
+    fn watch_config_files(cx: &mut Context<Self>) {
+        let Some(dir) = app_config_dir() else {
+            return;
+        };
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let (event_tx, event_rx) = flume::unbounded::<()>();
+        let Ok(mut watcher) =
+            notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
+                if event.is_ok() {
+                    let _ = event_tx.send(());
+                }
+            })
+        else {
+            return;
+        };
+        if watcher.watch(&dir, notify::RecursiveMode::Recursive).is_err() {
+            return;
+        }
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            let _watcher = watcher; // 监听器随任务存活，避免被提前丢弃
+            while event_rx.recv_async().await.is_ok() {
+                // 去抖：吸收 200ms 窗口内的连续事件（编辑器保存常触发多个）
+                while event_rx
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .is_ok()
+                {}
+                let _ = this.update(cx, |workspace, cx| workspace.reload_from_disk(cx));
+            }
+        })
+        .detach();
     }
 
     fn reset_settings(
@@ -830,7 +897,15 @@ fn settings_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>
                                 .child(scrollback_controls(cx, &settings)),
                         ),
                 )
-                .child(setting_row("主题", value_chip("Tokyo Night"), div())),
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .py_2()
+                        .child(div().w(px(64.0)).text_color(rgb(0xA9B1D6)).child("主题"))
+                        .child(theme_controls(cx, &workspace.themes, &settings.theme)),
+                )
         )
         .child(setting_button(
             "恢复默认",
@@ -877,6 +952,25 @@ fn scrollback_controls(cx: &mut Context<WorkspaceView>, settings: &Appearance) -
                     }),
                 )
             }),
+    )
+}
+
+fn theme_controls(
+    cx: &mut Context<WorkspaceView>,
+    themes: &ThemeRegistry,
+    current: &str,
+) -> gpui::Div {
+    div().flex().flex_wrap().gap_1().children(
+        themes.names().into_iter().map(|name| {
+            let selected = name == current;
+            setting_button(
+                name.clone(),
+                selected,
+                cx.listener(move |this, event, window, cx| {
+                    this.change_setting(event, window, cx, |s| s.theme = name.clone());
+                }),
+            )
+        }),
     )
 }
 
@@ -956,7 +1050,7 @@ fn value_chip(text: &str) -> gpui::Div {
 }
 
 fn setting_button(
-    label: &'static str,
+    label: impl Into<gpui::SharedString>,
     selected: bool,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Div {
@@ -988,7 +1082,7 @@ fn setting_button(
         .text_color(text)
         .hover(|this| this.bg(rgb(0x303150)))
         .on_mouse_down(MouseButton::Left, listener)
-        .child(label)
+        .child(label.into())
 }
 
 fn button(
@@ -1020,6 +1114,7 @@ fn create_local_terminal(
     workspace: gpui::WeakEntity<WorkspaceView>,
     cx: &mut Context<WorkspaceView>,
     settings: &Appearance,
+    theme: &Theme,
 ) -> (Entity<TerminalView>, Arc<SessionControl>) {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -1056,7 +1151,7 @@ fn create_local_terminal(
         scrollback: settings.scrollback,
         line_height_multiplier: settings.line_height,
         padding: Edges::all(px(settings.padding)),
-        colors: tokyo_night(),
+        colors: palette_for(theme),
     };
 
     let terminal = cx.new(|cx| {
@@ -1089,26 +1184,40 @@ fn create_local_terminal(
     (terminal, session)
 }
 
-fn tokyo_night() -> ColorPalette {
-    ColorPalette::builder()
-        .background(0x1A, 0x1B, 0x26)
-        .foreground(0xC0, 0xCA, 0xF5)
-        .cursor(0xC0, 0xCA, 0xF5)
-        .black(0x15, 0x16, 0x1E)
-        .red(0xF7, 0x76, 0x8E)
-        .green(0x9E, 0xCE, 0x6A)
-        .yellow(0xE0, 0xAF, 0x68)
-        .blue(0x7A, 0xA2, 0xF7)
-        .magenta(0xBB, 0x9A, 0xF7)
-        .cyan(0x7D, 0xCF, 0xFF)
-        .white(0xA9, 0xB1, 0xD6)
-        .bright_black(0x41, 0x48, 0x68)
-        .bright_red(0xF7, 0x76, 0x8E)
-        .bright_green(0x9E, 0xCE, 0x6A)
-        .bright_yellow(0xE0, 0xAF, 0x68)
-        .bright_blue(0x7A, 0xA2, 0xF7)
-        .bright_magenta(0xBB, 0x9A, 0xF7)
-        .bright_cyan(0x7D, 0xCF, 0xFF)
-        .bright_white(0xC0, 0xCA, 0xF5)
-        .build()
+/// laterterm_config 主题 → termview 调色板。
+///
+/// builder 的颜色方法都是 (r, g, b) 三参形式，这里用宏把 0xRRGGBB 打包值展开进去。
+macro_rules! set_color {
+    ($builder:expr, $method:ident, $value:expr) => {
+        $builder = $builder.$method(
+            ($value >> 16) as u8,
+            (($value >> 8) & 0xFF) as u8,
+            ($value & 0xFF) as u8,
+        )
+    };
+}
+
+fn palette_for(theme: &Theme) -> ColorPalette {
+    let colors = &theme.colors;
+    let mut builder = ColorPalette::builder();
+    set_color!(builder, background, colors.background);
+    set_color!(builder, foreground, colors.foreground);
+    set_color!(builder, cursor, colors.cursor);
+    set_color!(builder, black, colors.black);
+    set_color!(builder, red, colors.red);
+    set_color!(builder, green, colors.green);
+    set_color!(builder, yellow, colors.yellow);
+    set_color!(builder, blue, colors.blue);
+    set_color!(builder, magenta, colors.magenta);
+    set_color!(builder, cyan, colors.cyan);
+    set_color!(builder, white, colors.white);
+    set_color!(builder, bright_black, colors.bright_black);
+    set_color!(builder, bright_red, colors.bright_red);
+    set_color!(builder, bright_green, colors.bright_green);
+    set_color!(builder, bright_yellow, colors.bright_yellow);
+    set_color!(builder, bright_blue, colors.bright_blue);
+    set_color!(builder, bright_magenta, colors.bright_magenta);
+    set_color!(builder, bright_cyan, colors.bright_cyan);
+    set_color!(builder, bright_white, colors.bright_white);
+    builder.build()
 }
