@@ -1,6 +1,8 @@
 //! LaterTerm — 跨平台 GPU 终端。
 
 mod workspace;
+#[cfg(test)]
+mod workspace_tests;
 
 use anyhow::Result;
 use gpui::AppContext;

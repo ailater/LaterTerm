@@ -160,8 +160,10 @@ impl TerminalState {
     /// ```
     pub fn new(cols: usize, rows: usize, scrollback: usize, event_proxy: GpuiEventProxy) -> Self {
         // Configure the history buffer before creating the terminal grids.
-        let mut config = Config::default();
-        config.scrolling_history = scrollback;
+        let config = Config {
+            scrolling_history: scrollback,
+            ..Default::default()
+        };
 
         // Create dimensions for terminal initialization
         let dimensions = TermDimensions::new(cols, rows);

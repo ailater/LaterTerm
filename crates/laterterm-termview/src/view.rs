@@ -809,7 +809,7 @@ impl TerminalView {
                 if cell_height <= 0.0 {
                     return;
                 }
-                (point.y / gpui::px(cell_height)).into()
+                point.y / gpui::px(cell_height)
             }
         };
         // 当前桌面使用自然滚动：保持滚轮方向与内容移动方向一致。
@@ -900,6 +900,17 @@ impl TerminalView {
         self.state.resize(cols, rows);
         if let Some(callback) = &self.resize_callback {
             callback(cols, rows);
+        }
+    }
+
+    /// Send text directly to the PTY, used by trusted quick-command UI actions.
+    pub fn send_text(&mut self, text: &str) {
+        let mut writer = self.stdin_writer.lock();
+        if let Err(error) = writer
+            .write_all(text.as_bytes())
+            .and_then(|_| writer.flush())
+        {
+            eprintln!("写入快捷命令失败: {error}");
         }
     }
 
