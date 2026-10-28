@@ -31,13 +31,11 @@
 //! ```ignore
 //! use gpui::{Context, Edges, px};
 //! use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
+//! use laterterm_core::TerminalSession;
 //!
-//! // In a GPUI window context:
+//! // In a GPUI window context（session 由 laterterm-local / laterterm-ssh 提供）:
 //! let terminal = cx.new(|cx| {
-//!     TerminalView::new(pty_writer, pty_reader, TerminalConfig::default(), cx)
-//!         .with_resize_callback(move |cols, rows| {
-//!             // Notify PTY of new dimensions
-//!         })
+//!     TerminalView::new(session, TerminalConfig::default(), cx)
 //!         .with_exit_callback(|_, cx| {
 //!             cx.quit();
 //!         })
@@ -54,6 +52,7 @@ use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
 use alacritty_terminal::grid::Dimensions;
 use gpui::{Edges, ElementInputHandler, EntityInputHandler, UTF16Selection, *};
+use laterterm_core::TerminalSession;
 use std::io::{Read, Write};
 use std::ops::Range;
 use std::sync::Arc;
@@ -174,18 +173,9 @@ impl Default for TerminalConfig {
 /// # Example
 ///
 /// ```ignore
-/// use portable_pty::PtySize;
-///
-/// let pty = Arc::new(Mutex::new(pty_master));
-/// let pty_clone = pty.clone();
-///
+/// // 默认回调已把 resize 转发给 TerminalSession；仅特殊后端才需要覆盖：
 /// terminal.with_resize_callback(move |cols, rows| {
-///     pty_clone.lock().resize(PtySize {
-///         cols: cols as u16,
-///         rows: rows as u16,
-///         pixel_width: 0,
-///         pixel_height: 0,
-///     }).ok();
+///     custom_backend.resize(cols, rows);
 /// });
 /// ```
 pub type ResizeCallback = Box<dyn Fn(usize, usize) + Send + Sync>;
@@ -430,16 +420,15 @@ struct SearchState {
 }
 
 impl TerminalView {
-    /// Create a new terminal with provided I/O streams.
+    /// Create a new terminal bound to a [`TerminalSession`].
     ///
-    /// This method initializes a new terminal emulator with the given stdin writer
-    /// and stdout reader. It spawns a background task to read from stdout and
-    /// process incoming bytes through the VTE parser.
+    /// 字节流在构造时从会话一次性取出（`take_streams`），读泵与写端全部
+    /// 由视图接管；resize 默认回调转发给会话（本地 = PTY resize，
+    /// SSH = 窗口变更转义序列），可用 [`with_resize_callback`] 覆盖。
     ///
     /// # Arguments
     ///
-    /// * `stdin_writer` - Writer for sending input bytes to the terminal process
-    /// * `stdout_reader` - Reader for receiving output bytes from the terminal process
+    /// * `session` - 会话契约（本地 PTY / SSH 远程共用）
     /// * `config` - Terminal configuration (dimensions, font, etc.)
     /// * `cx` - GPUI context for this view
     ///
@@ -452,19 +441,19 @@ impl TerminalView {
     /// ```ignore
     /// // In a GPUI window context:
     /// let terminal = cx.new(|cx| {
-    ///     TerminalView::new(stdin_writer, stdout_reader, TerminalConfig::default(), cx)
+    ///     TerminalView::new(session, TerminalConfig::default(), cx)
     /// });
     /// ```
-    pub fn new<W, R>(
-        stdin_writer: W,
-        stdout_reader: R,
+    pub fn new(
+        session: Arc<dyn TerminalSession>,
         config: TerminalConfig,
         cx: &mut Context<Self>,
-    ) -> Self
-    where
-        W: Write + Send + 'static,
-        R: Read + Send + 'static,
-    {
+    ) -> Self {
+        // 取出会话字节流：只允许一次，双读者会分裂字节流
+        let streams = session.take_streams().expect("会话字节流已被取走");
+        let stdin_writer: Box<dyn Write + Send> = streams.writer;
+        let stdout_reader = streams.reader;
+
         // Create event channel for terminal events
         let (event_tx, event_rx) = mpsc::channel();
 
@@ -489,9 +478,7 @@ impl TerminalView {
         let focus_handle = cx.focus_handle();
 
         // Wrap stdin writer in Arc<Mutex> for thread-safe access
-        let stdin_writer = Arc::new(parking_lot::Mutex::new(
-            Box::new(stdin_writer) as Box<dyn Write + Send>
-        ));
+        let stdin_writer = Arc::new(parking_lot::Mutex::new(stdin_writer));
 
         // Create async channel for bytes (push-based notification)
         // Using flume instead of smol::channel because flume is executor-agnostic
@@ -542,7 +529,15 @@ impl TerminalView {
             event_rx,
             config,
             _reader_task: reader_task,
-            resize_callback: None,
+            // 默认 resize 回调转发给会话；with_resize_callback 可整体覆盖
+            resize_callback: {
+                let session_for_resize = Arc::clone(&session);
+                Some(Arc::new(Box::new(move |cols: usize, rows: usize| {
+                    if let Err(error) = session_for_resize.resize(cols as u16, rows as u16) {
+                        eprintln!("会话 resize 失败: {error}");
+                    }
+                })))
+            },
             key_handler: None,
             bell_callback: None,
             title_callback: None,
@@ -1041,8 +1036,7 @@ impl TerminalView {
         self.state.with_term_mut(|term| {
             let grid = term.grid();
             let history = grid.total_lines() - grid.screen_lines();
-            let desired = history as i64 + (grid.screen_lines() as i64 / 3)
-                - match_.line as i64;
+            let desired = history as i64 + (grid.screen_lines() as i64 / 3) - match_.line as i64;
             let desired = desired.clamp(0, history as i64) as i32;
             let delta = desired - grid.display_offset() as i32;
             if delta != 0 {
@@ -1371,9 +1365,7 @@ impl Render for TerminalView {
                         measured_renderer.paint(bounds, padding, &term, window, cx);
 
                         // 当前搜索命中的高亮覆盖层（网格坐标锚定，随滚动移动）
-                        if search_open
-                            && let Some(match_) = current_match
-                        {
+                        if search_open && let Some(match_) = current_match {
                             let grid = term.grid();
                             let history = grid.total_lines() - grid.screen_lines();
                             let display_offset = grid.display_offset() as i64;
@@ -1381,7 +1373,8 @@ impl Render for TerminalView {
                             if row >= 0 && (row as usize) < grid.screen_lines() {
                                 let origin_x = bounds.origin.x + padding.left;
                                 let origin_y = bounds.origin.y + padding.top;
-                                let x = origin_x + measured_renderer.cell_width * match_.column as f32;
+                                let x =
+                                    origin_x + measured_renderer.cell_width * match_.column as f32;
                                 let y = origin_y + measured_renderer.cell_height * row as f32;
                                 window.paint_quad(gpui::quad(
                                     Bounds {

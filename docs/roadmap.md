@@ -49,16 +49,19 @@ M0 骨架 ✅ → M1 交互完善 🚧(本阶段) → M2 快捷命令 ⏳ → M3
 | laterterm-config：TOML 设置持久化 | ✅ bffa421 |
 | 主题系统（ColorPalette builder + Tokyo Night）与 notify 热加载 | ✅ 6e2e085 |
 | 设置面板 UI（接 config 落盘） | ✅ |
+| 回滚搜索（terminal.rs `search_grid` + view.rs SearchState/搜索 UI，含 CJK 宽字符与回滚排序测试——前版路线图误标为「从零做」，勘误） | ✅ 存量已完成 |
+| TerminalSession trait 抽出：`laterterm-core`（纯 std 契约：backend/title/take_streams/resize/kill）+ `laterterm-local`（PTY 开启/spawn/回收线程内聚；termview 与 app 摆脱 portable-pty 直依赖，resize 走视图默认回调转发给会话） | ✅ 本次提交 |
 
 ### 剩余（按优先级）
 
 | # | 任务 | 说明 | 预估 |
 |---|------|------|------|
-| 1 | **TerminalSession trait 抽出** | 把 PTY 管理从 termview 抽进 `laterterm-core`：`recv/write/resize/backend_info`。M3 SSH 复用的前提，越早抽越便宜 | S |
-| 2 | **中文 IME 预编辑** | GPUI 的 IME 事件接入 termview；验收：fcitx5 拼行/候选框跟随、预编辑下划线不破坏网格 | M |
-| 3 | **分屏树** | workspace 内 H/V 嵌套分屏 + 焦点循环 + 快捷键（Ctrl+Shift+E/O 习惯对齐） | M |
-| 4 | **回滚搜索** | 滚动缓冲扩到 10 万行 + Ctrl+Shift+F 全文搜索（termview 现无 search 模块，从零做） | M |
-| 5 | 字体配置面（连字开关/字号/备选字体链） | config 已有热加载，补 UI 与 termview 接线 | S |
+| 1 | **中文 IME 预编辑** | GPUI 的 IME 事件接入 termview；验收：fcitx5 拼行/候选框跟随、预编辑下划线不破坏网格 | M |
+| 2 | **分屏树** | workspace 内 H/V 嵌套分屏 + 焦点循环 + 快捷键（Ctrl+Shift+E/O 习惯对齐） | M |
+| 3 | 字体配置面（连字开关/字号/备选字体链） | config 已有热加载，补 UI 与 termview 接线 | S |
+
+> 已知噪音：termview 的 29 个上游遗留 doctest 需 GPUI 运行时，本机必挂（干净 HEAD 同样挂），
+> 门禁口径用 `cargo test --workspace --lib --bins`；后续整批标 `ignore` 清噪。
 
 **验收**：拔掉原终端用一整天无不适；IME/搜索/分屏在 4K 缩放下不糊不跳。
 

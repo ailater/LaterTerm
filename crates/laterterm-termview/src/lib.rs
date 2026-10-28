@@ -22,41 +22,29 @@
 //!
 //! ## Quick Start
 //!
-//! The terminal view accepts I/O streams rather than spawning processes directly.
-//! This gives you full control over the PTY lifecycle. Here's a complete example
-//! using [portable-pty](https://docs.rs/portable-pty):
+//! The terminal view binds a [`laterterm_core::TerminalSession`] rather than
+//! spawning processes directly —— 本地 PTY（laterterm-local）与 SSH 远程
+//! （M3 的 laterterm-ssh）共用同一视图。完整示例：
 //!
 //! ```ignore
 //! use gpui::{Application, Edges, px};
 //! use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
-//! use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+//! use laterterm_local::{LocalOptions, LocalSession};
+//! use laterterm_core::TerminalSession;
 //! use std::sync::Arc;
 //!
 //! fn main() {
 //!     let app = Application::new();
 //!     app.run(|cx| {
-//!         // 1. Create PTY with initial dimensions
-//!         let pty_system = native_pty_system();
-//!         let pair = pty_system.openpty(PtySize {
-//!             rows: 24,
-//!             cols: 80,
-//!             pixel_width: 0,
-//!             pixel_height: 0,
-//!         }).expect("Failed to open PTY");
-//!
-//!         // 2. Spawn shell in the PTY
+//!         // 1. 启动本地会话（PTY 开启/spawn/回收线程全部内聚在 LocalSession）
 //!         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-//!         let mut cmd = CommandBuilder::new(&shell);
-//!         cmd.env("TERM", "xterm-256color");
-//!         cmd.env("COLORTERM", "truecolor");
-//!         let _child = pair.slave.spawn_command(cmd).expect("Failed to spawn shell");
+//!         let session: Arc<dyn TerminalSession> = Arc::new(
+//!             LocalSession::spawn(LocalOptions {
+//!                 shell, args: vec![], env: vec![], cols: 80, rows: 24,
+//!             }).expect("Failed to spawn shell"),
+//!         );
 //!
-//!         // 3. Get I/O handles from the PTY master
-//!         let writer = pair.master.take_writer().expect("Failed to get writer");
-//!         let reader = pair.master.try_clone_reader().expect("Failed to get reader");
-//!         let pty_master = Arc::new(parking_lot::Mutex::new(pair.master));
-//!
-//!         // 4. Create terminal configuration
+//!         // 2. Create terminal configuration
 //!         let config = TerminalConfig {
 //!             font_family: "monospace".into(),
 //!             font_size: px(14.0),
@@ -68,23 +56,11 @@
 //!             colors: ColorPalette::default(),
 //!         };
 //!
-//!         // 5. Create resize callback to sync PTY dimensions
-//!         let pty_for_resize = pty_master.clone();
-//!         let resize_callback = move |cols: usize, rows: usize| {
-//!             let _ = pty_for_resize.lock().resize(PtySize {
-//!                 cols: cols as u16,
-//!                 rows: rows as u16,
-//!                 pixel_width: 0,
-//!                 pixel_height: 0,
-//!             });
-//!         };
-//!
-//!         // 6. Open window with terminal
+//!         // 3. Open window with terminal（resize 默认转发给 session，无需另接回调）
 //!         cx.spawn(async move |cx| {
 //!             cx.open_window(Default::default(), |window, cx| {
 //!                 let terminal = cx.new(|cx| {
-//!                     TerminalView::new(writer, reader, config, cx)
-//!                         .with_resize_callback(resize_callback)
+//!                     TerminalView::new(session, config, cx)
 //!                         .with_exit_callback(|_, cx| cx.quit())
 //!                 });
 //!                 terminal.read(cx).focus_handle().focus(window);

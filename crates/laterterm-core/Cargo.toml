@@ -1,0 +1,9 @@
+[package]
+name = "laterterm-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "LaterTerm 会话抽象层：本地 PTY 与 SSH 远程共用的终端交互契约"
+
+[dependencies]

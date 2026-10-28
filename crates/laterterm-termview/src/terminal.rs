@@ -124,7 +124,6 @@ fn search_grid(grid: &Grid<Cell>, needle: &[char]) -> Vec<SearchMatch> {
     matches
 }
 
-
 /// Simple dimensions implementation for terminal initialization.
 struct TermDimensions {
     columns: usize,

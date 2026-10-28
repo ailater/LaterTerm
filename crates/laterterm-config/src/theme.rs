@@ -355,7 +355,8 @@ mod tests {
 
     #[test]
     fn missing_keys_fall_back_to_tokyo_night() {
-        let colors: ThemeColors = toml::from_str("background = \"#000000\"\nred = \"#FF0000\"").unwrap();
+        let colors: ThemeColors =
+            toml::from_str("background = \"#000000\"\nred = \"#FF0000\"").unwrap();
         assert_eq!(colors.background, 0x000000);
         assert_eq!(colors.red, 0xFF0000);
         // 缺失键回退 Tokyo Night
@@ -390,7 +391,8 @@ mod tests {
 
     #[test]
     fn registry_custom_dir_overrides_and_adds() {
-        let dir = std::env::temp_dir().join(format!("laterterm-themes-test-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("laterterm-themes-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // 自定义覆盖内置
         std::fs::write(

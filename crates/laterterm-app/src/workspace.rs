@@ -4,10 +4,10 @@ use gpui::{
     div, prelude::FluentBuilder, px, rgb,
 };
 use laterterm_config::{Appearance, Settings, Theme, ThemeRegistry, app_config_dir};
+use laterterm_core::TerminalSession;
+use laterterm_local::{LocalOptions, LocalSession};
 use laterterm_termview::{ColorPalette, TerminalConfig, TerminalView};
 use notify::Watcher;
-use parking_lot::Mutex;
-use portable_pty::{ChildKiller, CommandBuilder, PtySize, native_pty_system};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -56,15 +56,16 @@ impl TabStatus {
     }
 }
 
+/// 标签的会话关闭控制：持有会话契约，close 幂等。
 struct SessionControl {
-    killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
+    session: Arc<dyn TerminalSession>,
     closing: AtomicBool,
 }
 
 impl SessionControl {
-    fn new(killer: Box<dyn ChildKiller + Send + Sync>) -> Self {
+    fn new(session: Arc<dyn TerminalSession>) -> Self {
         Self {
-            killer: Mutex::new(Some(killer)),
+            session,
             closing: AtomicBool::new(false),
         }
     }
@@ -73,11 +74,7 @@ impl SessionControl {
         if self.closing.swap(true, Ordering::AcqRel) {
             return false;
         }
-        if let Some(mut killer) = self.killer.lock().take()
-            && let Err(error) = killer.kill()
-        {
-            eprintln!("终止终端会话失败: {error}");
-        }
+        self.session.kill();
         true
     }
 }
@@ -321,7 +318,10 @@ impl WorkspaceView {
         else {
             return;
         };
-        if watcher.watch(&dir, notify::RecursiveMode::Recursive).is_err() {
+        if watcher
+            .watch(&dir, notify::RecursiveMode::Recursive)
+            .is_err()
+        {
             return;
         }
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
@@ -911,7 +911,7 @@ fn settings_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>
                         .py_2()
                         .child(div().w(px(64.0)).text_color(rgb(0xA9B1D6)).child("主题"))
                         .child(theme_controls(cx, &workspace.themes, &settings.theme)),
-                )
+                ),
         )
         .child(setting_button(
             "恢复默认",
@@ -966,8 +966,11 @@ fn theme_controls(
     themes: &ThemeRegistry,
     current: &str,
 ) -> gpui::Div {
-    div().flex().flex_wrap().gap_1().children(
-        themes.names().into_iter().map(|name| {
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_1()
+        .children(themes.names().into_iter().map(|name| {
             let selected = name == current;
             setting_button(
                 name.clone(),
@@ -976,8 +979,7 @@ fn theme_controls(
                     this.change_setting(event, window, cx, |s| s.theme = name.clone());
                 }),
             )
-        }),
-    )
+        }))
 }
 
 fn shortcut_row(label: &str, keys: &str) -> gpui::Div {
@@ -1122,33 +1124,20 @@ fn create_local_terminal(
     settings: &Appearance,
     theme: &Theme,
 ) -> (Entity<TerminalView>, Arc<SessionControl>) {
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 30,
-            cols: 110,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("打开 PTY 失败");
+    // 会话的开启/spawn/回收线程全部内聚在 LocalSession（laterterm-local）
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let mut command = CommandBuilder::new(shell);
-    command.env("TERM", "xterm-256color");
-    command.env("COLORTERM", "truecolor");
-    let child = pair.slave.spawn_command(command).expect("启动 shell 失败");
-    let session = Arc::new(SessionControl::new(child.clone_killer()));
-    std::thread::spawn(move || {
-        let mut child = child;
-        if let Err(error) = child.wait() {
-            eprintln!("回收 shell 子进程失败: {error}");
-        }
-    });
+    let session: Arc<dyn TerminalSession> = Arc::new(
+        LocalSession::spawn(LocalOptions {
+            shell,
+            args: vec![],
+            env: vec![],
+            cols: 110,
+            rows: 30,
+        })
+        .expect("启动本地会话失败"),
+    );
+    let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
 
-    let writer = pair.master.take_writer().expect("获取 PTY 写端失败");
-    let reader = pair.master.try_clone_reader().expect("获取 PTY 读端失败");
-    let pty_master = Arc::new(parking_lot::Mutex::new(pair.master));
-    drop(pair.slave);
-    let pty_for_resize = pty_master;
     let config = TerminalConfig {
         font_family: settings.font_family.clone(),
         font_size: px(settings.font_size),
@@ -1161,17 +1150,8 @@ fn create_local_terminal(
     };
 
     let terminal = cx.new(|cx| {
-        TerminalView::new(writer, reader, config, cx)
-            .with_resize_callback(move |cols, rows| {
-                if let Err(error) = pty_for_resize.lock().resize(PtySize {
-                    cols: cols as u16,
-                    rows: rows as u16,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                }) {
-                    eprintln!("PTY resize 失败: {error}");
-                }
-            })
+        // resize 由视图默认回调转发给会话，无需在此另接
+        TerminalView::new(Arc::clone(&session), config, cx)
             .with_title_callback({
                 let workspace = workspace.clone();
                 move |window, cx, title| {
@@ -1187,7 +1167,7 @@ fn create_local_terminal(
                 let _ = workspace.update(cx, |workspace, cx| workspace.mark_exited(id, window, cx));
             })
     });
-    (terminal, session)
+    (terminal, session_control)
 }
 
 /// laterterm_config 主题 → termview 调色板。

@@ -27,7 +27,9 @@ cargo clippy --fix   # lint
 
 ## 当前阶段
 
-M1（交互完善）：M0 骨架已完成；配置持久化、主题热加载、设置面板已落地。
-剩余任务按序：TerminalSession trait 抽出（laterterm-core）→ 中文 IME 预编辑 →
-分屏树 → 回滚搜索 → 字体配置面。验收：拔掉原终端用一整天无不适，
-IME/搜索/分屏在 4K 缩放下不糊不跳。明细见 docs/roadmap.md。
+M1（交互完善）：配置持久化、主题热加载、设置面板、回滚搜索、TerminalSession 会话抽象
+（laterterm-core 契约 + laterterm-local PTY 实现）均已落地。
+剩余任务按序：中文 IME 预编辑 → 分屏树 → 字体配置面。
+验收：拔掉原终端用一整天无不适，IME/分屏在 4K 缩放下不糊不跳。
+明细见 docs/roadmap.md；测试门禁口径 `cargo test --workspace --lib --bins`
+（termview 上游遗留 doctest 需 GPUI 运行时，本机必挂，见 roadmap 注记）。

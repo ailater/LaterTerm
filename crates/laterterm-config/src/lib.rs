@@ -64,8 +64,8 @@ impl Settings {
         }
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("读取设置失败: {}", path.display()))?;
-        let mut settings: Settings = toml::from_str(&raw)
-            .with_context(|| format!("解析设置失败: {}", path.display()))?;
+        let mut settings: Settings =
+            toml::from_str(&raw).with_context(|| format!("解析设置失败: {}", path.display()))?;
         settings.appearance.sanitize();
         Ok(settings)
     }
@@ -96,7 +96,8 @@ impl Settings {
         // Windows 上 rename 不能覆盖已有文件，先移除再改名；Linux rename 本身原子。
         #[cfg(target_os = "windows")]
         if path.exists() {
-            std::fs::remove_file(path).with_context(|| format!("移除旧设置失败: {}", path.display()))?;
+            std::fs::remove_file(path)
+                .with_context(|| format!("移除旧设置失败: {}", path.display()))?;
         }
         std::fs::rename(&tmp, path)
             .with_context(|| format!("替换设置文件失败: {}", path.display()))?;
@@ -185,7 +186,10 @@ mod tests {
 
     fn temp_settings_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
-        path.push(format!("laterterm-config-test-{name}-{}.toml", std::process::id()));
+        path.push(format!(
+            "laterterm-config-test-{name}-{}.toml",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         path
     }

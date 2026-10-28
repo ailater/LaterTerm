@@ -1,0 +1,11 @@
+[package]
+name = "laterterm-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "LaterTerm 本地会话：portable-pty + 子进程回收线程"
+
+[dependencies]
+laterterm-core.workspace = true
+portable-pty.workspace = true

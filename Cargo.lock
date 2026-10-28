@@ -3017,10 +3017,11 @@ dependencies = [
  "flume 0.12.0",
  "gpui",
  "laterterm-config",
+ "laterterm-core",
+ "laterterm-local",
  "laterterm-termview",
  "notify",
  "parking_lot",
- "portable-pty",
 ]
 
 [[package]]
@@ -3033,6 +3034,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "laterterm-core"
+version = "0.1.0"
+
+[[package]]
+name = "laterterm-local"
+version = "0.1.0"
+dependencies = [
+ "laterterm-core",
+ "portable-pty",
+]
+
+[[package]]
 name = "laterterm-termview"
 version = "0.1.0"
 dependencies = [
@@ -3041,8 +3054,8 @@ dependencies = [
  "arboard",
  "flume 0.12.0",
  "gpui",
+ "laterterm-core",
  "parking_lot",
- "portable-pty",
  "ropey",
 ]
 
