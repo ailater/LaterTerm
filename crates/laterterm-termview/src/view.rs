@@ -1206,8 +1206,16 @@ impl EntityInputHandler for TerminalView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        // 锚定光标单元格：输入法候选框跟随光标，而不是停在视图左上角
+        let (row, col) = self.state.ime_anchor();
+        let x = element_bounds.origin.x
+            + self.config.padding.left
+            + self.renderer.cell_width * col as f32;
+        let y = element_bounds.origin.y
+            + self.config.padding.top
+            + self.renderer.cell_height * row as f32;
         Some(Bounds {
-            origin: element_bounds.origin,
+            origin: Point { x, y },
             size: Size {
                 width: self.renderer.cell_width,
                 height: self.renderer.cell_height,
@@ -1246,6 +1254,8 @@ impl Render for TerminalView {
             .search
             .as_ref()
             .and_then(|search| search.matches.get(search.current).copied());
+        // IME 预编辑快照（同上，绘制阶段读取）
+        let marked_text = self.marked_text.clone();
         let search_bar = self.search.as_ref().map(|search| {
             let counter = if search.query.is_empty() {
                 "0/0".to_string()
@@ -1391,6 +1401,20 @@ impl Render for TerminalView {
                                     gpui::BorderStyle::default(),
                                 ));
                             }
+                        }
+                        // IME 预编辑浮层：光标处起排、带下划线，画在网格与搜索层之上
+                        if !marked_text.is_empty() {
+                            let origin = Point {
+                                x: bounds.origin.x + padding.left,
+                                y: bounds.origin.y + padding.top,
+                            };
+                            measured_renderer.paint_preedit(
+                                &term,
+                                origin,
+                                window,
+                                cx,
+                                &marked_text,
+                            );
                         }
                     },
                 )

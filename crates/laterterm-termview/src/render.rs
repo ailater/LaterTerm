@@ -74,6 +74,41 @@ use gpui::{
     SharedString, Size, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
 };
 
+/// 单个字符在终端网格中占用的列数（东亚宽字符 2 列）。
+///
+/// 覆盖 CJK 常用区段即可满足中文输入法场景；与网格渲染的 WIDE_CHAR
+/// 语义一致（中文场景足够，不追求完整 unicode-width 表）。
+pub fn char_columns(ch: char) -> usize {
+    let c = ch as u32;
+    let wide = (0x1100..=0x115F).contains(&c)        // 谚文兼容字母
+        || (0x2E80..=0xA4CF).contains(&c)   // CJK 部首..彝文
+        || (0xAC00..=0xD7A3).contains(&c)   // 谚文音节
+        || (0xF900..=0xFAFF).contains(&c)   // CJK 兼容表意
+        || (0xFE30..=0xFE4F).contains(&c)   // CJK 兼容形式
+        || (0xFF00..=0xFF60).contains(&c)   // 全角形式
+        || (0xFFE0..=0xFFE6).contains(&c)
+        || (0x20000..=0x3FFFD).contains(&c); // CJK 扩展
+    if wide { 2 } else { 1 }
+}
+
+/// 预编辑文本的网格布局：每个字符 → (起始列, 字符, 占列数)。
+///
+/// 从光标列 `start_col` 起横向排布，行尾放不下即截断（候选框仍锚定在
+/// 已排布区域，符合终端 IME 的常见呈现）。纯函数，无窗口依赖，可测。
+pub fn preedit_layout(text: &str, start_col: usize, columns: usize) -> Vec<(usize, char, usize)> {
+    let mut placed = Vec::new();
+    let mut col = start_col.min(columns);
+    for ch in text.chars() {
+        let width = char_columns(ch);
+        if col + width > columns {
+            break;
+        }
+        placed.push((col, ch, width));
+        col += width;
+    }
+    placed
+}
+
 /// A batched run of text with consistent styling.
 ///
 /// This struct groups adjacent terminal cells with identical visual attributes
@@ -772,6 +807,69 @@ impl TerminalRenderer {
             Default::default(),
         ));
     }
+
+    /// 绘制 IME 预编辑浮层：光标处起排、带下划线、不写网格。
+    ///
+    /// 预编辑文本不属于 VT 流（shell 看不见它），只在提交时写入 PTY；
+    /// 因此这里按覆盖层画在网格之上，「不破坏网格」是硬约束。
+    /// 行尾放不下的部分截断（布局见 [`preedit_layout`]）。
+    pub fn paint_preedit(
+        &self,
+        term: &Term<GpuiEventProxy>,
+        origin: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        text: &str,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let grid = term.grid();
+        let display_offset = grid.display_offset() as i32;
+        let cursor = grid.cursor.point;
+        let row =
+            (cursor.line.0 + display_offset).clamp(0, grid.screen_lines() as i32 - 1) as usize;
+
+        let fg_color = self.palette.resolve(
+            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Foreground),
+            term.colors(),
+        );
+        let font = Font {
+            family: self.font_family.clone().into(),
+            features: FontFeatures::default(),
+            fallbacks: None,
+            weight: FontWeight::NORMAL,
+            style: FontStyle::Normal,
+        };
+        // 与网格文字相同的垂直居中口径
+        let base_height = self.cell_height / self.line_height_multiplier;
+        let vertical_offset = (self.cell_height - base_height) / 2.0;
+        let y = origin.y + self.cell_height * (row as f32) + vertical_offset;
+
+        for (col, ch, _) in preedit_layout(text, cursor.column.0, grid.columns()) {
+            let char_str = ch.to_string();
+            let run = TextRun {
+                len: char_str.len(),
+                font: font.clone(),
+                color: fg_color,
+                background_color: None,
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.0),
+                    color: Some(fg_color),
+                    wavy: false,
+                }),
+                strikethrough: None,
+            };
+            let shaped_line = window.text_system().shape_line(
+                SharedString::from(char_str),
+                self.font_size,
+                &[run],
+                None,
+            );
+            let x = origin.x + self.cell_width * (col as f32);
+            let _ = shaped_line.paint(Point { x, y }, self.cell_height, window, cx);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -850,5 +948,36 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].start_col, 0);
         assert_eq!(merged[0].end_col, 10);
+    }
+}
+
+#[cfg(test)]
+mod preedit_tests {
+    use super::{char_columns, preedit_layout};
+
+    #[test]
+    fn ascii_advances_one_column_each() {
+        let placed = preedit_layout("abc", 2, 10);
+        let cols: Vec<usize> = placed.iter().map(|(col, _, _)| *col).collect();
+        assert_eq!(cols, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn cjk_takes_two_columns_and_mixed_layout_is_contiguous() {
+        assert_eq!(char_columns('中'), 2);
+        assert_eq!(char_columns('a'), 1);
+        // "中a文" → 列 0(宽2)、2、3(宽2)
+        let placed = preedit_layout("中a文", 0, 10);
+        let layout: Vec<(usize, char, usize)> = placed;
+        assert_eq!(layout, vec![(0, '中', 2), (2, 'a', 1), (3, '文', 2)]);
+    }
+
+    #[test]
+    fn truncates_at_line_end() {
+        // 10 列宽，从第 8 列起：放 "中"(8..10) 后 "a" 放不下即截断
+        let placed = preedit_layout("中a", 8, 10);
+        assert_eq!(placed, vec![(8, '中', 2)]);
+        // 宽字符跨行尾放不下整个字符时，该字符整体不画
+        assert!(preedit_layout("中", 9, 10).is_empty());
     }
 }

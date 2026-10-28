@@ -355,6 +355,20 @@ impl TerminalState {
         *term.mode()
     }
 
+    /// IME 锚点：光标在「当前视口」中的 (行, 列)。
+    ///
+    /// 预编辑浮层与输入法候选框都以它定位。行按显示偏移换算并钳进
+    /// 视口（滚离屏幕时光标不可见，锚到最近的可见行，候选框不出屏）。
+    pub fn ime_anchor(&self) -> (usize, usize) {
+        self.with_term(|term| {
+            let grid = term.grid();
+            let display_offset = grid.display_offset() as i32;
+            let row = (grid.cursor.point.line.0 + display_offset)
+                .clamp(0, grid.screen_lines() as i32 - 1) as usize;
+            (row, grid.cursor.point.column.0)
+        })
+    }
+
     /// 大小写不敏感地搜索整个回滚缓冲与可见屏幕。
     ///
     /// 命中按从最老历史行到屏幕底行的顺序返回；`SearchMatch::line` 使用
@@ -560,6 +574,33 @@ mod tests {
             term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
         });
         terminal.with_term(|term| assert_eq!(term.grid().display_offset(), 0));
+    }
+
+    #[test]
+    fn test_ime_anchor_follows_cursor_and_clamps_when_scrolled() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        terminal.process_bytes(b"abc");
+
+        // 光标停在第一行列 3
+        assert_eq!(terminal.ime_anchor(), (0, 3));
+
+        // 满屏输出后光标在末行；上滚 2 行时锚点钳回视口内
+        for line in 0..40 {
+            terminal.process_bytes(format!("line-{line}\r\n").as_bytes());
+        }
+        terminal.with_term(|term| {
+            assert_eq!(term.grid().display_offset(), 0);
+        });
+        let (row, _) = terminal.ime_anchor();
+        assert!(row < 4, "未滚动时锚点应在视口内: {row}");
+
+        terminal.with_term_mut(|term| {
+            term.scroll_display(alacritty_terminal::grid::Scroll::Delta(2));
+        });
+        let (row, _) = terminal.ime_anchor();
+        assert!(row < 4, "滚动后锚点仍应钳在视口内: {row}");
     }
 
     #[test]
