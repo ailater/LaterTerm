@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/laterterm-app", "crates/laterterm-termview"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["crazykun <jilikun@gmail.com>"]
+
+[workspace.dependencies]
+gpui = "0.2.2"
+alacritty_terminal = "0.25.1"
+portable-pty = "0.9"
+anyhow = "1"
+parking_lot = "0.12"
+ropey = "1"
+flume = "0.12"
+arboard = { version = "3", features = ["wayland-data-control"] }
+
+[patch.crates-io]
+# xattr 0.2.3 引用了新版 libc 已移除的 Linux ENOATTR；Linux 语义等价于 ENODATA。
+xattr = { path = "vendor/xattr" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

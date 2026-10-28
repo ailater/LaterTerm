@@ -1,0 +1,18 @@
+[package]
+name = "laterterm-app"
+description = "LaterTerm 终端主程序"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "laterterm"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+laterterm-termview = { path = "../laterterm-termview" }
+anyhow.workspace = true
+portable-pty.workspace = true
+parking_lot.workspace = true

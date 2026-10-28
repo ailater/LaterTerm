@@ -1,0 +1,17 @@
+[package]
+name = "laterterm-termview"
+description = "LaterTerm 的 GPUI 终端网格视图（内化自 zortax/gpui-terminal 0.1.0）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+gpui.workspace = true
+alacritty_terminal.workspace = true
+anyhow.workspace = true
+portable-pty.workspace = true
+ropey.workspace = true
+parking_lot.workspace = true
+flume.workspace = true
+arboard.workspace = true
