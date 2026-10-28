@@ -1,0 +1,12 @@
+# Rust
+/target
+**/*.rs.bk
+
+# cargo-dist 产物
+/dist
+
+# 系统与编辑器
+.DS_Store
+*.log
+.idea/
+.vscode/
