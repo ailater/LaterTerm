@@ -185,6 +185,9 @@ pub struct TerminalRenderer {
 
     /// Color palette for resolving terminal colors
     pub palette: ColorPalette,
+
+    /// Whether cell metrics need to be measured again.
+    needs_measurement: bool,
 }
 
 impl TerminalRenderer {
@@ -228,7 +231,18 @@ impl TerminalRenderer {
             cell_height,
             line_height_multiplier,
             palette,
+            needs_measurement: true,
         }
+    }
+
+    /// Whether the renderer needs fresh font metrics.
+    pub fn needs_measurement(&self) -> bool {
+        self.needs_measurement
+    }
+
+    /// Mark the cached cell metrics as stale.
+    pub fn invalidate_measurement(&mut self) {
+        self.needs_measurement = true;
     }
 
     /// Measure cell dimensions based on actual font metrics.
@@ -274,8 +288,9 @@ impl TerminalRenderer {
         // Calculate height from ascent + descent with optional multiplier
         let line_height = (shaped.ascent + shaped.descent).ceil();
         if line_height > px(0.0) {
-            self.cell_height = line_height * self.line_height_multiplier;
+            self.cell_height = line_height * self.line_height_multiplier.max(0.1);
         }
+        self.needs_measurement = false;
     }
 
     /// Layout cells into batched text runs and background rects for a single row.
@@ -487,8 +502,9 @@ impl TerminalRenderer {
         };
 
         // Iterate over visible lines
+        let display_offset = grid.display_offset() as i32;
         for line_idx in 0..num_lines {
-            let line = Line(line_idx as i32);
+            let line = Line(line_idx as i32 - display_offset);
 
             // Collect cells for this line
             let cells: Vec<(usize, Cell)> = (0..num_cols)
@@ -715,10 +731,21 @@ impl TerminalRenderer {
             }
         }
 
-        // Paint cursor
+        // Paint cursor only when the terminal has not hidden it with DECSET ?25l.
+        if !term
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::SHOW_CURSOR)
+        {
+            return;
+        }
+
         let cursor_point = grid.cursor.point;
+        let cursor_line = cursor_point.line.0 + display_offset;
+        if cursor_line < 0 || cursor_line >= num_lines as i32 {
+            return;
+        }
         let cursor_x = origin.x + self.cell_width * (cursor_point.column.0 as f32);
-        let cursor_y = origin.y + self.cell_height * (cursor_point.line.0 as f32);
+        let cursor_y = origin.y + self.cell_height * (cursor_line as f32);
 
         let cursor_color = self.palette.resolve(
             Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),

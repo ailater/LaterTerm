@@ -36,7 +36,7 @@
 //!
 //! let (tx, rx) = channel();
 //! let event_proxy = GpuiEventProxy::new(tx);
-//! let mut terminal = TerminalState::new(80, 24, event_proxy);
+//! let mut terminal = TerminalState::new(80, 24, 10_000, event_proxy);
 //!
 //! // Process some output (e.g., colored text)
 //! terminal.process_bytes(b"\x1b[31mRed text\x1b[0m");
@@ -156,12 +156,12 @@ impl TerminalState {
     ///
     /// let (tx, rx) = channel();
     /// let event_proxy = GpuiEventProxy::new(tx);
-    /// let terminal = TerminalState::new(80, 24, event_proxy);
+    /// let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
     /// ```
-    pub fn new(cols: usize, rows: usize, event_proxy: GpuiEventProxy) -> Self {
-        // Create a default configuration
-        // The Config struct controls various terminal behaviors like scrolling history
-        let config = Config::default();
+    pub fn new(cols: usize, rows: usize, scrollback: usize, event_proxy: GpuiEventProxy) -> Self {
+        // Configure the history buffer before creating the terminal grids.
+        let mut config = Config::default();
+        config.scrolling_history = scrollback;
 
         // Create dimensions for terminal initialization
         let dimensions = TermDimensions::new(cols, rows);
@@ -197,7 +197,7 @@ impl TerminalState {
     /// # use gpui_terminal::terminal::TerminalState;
     /// # let (tx, rx) = channel();
     /// # let event_proxy = GpuiEventProxy::new(tx);
-    /// # let mut terminal = TerminalState::new(80, 24, event_proxy);
+    /// # let mut terminal = TerminalState::new(80, 24, 10_000, event_proxy);
     /// // Process some output from the PTY
     /// terminal.process_bytes(b"Hello, world!\r\n");
     /// ```
@@ -226,11 +226,13 @@ impl TerminalState {
     /// # use gpui_terminal::terminal::TerminalState;
     /// # let (tx, rx) = channel();
     /// # let event_proxy = GpuiEventProxy::new(tx);
-    /// # let mut terminal = TerminalState::new(80, 24, event_proxy);
+    /// # let mut terminal = TerminalState::new(80, 24, 10_000, event_proxy);
     /// // Resize to 120x30
     /// terminal.resize(120, 30);
     /// ```
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
         self.cols = cols;
         self.rows = rows;
 
@@ -241,6 +243,11 @@ impl TerminalState {
 
         // Resize the terminal
         term.resize(dimensions);
+    }
+
+    /// Update the scrollback history capacity of the active grid.
+    pub fn set_scrollback(&mut self, scrollback: usize) {
+        self.term.lock().grid_mut().update_history(scrollback);
     }
 
     /// Get the current terminal mode.
@@ -260,7 +267,7 @@ impl TerminalState {
     /// # use gpui_terminal::terminal::TerminalState;
     /// # let (tx, rx) = channel();
     /// # let event_proxy = GpuiEventProxy::new(tx);
-    /// # let terminal = TerminalState::new(80, 24, event_proxy);
+    /// # let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
     /// use alacritty_terminal::term::TermMode;
     ///
     /// let mode = terminal.mode();
@@ -294,7 +301,7 @@ impl TerminalState {
     /// # use gpui_terminal::terminal::TerminalState;
     /// # let (tx, rx) = channel();
     /// # let event_proxy = GpuiEventProxy::new(tx);
-    /// # let terminal = TerminalState::new(80, 24, event_proxy);
+    /// # let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
     /// let cursor_pos = terminal.with_term(|term| {
     ///     term.grid().cursor.point
     /// });
@@ -328,7 +335,7 @@ impl TerminalState {
     /// # use gpui_terminal::terminal::TerminalState;
     /// # let (tx, rx) = channel();
     /// # let event_proxy = GpuiEventProxy::new(tx);
-    /// # let terminal = TerminalState::new(80, 24, event_proxy);
+    /// # let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
     /// terminal.with_term_mut(|term| {
     ///     // Perform some mutation on the term
     ///     term.scroll_display(alacritty_terminal::grid::Scroll::Delta(5));
@@ -381,7 +388,7 @@ mod tests {
     fn test_terminal_creation() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let terminal = TerminalState::new(80, 24, event_proxy);
+        let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
 
         assert_eq!(terminal.cols(), 80);
         assert_eq!(terminal.rows(), 24);
@@ -391,7 +398,7 @@ mod tests {
     fn test_process_bytes() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(80, 24, event_proxy);
+        let mut terminal = TerminalState::new(80, 24, 10_000, event_proxy);
 
         // Process some text
         terminal.process_bytes(b"Hello, world!");
@@ -409,25 +416,54 @@ mod tests {
     fn test_resize() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(80, 24, event_proxy);
+        let mut terminal = TerminalState::new(80, 24, 10_000, event_proxy);
 
         terminal.resize(120, 30);
 
         assert_eq!(terminal.cols(), 120);
         assert_eq!(terminal.rows(), 30);
 
+        terminal.resize(0, 0);
+        assert_eq!(terminal.cols(), 1);
+        assert_eq!(terminal.rows(), 1);
+
         terminal.with_term(|term| {
             let grid = term.grid();
-            assert_eq!(grid.columns(), 120);
-            assert_eq!(grid.screen_lines(), 30);
+            assert_eq!(grid.columns(), 1);
+            assert_eq!(grid.screen_lines(), 1);
         });
+    }
+
+    #[test]
+    fn test_scrollback_and_display_offset() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+
+        for line in 0..40 {
+            terminal.process_bytes(format!("line-{line}\r\n").as_bytes());
+        }
+        terminal.with_term(|term| {
+            assert!(term.grid().total_lines() - term.grid().screen_lines() >= 32);
+            assert_eq!(term.grid().display_offset(), 0);
+        });
+
+        terminal.with_term_mut(|term| {
+            term.scroll_display(alacritty_terminal::grid::Scroll::Delta(2));
+        });
+        terminal.with_term(|term| assert_eq!(term.grid().display_offset(), 2));
+
+        terminal.with_term_mut(|term| {
+            term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+        });
+        terminal.with_term(|term| assert_eq!(term.grid().display_offset(), 0));
     }
 
     #[test]
     fn test_mode() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let terminal = TerminalState::new(80, 24, event_proxy);
+        let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
 
         let mode = terminal.mode();
         // Mode should be a valid TermMode value (just verify we can get it)
@@ -438,7 +474,7 @@ mod tests {
     fn test_with_term() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let terminal = TerminalState::new(80, 24, event_proxy);
+        let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
 
         let cols = terminal.with_term(|term| term.grid().columns());
         assert_eq!(cols, 80);
@@ -448,7 +484,7 @@ mod tests {
     fn test_with_term_mut() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let terminal = TerminalState::new(80, 24, event_proxy);
+        let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
 
         terminal.with_term_mut(|term| {
             // Just verify we can get mutable access
@@ -460,7 +496,7 @@ mod tests {
     fn test_term_arc() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let terminal = TerminalState::new(80, 24, event_proxy);
+        let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
 
         let arc1 = terminal.term_arc();
         let arc2 = terminal.term_arc();

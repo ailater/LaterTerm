@@ -52,8 +52,9 @@ use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
-use gpui::{Edges, *};
+use gpui::{Edges, ElementInputHandler, EntityInputHandler, UTF16Selection, *};
 use std::io::{Read, Write};
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
@@ -411,6 +412,9 @@ pub struct TerminalView {
 
     /// Callback for terminal exit events
     exit_callback: Option<ExitCallback>,
+
+    /// Text currently being composed by the system input method.
+    marked_text: String,
 }
 
 impl TerminalView {
@@ -459,7 +463,7 @@ impl TerminalView {
         let event_proxy = GpuiEventProxy::new(event_tx);
 
         // Create terminal state
-        let state = TerminalState::new(config.cols, config.rows, event_proxy);
+        let state = TerminalState::new(config.cols, config.rows, config.scrollback, event_proxy);
 
         // Create renderer with font settings and color palette
         let renderer = TerminalRenderer::new(
@@ -532,6 +536,7 @@ impl TerminalView {
             title_callback: None,
             clipboard_store_callback: None,
             exit_callback: None,
+            marked_text: String::new(),
         }
     }
 
@@ -723,10 +728,21 @@ impl TerminalView {
             return; // Event consumed by handler
         }
 
-        if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
+        let keystroke = &event.keystroke;
+        let is_plain_text = !keystroke.modifiers.control
+            && !keystroke.modifiers.alt
+            && (keystroke.key_char.is_some() || keystroke.key.len() == 1);
+        if is_plain_text {
+            // Printable text is delivered through GPUI's InputHandler so IME commit
+            // text and physical keyboard text share the same path.
+            return;
+        }
+
+        if let Some(bytes) = keystroke_to_bytes(keystroke, self.state.mode()) {
             let mut writer = self.stdin_writer.lock();
-            let _ = writer.write_all(&bytes);
-            let _ = writer.flush();
+            if let Err(error) = writer.write_all(&bytes).and_then(|_| writer.flush()) {
+                eprintln!("写入终端输入失败: {error}");
+            }
         }
     }
 
@@ -782,13 +798,42 @@ impl TerminalView {
     /// Currently a placeholder for future scrollback support.
     fn on_scroll(
         &mut self,
-        _event: &ScrollWheelEvent,
+        event: &ScrollWheelEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        // TODO: Implement scrollback
-        // - Scroll the terminal display up/down
-        // - Send scroll reports if alternate screen is not active
+        let cell_height: f32 = self.renderer.cell_height.into();
+        let delta_y: f32 = match event.delta {
+            ScrollDelta::Lines(point) => point.y,
+            ScrollDelta::Pixels(point) => {
+                if cell_height <= 0.0 {
+                    return;
+                }
+                (point.y / gpui::px(cell_height)).into()
+            }
+        };
+        // 当前桌面使用自然滚动：保持滚轮方向与内容移动方向一致。
+        let lines = delta_y.round() as i32;
+        if lines == 0 {
+            return;
+        }
+
+        let mode = self.state.mode();
+        let point = alacritty_terminal::index::Point::new(
+            alacritty_terminal::index::Line(0),
+            alacritty_terminal::index::Column(0),
+        );
+        if let Some(bytes) = crate::mouse::scroll_report(lines, point, 0, mode) {
+            let mut writer = self.stdin_writer.lock();
+            if let Err(error) = writer.write_all(&bytes).and_then(|_| writer.flush()) {
+                eprintln!("写入滚轮事件失败: {error}");
+            }
+        } else {
+            self.state.with_term_mut(|term| {
+                term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+            });
+        }
+        cx.notify();
     }
 
     /// Process pending terminal events.
@@ -850,7 +895,12 @@ impl TerminalView {
     /// * `cols` - New number of columns
     /// * `rows` - New number of rows
     pub fn resize(&mut self, cols: usize, rows: usize) {
+        let cols = cols.max(1);
+        let rows = rows.max(1);
         self.state.resize(cols, rows);
+        if let Some(callback) = &self.resize_callback {
+            callback(cols, rows);
+        }
     }
 
     /// Get the current terminal configuration.
@@ -881,11 +931,25 @@ impl TerminalView {
     /// * `config` - The new configuration to apply
     /// * `cx` - The context for triggering a repaint
     pub fn update_config(&mut self, config: TerminalConfig, cx: &mut Context<Self>) {
+        // Update the terminal grid and PTY when dimensions change.
+        if config.cols != self.config.cols || config.rows != self.config.rows {
+            self.resize(config.cols, config.rows);
+        }
+        if config.scrollback != self.config.scrollback {
+            self.state.set_scrollback(config.scrollback);
+        }
+
         // Update renderer with new font settings and palette
+        let font_changed = self.renderer.font_family != config.font_family
+            || self.renderer.font_size != config.font_size
+            || self.renderer.line_height_multiplier != config.line_height_multiplier;
         self.renderer.font_family = config.font_family.clone();
         self.renderer.font_size = config.font_size;
-        self.renderer.line_height_multiplier = config.line_height_multiplier;
+        self.renderer.line_height_multiplier = config.line_height_multiplier.max(0.1);
         self.renderer.palette = config.colors.clone();
+        if font_changed {
+            self.renderer.invalidate_measurement();
+        }
 
         // Store the new config
         self.config = config;
@@ -910,6 +974,110 @@ impl TerminalView {
     }
 }
 
+impl EntityInputHandler for TerminalView {
+    fn text_for_range(
+        &mut self,
+        range: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let utf16: Vec<u16> = self.marked_text.encode_utf16().collect();
+        if range.start <= range.end && range.end <= utf16.len() {
+            adjusted_range.replace(range.clone());
+            String::from_utf16(&utf16[range]).ok()
+        } else {
+            Some(String::new())
+        }
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let cursor = self.marked_text.encode_utf16().count();
+        Some(UTF16Selection {
+            range: cursor..cursor,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        if self.marked_text.is_empty() {
+            None
+        } else {
+            Some(0..self.marked_text.encode_utf16().count())
+        }
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.marked_text.clear();
+        cx.notify();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_text.clear();
+        let mut writer = self.stdin_writer.lock();
+        if let Err(error) = writer
+            .write_all(text.as_bytes())
+            .and_then(|_| writer.flush())
+        {
+            eprintln!("写入输入法文本失败: {error}");
+        }
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_text.clear();
+        self.marked_text.push_str(new_text);
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(Bounds {
+            origin: element_bounds.origin,
+            size: Size {
+                width: self.renderer.cell_width,
+                height: self.renderer.cell_height,
+            },
+        })
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(0)
+    }
+}
+
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Process any pending events
@@ -917,8 +1085,13 @@ impl Render for TerminalView {
 
         // Get terminal state and renderer for rendering
         let state_arc = self.state.term_arc();
+        if self.renderer.needs_measurement() {
+            self.renderer.measure_cell(window);
+        }
         let renderer = self.renderer.clone();
         let resize_callback = self.resize_callback.clone();
+        let focus_handle = self.focus_handle.clone();
+        let entity = cx.entity();
         let padding = self.config.padding;
 
         div()
@@ -934,13 +1107,20 @@ impl Render for TerminalView {
                 canvas(
                     move |bounds, _window, _cx| bounds,
                     move |bounds, _, window, cx| {
+                        window.handle_input(
+                            &focus_handle,
+                            ElementInputHandler::new(bounds, entity.clone()),
+                            cx,
+                        );
                         use alacritty_terminal::grid::Dimensions;
 
-                        // Measure actual cell dimensions from the font
+                        // Measure actual cell dimensions only when the font configuration changed.
                         let mut measured_renderer = renderer.clone();
-                        measured_renderer.measure_cell(window);
+                        if measured_renderer.needs_measurement() {
+                            measured_renderer.measure_cell(window);
+                        }
 
-                        // Calculate available space after padding
+                        // Calculate available space after padding, clamping tiny windows safely.
                         let available_width: f32 =
                             (bounds.size.width - padding.left - padding.right).into();
                         let available_height: f32 =
@@ -948,8 +1128,11 @@ impl Render for TerminalView {
                         let cell_width_f32: f32 = measured_renderer.cell_width.into();
                         let cell_height_f32: f32 = measured_renderer.cell_height.into();
 
-                        let cols = ((available_width / cell_width_f32) as usize).max(1);
-                        let rows = ((available_height / cell_height_f32) as usize).max(1);
+                        let cols =
+                            ((available_width.max(0.0) / cell_width_f32.max(1.0)) as usize).max(1);
+                        let rows = ((available_height.max(0.0) / cell_height_f32.max(1.0))
+                            as usize)
+                            .max(1);
 
                         // Helper struct implementing Dimensions for resize
                         struct TermSize {
@@ -977,17 +1160,23 @@ impl Render for TerminalView {
                             }
                         }
 
-                        // Resize terminal if dimensions changed
-                        let mut term = state_arc.lock();
-                        let current_cols = term.columns();
-                        let current_rows = term.screen_lines();
-                        if cols != current_cols || rows != current_rows {
-                            // Notify the PTY about the resize
-                            if let Some(ref callback) = resize_callback {
-                                callback(cols, rows);
+                        // Resize the grid first, then notify the PTY without holding its lock.
+                        let needs_resize = {
+                            let mut term = state_arc.lock();
+                            let current_cols = term.columns();
+                            let current_rows = term.screen_lines();
+                            if cols != current_cols || rows != current_rows {
+                                term.resize(TermSize { cols, rows });
+                                true
+                            } else {
+                                false
                             }
-                            term.resize(TermSize { cols, rows });
+                        };
+                        if needs_resize && let Some(ref callback) = resize_callback {
+                            callback(cols, rows);
                         }
+
+                        let term = state_arc.lock();
 
                         // Paint the terminal with measured dimensions
                         measured_renderer.paint(bounds, padding, &term, window, cx);
