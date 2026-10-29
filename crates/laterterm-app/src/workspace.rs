@@ -1,7 +1,7 @@
 use gpui::{
     App, AppContext, AsyncApp, Context, Edges, Entity, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, Styled, WeakEntity, Window,
-    div, prelude::FluentBuilder, px, rgb,
+    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, StatefulInteractiveElement,
+    Styled, WeakEntity, Window, div, prelude::FluentBuilder, px, rgb,
 };
 use laterterm_config::{Appearance, Settings, Theme, ThemeRegistry, app_config_dir};
 use laterterm_core::TerminalSession;
@@ -327,11 +327,10 @@ impl WorkspaceView {
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             let _watcher = watcher; // 监听器随任务存活，避免被提前丢弃
             while event_rx.recv_async().await.is_ok() {
-                // 去抖：吸收 200ms 窗口内的连续事件（编辑器保存常触发多个）
-                while event_rx
-                    .recv_timeout(std::time::Duration::from_millis(200))
-                    .is_ok()
-                {}
+                // 非阻塞排空已排队事件（编辑器保存的连发）。
+                // 本任务跑在前台执行器（主线程）上，任何阻塞等待都会卡 UI；
+                // reload 幂等，多触发一次只是多读一次小文件后等值比较。
+                while event_rx.try_recv().is_ok() {}
                 let _ = this.update(cx, |workspace, cx| workspace.reload_from_disk(cx));
             }
         })
@@ -665,7 +664,7 @@ fn settings_overlay(
     scrim_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     close_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     navigation: gpui::Div,
-    content: gpui::Div,
+    content: gpui::Stateful<gpui::Div>,
 ) -> gpui::Div {
     div()
         .absolute()
@@ -684,6 +683,7 @@ fn settings_overlay(
                 .max_h(px(520.0))
                 .flex()
                 .flex_col()
+                .overflow_hidden()
                 .bg(rgb(0x202132))
                 .border_1()
                 .border_color(rgb(0x3B3F5C))
@@ -781,7 +781,7 @@ fn settings_content(
     page: SettingsPage,
     workspace: &mut WorkspaceView,
     cx: &mut Context<WorkspaceView>,
-) -> gpui::Div {
+) -> gpui::Stateful<gpui::Div> {
     let title = match page {
         SettingsPage::Appearance => "外观",
         SettingsPage::Shortcuts => "快捷键",
@@ -833,9 +833,14 @@ fn settings_content(
             ),
     };
     div()
+        .id(gpui::SharedString::from(format!(
+            "settings-content-{page:?}"
+        )))
         .flex_1()
         .min_w(px(0.0))
+        .min_h(px(0.0))
         .h_full()
+        .overflow_y_scroll()
         .p_5()
         .text_color(rgb(0xC0CAF5))
         .child(div().text_color(rgb(0xC0CAF5)).child(title))
