@@ -121,6 +121,9 @@ pub struct BatchedTextRun {
     /// Starting column position
     pub start_col: usize,
 
+    /// Exclusive ending column, including wide-character spacer columns.
+    pub end_col: usize,
+
     /// Row position
     pub row: usize,
 
@@ -358,8 +361,11 @@ impl TerminalRenderer {
         let mut current_bg: Option<BackgroundRect> = None;
 
         for (col, cell) in cells {
-            // Skip wide character spacers
+            // Skip wide-character spacers; the leading cell owns both columns.
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                if let Some(run) = current_run.take() {
+                    text_runs.push(run);
+                }
                 continue;
             }
 
@@ -402,22 +408,31 @@ impl TerminalRenderer {
                 });
             }
 
-            // Handle text runs
+            // Handle text runs; custom box-drawing passes own these glyphs.
+            if box_drawing::is_box_drawing_char(cell.c) {
+                if let Some(run) = current_run.take() {
+                    text_runs.push(run);
+                }
+                continue;
+            }
             if let Some(ref mut run) = current_run {
                 if run.fg_color == fg_color
                     && run.bg_color == bg_color
                     && run.bold == bold
                     && run.italic == italic
                     && run.underline == underline
+                    && run.end_col == col
                 {
                     // Extend current run
                     run.text.push(ch);
+                    run.end_col = col + char_columns(ch);
                 } else {
                     // Save current run and start new one
                     text_runs.push(run.clone());
                     current_run = Some(BatchedTextRun {
                         text: ch.to_string(),
                         start_col: col,
+                        end_col: col + char_columns(ch),
                         row,
                         fg_color,
                         bg_color,
@@ -431,6 +446,7 @@ impl TerminalRenderer {
                 current_run = Some(BatchedTextRun {
                     text: ch.to_string(),
                     start_col: col,
+                    end_col: col + char_columns(ch),
                     row,
                     fg_color,
                     bg_color,
@@ -551,8 +567,8 @@ impl TerminalRenderer {
                 })
                 .collect();
 
-            // Layout the row for backgrounds
-            let (backgrounds, _) = self.layout_row(line_idx, cells.iter().cloned(), colors);
+            // Layout the row once; text runs are shaped in batches below.
+            let (backgrounds, text_runs) = self.layout_row(line_idx, cells.iter().cloned(), colors);
 
             // Paint backgrounds
             for bg_rect in backgrounds {
@@ -697,55 +713,33 @@ impl TerminalRenderer {
                 }
             }
 
-            // Third pass: draw regular text characters
-            for (col_idx, cell) in cells_vec.iter() {
-                let ch = cell.c;
-
-                // Skip empty cells and box-drawing (already handled)
-                if ch == ' ' || ch == '\0' || box_drawing::is_box_drawing_char(ch) {
-                    continue;
-                }
-
-                let x = origin.x + self.cell_width * (*col_idx as f32);
-                let fg_color = self.palette.resolve(cell.fg, colors);
-
-                // For regular text, apply vertical offset for centering
-                let y = y_base + vertical_offset;
-
-                // Get cell flags for styling
-                let flags = cell.flags;
-                let bold = flags.contains(alacritty_terminal::term::cell::Flags::BOLD);
-                let italic = flags.contains(alacritty_terminal::term::cell::Flags::ITALIC);
-                let underline = flags.contains(alacritty_terminal::term::cell::Flags::UNDERLINE);
-
-                // Create font with styling
+            // Third pass: shape and paint contiguous regular-text runs at once.
+            // This avoids one rustybuzz/cosmic-text shaping call per cell per pane.
+            for run in text_runs {
                 let font = Font {
                     family: self.font_family.clone().into(),
                     features: FontFeatures::default(),
                     fallbacks: None,
-                    weight: if bold {
+                    weight: if run.bold {
                         FontWeight::BOLD
                     } else {
                         FontWeight::NORMAL
                     },
-                    style: if italic {
+                    style: if run.italic {
                         FontStyle::Italic
                     } else {
                         FontStyle::Normal
                     },
                 };
-
-                // Create text run for this single character
-                let char_str = ch.to_string();
                 let text_run = TextRun {
-                    len: char_str.len(),
+                    len: run.text.len(),
                     font,
-                    color: fg_color,
+                    color: run.fg_color,
                     background_color: None,
-                    underline: if underline {
+                    underline: if run.underline {
                         Some(UnderlineStyle {
                             thickness: px(1.0),
-                            color: Some(fg_color),
+                            color: Some(run.fg_color),
                             wavy: false,
                         })
                     } else {
@@ -753,15 +747,13 @@ impl TerminalRenderer {
                     },
                     strikethrough: None,
                 };
-
-                // Shape and paint the character
-                let text: SharedString = char_str.into();
+                let text: SharedString = run.text.into();
                 let shaped_line =
                     window
                         .text_system()
                         .shape_line(text, self.font_size, &[text_run], None);
-
-                // Paint at exact cell position (ignore errors)
+                let x = origin.x + self.cell_width * run.start_col as f32;
+                let y = y_base + vertical_offset;
                 let _ = shaped_line.paint(Point { x, y }, self.cell_height, window, _cx);
             }
         }
