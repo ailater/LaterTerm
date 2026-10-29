@@ -22,8 +22,82 @@ enum SettingsPage {
     Servers,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct TabId(pub(crate) u64);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TabId(u64);
+pub(crate) enum SplitDirection {
+    Horizontal,
+    Vertical,
+}
+
+#[derive(Clone, Copy)]
+enum WorkspaceShortcut {
+    Split(SplitDirection),
+    FocusPrevious,
+    FocusNext,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum LayoutNode {
+    Leaf(TabId),
+    Split {
+        direction: SplitDirection,
+        first: Box<LayoutNode>,
+        second: Box<LayoutNode>,
+    },
+}
+
+impl LayoutNode {
+    pub(crate) fn leaves(&self, output: &mut Vec<TabId>) {
+        match self {
+            Self::Leaf(id) => output.push(*id),
+            Self::Split { first, second, .. } => {
+                first.leaves(output);
+                second.leaves(output);
+            }
+        }
+    }
+
+    pub(crate) fn replace_leaf(&mut self, target: TabId, replacement: LayoutNode) -> bool {
+        match self {
+            Self::Leaf(id) if *id == target => {
+                *self = replacement;
+                true
+            }
+            Self::Leaf(_) => false,
+            Self::Split { first, second, .. } => {
+                first.replace_leaf(target, replacement.clone())
+                    || second.replace_leaf(target, replacement)
+            }
+        }
+    }
+
+    pub(crate) fn remove_leaf(&mut self, target: TabId) -> bool {
+        match self {
+            // 根节点没有兄弟，不能凭空删除；Workspace 会在会话层补新叶子。
+            Self::Leaf(_) => false,
+            Self::Split { first, second, .. } => {
+                if matches!(first.as_ref(), Self::Leaf(id) if *id == target) {
+                    *self = (**second).clone();
+                    true
+                } else if matches!(second.as_ref(), Self::Leaf(id) if *id == target) {
+                    *self = (**first).clone();
+                    true
+                } else {
+                    first.remove_leaf(target) || second.remove_leaf(target)
+                }
+            }
+        }
+    }
+
+    pub(crate) fn contains(&self, target: TabId) -> bool {
+        match self {
+            Self::Leaf(id) => *id == target,
+            Self::Split { first, second, .. } => first.contains(target) || second.contains(target),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TabStatus {
@@ -89,7 +163,8 @@ struct TerminalTab {
 
 pub struct WorkspaceView {
     tabs: Vec<TerminalTab>,
-    active_tab: usize,
+    layout: LayoutNode,
+    focused_tab: TabId,
     next_tab_id: u64,
     left_panel: bool,
     right_panel: bool,
@@ -97,6 +172,9 @@ pub struct WorkspaceView {
     settings_page: SettingsPage,
     settings: Settings,
     themes: ThemeRegistry,
+    shortcut_tx: flume::Sender<(TabId, WorkspaceShortcut)>,
+    shortcut_rx: flume::Receiver<(TabId, WorkspaceShortcut)>,
+    pending_shortcuts: Vec<(TabId, WorkspaceShortcut)>,
 }
 
 impl WorkspaceView {
@@ -105,13 +183,23 @@ impl WorkspaceView {
         let settings = Settings::load_or_default();
         settings.ensure_settings_file();
         let themes = ThemeRegistry::load();
+        let (shortcut_tx, shortcut_rx) = flume::unbounded();
         let first_id = TabId(1);
         let theme = themes.resolve(&settings.appearance.theme).clone();
-        let (terminal, session) =
-            create_local_terminal(first_id, weak_workspace, cx, &settings.appearance, &theme);
+        let (terminal, session) = create_local_terminal(
+            first_id,
+            weak_workspace,
+            cx,
+            &settings.appearance,
+            &theme,
+            shortcut_tx.clone(),
+        );
         let view = Self {
             settings,
             themes,
+            shortcut_tx,
+            shortcut_rx,
+            pending_shortcuts: Vec::new(),
             settings_page: SettingsPage::Appearance,
             tabs: vec![TerminalTab {
                 id: first_id,
@@ -120,22 +208,94 @@ impl WorkspaceView {
                 session,
                 status: TabStatus::Running,
             }],
-            active_tab: 0,
+            layout: LayoutNode::Leaf(first_id),
+            focused_tab: first_id,
             next_tab_id: 2,
             left_panel: false,
             right_panel: false,
             settings_open: false,
         };
         Self::watch_config_files(cx);
+        view.start_shortcut_pump(cx);
         view
     }
 
+    fn start_shortcut_pump(&self, cx: &mut Context<Self>) {
+        let rx = self.shortcut_rx.clone();
+        cx.spawn(async move |this, cx| {
+            while let Ok(shortcut) = rx.recv_async().await {
+                let _ = this.update(cx, |workspace, cx| {
+                    workspace.pending_shortcuts.push(shortcut);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn process_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = std::mem::take(&mut self.pending_shortcuts);
+        for (id, shortcut) in pending {
+            if self.layout.contains(id) {
+                self.focused_tab = id;
+                self.handle_shortcut(shortcut, window, cx);
+            }
+        }
+    }
+
+    fn handle_shortcut(
+        &mut self,
+        shortcut: WorkspaceShortcut,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match shortcut {
+            WorkspaceShortcut::Split(direction) => self.split_focused(direction, window, cx),
+            WorkspaceShortcut::FocusPrevious => self.cycle_focus(false, window, cx),
+            WorkspaceShortcut::FocusNext => self.cycle_focus(true, window, cx),
+        }
+    }
+
     fn active_tab_id(&self) -> TabId {
-        self.tabs[self.active_tab].id
+        self.focused_tab
+    }
+
+    fn active_index(&self) -> usize {
+        self.tabs
+            .iter()
+            .position(|tab| tab.id == self.focused_tab)
+            .unwrap_or(0)
     }
 
     fn active_terminal(&self) -> Entity<TerminalView> {
-        self.tabs[self.active_tab].terminal.clone()
+        self.tabs[self.active_index()].terminal.clone()
+    }
+
+    fn focus_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) {
+            self.focused_tab = id;
+            window.set_window_title(&tab.title);
+            tab.terminal.read(cx).focus_handle().focus(window);
+            cx.notify();
+        }
+    }
+
+    fn cycle_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let mut leaves = Vec::new();
+        self.layout.leaves(&mut leaves);
+        if leaves.len() < 2 {
+            return;
+        }
+        let index = leaves
+            .iter()
+            .position(|id| *id == self.focused_tab)
+            .unwrap_or(0);
+        let next = if forward {
+            (index + 1) % leaves.len()
+        } else {
+            (index + leaves.len() - 1) % leaves.len()
+        };
+        self.focus_tab(leaves[next], window, cx);
     }
 
     fn new_tab(&mut self, _event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -147,8 +307,14 @@ impl WorkspaceView {
         let id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
         let theme = self.themes.resolve(&self.settings.appearance.theme).clone();
-        let (terminal, session) =
-            create_local_terminal(id, cx.weak_entity(), cx, &self.settings.appearance, &theme);
+        let (terminal, session) = create_local_terminal(
+            id,
+            cx.weak_entity(),
+            cx,
+            &self.settings.appearance,
+            &theme,
+            self.shortcut_tx.clone(),
+        );
         self.tabs.push(TerminalTab {
             id,
             title: format!("终端 {}", id.0),
@@ -156,9 +322,46 @@ impl WorkspaceView {
             session,
             status: TabStatus::Running,
         });
-        self.active_tab = self.tabs.len() - 1;
-        self.focus_active(window, cx);
+        self.layout = LayoutNode::Leaf(id);
+        self.focus_tab(id, window, cx);
         cx.notify();
+    }
+
+    fn split_focused(
+        &mut self,
+        direction: SplitDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let old = self.focused_tab;
+        let id = TabId(self.next_tab_id);
+        self.next_tab_id += 1;
+        let theme = self.themes.resolve(&self.settings.appearance.theme).clone();
+        let (terminal, session) = create_local_terminal(
+            id,
+            cx.weak_entity(),
+            cx,
+            &self.settings.appearance,
+            &theme,
+            self.shortcut_tx.clone(),
+        );
+        self.tabs.push(TerminalTab {
+            id,
+            title: format!("终端 {}", id.0),
+            terminal,
+            session,
+            status: TabStatus::Running,
+        });
+        let replacement = LayoutNode::Split {
+            direction,
+            first: Box::new(LayoutNode::Leaf(old)),
+            second: Box::new(LayoutNode::Leaf(id)),
+        };
+        if !self.layout.replace_leaf(old, replacement) {
+            self.tabs.pop();
+            return;
+        }
+        self.focus_tab(id, window, cx);
     }
 
     fn activate_tab(
@@ -169,11 +372,8 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
-            self.active_tab = index;
-            window.set_window_title(&self.tabs[index].title);
-            self.focus_active(window, cx);
-            cx.notify();
+        if self.tabs.iter().any(|tab| tab.id == id) {
+            self.focus_tab(id, window, cx);
         }
     }
 
@@ -187,12 +387,10 @@ impl WorkspaceView {
         cx.stop_propagation();
         if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
             if self.tabs[index].status.is_exited() {
-                // 已退出的标签直接移除；移除最后一个后会自动补一个新终端
                 self.remove_tab_at(index, window, cx);
                 return;
             }
             if self.tabs.len() == 1 {
-                // 仅剩一个运行中的标签时不从标签 × 关闭，退出窗口走标题栏 ×
                 return;
             }
             if !self.tabs[index].status.mark_closing() {
@@ -204,20 +402,21 @@ impl WorkspaceView {
     }
 
     fn remove_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.tabs.remove(index);
+        let removed = self.tabs.remove(index);
+        let was_focused = removed.id == self.focused_tab;
+        self.layout.remove_leaf(removed.id);
         if self.tabs.is_empty() {
-            // 空工作区没有可聚焦的终端，自动补一个本地标签
             self.spawn_tab(window, cx);
             return;
         }
-        if self.active_tab >= self.tabs.len() {
-            self.active_tab = self.tabs.len() - 1;
-        } else if index < self.active_tab {
-            self.active_tab -= 1;
+        if was_focused || !self.layout.contains(self.focused_tab) {
+            let mut leaves = Vec::new();
+            self.layout.leaves(&mut leaves);
+            if let Some(id) = leaves.first().copied() {
+                self.focused_tab = id;
+            }
         }
-        window.set_window_title(&self.tabs[self.active_tab].title);
-        self.focus_active(window, cx);
-        cx.notify();
+        self.focus_tab(self.focused_tab, window, cx);
     }
 
     fn toggle_left_panel(
@@ -399,7 +598,7 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        if matches!(self.tabs[self.active_tab].status, TabStatus::Running) {
+        if matches!(self.tabs[self.active_index()].status, TabStatus::Running) {
             let terminal = self.active_terminal();
             terminal.update(cx, |terminal, _cx| {
                 terminal.send_text(&format!("{command}\n"))
@@ -428,7 +627,27 @@ impl WorkspaceView {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
-        if event.keystroke.modifiers.control && key == "t" {
+        if event.keystroke.modifiers.control
+            && event.keystroke.modifiers.shift
+            && key.eq_ignore_ascii_case("e")
+        {
+            self.split_focused(SplitDirection::Horizontal, window, cx);
+            cx.stop_propagation();
+        } else if event.keystroke.modifiers.control
+            && event.keystroke.modifiers.shift
+            && key.eq_ignore_ascii_case("o")
+        {
+            self.split_focused(SplitDirection::Vertical, window, cx);
+            cx.stop_propagation();
+        } else if event.keystroke.modifiers.control && event.keystroke.modifiers.shift && key == "["
+        {
+            self.cycle_focus(false, window, cx);
+            cx.stop_propagation();
+        } else if event.keystroke.modifiers.control && event.keystroke.modifiers.shift && key == "]"
+        {
+            self.cycle_focus(true, window, cx);
+            cx.stop_propagation();
+        } else if event.keystroke.modifiers.control && key.eq_ignore_ascii_case("t") {
             self.new_tab(
                 &MouseDownEvent {
                     position: gpui::point(px(0.0), px(0.0)),
@@ -501,9 +720,10 @@ impl WorkspaceView {
 }
 
 impl Render for WorkspaceView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let active_terminal = self.active_terminal();
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.process_shortcuts(window, cx);
         let active_id = self.active_tab_id();
+        let layout = self.layout.clone();
         let tabs = self
             .tabs
             .iter()
@@ -518,7 +738,7 @@ impl Render for WorkspaceView {
             .flex()
             .flex_col()
             .bg(rgb(0x1A1B26))
-            .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_down(cx.listener(WorkspaceView::on_key_down))
             .child(
                 div()
                     .h(px(TITLEBAR_HEIGHT))
@@ -581,6 +801,20 @@ impl Render for WorkspaceView {
                             .child(button("+", cx.listener(Self::new_tab)))
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::start_move)),
                     )
+                    .child(button(
+                        "⇔",
+                        cx.listener(|this, _event, window, cx| {
+                            cx.stop_propagation();
+                            this.split_focused(SplitDirection::Horizontal, window, cx);
+                        }),
+                    ))
+                    .child(button(
+                        "⇕",
+                        cx.listener(|this, _event, window, cx| {
+                            cx.stop_propagation();
+                            this.split_focused(SplitDirection::Vertical, window, cx);
+                        }),
+                    ))
                     .child(button("▣", cx.listener(Self::toggle_right_panel)))
                     .child(button("⚙", cx.listener(Self::toggle_settings)))
                     .child(button("—", cx.listener(Self::minimize)))
@@ -616,7 +850,13 @@ impl Render for WorkspaceView {
                     } else {
                         div()
                     })
-                    .child(div().flex_1().min_w(px(0.0)).child(active_terminal))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .min_h(px(0.0))
+                            .child(render_layout(&layout, &self.tabs, active_id, cx)),
+                    )
                     .child(if right_panel { quick_panel(cx) } else { div() }),
             )
             .when(settings_open, |root| {
@@ -627,6 +867,52 @@ impl Render for WorkspaceView {
                     settings_content(self.settings_page, self, cx),
                 ))
             })
+    }
+}
+
+fn render_layout(
+    node: &LayoutNode,
+    tabs: &[TerminalTab],
+    focused: TabId,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    match node {
+        LayoutNode::Leaf(id) => {
+            let Some(tab) = tabs.iter().find(|tab| tab.id == *id) else {
+                return div();
+            };
+            let mut pane = div()
+                .flex_1()
+                .min_w(px(0.0))
+                .min_h(px(0.0))
+                .on_key_down(cx.listener(WorkspaceView::on_key_down))
+                .child(tab.terminal.clone());
+            if *id == focused {
+                pane = pane.border_1().border_color(rgb(0x7AA2F7));
+            }
+            pane
+        }
+        LayoutNode::Split {
+            direction,
+            first,
+            second,
+        } => {
+            let horizontal = matches!(direction, SplitDirection::Horizontal);
+            let mut container = div().flex().flex_1().min_w(px(0.0)).min_h(px(0.0));
+            if horizontal {
+                container = container.flex_row();
+            } else {
+                container = container.flex_col();
+            }
+            container
+                .child(render_layout(first, tabs, focused, cx))
+                .child(if horizontal {
+                    div().w(px(1.0)).h_full().bg(rgb(0x343750))
+                } else {
+                    div().h(px(1.0)).w_full().bg(rgb(0x343750))
+                })
+                .child(render_layout(second, tabs, focused, cx))
+        }
     }
 }
 
@@ -1128,6 +1414,7 @@ fn create_local_terminal(
     cx: &mut Context<WorkspaceView>,
     settings: &Appearance,
     theme: &Theme,
+    shortcut_tx: flume::Sender<(TabId, WorkspaceShortcut)>,
 ) -> (Entity<TerminalView>, Arc<SessionControl>) {
     // 会话的开启/spawn/回收线程全部内聚在 LocalSession（laterterm-local）
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
@@ -1156,7 +1443,39 @@ fn create_local_terminal(
 
     let terminal = cx.new(|cx| {
         // resize 由视图默认回调转发给会话，无需在此另接
+        let shortcut_tx = shortcut_tx.clone();
         TerminalView::new(Arc::clone(&session), config, cx)
+            .with_key_handler(move |event| {
+                let shortcut = if event.keystroke.modifiers.control
+                    && event.keystroke.modifiers.shift
+                    && event.keystroke.key.eq_ignore_ascii_case("e")
+                {
+                    Some(WorkspaceShortcut::Split(SplitDirection::Horizontal))
+                } else if event.keystroke.modifiers.control
+                    && event.keystroke.modifiers.shift
+                    && event.keystroke.key.eq_ignore_ascii_case("o")
+                {
+                    Some(WorkspaceShortcut::Split(SplitDirection::Vertical))
+                } else if event.keystroke.modifiers.control
+                    && event.keystroke.modifiers.shift
+                    && event.keystroke.key == "["
+                {
+                    Some(WorkspaceShortcut::FocusPrevious)
+                } else if event.keystroke.modifiers.control
+                    && event.keystroke.modifiers.shift
+                    && event.keystroke.key == "]"
+                {
+                    Some(WorkspaceShortcut::FocusNext)
+                } else {
+                    None
+                };
+                if let Some(shortcut) = shortcut {
+                    let _ = shortcut_tx.send((id, shortcut));
+                    true
+                } else {
+                    false
+                }
+            })
             .with_title_callback({
                 let workspace = workspace.clone();
                 move |window, cx, title| {
