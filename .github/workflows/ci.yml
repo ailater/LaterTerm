@@ -1,0 +1,51 @@
+# LaterTerm CI 门禁
+#
+# 口径与 AGENTS.md 一致：
+# - fmt --check
+# - clippy --workspace --all-targets -D warnings
+# - cargo test --workspace --lib --bins
+#   （termview 上游遗留 doctest 需 GPUI 运行时，本机/CI 必挂，
+#    门禁不含 --doc；见 docs/roadmap.md M1 注记）
+#
+# GPUI 在 Linux 上链接需要系统库（xkbcommon/wayland/alsa 等）；
+# lib/bin 测试不开窗口，无头环境可跑。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    name: 门禁 (fmt / clippy / test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          components: rustfmt, clippy
+
+      - name: 安装 GPUI 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev \
+            libasound2-dev libudev-dev libfontconfig1-dev pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace --lib --bins
