@@ -91,6 +91,13 @@ impl LayoutNode {
         }
     }
 
+    fn leaf_count(&self) -> usize {
+        match self {
+            Self::Leaf(_) => 1,
+            Self::Split { first, second, .. } => first.leaf_count() + second.leaf_count(),
+        }
+    }
+
     pub(crate) fn contains(&self, target: TabId) -> bool {
         match self {
             Self::Leaf(id) => *id == target,
@@ -300,7 +307,11 @@ impl WorkspaceView {
 
     fn new_tab(&mut self, _event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
-        self.spawn_tab(window, cx);
+        if self.layout.leaf_count() > 1 {
+            self.split_focused(SplitDirection::Horizontal, window, cx);
+        } else {
+            self.spawn_tab(window, cx);
+        }
     }
 
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -732,6 +743,7 @@ impl Render for WorkspaceView {
         let left_panel = self.left_panel;
         let right_panel = self.right_panel;
         let settings_open = self.settings_open;
+        let pane_count = layout.leaf_count();
 
         div()
             .size_full()
@@ -764,40 +776,46 @@ impl Render for WorkspaceView {
                             .flex()
                             .items_center()
                             .overflow_x_hidden()
-                            .children(tabs.into_iter().map(|(id, title, exited)| {
-                                let is_active = id == active_id;
+                            .child(if pane_count > 1 {
                                 div()
                                     .h_full()
                                     .flex()
                                     .items_center()
-                                    .gap_1()
                                     .px_3()
-                                    .bg(if is_active {
-                                        rgb(0x292B3D)
-                                    } else {
-                                        rgb(0x161722)
-                                    })
-                                    .text_color(if exited { rgb(0x565A78) } else { rgb(0xC0CAF5) })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, event, window, cx| {
-                                            this.activate_tab(id, event, window, cx)
-                                        }),
-                                    )
-                                    .child(title)
-                                    .child(
+                                    .text_color(rgb(0x7DCEFF))
+                                    .child(format!("分屏 · {pane_count} 个窗格"))
+                            } else {
+                                div()
+                                    .h_full()
+                                    .flex()
+                                    .items_center()
+                                    .children(tabs.into_iter().map(|(id, title, exited)| {
+                                        let is_active = id == active_id;
                                         div()
-                                            .px_1()
-                                            .text_color(rgb(0x7D829F))
+                                            .h_full()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .px_3()
+                                            .bg(if is_active {
+                                                rgb(0x292B3D)
+                                            } else {
+                                                rgb(0x161722)
+                                            })
+                                            .text_color(if exited {
+                                                rgb(0x565A78)
+                                            } else {
+                                                rgb(0xC0CAF5)
+                                            })
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |this, event, window, cx| {
-                                                    this.close_tab(id, event, window, cx)
+                                                    this.activate_tab(id, event, window, cx)
                                                 }),
                                             )
-                                            .child("×"),
-                                    )
-                            }))
+                                            .child(title)
+                                    }))
+                            })
                             .child(button("+", cx.listener(Self::new_tab)))
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::start_move)),
                     )
@@ -852,6 +870,8 @@ impl Render for WorkspaceView {
                     })
                     .child(
                         div()
+                            .flex()
+                            .flex_col()
                             .flex_1()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
@@ -881,12 +901,30 @@ fn render_layout(
             let Some(tab) = tabs.iter().find(|tab| tab.id == *id) else {
                 return div();
             };
+            let close_id = *id;
             let mut pane = div()
+                .relative()
                 .flex_1()
                 .min_w(px(0.0))
                 .min_h(px(0.0))
                 .on_key_down(cx.listener(WorkspaceView::on_key_down))
-                .child(tab.terminal.clone());
+                .child(tab.terminal.clone())
+                .child(
+                    div()
+                        .absolute()
+                        .top_1()
+                        .right_1()
+                        .px_1()
+                        .text_color(rgb(0x7D829F))
+                        .bg(gpui::Hsla::from(rgb(0x202132)).opacity(0.85))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event, window, cx| {
+                                this.close_tab(close_id, event, window, cx)
+                            }),
+                        )
+                        .child("×"),
+                );
             if *id == focused {
                 pane = pane.border_1().border_color(rgb(0x7AA2F7));
             }
