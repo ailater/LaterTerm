@@ -22,6 +22,11 @@ enum SettingsPage {
     Servers,
 }
 
+/// 窗格（pane）ID：一个终端会话的最小分屏单元。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PaneId(pub(crate) u64);
+
+/// 标签 ID：一组窗格（含其分屏树）的容器。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct TabId(pub(crate) u64);
 
@@ -38,9 +43,10 @@ enum WorkspaceShortcut {
     FocusNext,
 }
 
+/// 标签内的分屏布局树，叶子是 PaneId。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LayoutNode {
-    Leaf(TabId),
+    Leaf(PaneId),
     Split {
         direction: SplitDirection,
         first: Box<LayoutNode>,
@@ -49,7 +55,7 @@ pub(crate) enum LayoutNode {
 }
 
 impl LayoutNode {
-    pub(crate) fn leaves(&self, output: &mut Vec<TabId>) {
+    pub(crate) fn leaves(&self, output: &mut Vec<PaneId>) {
         match self {
             Self::Leaf(id) => output.push(*id),
             Self::Split { first, second, .. } => {
@@ -59,7 +65,7 @@ impl LayoutNode {
         }
     }
 
-    pub(crate) fn replace_leaf(&mut self, target: TabId, replacement: LayoutNode) -> bool {
+    pub(crate) fn replace_leaf(&mut self, target: PaneId, replacement: LayoutNode) -> bool {
         match self {
             Self::Leaf(id) if *id == target => {
                 *self = replacement;
@@ -73,9 +79,9 @@ impl LayoutNode {
         }
     }
 
-    pub(crate) fn remove_leaf(&mut self, target: TabId) -> bool {
+    pub(crate) fn remove_leaf(&mut self, target: PaneId) -> bool {
         match self {
-            // 根节点没有兄弟，不能凭空删除；Workspace 会在会话层补新叶子。
+            // 根节点没有兄弟，不能凭空删除；Workspace 会在此状态下补新窗格。
             Self::Leaf(_) => false,
             Self::Split { first, second, .. } => {
                 if matches!(first.as_ref(), Self::Leaf(id) if *id == target) {
@@ -91,14 +97,14 @@ impl LayoutNode {
         }
     }
 
-    fn leaf_count(&self) -> usize {
+    pub(crate) fn leaf_count(&self) -> usize {
         match self {
             Self::Leaf(_) => 1,
             Self::Split { first, second, .. } => first.leaf_count() + second.leaf_count(),
         }
     }
 
-    pub(crate) fn contains(&self, target: TabId) -> bool {
+    pub(crate) fn contains(&self, target: PaneId) -> bool {
         match self {
             Self::Leaf(id) => *id == target,
             Self::Split { first, second, .. } => first.contains(target) || second.contains(target),
@@ -160,18 +166,37 @@ impl SessionControl {
     }
 }
 
-struct TerminalTab {
-    id: TabId,
+/// 窗格：一个终端实体 + 会话生命周期。
+struct Pane {
+    id: PaneId,
     title: String,
     terminal: Entity<TerminalView>,
     session: Arc<SessionControl>,
     status: TabStatus,
 }
 
-pub struct WorkspaceView {
-    tabs: Vec<TerminalTab>,
+/// 标签：持有自己的分屏树与窗格焦点。
+struct WorkspaceTab {
+    id: TabId,
     layout: LayoutNode,
-    focused_tab: TabId,
+    focused_pane: PaneId,
+}
+
+impl WorkspaceTab {
+    fn tab_title(&self, panes: &[Pane]) -> String {
+        panes
+            .iter()
+            .find(|pane| pane.id == self.focused_pane)
+            .map(|pane| pane.title.clone())
+            .unwrap_or_else(|| "终端".into())
+    }
+}
+
+pub struct WorkspaceView {
+    tabs: Vec<WorkspaceTab>,
+    panes: Vec<Pane>,
+    active_tab: TabId,
+    next_pane_id: u64,
     next_tab_id: u64,
     left_panel: bool,
     right_panel: bool,
@@ -179,9 +204,9 @@ pub struct WorkspaceView {
     settings_page: SettingsPage,
     settings: Settings,
     themes: ThemeRegistry,
-    shortcut_tx: flume::Sender<(TabId, WorkspaceShortcut)>,
-    shortcut_rx: flume::Receiver<(TabId, WorkspaceShortcut)>,
-    pending_shortcuts: Vec<(TabId, WorkspaceShortcut)>,
+    shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
+    shortcut_rx: flume::Receiver<(PaneId, WorkspaceShortcut)>,
+    pending_shortcuts: Vec<(PaneId, WorkspaceShortcut)>,
 }
 
 impl WorkspaceView {
@@ -191,10 +216,11 @@ impl WorkspaceView {
         settings.ensure_settings_file();
         let themes = ThemeRegistry::load();
         let (shortcut_tx, shortcut_rx) = flume::unbounded();
-        let first_id = TabId(1);
+        let first_pane = PaneId(1);
+        let first_tab = TabId(1);
         let theme = themes.resolve(&settings.appearance.theme).clone();
         let (terminal, session) = create_local_terminal(
-            first_id,
+            first_pane,
             weak_workspace,
             cx,
             &settings.appearance,
@@ -208,15 +234,20 @@ impl WorkspaceView {
             shortcut_rx,
             pending_shortcuts: Vec::new(),
             settings_page: SettingsPage::Appearance,
-            tabs: vec![TerminalTab {
-                id: first_id,
+            panes: vec![Pane {
+                id: first_pane,
                 title: "本地终端".into(),
                 terminal,
                 session,
                 status: TabStatus::Running,
             }],
-            layout: LayoutNode::Leaf(first_id),
-            focused_tab: first_id,
+            tabs: vec![WorkspaceTab {
+                id: first_tab,
+                layout: LayoutNode::Leaf(first_pane),
+                focused_pane: first_pane,
+            }],
+            active_tab: first_tab,
+            next_pane_id: 2,
             next_tab_id: 2,
             left_panel: false,
             right_panel: false,
@@ -242,9 +273,15 @@ impl WorkspaceView {
 
     fn process_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pending = std::mem::take(&mut self.pending_shortcuts);
-        for (id, shortcut) in pending {
-            if self.layout.contains(id) {
-                self.focused_tab = id;
+        for (pane_id, shortcut) in pending {
+            // 快捷键来自某个窗格：先激活其所在标签并聚焦该窗格，再执行分屏/循环
+            if let Some(tab_index) = self
+                .tabs
+                .iter()
+                .position(|tab| tab.layout.contains(pane_id))
+            {
+                self.active_tab = self.tabs[tab_index].id;
+                self.tabs[tab_index].focused_pane = pane_id;
                 self.handle_shortcut(shortcut, window, cx);
             }
         }
@@ -263,116 +300,132 @@ impl WorkspaceView {
         }
     }
 
-    fn active_tab_id(&self) -> TabId {
-        self.focused_tab
-    }
-
-    fn active_index(&self) -> usize {
+    fn active_tab_index(&self) -> usize {
         self.tabs
             .iter()
-            .position(|tab| tab.id == self.focused_tab)
+            .position(|tab| tab.id == self.active_tab)
             .unwrap_or(0)
     }
 
-    fn active_terminal(&self) -> Entity<TerminalView> {
-        self.tabs[self.active_index()].terminal.clone()
+    fn active_tab(&self) -> &WorkspaceTab {
+        &self.tabs[self.active_tab_index()]
     }
 
-    fn focus_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) {
-            self.focused_tab = id;
-            window.set_window_title(&tab.title);
-            tab.terminal.read(cx).focus_handle().focus(window);
+    fn focused_pane_id(&self) -> PaneId {
+        self.active_tab().focused_pane
+    }
+
+    fn pane(&self, id: PaneId) -> Option<&Pane> {
+        self.panes.iter().find(|pane| pane.id == id)
+    }
+
+    fn focused_terminal(&self) -> Entity<TerminalView> {
+        let id = self.focused_pane_id();
+        self.pane(id)
+            .map(|pane| pane.terminal.clone())
+            .unwrap_or_else(|| self.panes[0].terminal.clone())
+    }
+
+    fn focus_pane(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab_index) = self.tabs.iter().position(|tab| tab.layout.contains(id)) {
+            self.active_tab = self.tabs[tab_index].id;
+            self.tabs[tab_index].focused_pane = id;
+            if let Some(pane) = self.pane(id) {
+                window.set_window_title(&pane.title);
+                pane.terminal.read(cx).focus_handle().focus(window);
+            }
             cx.notify();
         }
     }
 
     fn cycle_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
         let mut leaves = Vec::new();
-        self.layout.leaves(&mut leaves);
+        self.active_tab().layout.leaves(&mut leaves);
         if leaves.len() < 2 {
             return;
         }
-        let index = leaves
-            .iter()
-            .position(|id| *id == self.focused_tab)
-            .unwrap_or(0);
+        let current = self.focused_pane_id();
+        let index = leaves.iter().position(|id| *id == current).unwrap_or(0);
         let next = if forward {
             (index + 1) % leaves.len()
         } else {
             (index + leaves.len() - 1) % leaves.len()
         };
-        self.focus_tab(leaves[next], window, cx);
+        self.focus_pane(leaves[next], window, cx);
     }
 
     fn new_tab(&mut self, _event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
-        if self.layout.leaf_count() > 1 {
-            self.split_focused(SplitDirection::Horizontal, window, cx);
-        } else {
-            self.spawn_tab(window, cx);
-        }
+        self.spawn_tab(window, cx);
     }
 
+    /// 新建标签：一个标签一个全新窗格与分屏树根。
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = TabId(self.next_tab_id);
+        let pane_id = PaneId(self.next_pane_id);
+        self.next_pane_id += 1;
+        let tab_id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
         let theme = self.themes.resolve(&self.settings.appearance.theme).clone();
         let (terminal, session) = create_local_terminal(
-            id,
+            pane_id,
             cx.weak_entity(),
             cx,
             &self.settings.appearance,
             &theme,
             self.shortcut_tx.clone(),
         );
-        self.tabs.push(TerminalTab {
-            id,
-            title: format!("终端 {}", id.0),
+        self.panes.push(Pane {
+            id: pane_id,
+            title: format!("终端 {}", pane_id.0),
             terminal,
             session,
             status: TabStatus::Running,
         });
-        self.layout = LayoutNode::Leaf(id);
-        self.focus_tab(id, window, cx);
-        cx.notify();
+        self.tabs.push(WorkspaceTab {
+            id: tab_id,
+            layout: LayoutNode::Leaf(pane_id),
+            focused_pane: pane_id,
+        });
+        self.focus_pane(pane_id, window, cx);
     }
 
+    /// 在当前焦点窗格处创建分屏，新窗格获得焦点。
     fn split_focused(
         &mut self,
         direction: SplitDirection,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let old = self.focused_tab;
-        let id = TabId(self.next_tab_id);
-        self.next_tab_id += 1;
+        let old = self.focused_pane_id();
+        let pane_id = PaneId(self.next_pane_id);
+        self.next_pane_id += 1;
         let theme = self.themes.resolve(&self.settings.appearance.theme).clone();
         let (terminal, session) = create_local_terminal(
-            id,
+            pane_id,
             cx.weak_entity(),
             cx,
             &self.settings.appearance,
             &theme,
             self.shortcut_tx.clone(),
         );
-        self.tabs.push(TerminalTab {
-            id,
-            title: format!("终端 {}", id.0),
+        self.panes.push(Pane {
+            id: pane_id,
+            title: format!("终端 {}", pane_id.0),
             terminal,
             session,
             status: TabStatus::Running,
         });
+        let tab_index = self.active_tab_index();
         let replacement = LayoutNode::Split {
             direction,
             first: Box::new(LayoutNode::Leaf(old)),
-            second: Box::new(LayoutNode::Leaf(id)),
+            second: Box::new(LayoutNode::Leaf(pane_id)),
         };
-        if !self.layout.replace_leaf(old, replacement) {
-            self.tabs.pop();
+        if !self.tabs[tab_index].layout.replace_leaf(old, replacement) {
+            self.panes.pop();
             return;
         }
-        self.focus_tab(id, window, cx);
+        self.focus_pane(pane_id, window, cx);
     }
 
     fn activate_tab(
@@ -383,11 +436,32 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        if self.tabs.iter().any(|tab| tab.id == id) {
-            self.focus_tab(id, window, cx);
+        if let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) {
+            let pane_id = tab.focused_pane;
+            self.focus_pane(pane_id, window, cx);
         }
     }
 
+    /// 关闭窗格（pane 角标 × / Ctrl+W）。 exited 直接移除，Running 走 Closing 生命周期；
+    /// 移除后修剪所在标签的布局树，标签空则移除标签，全部空则补一个新标签。
+    fn close_pane(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        let Some(index) = self.panes.iter().position(|pane| pane.id == id) else {
+            return;
+        };
+        if self.panes[index].status.is_exited() {
+            self.remove_pane_at(index, window, cx);
+            return;
+        }
+        if !self.panes[index].status.mark_closing() {
+            return;
+        }
+        self.panes[index].session.close();
+        cx.notify();
+    }
+
+    /// 关闭整个标签（标签栏 ×）：向该标签所有窗格会话发关闭请求（幂等），
+    /// 窗格实体随退出回调逐个清理；标签立即从标签栏消失。
     fn close_tab(
         &mut self,
         id: TabId,
@@ -396,38 +470,71 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
-            if self.tabs[index].status.is_exited() {
-                self.remove_tab_at(index, window, cx);
-                return;
+        let Some(tab_index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        let mut leaves = Vec::new();
+        self.tabs[tab_index].layout.leaves(&mut leaves);
+        for pane_id in leaves {
+            if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id)
+                && pane.status.mark_closing()
+            {
+                pane.session.close();
             }
-            if self.tabs.len() == 1 {
-                return;
-            }
-            if !self.tabs[index].status.mark_closing() {
-                return;
-            }
-            self.tabs[index].session.close();
-            cx.notify();
         }
-    }
-
-    fn remove_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let removed = self.tabs.remove(index);
-        let was_focused = removed.id == self.focused_tab;
-        self.layout.remove_leaf(removed.id);
+        self.tabs.remove(tab_index);
         if self.tabs.is_empty() {
             self.spawn_tab(window, cx);
             return;
         }
-        if was_focused || !self.layout.contains(self.focused_tab) {
-            let mut leaves = Vec::new();
-            self.layout.leaves(&mut leaves);
-            if let Some(id) = leaves.first().copied() {
-                self.focused_tab = id;
+        if self.active_tab == id {
+            let index = self.tabs.len() - 1;
+            let pane_id = self.tabs[index].focused_pane;
+            self.focus_pane(pane_id, window, cx);
+        }
+    }
+
+    fn remove_pane_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let removed = self.panes.remove(index);
+        // 从所在标签的布局树修剪；若该窗格是标签内最后一个（根叶子无法自删），
+        // 整个标签随之关闭
+        if let Some(tab_index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.layout.contains(removed.id))
+        {
+            if self.tabs[tab_index].layout.leaf_count() == 1 {
+                self.tabs.remove(tab_index);
+            } else {
+                self.tabs[tab_index].layout.remove_leaf(removed.id);
             }
         }
-        self.focus_tab(self.focused_tab, window, cx);
+        if self.tabs.is_empty() {
+            self.spawn_tab(window, cx);
+            return;
+        }
+        // 活动标签被移除时回退到最后一个标签
+        if !self.tabs.iter().any(|tab| tab.id == self.active_tab)
+            && let Some(last) = self.tabs.last()
+        {
+            self.active_tab = last.id;
+        }
+        // 焦点窗格失效时回退到活动标签的首个窗格
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == self.active_tab)
+            && !tab.layout.contains(tab.focused_pane)
+        {
+            let mut leaves = Vec::new();
+            tab.layout.leaves(&mut leaves);
+            if let Some(first) = leaves.first() {
+                tab.focused_pane = *first;
+            }
+        }
+        let pane_id = self.focused_pane_id();
+        if self.pane(pane_id).is_some() {
+            self.focus_pane(pane_id, window, cx);
+        } else if let Some(first) = self.panes.first() {
+            self.focus_pane(first.id, window, cx);
+        }
     }
 
     fn toggle_left_panel(
@@ -476,12 +583,12 @@ impl WorkspaceView {
         self.apply_appearance(cx);
     }
 
-    /// 把当前设置（外观五项 + 主题）应用到所有标签，不重建终端。
+    /// 把当前设置（外观五项 + 主题）应用到所有窗格，不重建终端。
     fn apply_appearance(&mut self, cx: &mut Context<Self>) {
         let appearance = self.settings.appearance.clone();
         let palette = palette_for(self.themes.resolve(&appearance.theme));
-        for tab in &self.tabs {
-            tab.terminal.update(cx, |terminal, cx| {
+        for pane in &self.panes {
+            pane.terminal.update(cx, |terminal, cx| {
                 let mut config = terminal.config().clone();
                 config.font_family = appearance.font_family.clone();
                 config.font_size = px(appearance.font_size);
@@ -609,8 +716,11 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        if matches!(self.tabs[self.active_index()].status, TabStatus::Running) {
-            let terminal = self.active_terminal();
+        let pane_id = self.focused_pane_id();
+        if let Some(pane) = self.pane(pane_id)
+            && matches!(pane.status, TabStatus::Running)
+        {
+            let terminal = pane.terminal.clone();
             terminal.update(cx, |terminal, _cx| {
                 terminal.send_text(&format!("{command}\n"))
             });
@@ -626,14 +736,17 @@ impl WorkspaceView {
     ) {
         cx.stop_propagation();
         // 退出前向所有会话发送关闭请求；SessionControl.close 幂等，wait 线程负责回收子进程
-        for tab in &self.tabs {
-            tab.session.close();
+        for pane in &self.panes {
+            pane.session.close();
         }
         cx.quit();
     }
 
     pub fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
-        self.active_terminal().read(cx).focus_handle().focus(window);
+        self.focused_terminal()
+            .read(cx)
+            .focus_handle()
+            .focus(window);
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -672,58 +785,48 @@ impl WorkspaceView {
             );
             cx.stop_propagation();
         } else if event.keystroke.modifiers.control && key == "w" {
-            let id = self.active_tab_id();
-            self.close_tab(
-                id,
-                &MouseDownEvent {
-                    position: gpui::point(px(0.0), px(0.0)),
-                    button: MouseButton::Left,
-                    modifiers: Default::default(),
-                    click_count: 1,
-                    first_mouse: true,
-                },
-                window,
-                cx,
-            );
+            let id = self.focused_pane_id();
+            self.close_pane(id, window, cx);
             cx.stop_propagation();
         }
     }
 
-    fn set_tab_title(&mut self, id: TabId, title: &str, cx: &mut Context<Self>) -> bool {
-        let active_id = self.active_tab_id();
-        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
-            if tab.status.is_exited() {
-                // 已退出的标签不接受迟到的 OSC 标题，避免覆盖退出后缀
+    /// OSC 标题回调：更新窗格标题；返回是否需要同步窗口标题
+    /// （仅当该窗格是活动标签的焦点窗格）。
+    fn set_pane_title(&mut self, id: PaneId, title: &str, cx: &mut Context<Self>) -> bool {
+        if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id) {
+            if pane.status.is_exited() {
+                // 已退出的窗格不接受迟到的 OSC 标题，避免覆盖退出后缀
                 return false;
             }
-            tab.title = if title.is_empty() {
+            pane.title = if title.is_empty() {
                 "本地终端".into()
             } else {
                 title.into()
             };
             cx.notify();
-            return tab.id == active_id;
+            return self.active_tab().focused_pane == id;
         }
         false
     }
 
-    fn mark_exited(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+    fn mark_exited(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         let closing = self
-            .tabs
+            .panes
             .iter()
-            .find(|tab| tab.id == id)
-            .is_some_and(|tab| matches!(tab.status, TabStatus::Closing));
+            .find(|pane| pane.id == id)
+            .is_some_and(|pane| matches!(pane.status, TabStatus::Closing));
         if closing {
-            if let Some(index) = self.tabs.iter().position(|tab| tab.id == id) {
-                self.remove_tab_at(index, window, cx);
+            if let Some(index) = self.panes.iter().position(|pane| pane.id == id) {
+                self.remove_pane_at(index, window, cx);
             }
             return;
         }
-        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id)
-            && tab.status.mark_exited()
+        if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id)
+            && pane.status.mark_exited()
         {
-            if !tab.title.ends_with("（已退出）") {
-                tab.title.push_str("（已退出）");
+            if !pane.title.ends_with("（已退出）") {
+                pane.title.push_str("（已退出）");
             }
             cx.notify();
         }
@@ -733,17 +836,22 @@ impl WorkspaceView {
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_shortcuts(window, cx);
-        let active_id = self.active_tab_id();
-        let layout = self.layout.clone();
-        let tabs = self
+        let active_tab_id = self.active_tab;
+        let active_layout = self.active_tab().layout.clone();
+        let focused_pane = self.active_tab().focused_pane;
+        // 每个标签的标题 = 其焦点窗格标题；多窗格时附带窗格数
+        let tab_labels = self
             .tabs
             .iter()
-            .map(|tab| (tab.id, tab.title.clone(), tab.status.is_exited()))
+            .map(|tab| {
+                let count = tab.layout.leaf_count();
+                let title = tab.tab_title(&self.panes);
+                (tab.id, title, count)
+            })
             .collect::<Vec<_>>();
         let left_panel = self.left_panel;
         let right_panel = self.right_panel;
         let settings_open = self.settings_open;
-        let pane_count = layout.leaf_count();
 
         div()
             .size_full()
@@ -776,46 +884,50 @@ impl Render for WorkspaceView {
                             .flex()
                             .items_center()
                             .overflow_x_hidden()
-                            .child(if pane_count > 1 {
+                            .children(tab_labels.iter().map(|(id, title, count)| {
+                                let id = *id;
+                                let is_active = id == active_tab_id;
+                                let label = if *count > 1 {
+                                    format!("{title} ⊞{count}")
+                                } else {
+                                    title.clone()
+                                };
                                 div()
                                     .h_full()
                                     .flex()
                                     .items_center()
+                                    .gap_1()
                                     .px_3()
-                                    .text_color(rgb(0x7DCEFF))
-                                    .child(format!("分屏 · {pane_count} 个窗格"))
-                            } else {
-                                div()
-                                    .h_full()
-                                    .flex()
-                                    .items_center()
-                                    .children(tabs.into_iter().map(|(id, title, exited)| {
-                                        let is_active = id == active_id;
+                                    .bg(if is_active {
+                                        rgb(0x292B3D)
+                                    } else {
+                                        rgb(0x161722)
+                                    })
+                                    .text_color(if is_active {
+                                        rgb(0xC0CAF5)
+                                    } else {
+                                        rgb(0xA9B1D6)
+                                    })
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, event, window, cx| {
+                                            this.activate_tab(id, event, window, cx)
+                                        }),
+                                    )
+                                    .child(label)
+                                    .child(
                                         div()
-                                            .h_full()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .px_3()
-                                            .bg(if is_active {
-                                                rgb(0x292B3D)
-                                            } else {
-                                                rgb(0x161722)
-                                            })
-                                            .text_color(if exited {
-                                                rgb(0x565A78)
-                                            } else {
-                                                rgb(0xC0CAF5)
-                                            })
+                                            .px_1()
+                                            .text_color(rgb(0x7D829F))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |this, event, window, cx| {
-                                                    this.activate_tab(id, event, window, cx)
+                                                    this.close_tab(id, event, window, cx)
                                                 }),
                                             )
-                                            .child(title)
-                                    }))
-                            })
+                                            .child("×"),
+                                    )
+                            }))
                             .child(button("+", cx.listener(Self::new_tab)))
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::start_move)),
                     )
@@ -854,16 +966,16 @@ impl Render for WorkspaceView {
                             .h_full()
                             .bg(rgb(0x202132))
                             .p_3()
-                            .child(div().text_color(rgb(0xC0CAF5)).child("会话"))
-                            .children(self.tabs.iter().map(|tab| {
+                            .child(div().text_color(rgb(0xC0CAF5)).child("标签"))
+                            .children(tab_labels.iter().map(|(id, title, _)| {
                                 div()
                                     .py_1()
-                                    .text_color(if tab.id == active_id {
+                                    .text_color(if *id == active_tab_id {
                                         rgb(0x7DCEFF)
                                     } else {
                                         rgb(0xA9B1D6)
                                     })
-                                    .child(tab.title.clone())
+                                    .child(title.clone())
                             }))
                     } else {
                         div()
@@ -875,7 +987,7 @@ impl Render for WorkspaceView {
                             .flex_1()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
-                            .child(render_layout(&layout, &self.tabs, active_id, cx)),
+                            .child(render_layout(&active_layout, &self.panes, focused_pane, cx)),
                     )
                     .child(if right_panel { quick_panel(cx) } else { div() }),
             )
@@ -892,23 +1004,35 @@ impl Render for WorkspaceView {
 
 fn render_layout(
     node: &LayoutNode,
-    tabs: &[TerminalTab],
-    focused: TabId,
+    panes: &[Pane],
+    focused: PaneId,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
     match node {
         LayoutNode::Leaf(id) => {
-            let Some(tab) = tabs.iter().find(|tab| tab.id == *id) else {
+            let Some(pane) = panes.iter().find(|pane| pane.id == *id) else {
                 return div();
             };
             let close_id = *id;
-            let mut pane = div()
+            let mut pane_div = div()
                 .relative()
                 .flex_1()
                 .min_w(px(0.0))
                 .min_h(px(0.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, window, cx| {
+                        // 点击 pane 任意处即聚焦该 pane
+                        let pane_id = close_id;
+                        if this.focused_pane_id() != pane_id {
+                            this.focus_pane(pane_id, window, cx);
+                        } else {
+                            this.focus_active(window, cx);
+                        }
+                    }),
+                )
                 .on_key_down(cx.listener(WorkspaceView::on_key_down))
-                .child(tab.terminal.clone())
+                .child(pane.terminal.clone())
                 .child(
                     div()
                         .absolute()
@@ -919,16 +1043,16 @@ fn render_layout(
                         .bg(gpui::Hsla::from(rgb(0x202132)).opacity(0.85))
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, event, window, cx| {
-                                this.close_tab(close_id, event, window, cx)
+                            cx.listener(move |this, _event, window, cx| {
+                                this.close_pane(close_id, window, cx)
                             }),
                         )
                         .child("×"),
                 );
             if *id == focused {
-                pane = pane.border_1().border_color(rgb(0x7AA2F7));
+                pane_div = pane_div.border_1().border_color(rgb(0x7AA2F7));
             }
-            pane
+            pane_div
         }
         LayoutNode::Split {
             direction,
@@ -943,13 +1067,13 @@ fn render_layout(
                 container = container.flex_col();
             }
             container
-                .child(render_layout(first, tabs, focused, cx))
+                .child(render_layout(first, panes, focused, cx))
                 .child(if horizontal {
                     div().w(px(1.0)).h_full().bg(rgb(0x343750))
                 } else {
                     div().h(px(1.0)).w_full().bg(rgb(0x343750))
                 })
-                .child(render_layout(second, tabs, focused, cx))
+                .child(render_layout(second, panes, focused, cx))
         }
     }
 }
@@ -1447,12 +1571,12 @@ fn button_with_color(
 }
 
 fn create_local_terminal(
-    id: TabId,
+    id: PaneId,
     workspace: gpui::WeakEntity<WorkspaceView>,
     cx: &mut Context<WorkspaceView>,
     settings: &Appearance,
     theme: &Theme,
-    shortcut_tx: flume::Sender<(TabId, WorkspaceShortcut)>,
+    shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
 ) -> (Entity<TerminalView>, Arc<SessionControl>) {
     // 会话的开启/spawn/回收线程全部内聚在 LocalSession（laterterm-local）
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
@@ -1518,7 +1642,7 @@ fn create_local_terminal(
                 let workspace = workspace.clone();
                 move |window, cx, title| {
                     let active = workspace
-                        .update(cx, |workspace, cx| workspace.set_tab_title(id, title, cx))
+                        .update(cx, |workspace, cx| workspace.set_pane_title(id, title, cx))
                         .unwrap_or(false);
                     if active {
                         window.set_window_title(if title.is_empty() { "LaterTerm" } else { title });
