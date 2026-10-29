@@ -1243,6 +1243,8 @@ impl Render for TerminalView {
         if self.renderer.needs_measurement() {
             self.renderer.measure_cell(window);
         }
+        // metrics 已在实体 render 阶段测量完成；canvas 只捕获一次不可变快照，
+        // 避免每个标签切换/每帧再 clone 后重复测量。
         let renderer = self.renderer.clone();
         let resize_callback = self.resize_callback.clone();
         let focus_handle = self.focus_handle.clone();
@@ -1307,11 +1309,9 @@ impl Render for TerminalView {
                         );
                         use alacritty_terminal::grid::Dimensions;
 
-                        // Measure actual cell dimensions only when the font configuration changed.
-                        let mut measured_renderer = renderer.clone();
-                        if measured_renderer.needs_measurement() {
-                            measured_renderer.measure_cell(window);
-                        }
+                        // 测量已在上面的实体 render 阶段完成；这里直接使用快照，
+                        // 不在 canvas 闭包中重复字体整形。
+                        let measured_renderer = renderer.clone();
 
                         // Calculate available space after padding, clamping tiny windows safely.
                         let available_width: f32 =

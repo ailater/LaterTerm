@@ -353,6 +353,7 @@ impl TerminalRenderer {
         row: usize,
         cells: impl Iterator<Item = (usize, Cell)>,
         colors: &Colors,
+        default_bg: Hsla,
     ) -> (Vec<BackgroundRect>, Vec<BatchedTextRun>) {
         let mut backgrounds = Vec::new();
         let mut text_runs = Vec::new();
@@ -383,13 +384,15 @@ impl TerminalRenderer {
                 cell.c
             };
 
-            // Handle background rectangles
-            if let Some(ref mut bg_rect) = current_bg {
+            // 默认背景由整行底色覆盖，不创建逐格背景矩形。
+            if bg_color == default_bg {
+                if let Some(bg_rect) = current_bg.take() {
+                    backgrounds.push(bg_rect);
+                }
+            } else if let Some(ref mut bg_rect) = current_bg {
                 if bg_rect.color == bg_color && bg_rect.end_col == col {
-                    // Extend current background
                     bg_rect.end_col = col + 1;
                 } else {
-                    // Save current background and start new one
                     backgrounds.push(bg_rect.clone());
                     current_bg = Some(BackgroundRect {
                         start_col: col,
@@ -399,13 +402,20 @@ impl TerminalRenderer {
                     });
                 }
             } else {
-                // Start new background
                 current_bg = Some(BackgroundRect {
                     start_col: col,
                     end_col: col + 1,
                     row,
                     color: bg_color,
                 });
+            }
+
+            // 空格只由背景层覆盖，不需要进入字体整形；空白处也切断文本 run。
+            if ch == ' ' || ch == '\0' {
+                if let Some(run) = current_run.take() {
+                    text_runs.push(run);
+                }
+                continue;
             }
 
             // Handle text runs; custom box-drawing passes own these glyphs.
@@ -568,7 +578,8 @@ impl TerminalRenderer {
                 .collect();
 
             // Layout the row once; text runs are shaped in batches below.
-            let (backgrounds, text_runs) = self.layout_row(line_idx, cells.iter().cloned(), colors);
+            let (backgrounds, text_runs) =
+                self.layout_row(line_idx, cells.iter().cloned(), colors, default_bg);
 
             // Paint backgrounds
             for bg_rect in backgrounds {
