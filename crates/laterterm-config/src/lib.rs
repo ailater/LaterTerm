@@ -67,6 +67,35 @@ impl Default for Appearance {
 }
 
 impl Settings {
+    pub fn upsert_command(&mut self, command: CommandTemplate) -> Result<()> {
+        command.validate()?;
+        if let Some(existing) = self
+            .commands
+            .iter_mut()
+            .find(|item| item.name == command.name)
+        {
+            *existing = command;
+        } else {
+            self.commands.push(command);
+        }
+        Ok(())
+    }
+
+    pub fn remove_command(&mut self, name: &str) -> bool {
+        let before = self.commands.len();
+        self.commands.retain(|command| command.name != name);
+        before != self.commands.len()
+    }
+
+    pub fn command_shortcut_conflicts(&self) -> Vec<String> {
+        commands::shortcut_conflicts(self.commands.iter().filter_map(|command| {
+            command
+                .shortcut
+                .as_deref()
+                .map(|shortcut| (command.name.as_str(), shortcut))
+        }))
+    }
+
     /// 用户配置目录下的设置文件路径。
     pub fn default_path() -> Option<PathBuf> {
         Some(config_dir()?.join(APP_DIR).join(SETTINGS_FILE))

@@ -171,6 +171,17 @@ impl SessionControl {
 }
 
 /// 窗格：一个终端实体 + 会话生命周期。
+#[derive(Clone, Debug)]
+enum CommandDialog {
+    Preview {
+        template: CommandTemplate,
+        preview: Option<String>,
+    },
+    Edit {
+        original_name: Option<String>,
+    },
+}
+
 struct Pane {
     id: PaneId,
     title: String,
@@ -212,10 +223,12 @@ pub struct WorkspaceView {
     shortcut_rx: flume::Receiver<(PaneId, WorkspaceShortcut)>,
     pending_shortcuts: Vec<(PaneId, WorkspaceShortcut)>,
     command_values: BTreeMap<String, String>,
-    command_preview: Option<(String, bool)>,
-    command_template: Option<CommandTemplate>,
+    command_dialog: Option<CommandDialog>,
     command_target: Option<PaneId>,
     command_fields: Vec<(String, Entity<CommandTextField>)>,
+    command_field_subscriptions: Vec<gpui::Subscription>,
+    command_delete_confirm: Option<String>,
+    command_error: Option<String>,
 }
 
 impl WorkspaceView {
@@ -243,10 +256,12 @@ impl WorkspaceView {
             shortcut_rx,
             pending_shortcuts: Vec::new(),
             command_values: BTreeMap::new(),
-            command_preview: None,
-            command_template: None,
+            command_dialog: None,
             command_target: None,
             command_fields: Vec::new(),
+            command_field_subscriptions: Vec::new(),
+            command_delete_confirm: None,
+            command_error: None,
             settings_page: SettingsPage::Appearance,
             panes: vec![Pane {
                 id: first_pane,
@@ -724,6 +739,42 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    fn save_command(&mut self, command: CommandTemplate, cx: &mut Context<Self>) {
+        let previous = self.settings.clone();
+        if let Err(error) = self.settings.upsert_command(command) {
+            self.command_error = Some(error.to_string());
+            return;
+        }
+        if let Some(path) = Settings::default_path()
+            && let Err(error) = self.settings.save_to(&path)
+        {
+            self.settings = previous;
+            self.command_error = Some(format!("保存命令失败: {error}"));
+        } else {
+            self.command_error = None;
+        }
+        cx.notify();
+    }
+
+    fn delete_command(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.command_delete_confirm.as_deref() != Some(name) {
+            self.command_delete_confirm = Some(name.to_string());
+            return;
+        }
+        let previous = self.settings.clone();
+        self.settings.remove_command(name);
+        if let Some(path) = Settings::default_path()
+            && let Err(error) = self.settings.save_to(&path)
+        {
+            self.settings = previous;
+            self.command_error = Some(format!("删除命令失败: {error}"));
+        } else {
+            self.command_delete_confirm = None;
+            self.command_error = None;
+        }
+        cx.notify();
+    }
+
     fn send_command_to_pane(
         &mut self,
         pane_id: PaneId,
@@ -744,19 +795,89 @@ impl WorkspaceView {
         self.focus_pane(pane_id, window, cx);
     }
 
+    fn edit_command(&mut self, command: Option<CommandTemplate>, cx: &mut Context<Self>) {
+        let draft = command.clone().unwrap_or_default();
+        self.command_fields.clear();
+        self.command_field_subscriptions.clear();
+        for (name, value) in [
+            ("名称", draft.name.clone()),
+            ("模板", draft.template.clone()),
+            ("快捷键", draft.shortcut.clone().unwrap_or_default()),
+        ] {
+            let field = cx.new(|cx| CommandTextField::new(value, name, cx));
+            self.command_fields.push((name.to_string(), field));
+        }
+        self.command_dialog = Some(CommandDialog::Edit {
+            original_name: command.map(|item| item.name),
+        });
+        self.command_error = None;
+        cx.notify();
+    }
+
+    fn save_edit_command(&mut self, original_name: Option<String>, cx: &mut Context<Self>) {
+        let values = self
+            .command_fields
+            .iter()
+            .map(|(name, field)| (name.as_str(), field.read(cx).value()))
+            .collect::<BTreeMap<_, _>>();
+        let name = values
+            .get("名称")
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let template = values
+            .get("模板")
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let shortcut = values
+            .get("快捷键")
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| value.to_string());
+        let command = CommandTemplate {
+            name,
+            template,
+            shortcut,
+            confirm: true,
+        };
+        if let Some(original) = original_name
+            && original != command.name
+        {
+            self.settings.remove_command(&original);
+        }
+        if !self.settings.command_shortcut_conflicts().is_empty() {
+            self.command_error = Some("快捷键与已有命令冲突".into());
+            return;
+        }
+        self.save_command(command, cx);
+        if self.command_error.is_none() {
+            self.command_dialog = None;
+            self.command_fields.clear();
+        }
+    }
+
     fn open_command(
         &mut self,
         command: &CommandTemplate,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.command_template = Some(command.clone());
+        self.command_dialog = Some(CommandDialog::Preview {
+            template: command.clone(),
+            preview: None,
+        });
         self.command_target = Some(self.focused_pane_id());
         self.command_fields.clear();
+        self.command_field_subscriptions.clear();
         self.command_values.clear();
         if let Ok(variables) = command.variables() {
             for variable in variables {
                 let field = cx.new(|cx| CommandTextField::new(String::new(), variable.clone(), cx));
+                self.command_field_subscriptions.push(cx.subscribe(
+                    &field,
+                    |workspace, _field, _event, cx| {
+                        workspace.sync_command_values(cx);
+                        cx.notify();
+                    },
+                ));
                 self.command_fields.push((variable, field));
             }
         }
@@ -767,43 +888,35 @@ impl WorkspaceView {
                 window,
                 cx,
             );
-            self.command_template = None;
+            self.command_dialog = None;
             self.command_target = None;
             return;
         }
-        match command.expand(&self.command_values) {
-            Ok(preview) => {
-                self.command_preview =
-                    Some((preview, command.confirm || !self.command_fields.is_empty()));
-            }
-            Err(_) => {
-                // 参数未填齐时打开表单状态；不会向 PTY 写入半成品。
-                self.command_preview = Some((
-                    format!(
-                        "参数：{}",
-                        command.variables().unwrap_or_default().join(", ")
-                    ),
-                    true,
-                ));
-            }
-        }
+        let preview = command.expand(&self.command_values).ok();
+        self.command_dialog = Some(CommandDialog::Preview {
+            template: command.clone(),
+            preview,
+        });
         cx.notify();
     }
 
     fn confirm_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_command_values(cx);
-        let Some((command, _confirm)) = self.command_preview.take() else {
+        let Some(CommandDialog::Preview {
+            preview: Some(command),
+            template,
+        }) = self.command_dialog.clone()
+        else {
+            self.command_error = Some("参数未填写完整或命令无效".into());
             return;
         };
-        if command.starts_with("参数错误：") || command.starts_with("参数：") {
-            return;
-        }
         let target = self
             .command_target
             .take()
             .unwrap_or_else(|| self.focused_pane_id());
         self.send_command_to_pane(target, command, window, cx);
-        self.command_template = None;
+        let _ = template;
+        self.command_dialog = None;
         self.command_fields.clear();
         cx.notify();
     }
@@ -814,11 +927,8 @@ impl WorkspaceView {
             .iter()
             .map(|(name, field)| (name.clone(), field.read(cx).value().to_string()))
             .collect();
-        if let Some(template) = &self.command_template {
-            self.command_preview = Some(match template.expand(&self.command_values) {
-                Ok(preview) => (preview, template.confirm || !self.command_fields.is_empty()),
-                Err(error) => (format!("参数错误：{error}"), true),
-            });
+        if let Some(CommandDialog::Preview { template, preview }) = &mut self.command_dialog {
+            *preview = template.expand(&self.command_values).ok();
         }
     }
 
@@ -829,10 +939,11 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        self.command_preview = None;
-        self.command_template = None;
+        self.command_dialog = None;
+        self.command_error = None;
         self.command_target = None;
         self.command_fields.clear();
+        self.command_field_subscriptions.clear();
         self.command_values.clear();
         cx.notify();
     }
@@ -859,6 +970,25 @@ impl WorkspaceView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.command_dialog.is_some() {
+            return;
+        }
+        if let Some(command) = self
+            .settings
+            .commands
+            .iter()
+            .find(|command| {
+                command
+                    .shortcut
+                    .as_deref()
+                    .is_some_and(|shortcut| keystroke_matches_shortcut(event, shortcut))
+            })
+            .cloned()
+        {
+            self.open_command(&command, window, cx);
+            cx.stop_propagation();
+            return;
+        }
         let key = event.keystroke.key.as_str();
         if event.keystroke.modifiers.control
             && event.keystroke.modifiers.shift
@@ -967,7 +1097,7 @@ impl Render for WorkspaceView {
             .flex()
             .flex_col()
             .bg(rgb(0x1A1B26))
-            .on_key_down(cx.listener(WorkspaceView::on_key_down))
+            .capture_key_down(cx.listener(WorkspaceView::on_key_down))
             .child(
                 div()
                     .h(px(TITLEBAR_HEIGHT))
@@ -1144,7 +1274,7 @@ fn render_layout(
                         }
                     }),
                 )
-                .on_key_down(cx.listener(WorkspaceView::on_key_down))
+                .capture_key_down(cx.listener(WorkspaceView::on_key_down))
                 .child(pane.terminal.clone())
                 .child(
                     div()
@@ -1191,41 +1321,11 @@ fn render_layout(
     }
 }
 
-fn default_commands() -> Vec<CommandTemplate> {
-    [
-        ("htop", "htop"),
-        ("tmux", "tmux"),
-        ("vim", "vim"),
-        ("清屏", "clear"),
-    ]
-    .into_iter()
-    .map(|(name, template)| CommandTemplate {
-        name: name.into(),
-        template: template.into(),
-        shortcut: None,
-        confirm: false,
-    })
-    .collect()
-}
-
 fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
-    let commands = if workspace.settings.commands.is_empty() {
-        default_commands()
-    } else {
-        workspace.settings.commands.clone()
-    };
-    let preview = workspace.command_preview.clone();
+    let commands = workspace.settings.commands.clone();
+    let dialog = workspace.command_dialog.clone();
     let fields = workspace.command_fields.clone();
-    let live_preview = workspace.command_template.as_ref().map(|template| {
-        let values = fields
-            .iter()
-            .map(|(name, field)| (name.clone(), field.read(cx).value().to_string()))
-            .collect::<BTreeMap<_, _>>();
-        (
-            template.expand(&values),
-            template.confirm || !fields.is_empty(),
-        )
-    });
+    let error = workspace.command_error.clone();
 
     let mut panel = div()
         .w(px(PANEL_WIDTH))
@@ -1234,22 +1334,61 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
         .p_3()
         .text_color(rgb(0xC0CAF5))
         .child(div().child("快捷命令"))
+        .child(setting_button(
+            "新建命令",
+            true,
+            cx.listener(|this, _event, _window, cx| this.edit_command(None, cx)),
+        ))
+        .child(
+            div()
+                .pt_2()
+                .text_color(rgb(0x7D829F))
+                .child("模板和快捷键保存在 settings.toml"),
+        )
+        .when_some(error, |panel, error| {
+            panel.child(div().text_color(rgb(0xF7768E)).child(error))
+        })
         .children(commands.into_iter().map(|command| {
+            let shortcut = command.shortcut.clone();
             let label = if command.template == command.name {
                 command.name.clone()
             } else {
                 format!("{}  ·  {}", command.name, command.template)
             };
+            let open_command = command.clone();
             div()
                 .py_2()
                 .text_color(rgb(0xA9B1D6))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _event, window, cx| {
-                        this.open_command(&command, window, cx);
+                        this.open_command(&open_command, window, cx);
                     }),
                 )
                 .child(label)
+                .child(setting_button(
+                    "编辑",
+                    false,
+                    cx.listener({
+                        let command = command.clone();
+                        move |this, _event, _window, cx| {
+                            this.edit_command(Some(command.clone()), cx)
+                        }
+                    }),
+                ))
+                .child(setting_button(
+                    "删",
+                    false,
+                    cx.listener({
+                        let name = command.name.clone();
+                        move |this, _event, _window, cx| this.delete_command(&name, cx)
+                    }),
+                ))
+                .child(
+                    shortcut
+                        .map(|key| format!("  [{}]", key))
+                        .unwrap_or_default(),
+                )
         }))
         .child(div().pt_4().child("快捷服务器"))
         .child(div().pt_2().text_color(rgb(0x7D829F)).child("本地 Shell"))
@@ -1259,15 +1398,45 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                 .text_color(rgb(0x565A78))
                 .child("SSH 服务器将在 SSH 模块接入后可用"),
         );
-    if let Some((command, confirm)) = preview {
-        let (display_command, display_confirm) = live_preview
-            .map(|(result, needs_confirm)| {
-                (
-                    result.unwrap_or_else(|error| format!("参数错误：{error}")),
-                    needs_confirm,
+    if let Some(CommandDialog::Edit { original_name }) = dialog.clone() {
+        panel = panel.child(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.98))
+                .p_3()
+                .child(div().text_color(rgb(0x7DCFFF)).child("编辑命令"))
+                .children(
+                    fields
+                        .clone()
+                        .into_iter()
+                        .map(|(name, field)| div().pt_2().child(name).child(field)),
                 )
-            })
-            .unwrap_or((command, confirm));
+                .child(setting_button(
+                    "保存",
+                    true,
+                    cx.listener(move |this, _event, _window, cx| {
+                        this.save_edit_command(original_name.clone(), cx)
+                    }),
+                ))
+                .child(setting_button(
+                    "取消",
+                    false,
+                    cx.listener(WorkspaceView::cancel_command),
+                )),
+        );
+    }
+    if let Some(CommandDialog::Preview { template, preview }) = dialog {
+        let display_command = preview.unwrap_or_else(|| {
+            format!(
+                "参数错误：{}",
+                template.variables().unwrap_or_default().join(", ")
+            )
+        });
+        let display_confirm = template.confirm || !fields.is_empty();
         panel = panel.child(
             div()
                 .absolute()
@@ -1278,7 +1447,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                 .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.98))
                 .p_3()
                 .child(div().text_color(rgb(0x7DCFFF)).child("命令预览"))
-                .children(fields.into_iter().map(|(name, field)| {
+                .children(fields.clone().into_iter().map(|(name, field)| {
                     div()
                         .pt_2()
                         .child(div().text_color(rgb(0x7D829F)).child(name))
@@ -2010,6 +2179,26 @@ macro_rules! set_color {
             ($value & 0xFF) as u8,
         )
     };
+}
+
+fn keystroke_matches_shortcut(event: &KeyDownEvent, shortcut: &str) -> bool {
+    let parts = shortcut.to_ascii_lowercase();
+    let tokens = parts.split('+').collect::<Vec<_>>();
+    let key = tokens.last().copied().unwrap_or_default();
+    let modifiers = &event.keystroke.modifiers;
+    let wants_ctrl = tokens
+        .iter()
+        .any(|token| matches!(*token, "ctrl" | "control"));
+    let wants_alt = tokens.contains(&"alt");
+    let wants_shift = tokens.contains(&"shift");
+    let wants_cmd = tokens
+        .iter()
+        .any(|token| matches!(*token, "cmd" | "super" | "meta"));
+    modifiers.control == wants_ctrl
+        && modifiers.alt == wants_alt
+        && modifiers.shift == wants_shift
+        && modifiers.platform == wants_cmd
+        && event.keystroke.key.eq_ignore_ascii_case(key)
 }
 
 fn palette_for(theme: &Theme) -> ColorPalette {
