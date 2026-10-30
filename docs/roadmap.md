@@ -52,16 +52,13 @@ M0 骨架 ✅ → M1 交互完善 🚧(本阶段) → M2 快捷命令 ⏳ → M3
 | 回滚搜索（terminal.rs `search_grid` + view.rs SearchState/搜索 UI，含 CJK 宽字符与回滚排序测试——前版路线图误标为「从零做」，勘误） | ✅ 存量已完成 |
 | TerminalSession trait 抽出：`laterterm-core`（纯 std 契约：backend/title/take_streams/resize/kill）+ `laterterm-local`（PTY 开启/spawn/回收线程内聚；termview 与 app 摆脱 portable-pty 直依赖，resize 走视图默认回调转发给会话） | ✅ 本次提交 |
 | **中文 IME 预编辑**：`preedit_layout` 布局（宽字符 2 列/行尾截断）+ `paint_preedit` 下划线浮层（不写网格）+ `ime_anchor` 视口锚点（滚动钳制）+ `bounds_for_range` 改锚光标（原为视图左上角，候选框不跟随） | ✅ 5cee2aa |
+| **分屏树**：Tab/Pane 双层模型（每个标签持有自己的分屏树与焦点）、H/V 嵌套、焦点循环、标题栏按钮 + Ctrl+Shift+E/O/[/]；标签栏 × / pane 角标 × 双级关闭，最后窗格自动补位 | ✅ c27422e |
+| **字体配置面**：字体族预设芯片、连字开关（FontFeatures calt）、备选字体链多选（FontFallbacks），即时落盘 + 热加载 | ✅ bb11f57 |
 
 ### 剩余（按优先级）
 
-| # | 任务 | 说明 | 预估 |
-|---|------|------|------|
-| 1 | **分屏树** | workspace 内 H/V 嵌套分屏 + 焦点循环 + 快捷键（Ctrl+Shift+E/O 习惯对齐），分屏状态使用 pane 控制而非全局标签 | ✅ 368e5d2 |
-| 2 | 字体配置面（连字开关/字号/备选字体链） | config 已有热加载，补 UI 与 termview 接线 | S |
-
-> 已知噪音：termview 的 29 个上游遗留 doctest 需 GPUI 运行时，本机必挂（干净 HEAD 同样挂），
-> 门禁口径用 `cargo test --workspace --lib --bins`；后续整批标 `ignore` 清噪。
+> M1 功能项已清空；进入 M1 验收期（拔掉原终端用一天）后启动 M2。
+> 已知体验债：终端锁覆盖 paint（可做可见网格 snapshot）；渲染器克隆/测量可再省。
 
 **验收**：拔掉原终端用一整天无不适；IME/搜索/分屏在 4K 缩放下不糊不跳。
 
