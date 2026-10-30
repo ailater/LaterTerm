@@ -1,3 +1,4 @@
+use crate::command_text_field::CommandTextField;
 use gpui::{
     App, AppContext, AsyncApp, Context, Edges, Entity, InteractiveElement, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, StatefulInteractiveElement,
@@ -212,6 +213,9 @@ pub struct WorkspaceView {
     pending_shortcuts: Vec<(PaneId, WorkspaceShortcut)>,
     command_values: BTreeMap<String, String>,
     command_preview: Option<(String, bool)>,
+    command_template: Option<CommandTemplate>,
+    command_target: Option<PaneId>,
+    command_fields: Vec<(String, Entity<CommandTextField>)>,
 }
 
 impl WorkspaceView {
@@ -240,6 +244,9 @@ impl WorkspaceView {
             pending_shortcuts: Vec::new(),
             command_values: BTreeMap::new(),
             command_preview: None,
+            command_template: None,
+            command_target: None,
+            command_fields: Vec::new(),
             settings_page: SettingsPage::Appearance,
             panes: vec![Pane {
                 id: first_pane,
@@ -717,31 +724,57 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn run_quick_command(
+    fn send_command_to_pane(
         &mut self,
-        command: impl Into<String>,
-        _event: &MouseDownEvent,
+        pane_id: PaneId,
+        command: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        cx.stop_propagation();
-        let command = command.into();
-        let pane_id = self.focused_pane_id();
-        if let Some(pane) = self.pane(pane_id)
-            && matches!(pane.status, TabStatus::Running)
-        {
-            let terminal = pane.terminal.clone();
-            terminal.update(cx, |terminal, _cx| {
-                terminal.send_text(&format!("{command}\n"))
-            });
-            self.focus_active(window, cx);
+        let Some(pane) = self.pane(pane_id) else {
+            return;
+        };
+        if !matches!(pane.status, TabStatus::Running) {
+            return;
         }
+        let terminal = pane.terminal.clone();
+        terminal.update(cx, |terminal, _cx| {
+            terminal.send_text(&format!("{command}\n"))
+        });
+        self.focus_pane(pane_id, window, cx);
     }
 
-    fn open_command(&mut self, command: &CommandTemplate, cx: &mut Context<Self>) {
+    fn open_command(
+        &mut self,
+        command: &CommandTemplate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.command_template = Some(command.clone());
+        self.command_target = Some(self.focused_pane_id());
+        self.command_fields.clear();
+        self.command_values.clear();
+        if let Ok(variables) = command.variables() {
+            for variable in variables {
+                let field = cx.new(|cx| CommandTextField::new(String::new(), variable.clone(), cx));
+                self.command_fields.push((variable, field));
+            }
+        }
+        if self.command_fields.is_empty() && !command.confirm {
+            self.send_command_to_pane(
+                self.command_target.unwrap_or(self.focused_pane_id()),
+                command.template.clone(),
+                window,
+                cx,
+            );
+            self.command_template = None;
+            self.command_target = None;
+            return;
+        }
         match command.expand(&self.command_values) {
             Ok(preview) => {
-                self.command_preview = Some((preview, command.confirm));
+                self.command_preview =
+                    Some((preview, command.confirm || !self.command_fields.is_empty()));
             }
             Err(_) => {
                 // 参数未填齐时打开表单状态；不会向 PTY 写入半成品。
@@ -758,24 +791,35 @@ impl WorkspaceView {
     }
 
     fn confirm_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_command_values(cx);
         let Some((command, _confirm)) = self.command_preview.take() else {
             return;
         };
-        if !command.starts_with("参数：") {
-            self.run_quick_command(
-                command,
-                &MouseDownEvent {
-                    position: gpui::point(px(0.0), px(0.0)),
-                    button: MouseButton::Left,
-                    modifiers: Default::default(),
-                    click_count: 1,
-                    first_mouse: true,
-                },
-                window,
-                cx,
-            );
+        if command.starts_with("参数错误：") || command.starts_with("参数：") {
+            return;
         }
+        let target = self
+            .command_target
+            .take()
+            .unwrap_or_else(|| self.focused_pane_id());
+        self.send_command_to_pane(target, command, window, cx);
+        self.command_template = None;
+        self.command_fields.clear();
         cx.notify();
+    }
+
+    fn sync_command_values(&mut self, cx: &mut Context<Self>) {
+        self.command_values = self
+            .command_fields
+            .iter()
+            .map(|(name, field)| (name.clone(), field.read(cx).value().to_string()))
+            .collect();
+        if let Some(template) = &self.command_template {
+            self.command_preview = Some(match template.expand(&self.command_values) {
+                Ok(preview) => (preview, template.confirm || !self.command_fields.is_empty()),
+                Err(error) => (format!("参数错误：{error}"), true),
+            });
+        }
     }
 
     fn cancel_command(
@@ -786,6 +830,10 @@ impl WorkspaceView {
     ) {
         cx.stop_propagation();
         self.command_preview = None;
+        self.command_template = None;
+        self.command_target = None;
+        self.command_fields.clear();
+        self.command_values.clear();
         cx.notify();
     }
 
@@ -1167,6 +1215,18 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
         workspace.settings.commands.clone()
     };
     let preview = workspace.command_preview.clone();
+    let fields = workspace.command_fields.clone();
+    let live_preview = workspace.command_template.as_ref().map(|template| {
+        let values = fields
+            .iter()
+            .map(|(name, field)| (name.clone(), field.read(cx).value().to_string()))
+            .collect::<BTreeMap<_, _>>();
+        (
+            template.expand(&values),
+            template.confirm || !fields.is_empty(),
+        )
+    });
+
     let mut panel = div()
         .w(px(PANEL_WIDTH))
         .h_full()
@@ -1185,8 +1245,8 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                 .text_color(rgb(0xA9B1D6))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _event, _window, cx| {
-                        this.open_command(&command, cx);
+                    cx.listener(move |this, _event, window, cx| {
+                        this.open_command(&command, window, cx);
                     }),
                 )
                 .child(label)
@@ -1200,6 +1260,14 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                 .child("SSH 服务器将在 SSH 模块接入后可用"),
         );
     if let Some((command, confirm)) = preview {
+        let (display_command, display_confirm) = live_preview
+            .map(|(result, needs_confirm)| {
+                (
+                    result.unwrap_or_else(|error| format!("参数错误：{error}")),
+                    needs_confirm,
+                )
+            })
+            .unwrap_or((command, confirm));
         panel = panel.child(
             div()
                 .absolute()
@@ -1210,8 +1278,19 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                 .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.98))
                 .p_3()
                 .child(div().text_color(rgb(0x7DCFFF)).child("命令预览"))
-                .child(div().pt_3().text_color(rgb(0xC0CAF5)).child(command))
-                .child(if confirm {
+                .children(fields.into_iter().map(|(name, field)| {
+                    div()
+                        .pt_2()
+                        .child(div().text_color(rgb(0x7D829F)).child(name))
+                        .child(field)
+                }))
+                .child(
+                    div()
+                        .pt_3()
+                        .text_color(rgb(0xC0CAF5))
+                        .child(display_command),
+                )
+                .child(if display_confirm {
                     div()
                         .pt_4()
                         .flex()
