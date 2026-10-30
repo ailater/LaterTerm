@@ -3,11 +3,14 @@ use gpui::{
     KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, StatefulInteractiveElement,
     Styled, WeakEntity, Window, div, prelude::FluentBuilder, px, rgb,
 };
-use laterterm_config::{Appearance, Settings, Theme, ThemeRegistry, app_config_dir};
+use laterterm_config::{
+    Appearance, CommandTemplate, Settings, Theme, ThemeRegistry, app_config_dir,
+};
 use laterterm_core::TerminalSession;
 use laterterm_local::{LocalOptions, LocalSession};
 use laterterm_termview::{ColorPalette, TerminalConfig, TerminalView};
 use notify::Watcher;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -207,6 +210,8 @@ pub struct WorkspaceView {
     shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
     shortcut_rx: flume::Receiver<(PaneId, WorkspaceShortcut)>,
     pending_shortcuts: Vec<(PaneId, WorkspaceShortcut)>,
+    command_values: BTreeMap<String, String>,
+    command_preview: Option<(String, bool)>,
 }
 
 impl WorkspaceView {
@@ -233,6 +238,8 @@ impl WorkspaceView {
             shortcut_tx,
             shortcut_rx,
             pending_shortcuts: Vec::new(),
+            command_values: BTreeMap::new(),
+            command_preview: None,
             settings_page: SettingsPage::Appearance,
             panes: vec![Pane {
                 id: first_pane,
@@ -712,12 +719,13 @@ impl WorkspaceView {
 
     fn run_quick_command(
         &mut self,
-        command: &'static str,
+        command: impl Into<String>,
         _event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
+        let command = command.into();
         let pane_id = self.focused_pane_id();
         if let Some(pane) = self.pane(pane_id)
             && matches!(pane.status, TabStatus::Running)
@@ -728,6 +736,57 @@ impl WorkspaceView {
             });
             self.focus_active(window, cx);
         }
+    }
+
+    fn open_command(&mut self, command: &CommandTemplate, cx: &mut Context<Self>) {
+        match command.expand(&self.command_values) {
+            Ok(preview) => {
+                self.command_preview = Some((preview, command.confirm));
+            }
+            Err(_) => {
+                // 参数未填齐时打开表单状态；不会向 PTY 写入半成品。
+                self.command_preview = Some((
+                    format!(
+                        "参数：{}",
+                        command.variables().unwrap_or_default().join(", ")
+                    ),
+                    true,
+                ));
+            }
+        }
+        cx.notify();
+    }
+
+    fn confirm_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((command, _confirm)) = self.command_preview.take() else {
+            return;
+        };
+        if !command.starts_with("参数：") {
+            self.run_quick_command(
+                command,
+                &MouseDownEvent {
+                    position: gpui::point(px(0.0), px(0.0)),
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: true,
+                },
+                window,
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    fn cancel_command(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        self.command_preview = None;
+        cx.notify();
     }
 
     fn close_window(
@@ -991,7 +1050,11 @@ impl Render for WorkspaceView {
                             .min_h(px(0.0))
                             .child(render_layout(&active_layout, &self.panes, focused_pane, cx)),
                     )
-                    .child(if right_panel { quick_panel(cx) } else { div() }),
+                    .child(if right_panel {
+                        quick_panel(self, cx)
+                    } else {
+                        div()
+                    }),
             )
             .when(settings_open, |root| {
                 root.child(settings_overlay(
@@ -1080,25 +1143,53 @@ fn render_layout(
     }
 }
 
-fn quick_panel(cx: &mut Context<WorkspaceView>) -> gpui::Div {
-    div()
+fn default_commands() -> Vec<CommandTemplate> {
+    [
+        ("htop", "htop"),
+        ("tmux", "tmux"),
+        ("vim", "vim"),
+        ("清屏", "clear"),
+    ]
+    .into_iter()
+    .map(|(name, template)| CommandTemplate {
+        name: name.into(),
+        template: template.into(),
+        shortcut: None,
+        confirm: false,
+    })
+    .collect()
+}
+
+fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
+    let commands = if workspace.settings.commands.is_empty() {
+        default_commands()
+    } else {
+        workspace.settings.commands.clone()
+    };
+    let preview = workspace.command_preview.clone();
+    let mut panel = div()
         .w(px(PANEL_WIDTH))
         .h_full()
         .bg(rgb(0x202132))
         .p_3()
         .text_color(rgb(0xC0CAF5))
         .child(div().child("快捷命令"))
-        .children(["htop", "tmux", "vim", "clear"].into_iter().map(|command| {
+        .children(commands.into_iter().map(|command| {
+            let label = if command.template == command.name {
+                command.name.clone()
+            } else {
+                format!("{}  ·  {}", command.name, command.template)
+            };
             div()
                 .py_2()
                 .text_color(rgb(0xA9B1D6))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, event, window, cx| {
-                        this.run_quick_command(command, event, window, cx)
+                    cx.listener(move |this, _event, _window, cx| {
+                        this.open_command(&command, cx);
                     }),
                 )
-                .child(command)
+                .child(label)
         }))
         .child(div().pt_4().child("快捷服务器"))
         .child(div().pt_2().text_color(rgb(0x7D829F)).child("本地 Shell"))
@@ -1107,7 +1198,42 @@ fn quick_panel(cx: &mut Context<WorkspaceView>) -> gpui::Div {
                 .pt_2()
                 .text_color(rgb(0x565A78))
                 .child("SSH 服务器将在 SSH 模块接入后可用"),
-        )
+        );
+    if let Some((command, confirm)) = preview {
+        panel = panel.child(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.98))
+                .p_3()
+                .child(div().text_color(rgb(0x7DCFFF)).child("命令预览"))
+                .child(div().pt_3().text_color(rgb(0xC0CAF5)).child(command))
+                .child(if confirm {
+                    div()
+                        .pt_4()
+                        .flex()
+                        .gap_1()
+                        .child(setting_button(
+                            "发送",
+                            true,
+                            cx.listener(|this, _event, window, cx| {
+                                this.confirm_command(window, cx);
+                            }),
+                        ))
+                        .child(setting_button(
+                            "取消",
+                            false,
+                            cx.listener(WorkspaceView::cancel_command),
+                        ))
+                } else {
+                    div()
+                }),
+        );
+    }
+    panel
 }
 
 fn settings_overlay(

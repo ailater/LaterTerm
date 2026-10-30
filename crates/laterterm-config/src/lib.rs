@@ -10,8 +10,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub mod commands;
 pub mod theme;
 
+pub use commands::CommandTemplate;
 pub use theme::{DEFAULT_THEME, Theme, ThemeRegistry, themes_dir};
 
 pub const APP_DIR: &str = "laterterm";
@@ -22,6 +24,9 @@ pub const SETTINGS_FILE: &str = "settings.toml";
 #[serde(default)]
 pub struct Settings {
     pub appearance: Appearance,
+    /// 用户自定义快捷命令模板；缺字段的旧配置自动为空。
+    #[serde(default)]
+    pub commands: Vec<CommandTemplate>,
 }
 
 /// 外观项。数值范围与设置面板的步进按钮一致。
