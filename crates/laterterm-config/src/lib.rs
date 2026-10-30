@@ -34,6 +34,16 @@ pub struct Appearance {
     pub padding: f32,
     pub scrollback: usize,
     pub theme: String,
+    /// 是否启用连字（calt）；终端下常有人偏好关闭。
+    #[serde(default = "default_true")]
+    pub ligatures: bool,
+    /// 备选字体链（主字体缺字时按序回退，如 CJK）；空表示用系统默认回退。
+    #[serde(default)]
+    pub font_fallbacks: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Appearance {
@@ -45,6 +55,8 @@ impl Default for Appearance {
             padding: 8.0,
             scrollback: 100_000,
             theme: DEFAULT_THEME.into(),
+            ligatures: true,
+            font_fallbacks: Vec::new(),
         }
     }
 }
@@ -138,6 +150,12 @@ impl Appearance {
         if self.theme.is_empty() {
             self.theme = DEFAULT_THEME.into();
         }
+        self.font_fallbacks = self
+            .font_fallbacks
+            .iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect();
     }
 }
 
@@ -238,6 +256,32 @@ mod tests {
         assert_eq!(settings, loaded);
         // 原子写不应留下临时文件
         assert!(!path.with_extension("toml.tmp").exists());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn font_options_roundtrip_and_defaults() {
+        // 旧版文件缺 ligatures/font_fallbacks 字段也能读出默认值
+        let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert!(legacy.appearance.ligatures);
+        assert!(legacy.appearance.font_fallbacks.is_empty());
+
+        let path = temp_settings_path("font-options");
+        let mut settings = Settings::default();
+        settings.appearance.ligatures = false;
+        settings.appearance.font_fallbacks = vec![
+            " Sarasa Mono SC ".into(),
+            "".into(),
+            "Noto Sans Mono CJK SC".into(),
+        ];
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert!(!loaded.appearance.ligatures);
+        // sanitize 应去空白、丢空项
+        assert_eq!(
+            loaded.appearance.font_fallbacks,
+            vec!["Sarasa Mono SC", "Noto Sans Mono CJK SC"]
+        );
         std::fs::remove_file(&path).unwrap();
     }
 

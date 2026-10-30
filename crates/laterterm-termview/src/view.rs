@@ -138,6 +138,12 @@ pub struct TerminalConfig {
     /// Color palette for terminal colors (16 ANSI colors, 256 extended colors,
     /// foreground, background, and cursor colors)
     pub colors: ColorPalette,
+
+    /// 是否启用连字（calt）。默认启用；关闭后 `->` 等序列按单字符渲染。
+    pub ligatures: bool,
+
+    /// 备选字体链：主字体缺字时按序回退（如 CJK 字体）；空表示系统默认回退。
+    pub font_fallbacks: Vec<String>,
 }
 
 impl Default for TerminalConfig {
@@ -151,6 +157,8 @@ impl Default for TerminalConfig {
             line_height_multiplier: 1.0,
             padding: Edges::all(px(0.0)),
             colors: ColorPalette::default(),
+            ligatures: true,
+            font_fallbacks: Vec::new(),
         }
     }
 }
@@ -472,6 +480,8 @@ impl TerminalView {
             config.font_size,
             config.line_height_multiplier,
             config.colors.clone(),
+            config.ligatures,
+            config.font_fallbacks.clone(),
         );
 
         // Create focus handle
@@ -1084,11 +1094,15 @@ impl TerminalView {
         // Update renderer with new font settings and palette
         let font_changed = self.renderer.font_family != config.font_family
             || self.renderer.font_size != config.font_size
-            || self.renderer.line_height_multiplier != config.line_height_multiplier;
+            || self.renderer.line_height_multiplier != config.line_height_multiplier
+            || self.renderer.font_fallbacks != config.font_fallbacks;
         self.renderer.font_family = config.font_family.clone();
         self.renderer.font_size = config.font_size;
         self.renderer.line_height_multiplier = config.line_height_multiplier.max(0.1);
         self.renderer.palette = config.colors.clone();
+        // 连字不影响单元格度量，无需重新测量
+        self.renderer.ligatures = config.ligatures;
+        self.renderer.font_fallbacks = config.font_fallbacks.clone();
         if font_changed {
             self.renderer.invalidate_measurement();
         }

@@ -596,6 +596,8 @@ impl WorkspaceView {
                 config.padding = Edges::all(px(appearance.padding));
                 config.scrollback = appearance.scrollback;
                 config.colors = palette.clone();
+                config.ligatures = appearance.ligatures;
+                config.font_fallbacks = appearance.font_fallbacks.clone();
                 terminal.update_config(config, cx);
             });
         }
@@ -1339,6 +1341,51 @@ fn settings_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>
                     ),
                 )),
         )
+        .child(section_title("字体"))
+        .child(
+            setting_card()
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .py_2()
+                        .child(
+                            div()
+                                .w(px(64.0))
+                                .pt_1()
+                                .text_color(rgb(0xA9B1D6))
+                                .child("字体"),
+                        )
+                        .child(font_family_controls(cx, &settings.font_family)),
+                )
+                .child(setting_row(
+                    "连字",
+                    div(),
+                    toggle_controls(
+                        cx,
+                        ("开", true),
+                        ("关", false),
+                        settings.ligatures,
+                        |s: &mut Appearance, value| s.ligatures = value,
+                    ),
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .py_2()
+                        .child(
+                            div()
+                                .w(px(64.0))
+                                .pt_1()
+                                .text_color(rgb(0xA9B1D6))
+                                .child("备选"),
+                        )
+                        .child(font_fallback_controls(cx, &settings.font_fallbacks)),
+                ),
+        )
         .child(section_title("滚动与主题"))
         .child(
             setting_card()
@@ -1412,6 +1459,95 @@ fn scrollback_controls(cx: &mut Context<WorkspaceView>, settings: &Appearance) -
                 )
             }),
     )
+}
+
+/// 常用等宽字体预设（fontconfig 解析不到的名称会自然回退系统默认）。
+const FONT_PRESETS: [&str; 6] = [
+    "JetBrainsMono Nerd Font",
+    "CaskaydiaCove Nerd Font",
+    "FiraCode Nerd Font",
+    "Sarasa Mono SC",
+    "Noto Sans Mono CJK SC",
+    "monospace",
+];
+
+/// 常用 CJK 备选字体预设；空表表示交回系统默认回退。
+const FALLBACK_PRESETS: [&str; 3] = ["Sarasa Mono SC", "Noto Sans Mono CJK SC", "无"];
+
+fn font_family_controls(cx: &mut Context<WorkspaceView>, current: &str) -> gpui::Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_1()
+        .children(FONT_PRESETS.into_iter().map(|name| {
+            let selected = name == current;
+            setting_button(
+                name,
+                selected,
+                cx.listener(move |this, event, window, cx| {
+                    this.change_setting(event, window, cx, |s| s.font_family = name.to_string());
+                }),
+            )
+        }))
+}
+
+fn font_fallback_controls(cx: &mut Context<WorkspaceView>, current: &[String]) -> gpui::Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_1()
+        .children(FALLBACK_PRESETS.into_iter().map(|name| {
+            let selected = if name == "无" {
+                current.is_empty()
+            } else {
+                current.iter().any(|entry| entry == name)
+            };
+            setting_button(
+                name,
+                selected,
+                cx.listener(move |this, event, window, cx| {
+                    this.change_setting(event, window, cx, |s| {
+                        if name == "无" {
+                            s.font_fallbacks.clear();
+                        } else if let Some(position) =
+                            s.font_fallbacks.iter().position(|entry| entry == name)
+                        {
+                            s.font_fallbacks.remove(position);
+                        } else {
+                            s.font_fallbacks.push(name.to_string());
+                        }
+                    });
+                }),
+            )
+        }))
+}
+
+/// 二值开关控件（选中侧高亮），如连字开/关。
+fn toggle_controls(
+    cx: &mut Context<WorkspaceView>,
+    on: (&'static str, bool),
+    off: (&'static str, bool),
+    current: bool,
+    apply: impl Fn(&mut Appearance, bool) + Clone + 'static,
+) -> gpui::Div {
+    div()
+        .flex()
+        .gap_1()
+        .children(
+            [(on, true), (off, false)]
+                .into_iter()
+                .map(|((label, value), _)| {
+                    let selected = value == current;
+                    let apply = apply.clone();
+                    setting_button(
+                        label,
+                        selected,
+                        cx.listener(move |this, event, window, cx| {
+                            this.change_setting(event, window, cx, |s| apply(s, value));
+                        }),
+                    )
+                }),
+        )
 }
 
 fn theme_controls(
@@ -1601,6 +1737,8 @@ fn create_local_terminal(
         line_height_multiplier: settings.line_height,
         padding: Edges::all(px(settings.padding)),
         colors: palette_for(theme),
+        ligatures: settings.ligatures,
+        font_fallbacks: settings.font_fallbacks.clone(),
     };
 
     let terminal = cx.new(|cx| {

@@ -70,8 +70,8 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::Color;
 use gpui::{
-    App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, Point,
-    SharedString, Size, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
+    App, Bounds, Edges, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Hsla, Pixels,
+    Point, SharedString, Size, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
 };
 
 /// 单个字符在终端网格中占用的列数（东亚宽字符 2 列）。
@@ -221,6 +221,12 @@ pub struct TerminalRenderer {
     /// Multiplier for line height to accommodate tall glyphs
     pub line_height_multiplier: f32,
 
+    /// 是否启用连字（calt）；关闭后 `->` 等按单字符渲染
+    pub ligatures: bool,
+
+    /// 备选字体链：主字体缺字时按序回退（如 CJK）；空表示系统默认回退
+    pub font_fallbacks: Vec<String>,
+
     /// Color palette for resolving terminal colors
     pub palette: ColorPalette,
 
@@ -249,13 +255,15 @@ impl TerminalRenderer {
     /// use gpui_terminal::render::TerminalRenderer;
     /// use gpui_terminal::ColorPalette;
     ///
-    /// let renderer = TerminalRenderer::new("Fira Code".to_string(), px(14.0), 1.0, ColorPalette::default());
+    /// let renderer = TerminalRenderer::new("Fira Code".to_string(), px(14.0), 1.0, ColorPalette::default(), true, Vec::new());
     /// ```
     pub fn new(
         font_family: String,
         font_size: Pixels,
         line_height_multiplier: f32,
         palette: ColorPalette,
+        ligatures: bool,
+        font_fallbacks: Vec<String>,
     ) -> Self {
         // Default cell dimensions - will be measured on first paint
         // Using 0.6 as approximate em-width ratio for monospace fonts
@@ -268,8 +276,39 @@ impl TerminalRenderer {
             cell_width,
             cell_height,
             line_height_multiplier,
+            ligatures,
+            font_fallbacks,
             palette,
             needs_measurement: true,
+        }
+    }
+
+    /// 按样式构造字体：应用连字开关与备选字体链。
+    ///
+    /// 渲染器所有 Font 构造点（测量/批量文本）都走这里，保证设置一致。
+    pub fn font_for(&self, bold: bool, italic: bool) -> Font {
+        Font {
+            family: self.font_family.clone().into(),
+            features: if self.ligatures {
+                FontFeatures::default()
+            } else {
+                FontFeatures::disable_ligatures()
+            },
+            fallbacks: if self.font_fallbacks.is_empty() {
+                None
+            } else {
+                Some(FontFallbacks::from_fonts(self.font_fallbacks.clone()))
+            },
+            weight: if bold {
+                FontWeight::BOLD
+            } else {
+                FontWeight::NORMAL
+            },
+            style: if italic {
+                FontStyle::Italic
+            } else {
+                FontStyle::Normal
+            },
         }
     }
 
@@ -296,13 +335,7 @@ impl TerminalRenderer {
         // Measure using '│' (U+2502, BOX DRAWINGS LIGHT VERTICAL)
         // This character spans the full cell height in terminal fonts, making it
         // ideal for measuring exact cell dimensions used by TUIs
-        let font = Font {
-            family: self.font_family.clone().into(),
-            features: FontFeatures::default(),
-            fallbacks: None,
-            weight: FontWeight::NORMAL,
-            style: FontStyle::Normal,
-        };
+        let font = self.font_for(false, false);
 
         let text_run = TextRun {
             len: "│".len(),
@@ -727,21 +760,7 @@ impl TerminalRenderer {
             // Third pass: shape and paint contiguous regular-text runs at once.
             // This avoids one rustybuzz/cosmic-text shaping call per cell per pane.
             for run in text_runs {
-                let font = Font {
-                    family: self.font_family.clone().into(),
-                    features: FontFeatures::default(),
-                    fallbacks: None,
-                    weight: if run.bold {
-                        FontWeight::BOLD
-                    } else {
-                        FontWeight::NORMAL
-                    },
-                    style: if run.italic {
-                        FontStyle::Italic
-                    } else {
-                        FontStyle::Normal
-                    },
-                };
+                let font = self.font_for(run.bold, run.italic);
                 let text_run = TextRun {
                     len: run.text.len(),
                     font,
@@ -837,13 +856,7 @@ impl TerminalRenderer {
             Color::Named(alacritty_terminal::vte::ansi::NamedColor::Foreground),
             term.colors(),
         );
-        let font = Font {
-            family: self.font_family.clone().into(),
-            features: FontFeatures::default(),
-            fallbacks: None,
-            weight: FontWeight::NORMAL,
-            style: FontStyle::Normal,
-        };
+        let font = self.font_for(false, false);
         // 与网格文字相同的垂直居中口径
         let base_height = self.cell_height / self.line_height_multiplier;
         let vertical_offset = (self.cell_height - base_height) / 2.0;
@@ -886,6 +899,8 @@ mod tests {
             px(14.0),
             1.0,
             ColorPalette::default(),
+            true,
+            Vec::new(),
         );
         assert_eq!(renderer.font_family, "Fira Code");
         assert_eq!(renderer.font_size, px(14.0));
@@ -929,6 +944,8 @@ mod tests {
             px(14.0),
             1.0,
             ColorPalette::default(),
+            true,
+            Vec::new(),
         );
         let black = Hsla::black();
 
