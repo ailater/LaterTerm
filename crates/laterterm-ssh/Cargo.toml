@@ -13,4 +13,5 @@ russh = { version = "0.65", default-features = false, features = ["ring", "rsa"]
 tokio = { version = "1", features = ["rt", "sync", "time", "net", "io-util"] }
 
 [dev-dependencies]
+tempfile = "3.27.0"
 tokio = { version = "1", features = ["rt", "macros", "sync", "io-util"] }

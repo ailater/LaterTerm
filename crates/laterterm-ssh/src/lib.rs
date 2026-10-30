@@ -5,36 +5,87 @@
 //! current_thread runtime，SSH 读写经无界通道桥接为阻塞字节流，
 //! 视图侧（termview）的读泵/写端完全不感知异步。
 //!
-//! MVP 范围（M3 第一步）：
-//! - 密码认证（跳板机「密码 + 动态码」验收主路径；密钥文件/ssh-agent 紧随）
-//! - PTY + shell 通道、窗口变更（resize）、优雅断连（kill）
-//! - 主机密钥策略目前仅 `AcceptAll`（显式选项 + 风险注释），known_hosts/TOFU
-//!   校验是 M3 后续项——见 docs/roadmap.md
+//! 认证（M3）：密码 / 私钥文件（OpenSSH 格式，可带口令）/ ssh-agent
+//! （`SSH_AUTH_SOCK`，逐身份尝试）。
 //!
-//! GBK 转码与 trzsz 同样在 M3 后续：本层透传字节，编码转换挂在
+//! 主机密钥（M3）：`AcceptAll`（显式风险）或 `KnownHosts`——OpenSSH
+//! `known_hosts` 兼容的 TOFU（首次学习、比对通过、变更拒绝），
+//! 默认路径 `~/.ssh/known_hosts`，与系统既有信任直接共享。
+//!
+//! GBK 转码与 trzsz 仍是 M3 后续：本层透传字节，编码转换挂在
 //! take_streams 返回的 reader/writer 装饰器上是既定演进位。
 
 use laterterm_core::{BackendKind, SessionStreams, TerminalSession};
 use std::io;
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 
 /// 主机密钥校验策略。
-///
-/// `AcceptAll` 有中间人风险，仅作为 MVP 显式默认——等 known_hosts/TOFU
-/// 落地（M3）后移除或改为非默认。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum HostKeyPolicy {
-    /// 接受任意主机密钥（不安全：中间人可冒充主机；MVP 显式选择）。
+    /// 接受任意主机密钥（**有中间人风险**，仅用于一次性/测试场景）。
     #[default]
     AcceptAll,
+    /// OpenSSH known_hosts 兼容的 TOFU：
+    /// 首次连接记录密钥；此后比对一致放行；**不一致拒绝连接**（密钥变更
+    /// 视为潜在的中间人攻击）。`path` 为 `None` 用默认 `~/.ssh/known_hosts`。
+    KnownHosts { path: Option<PathBuf> },
 }
 
-/// 认证方式。MVP 仅密码；密钥文件/ssh-agent 为 M3 后续项。
+/// 认证方式。
 #[derive(Clone, Debug)]
 pub enum SshAuth {
+    /// 密码认证。
     Password(String),
+    /// 私钥文件（OpenSSH 格式；`passphrase` 为私钥口令，未加密传 `None`）。
+    KeyFile {
+        path: PathBuf,
+        passphrase: Option<String>,
+    },
+    /// ssh-agent（读 `SSH_AUTH_SOCK`；依次尝试 agent 持有的全部身份）。
+    Agent,
+}
+
+/// RSA 密钥的签名散列：SHA-256（russh 对 RSA 传 `None` 会落回 SHA-1
+/// 遗留算法，显式选 256 与 OpenSSH 默认一致）；其他算法忽略该参数。
+fn hash_alg_for(key: &russh::keys::PublicKey) -> Option<russh::keys::HashAlg> {
+    match key.algorithm() {
+        russh::keys::Algorithm::Rsa { .. } => Some(russh::keys::HashAlg::Sha256),
+        _ => None,
+    }
+}
+
+/// TOFU 判定结果。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostKeyVerdict {
+    /// 已记录且一致（放行）。
+    Match,
+    /// 该主机有记录但无一匹配（密钥变更，拒绝）。
+    Mismatch,
+    /// 无该主机的记录（首次连接，学习后放行）。
+    Unknown,
+}
+
+/// TOFU 判定（纯逻辑）：按 OpenSSH 语义只比较 key_data（算法 + 密钥材料），
+/// 注释不参与身份——russh 自带的 check 把注释计入相等，且其 learn 写注释、
+/// 回读丢弃，带注释密钥 learn→check 必假红，故自行实现。
+fn verify_host_key(
+    recorded: &[(usize, russh::keys::PublicKey)],
+    key: &russh::keys::PublicKey,
+) -> HostKeyVerdict {
+    if recorded.is_empty() {
+        return HostKeyVerdict::Unknown;
+    }
+    if recorded
+        .iter()
+        .any(|(_, entry)| entry.key_data() == key.key_data())
+    {
+        HostKeyVerdict::Match
+    } else {
+        HostKeyVerdict::Mismatch
+    }
 }
 
 /// SSH 会话启动参数。
@@ -218,9 +269,11 @@ impl io::Write for ChannelWriter {
     }
 }
 
-/// 最小客户端 Handler：只消费主机密钥回调。
+/// 最小客户端 Handler：实现主机密钥策略。
 struct ClientHandler {
     host_key_policy: HostKeyPolicy,
+    host: String,
+    port: u16,
 }
 
 impl russh::client::Handler for ClientHandler {
@@ -228,10 +281,54 @@ impl russh::client::Handler for ClientHandler {
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        match self.host_key_policy {
+        match &self.host_key_policy {
             HostKeyPolicy::AcceptAll => Ok(true),
+            HostKeyPolicy::KnownHosts { path } => {
+                // 证书形态取底层公钥比对（known_hosts 记录的是公钥）
+                let key_owned;
+                let key = match server_public_key {
+                    russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key,
+                    russh::keys::PublicKeyOrCertificate::Certificate(cert) => {
+                        key_owned = russh::keys::PublicKey::new(cert.public_key().clone(), "");
+                        &key_owned
+                    }
+                };
+                let path = path
+                    .clone()
+                    .or_else(|| std::env::home_dir().map(|home| home.join(".ssh/known_hosts")))
+                    .ok_or_else(|| {
+                        io::Error::other("无法定位 known_hosts（未提供路径且无 HOME）")
+                    })?;
+                let recorded =
+                    russh::keys::known_hosts::known_host_keys_path(&self.host, self.port, &path)
+                        .map_err(russh::Error::from)?;
+                match verify_host_key(&recorded, key) {
+                    HostKeyVerdict::Match => Ok(true),
+                    HostKeyVerdict::Unknown => {
+                        // 首次连接：学习后放行
+                        russh::keys::known_hosts::learn_known_hosts_path(
+                            &self.host, self.port, key, &path,
+                        )
+                        .map_err(russh::Error::from)?;
+                        Ok(true)
+                    }
+                    HostKeyVerdict::Mismatch => {
+                        // 密钥变更：按中间人攻击处置，硬拒绝（返回 false 让
+                        // russh 中止握手），修复指引见日志
+                        eprintln!(
+                            "主机密钥校验失败（{}:{}, {}）：已记录 {} 条密钥均不匹配——\
+                             若确认服务器确实换过密钥，请手工清理 known_hosts 中该主机的行",
+                            self.host,
+                            self.port,
+                            path.display(),
+                            recorded.len()
+                        );
+                        Ok(false)
+                    }
+                }
+            }
         }
     }
 }
@@ -245,7 +342,9 @@ impl russh::client::Handler for ClientHandler {
 async fn network_main(options: SshOptions, ready_tx: std_mpsc::Sender<SessionHandles>) {
     let config = std::sync::Arc::new(russh::client::Config::default());
     let handler = ClientHandler {
-        host_key_policy: options.host_key_policy,
+        host_key_policy: options.host_key_policy.clone(),
+        host: options.host.clone(),
+        port: options.port(),
     };
     let addr = (options.host.as_str(), options.port());
 
@@ -254,14 +353,61 @@ async fn network_main(options: SshOptions, ready_tx: std_mpsc::Sender<SessionHan
             .await
             .map_err(|error| io::Error::other(format!("SSH 连接失败: {error}")))?;
 
-        let auth_result = match &options.auth {
+        let authenticated = match &options.auth {
             SshAuth::Password(password) => handle
                 .authenticate_password(&options.username, password)
                 .await
-                .map_err(|error| io::Error::other(format!("SSH 认证通信失败: {error}")))?,
+                .map_err(|error| io::Error::other(format!("SSH 认证通信失败: {error}")))?
+                .success(),
+            SshAuth::KeyFile { path, passphrase } => {
+                let key =
+                    russh::keys::load_secret_key(path, passphrase.as_deref()).map_err(|error| {
+                        io::Error::other(format!("加载私钥 {} 失败: {error}", path.display()))
+                    })?;
+                let hash_alg = hash_alg_for(key.public_key());
+                handle
+                    .authenticate_publickey(
+                        &options.username,
+                        russh::keys::PrivateKeyWithHashAlg::new(std::sync::Arc::new(key), hash_alg),
+                    )
+                    .await
+                    .map_err(|error| io::Error::other(format!("SSH 认证通信失败: {error}")))?
+                    .success()
+            }
+            SshAuth::Agent => {
+                // 连接 ssh-agent（SSH_AUTH_SOCK），逐身份尝试，成功即止
+                let mut agent = russh::keys::agent::client::AgentClient::connect_env()
+                    .await
+                    .map_err(|error| io::Error::other(format!("连接 ssh-agent 失败: {error}")))?;
+                let identities = agent.request_identities().await.map_err(|error| {
+                    io::Error::other(format!("ssh-agent 列举身份失败: {error}"))
+                })?;
+                let mut success = false;
+                for identity in &identities {
+                    let public_key = identity.public_key().into_owned();
+                    let result = handle
+                        .authenticate_publickey_with(
+                            &options.username,
+                            public_key,
+                            hash_alg_for(identity.public_key().as_ref()),
+                            &mut agent,
+                        )
+                        .await;
+                    if matches!(result, Ok(auth) if auth.success()) {
+                        success = true;
+                        break;
+                    }
+                }
+                if !success {
+                    return Err(io::Error::other(
+                        "ssh-agent 认证失败（agent 内无该服务器接受的密钥）",
+                    ));
+                }
+                true
+            }
         };
-        if !auth_result.success() {
-            return Err(io::Error::other("SSH 认证失败（用户名或密码错误）"));
+        if !authenticated {
+            return Err(io::Error::other("SSH 认证失败（凭据不被服务器接受）"));
         }
 
         let mut channel = handle
@@ -350,6 +496,18 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    /// 一次性 ed25519 测试密钥对（专为测试生成，与任何真实主机无关）。
+    const TEST_ED25519_PUBLIC: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMM7EdDz4EBMGoDkjYWf0lCdnlZwIwWvXrNM6TP/eU9S laterterm-test";
+    const TEST_ED25519_PRIVATE: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW\nQyNTUxOQAAACDDOxHQ8+BATBqA5I2Fn9JQnZ5WcCMFr16zTOkz/3lPUgAAAJhXNAu2VzQL\ntgAAAAtzc2gtZWQyNTUxOQAAACDDOxHQ8+BATBqA5I2Fn9JQnZ5WcCMFr16zTOkz/3lPUg\nAAAEAxto8E1r+xSL8gIGqp5XQE73hsgtCD04sXirPd/KEQCcM7EdDz4EBMGoDkjYWf0lCd\nnlZwIwWvXrNM6TP/eU9SAAAADmxhdGVydGVybS10ZXN0AQIDBAUGBw==\n-----END OPENSSH PRIVATE KEY-----";
+    /// 另一把 ed25519 公钥（扮演「变更后的密钥」/无关密钥）。
+    const TEST_OTHER_PUBLIC: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAII5BrvKWR7S5LfqRVGzTcbNhs1dWfVcX8fXmC4xNfa6v other-key";
+    /// RSA 公钥（验证 hash_alg 选择）。
+    const TEST_RSA_PUBLIC: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC8zPKxr3FIpKLfwr51MenF56LCHXRorzZ8xFrT0eIvnLqmZpThn8VFjv9LoLB6lobfIKXmRadbLvdo6efVBIWy5BwYkb2lP9lL4COqCWxRu+1rdQ8gdM1EkoTUS/y3/JhumeNoxFO5ytTJO6QmCD5GBQ5fELEbrfkG+4I6L0ueo60yBqa5FrgRqTA+u9fRZRHZy7VYbfvsa341jWigwvrqwNRt/GkOS1Bz1NfFYckg7qBSH7//dIngSBPmCrHqpMxM9PIgagPhdUIiGmTi+rtwxRZKw0/gfYRHx19msiJqqOm+IjSGg2VDYfEJ8kt233/c9bJJbGOeOjexiOupAnIf laterterm-test-rsa";
+
+    fn parse_public(line: &str) -> russh::keys::PublicKey {
+        russh::keys::PublicKey::from_openssh(line).expect("解析测试公钥")
+    }
+
     fn sample_options() -> SshOptions {
         SshOptions {
             host: "bastion.example.com".into(),
@@ -360,6 +518,77 @@ mod tests {
             rows: 30,
             host_key_policy: HostKeyPolicy::AcceptAll,
         }
+    }
+
+    /// TOFU 三段语义（本 crate 的判定 + russh 的落盘件）：无记录 Unknown →
+    /// 学习 → 一致 Match；**变更 Mismatch**——中间人防线，不静默放行。
+    /// 注释不参与身份：密钥带注释学习后回读（注释被丢弃）仍须 Match。
+    #[test]
+    fn known_hosts_tofu_semantics() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let known_hosts = dir.path().join("known_hosts");
+        let key = parse_public(TEST_ED25519_PUBLIC);
+        let load = |host: &str, port: u16| {
+            russh::keys::known_hosts::known_host_keys_path(host, port, &known_hosts)
+                .expect("读 known_hosts")
+        };
+
+        // ① 无记录：Unknown（TOFU 待学习）
+        assert_eq!(
+            verify_host_key(&load("bastion.example.com", 22), &key),
+            HostKeyVerdict::Unknown
+        );
+
+        // ② 学习后：一致 Match（注释在回读中丢失也不影响身份判定）
+        russh::keys::known_hosts::learn_known_hosts_path(
+            "bastion.example.com",
+            22,
+            &key,
+            &known_hosts,
+        )
+        .expect("学习（落盘）");
+        assert_eq!(
+            verify_host_key(&load("bastion.example.com", 22), &key),
+            HostKeyVerdict::Match
+        );
+
+        // ③ 变更拒绝：同一主机的不同密钥 Mismatch
+        let other = parse_public(TEST_OTHER_PUBLIC);
+        assert_eq!(
+            verify_host_key(&load("bastion.example.com", 22), &other),
+            HostKeyVerdict::Mismatch
+        );
+
+        // ④ 不同主机/端口不受既有记录影响
+        assert_eq!(
+            verify_host_key(&load("other.example.com", 2222), &key),
+            HostKeyVerdict::Unknown
+        );
+    }
+
+    /// 私钥文件加载：OpenSSH 格式无口令私钥可解析，公钥与文件内嵌对一致。
+    #[test]
+    fn keyfile_loads_and_public_key_matches() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let key_path = dir.path().join("id_ed25519");
+        std::fs::write(&key_path, TEST_ED25519_PRIVATE).expect("写私钥文件");
+
+        let key = russh::keys::load_secret_key(&key_path, None).expect("加载无口令私钥");
+        assert_eq!(
+            key.public_key().to_openssh().expect("序列化公钥").trim(),
+            TEST_ED25519_PUBLIC
+        );
+    }
+
+    /// RSA 走 SHA-256 签名散列（ russh 对 RSA 传 None 会落回 SHA-1 遗留算法），
+    /// ed25519 忽略该参数（None）。
+    #[test]
+    fn hash_alg_prefers_sha256_for_rsa_only() {
+        assert_eq!(
+            hash_alg_for(&parse_public(TEST_RSA_PUBLIC)),
+            Some(russh::keys::HashAlg::Sha256)
+        );
+        assert_eq!(hash_alg_for(&parse_public(TEST_ED25519_PUBLIC)), None);
     }
 
     #[test]
