@@ -1,0 +1,16 @@
+[package]
+name = "laterterm-ssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "LaterTerm SSH 会话后端：russh 实现 TerminalSession 契约"
+
+[dependencies]
+laterterm-core.workspace = true
+# ring 后端避开 aws-lc-rs 的 cmake 依赖；rsa 保留老服务器 ssh-rsa 主机密钥兼容
+russh = { version = "0.65", default-features = false, features = ["ring", "rsa"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "sync", "io-util"] }

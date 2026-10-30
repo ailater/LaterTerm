@@ -14,6 +14,8 @@ use std::io::{self, Read, Write};
 pub enum BackendKind {
     /// 本地 PTY（laterterm-local）。
     Local,
+    /// SSH 远程会话（laterterm-ssh）。
+    Ssh,
 }
 
 /// 会话的字节流，由 [`TerminalSession::take_streams`] 一次性移交给视图。
