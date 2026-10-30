@@ -15,3 +15,6 @@ ropey.workspace = true
 parking_lot.workspace = true
 flume.workspace = true
 arboard.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

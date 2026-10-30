@@ -232,7 +232,7 @@ pub struct WorkspaceView {
 }
 
 impl WorkspaceView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let weak_workspace = cx.weak_entity();
         let settings = Settings::load_or_default();
         settings.ensure_settings_file();
@@ -249,6 +249,14 @@ impl WorkspaceView {
             &theme,
             shortcut_tx.clone(),
         );
+        cx.subscribe_in(
+            &terminal,
+            window,
+            move |this, _, _: &laterterm_termview::view::TerminalExited, window, cx| {
+                this.mark_exited(first_pane, window, cx);
+            },
+        )
+        .detach();
         let view = Self {
             settings,
             themes,
@@ -403,6 +411,14 @@ impl WorkspaceView {
             &theme,
             self.shortcut_tx.clone(),
         );
+        cx.subscribe_in(
+            &terminal,
+            window,
+            move |this, _, _: &laterterm_termview::view::TerminalExited, window, cx| {
+                this.mark_exited(pane_id, window, cx);
+            },
+        )
+        .detach();
         self.panes.push(Pane {
             id: pane_id,
             title: format!("终端 {}", pane_id.0),
@@ -437,6 +453,14 @@ impl WorkspaceView {
             &theme,
             self.shortcut_tx.clone(),
         );
+        cx.subscribe_in(
+            &terminal,
+            window,
+            move |this, _, _: &laterterm_termview::view::TerminalExited, window, cx| {
+                this.mark_exited(pane_id, window, cx);
+            },
+        )
+        .detach();
         self.panes.push(Pane {
             id: pane_id,
             title: format!("终端 {}", pane_id.0),
@@ -490,7 +514,7 @@ impl WorkspaceView {
     }
 
     /// 关闭整个标签（标签栏 ×）：向该标签所有窗格会话发关闭请求（幂等），
-    /// 窗格实体随退出回调逐个清理；标签立即从标签栏消失。
+    /// 窗格实体随 TerminalExited 事件逐个清理（隐藏标签同样生效）；标签立即从标签栏消失。
     fn close_tab(
         &mut self,
         id: TabId,
@@ -512,6 +536,7 @@ impl WorkspaceView {
             }
         }
         self.tabs.remove(tab_index);
+        cx.notify();
         if self.tabs.is_empty() {
             self.spawn_tab(window, cx);
             return;
@@ -2161,9 +2186,6 @@ fn create_local_terminal(
                     }
                 }
             })
-            .with_exit_callback(move |window, cx| {
-                let _ = workspace.update(cx, |workspace, cx| workspace.mark_exited(id, window, cx));
-            })
     });
     (terminal, session_control)
 }
@@ -2224,4 +2246,60 @@ fn palette_for(theme: &Theme) -> ColorPalette {
     set_color!(builder, bright_cyan, colors.bright_cyan);
     set_color!(builder, bright_white, colors.bright_white);
     builder.build()
+}
+
+#[cfg(test)]
+mod exit_regression_tests {
+    use super::{SplitDirection, WorkspaceView};
+    use gpui::{MouseDownEvent, TestAppContext};
+
+    #[gpui::test]
+    fn close_hidden_split_and_last_pane(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let (hidden, split) = workspace.update_in(cx, |view, window, cx| {
+            let hidden = view.focused_pane_id();
+            view.spawn_tab(window, cx);
+            view.split_focused(SplitDirection::Horizontal, window, cx);
+            let split = view.focused_pane_id();
+            let tab = view.tabs[0].id;
+            view.close_tab(tab, &MouseDownEvent::default(), window, cx);
+            view.close_pane(split, window, cx);
+            (hidden, split)
+        });
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if workspace.read_with(cx, |view, _| view.panes.len() == 1) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        workspace.update_in(cx, |view, window, cx| {
+            assert_eq!(
+                view.panes.len(),
+                1,
+                "隐藏标签和分屏必须在无需鼠标输入时被回收"
+            );
+            assert_eq!(view.active_tab().layout.leaf_count(), 1);
+            view.mark_exited(hidden, window, cx);
+            view.mark_exited(split, window, cx);
+            assert_eq!(view.panes.len(), 1, "重复退出不能删除存活窗格");
+            let last = view.focused_pane_id();
+            view.close_pane(last, window, cx);
+        });
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if workspace.read_with(cx, |view, _| view.next_pane_id == 5) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(view.next_pane_id, 5, "最后窗格退出后只补位一次");
+            assert_eq!(view.panes.len(), 1);
+            assert_eq!(view.tabs.len(), 1);
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
 }

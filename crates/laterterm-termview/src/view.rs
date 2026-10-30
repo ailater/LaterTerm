@@ -427,6 +427,11 @@ struct SearchState {
     current: usize,
 }
 
+/// 会话退出事件；不依赖终端是否可见。
+pub struct TerminalExited;
+
+impl EventEmitter<TerminalExited> for TerminalView {}
+
 impl TerminalView {
     /// Create a new terminal bound to a [`TerminalSession`].
     ///
@@ -521,8 +526,9 @@ impl TerminalView {
                     Err(_) => {
                         // Channel closed - PTY has finished, send Exit event
                         let _ = exit_event_tx.send(TerminalEvent::Exit);
-                        // Notify view to process the Exit event
+                        // 生命周期事件必须在绘制之外派发，隐藏终端也能被父视图回收。
                         let _ = this.update(cx, |_view, cx: &mut Context<Self>| {
+                            cx.emit(TerminalExited);
                             cx.notify();
                         });
                         break;
@@ -918,8 +924,9 @@ impl TerminalView {
                     // TODO: Implement clipboard integration
                 }
                 TerminalEvent::Exit => {
-                    if let Some(ref callback) = self.exit_callback {
-                        callback(window, cx);
+                    if let Some(callback) = self.exit_callback.take() {
+                        // 兼容旧回调接口，不能在 render 中直接修改父布局。
+                        cx.defer_in(window, move |_, window, cx| callback(window, cx));
                     }
                 }
             }
@@ -1442,5 +1449,54 @@ impl Render for TerminalView {
     }
 }
 
-// Tests are omitted due to macro expansion issues with the test attribute
-// in this configuration. Integration tests can be added separately.
+#[cfg(test)]
+mod tests {
+    use super::{TerminalConfig, TerminalExited, TerminalSession, TerminalView};
+    use gpui::{AppContext, TestAppContext};
+    use laterterm_core::{BackendKind, SessionStreams};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FinishedSession;
+    impl TerminalSession for FinishedSession {
+        fn backend(&self) -> BackendKind {
+            BackendKind::Local
+        }
+        fn title(&self) -> String {
+            String::new()
+        }
+        fn take_streams(&self) -> std::io::Result<SessionStreams> {
+            Ok(SessionStreams {
+                reader: Box::new(std::io::empty()),
+                writer: Box::new(std::io::sink()),
+            })
+        }
+        fn resize(&self, _: u16, _: u16) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn kill(&self) {}
+    }
+
+    #[gpui::test]
+    fn hidden_terminal_exits_without_render(cx: &mut TestAppContext) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let terminal = cx
+            .new(|cx| TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&terminal, move |_, _: &TerminalExited, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        // 不挂载到窗口：模拟非活动标签的终端。读泵 EOF 必须独立于 render 消费。
+        for _ in 0..100 {
+            cx.run_until_parked();
+            if calls.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(terminal);
+    }
+}
