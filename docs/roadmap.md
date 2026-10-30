@@ -68,7 +68,7 @@ M0 骨架 ✅ → M1 交互完善 🚧(本阶段) → M2 快捷命令 ⏳ → M3
 
 ## M2 · 快捷命令面板 🚧
 
-> 命令模板第一阶段已完成（`CommandTemplate` 持久化、参数解析/安全 shell 转义、预览确认、focused pane 发送）；TOTP/keyring 与独立快捷键仍待实现。
+> 命令模板系统已完成：持久化、变量解析、安全 shell 转义、真实 IME 参数输入、实时预览/确认、focused pane 目标锁定。当前仍待：模板 CRUD、独立快捷键、TOTP/keyring。
 
 **目标**：Deepin 终端灵魂功能落地——运维的跳板机操作台。
 
