@@ -5,15 +5,18 @@ use gpui::{
     Styled, WeakEntity, Window, div, prelude::FluentBuilder, px, rgb,
 };
 use laterterm_config::{
-    Appearance, CommandTemplate, Settings, Theme, ThemeRegistry, app_config_dir,
+    Appearance, CommandTemplate, Settings, Theme, ThemeRegistry, TotpAlgorithm, TotpConfig,
+    TotpEntry, app_config_dir, generate_code, parse_secret_input,
 };
 use laterterm_core::TerminalSession;
 use laterterm_local::{LocalOptions, LocalSession};
+use laterterm_secrets::{SecretStore, default_store, totp_account};
 use laterterm_termview::{ColorPalette, TerminalConfig, TerminalView};
 use notify::Watcher;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TITLEBAR_HEIGHT: f32 = 34.0;
 const PANEL_WIDTH: f32 = 220.0;
@@ -182,6 +185,20 @@ enum CommandDialog {
     },
 }
 
+/// TOTP 侧面板对话框。Preview 的 code 为 None 表示正在从密钥环读取并计算。
+#[derive(Clone, Debug)]
+enum TotpDialog {
+    Edit {
+        original: Option<String>,
+    },
+    Preview {
+        name: String,
+        code: Option<String>,
+        generated_at: SystemTime,
+        period: u64,
+    },
+}
+
 struct Pane {
     id: PaneId,
     title: String,
@@ -229,6 +246,14 @@ pub struct WorkspaceView {
     command_field_subscriptions: Vec<gpui::Subscription>,
     command_delete_confirm: Option<String>,
     command_error: Option<String>,
+    totp_dialog: Option<TotpDialog>,
+    totp_fields: Vec<(String, Entity<CommandTextField>)>,
+    totp_meta_draft: TotpEntry,
+    totp_delete_confirm: Option<String>,
+    totp_error: Option<String>,
+    totp_target: Option<PaneId>,
+    totp_generating: bool,
+    secret_store: Arc<dyn SecretStore>,
 }
 
 impl WorkspaceView {
@@ -270,6 +295,14 @@ impl WorkspaceView {
             command_field_subscriptions: Vec::new(),
             command_delete_confirm: None,
             command_error: None,
+            totp_dialog: None,
+            totp_fields: Vec::new(),
+            totp_meta_draft: TotpEntry::default(),
+            totp_delete_confirm: None,
+            totp_error: None,
+            totp_target: None,
+            totp_generating: false,
+            secret_store: default_store(),
             settings_page: SettingsPage::Appearance,
             panes: vec![Pane {
                 id: first_pane,
@@ -292,6 +325,7 @@ impl WorkspaceView {
         };
         Self::watch_config_files(cx);
         view.start_shortcut_pump(cx);
+        view.start_totp_ticker(cx);
         view
     }
 
@@ -973,6 +1007,288 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// 每秒唤醒一次渲染，让动态码剩余秒数可见；右面板关闭时空转，不产生重绘。
+    fn start_totp_ticker(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if this
+                    .update(cx, |workspace, cx| {
+                        if workspace.right_panel {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn edit_totp(&mut self, entry: Option<&TotpEntry>, cx: &mut Context<Self>) {
+        let draft = entry.cloned().unwrap_or_default();
+        self.totp_meta_draft = TotpEntry {
+            name: String::new(),
+            algorithm: draft.algorithm,
+            digits: draft.digits,
+            period: draft.period,
+        };
+        self.totp_fields.clear();
+        // 编辑时密钥框留空表示不改动；新建时必须填。
+        let secret_placeholder = if entry.is_some() {
+            "留空保持现有密钥"
+        } else {
+            "base32 密钥或 otpauth:// 链接"
+        };
+        let name_field = cx.new(|cx| CommandTextField::new(draft.name.clone(), "名称", cx));
+        let secret_field =
+            cx.new(|cx| CommandTextField::new(String::new(), secret_placeholder, cx));
+        self.totp_fields.push(("名称".into(), name_field));
+        self.totp_fields.push(("密钥".into(), secret_field));
+        self.totp_dialog = Some(TotpDialog::Edit {
+            original: entry.map(|item| item.name.clone()),
+        });
+        self.totp_error = None;
+        cx.notify();
+    }
+
+    /// 保存 TOTP 条目：密钥校验、试算、密钥环写入全部在后台线程，避免 DBus 阻塞主线程。
+    fn save_totp(&mut self, original: Option<String>, cx: &mut Context<Self>) {
+        let values = self
+            .totp_fields
+            .iter()
+            .map(|(name, field)| (name.as_str(), field.read(cx).value().to_string()))
+            .collect::<BTreeMap<_, _>>();
+        let name = values
+            .get("名称")
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default();
+        let secret_input = values
+            .get("密钥")
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let mut meta = self.totp_meta_draft.clone();
+        meta.name = name.clone();
+        if let Err(error) = meta.validate() {
+            self.totp_error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        if secret_input.trim().is_empty() && original.is_none() {
+            self.totp_error = Some("密钥不能为空（支持 base32 或 otpauth:// 链接）".into());
+            cx.notify();
+            return;
+        }
+        let store = self.secret_store.clone();
+        let original_bg = original.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let account = totp_account(&name)?;
+                    if !secret_input.trim().is_empty() {
+                        // 链接导入时以链接内参数为准，回填算法/位数/周期。
+                        let parsed = parse_secret_input(&secret_input)?;
+                        meta.algorithm = parsed.config.algorithm;
+                        meta.digits = parsed.config.digits;
+                        meta.period = parsed.config.period;
+                        // 落库前试算一次，把密钥/参数错误挡在保存之前。
+                        generate_code(&parsed.secret, &parsed.config, SystemTime::now())?;
+                        store.set(&account, &parsed.secret)?;
+                    } else if let Some(previous) = &original_bg {
+                        let previous_account = totp_account(previous)?;
+                        if previous_account != account {
+                            // 改名不重录密钥：从旧账户迁移，失败则保持原状。
+                            match store.get(&previous_account)? {
+                                Some(secret) => {
+                                    store.set(&account, &secret)?;
+                                    store.delete(&previous_account)?;
+                                }
+                                None => store.delete(&previous_account)?,
+                            }
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(meta)
+                })
+                .await;
+            let _ = this.update(cx, |workspace, cx| match result {
+                Ok(meta) => {
+                    let previous_settings = workspace.settings.clone();
+                    if let Some(previous) = &original
+                        && previous != &meta.name
+                    {
+                        workspace.settings.remove_totp(previous);
+                    }
+                    if let Err(error) = workspace.settings.upsert_totp(meta) {
+                        workspace.settings = previous_settings;
+                        workspace.totp_error = Some(error.to_string());
+                    } else if let Some(path) = Settings::default_path()
+                        && let Err(error) = workspace.settings.save_to(&path)
+                    {
+                        workspace.settings = previous_settings;
+                        workspace.totp_error = Some(format!("保存动态码失败: {error:#}"));
+                    } else {
+                        workspace.totp_dialog = None;
+                        workspace.totp_fields.clear();
+                        workspace.totp_error = None;
+                    }
+                    cx.notify();
+                }
+                Err(error) => {
+                    workspace.totp_error = Some(format!("保存动态码失败: {error:#}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 点击条目：后台读密钥环并生成当前码，完成后回填预览。
+    fn open_totp(&mut self, entry: &TotpEntry, cx: &mut Context<Self>) {
+        self.totp_dialog = Some(TotpDialog::Preview {
+            name: entry.name.clone(),
+            code: None,
+            generated_at: SystemTime::now(),
+            period: entry.period,
+        });
+        self.totp_target = Some(self.focused_pane_id());
+        self.totp_error = None;
+        self.totp_generating = true;
+        let store = self.secret_store.clone();
+        let entry = entry.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let account = totp_account(&entry.name)?;
+                    let secret = store
+                        .get(&account)?
+                        .ok_or_else(|| anyhow::anyhow!("密钥环中没有该条目的密钥"))?;
+                    let code = generate_code(
+                        &secret,
+                        &TotpConfig {
+                            algorithm: entry.algorithm,
+                            digits: entry.digits,
+                            period: entry.period,
+                        },
+                        SystemTime::now(),
+                    )?;
+                    Ok::<_, anyhow::Error>((entry.name.clone(), code))
+                })
+                .await;
+            let _ = this.update(cx, |workspace, cx| {
+                workspace.totp_generating = false;
+                match result {
+                    Ok((name, code)) => {
+                        if let Some(TotpDialog::Preview {
+                            name: current,
+                            code: slot,
+                            generated_at,
+                            period,
+                        }) = &mut workspace.totp_dialog
+                            && *current == name
+                        {
+                            *slot = Some(code.code);
+                            *generated_at = SystemTime::now();
+                            *period = entry.period;
+                        }
+                    }
+                    Err(error) => {
+                        workspace.totp_dialog = None;
+                        workspace.totp_error = Some(format!("生成动态码失败: {error:#}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_totp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(TotpDialog::Preview {
+            code: Some(code),
+            generated_at,
+            period,
+            ..
+        }) = self.totp_dialog.clone()
+        else {
+            self.totp_error = Some("动态码尚未生成".into());
+            cx.notify();
+            return;
+        };
+        // 过期码发上去就是错误输入；让用户重新点击条目生成新码。
+        if generated_at + Duration::from_secs(period) <= SystemTime::now() {
+            self.totp_dialog = None;
+            self.totp_error = Some("动态码已过期，请重新点击条目生成".into());
+            cx.notify();
+            return;
+        }
+        let target = self
+            .totp_target
+            .take()
+            .unwrap_or_else(|| self.focused_pane_id());
+        self.send_command_to_pane(target, code, window, cx);
+        self.totp_dialog = None;
+        cx.notify();
+    }
+
+    fn cancel_totp(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        self.totp_dialog = None;
+        self.totp_error = None;
+        self.totp_target = None;
+        self.totp_fields.clear();
+        self.totp_delete_confirm = None;
+        cx.notify();
+    }
+
+    fn delete_totp(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.totp_delete_confirm.as_deref() != Some(name) {
+            self.totp_delete_confirm = Some(name.to_string());
+            cx.notify();
+            return;
+        }
+        let store = self.secret_store.clone();
+        let Ok(account) = totp_account(name) else {
+            self.totp_error = Some("条目名称非法".into());
+            cx.notify();
+            return;
+        };
+        let name = name.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { store.delete(&account) })
+                .await;
+            let _ = this.update(cx, |workspace, cx| match result {
+                Ok(()) => {
+                    workspace.settings.remove_totp(&name);
+                    if let Some(path) = Settings::default_path()
+                        && let Err(error) = workspace.settings.save_to(&path)
+                    {
+                        workspace.totp_error = Some(format!("删除动态码失败: {error:#}"));
+                    } else {
+                        workspace.totp_delete_confirm = None;
+                        workspace.totp_error = None;
+                    }
+                    cx.notify();
+                }
+                Err(error) => {
+                    workspace.totp_error = Some(format!("删除密钥失败: {error:#}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     fn close_window(
         &mut self,
         _event: &MouseDownEvent,
@@ -995,7 +1311,7 @@ impl WorkspaceView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.command_dialog.is_some() {
+        if self.command_dialog.is_some() || self.totp_dialog.is_some() {
             return;
         }
         if let Some(command) = self
@@ -1423,6 +1739,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                 .text_color(rgb(0x565A78))
                 .child("SSH 服务器将在 SSH 模块接入后可用"),
         );
+    panel = render_totp_section(workspace, panel, cx);
     if let Some(CommandDialog::Edit { original_name }) = dialog.clone() {
         panel = panel.child(
             div()
@@ -1504,6 +1821,247 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                 } else {
                     div()
                 }),
+        );
+    }
+    panel
+}
+
+/// 当前时间窗口的剩余秒数（条目行内的轮换提示，随 ticker 每秒刷新）。
+fn totp_window_remaining(period: u64) -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    period - now % period
+}
+
+/// 预览里该动态码距过期的秒数。
+fn totp_preview_remaining(generated_at: SystemTime, period: u64) -> u64 {
+    SystemTime::now()
+        .duration_since(generated_at)
+        .map(|elapsed| period.saturating_sub(elapsed.as_secs()))
+        .unwrap_or(0)
+}
+
+/// 右面板「动态码」区：条目列表 + 编辑/预览覆盖层。
+fn render_totp_section(
+    workspace: &mut WorkspaceView,
+    panel: gpui::Div,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let entries = workspace.settings.totp.clone();
+    let dialog = workspace.totp_dialog.clone();
+    let fields = workspace.totp_fields.clone();
+    let meta_draft = workspace.totp_meta_draft.clone();
+    let delete_confirm = workspace.totp_delete_confirm.clone();
+    let error = workspace.totp_error.clone();
+
+    let mut panel = panel
+        .child(div().pt_4().child("动态码 (TOTP)"))
+        .child(setting_button(
+            "新建动态码",
+            true,
+            cx.listener(|this, _event, _window, cx| this.edit_totp(None, cx)),
+        ))
+        .child(
+            div()
+                .pt_2()
+                .text_color(rgb(0x7D829F))
+                .child("密钥只存系统密钥环；支持粘贴 otpauth:// 链接"),
+        )
+        .when_some(error, |panel, error| {
+            panel.child(div().text_color(rgb(0xF7768E)).child(error))
+        })
+        .children(entries.iter().map(|entry| {
+            let name = entry.name.clone();
+            let remaining = totp_window_remaining(entry.period);
+            let pending_delete = delete_confirm.as_deref() == Some(entry.name.as_str());
+            div()
+                .pt_2()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_color(rgb(0xA9B1D6))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener({
+                                let entry = entry.clone();
+                                move |this, _event, _window, cx| this.open_totp(&entry, cx)
+                            }),
+                        )
+                        .child(format!("{} · {}s", entry.name, remaining)),
+                )
+                .child(setting_button(
+                    "编辑",
+                    false,
+                    cx.listener({
+                        let entry = entry.clone();
+                        move |this, _event, _window, cx| this.edit_totp(Some(&entry), cx)
+                    }),
+                ))
+                .child(setting_button(
+                    if pending_delete { "确认?" } else { "删" },
+                    pending_delete,
+                    cx.listener(move |this, _event, _window, cx| this.delete_totp(&name, cx)),
+                ))
+        }));
+
+    if let Some(TotpDialog::Edit { original }) = dialog.clone() {
+        let meta = meta_draft;
+        panel = panel.child(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.98))
+                .p_3()
+                .child(
+                    div()
+                        .text_color(rgb(0x7DCFFF))
+                        .child(if original.is_some() {
+                            "编辑动态码"
+                        } else {
+                            "新建动态码"
+                        }),
+                )
+                .children(fields.clone().into_iter().map(|(name, field)| {
+                    div()
+                        .pt_2()
+                        .child(div().text_color(rgb(0x7D829F)).child(name))
+                        .child(field)
+                }))
+                .child(
+                    div()
+                        .pt_2()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(div().text_color(rgb(0x7D829F)).child("算法"))
+                        .children(
+                            [
+                                TotpAlgorithm::Sha1,
+                                TotpAlgorithm::Sha256,
+                                TotpAlgorithm::Sha512,
+                            ]
+                            .into_iter()
+                            .map(|algo| {
+                                setting_button(
+                                    algo.label(),
+                                    meta.algorithm == algo,
+                                    cx.listener({
+                                        move |this, _event, _window, cx| {
+                                            this.totp_meta_draft.algorithm = algo;
+                                            cx.notify();
+                                        }
+                                    }),
+                                )
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .pt_2()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(div().text_color(rgb(0x7D829F)).child("位数"))
+                        .children([6u32, 8].into_iter().map(|digits| {
+                            setting_button(
+                                digits.to_string(),
+                                meta.digits == digits,
+                                cx.listener({
+                                    move |this, _event, _window, cx| {
+                                        this.totp_meta_draft.digits = digits;
+                                        cx.notify();
+                                    }
+                                }),
+                            )
+                        }))
+                        .child(
+                            div()
+                                .text_color(rgb(0x565A78))
+                                .child(format!("周期 {} 秒", meta.period)),
+                        ),
+                )
+                .child(
+                    div()
+                        .pt_3()
+                        .flex()
+                        .gap_1()
+                        .child(setting_button(
+                            "保存",
+                            true,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.save_totp(original.clone(), cx)
+                            }),
+                        ))
+                        .child(setting_button(
+                            "取消",
+                            false,
+                            cx.listener(WorkspaceView::cancel_totp),
+                        )),
+                ),
+        );
+    }
+
+    if let Some(TotpDialog::Preview {
+        name,
+        code,
+        generated_at,
+        period,
+    }) = dialog
+    {
+        let remaining = totp_preview_remaining(generated_at, period);
+        let expired = code.is_some() && remaining == 0;
+        let ready = code.is_some() && !expired;
+        let body = match (code, expired) {
+            (None, _) => div().text_color(rgb(0x7D829F)).child("正在从密钥环读取…"),
+            (Some(code), false) => div()
+                .text_color(rgb(0xC0CAF5))
+                .child(format!("{code}   {remaining}s 后轮换")),
+            (Some(_), true) => div()
+                .text_color(rgb(0xF7768E))
+                .child("已过期，重新点击条目生成"),
+        };
+        panel = panel.child(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.98))
+                .p_3()
+                .child(
+                    div()
+                        .text_color(rgb(0x7DCFFF))
+                        .child(format!("动态码 · {name}")),
+                )
+                .child(div().pt_2().child(body))
+                .child(
+                    div()
+                        .pt_3()
+                        .flex()
+                        .gap_1()
+                        .child(setting_button(
+                            "发送",
+                            ready,
+                            cx.listener(|this, _event, window, cx| {
+                                this.confirm_totp(window, cx);
+                            }),
+                        ))
+                        .child(setting_button(
+                            "取消",
+                            false,
+                            cx.listener(WorkspaceView::cancel_totp),
+                        )),
+                ),
         );
     }
     panel
