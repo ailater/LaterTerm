@@ -1,0 +1,20 @@
+[package]
+name = "laterterm-ssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "LaterTerm SSH 远程会话：russh + 线程泵 + 密钥环凭据"
+
+[dependencies]
+laterterm-core.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "io-util"] }
+russh.workspace = true
+flume.workspace = true
+
+[dev-dependencies]
+# 版本对齐 russh 0.65 内部的 rand_core 0.10（PrivateKey::random 的 CryptoRng）
+rand = "0.10"
+tempfile = "3"
+env_logger = "0.11"
+log = "0.4"

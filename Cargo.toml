@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/laterterm-app", "crates/laterterm-config", "crates/laterterm-core", "crates/laterterm-local", "crates/laterterm-secrets", "crates/laterterm-termview"]
+members = ["crates/laterterm-app", "crates/laterterm-config", "crates/laterterm-core", "crates/laterterm-local", "crates/laterterm-secrets", "crates/laterterm-ssh", "crates/laterterm-termview"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,6 +23,7 @@ hmac = "0.13"
 sha1 = "0.11"
 sha2 = "0.11"
 keyring = "4.2"
+russh = "0.65"
 laterterm-core = { path = "crates/laterterm-core" }
 laterterm-local = { path = "crates/laterterm-local" }
 laterterm-secrets = { path = "crates/laterterm-secrets" }
