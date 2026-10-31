@@ -1,0 +1,15 @@
+[package]
+name = "laterterm-transfer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "LaterTerm 终端内文件传输：ZMODEM(rz/sz) 兼容通道，trzsz 协议后续演进"
+
+[dependencies]
+laterterm-core.workspace = true
+# 现代 lrzsz 重写的库形态；ZMODEM 状态机不自造（AGENTS「禁自造轮子」同纪律）
+rzsz = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
