@@ -23,7 +23,7 @@ fn main() -> Result<()> {
                     ..Default::default()
                 },
                 |window, cx| {
-                    let workspace = cx.new(WorkspaceView::new);
+                    let workspace = cx.new(|cx| WorkspaceView::new(window, cx));
                     workspace.update(cx, |workspace, cx| workspace.focus_active(window, cx));
                     workspace
                 },

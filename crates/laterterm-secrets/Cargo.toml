@@ -1,0 +1,11 @@
+[package]
+name = "laterterm-secrets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "LaterTerm 密钥环封装：TOTP/SSH 凭据存取（Linux 走 Secret Service）"
+
+[dependencies]
+keyring.workspace = true
+anyhow.workspace = true

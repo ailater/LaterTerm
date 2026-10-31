@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/laterterm-app", "crates/laterterm-config", "crates/laterterm-core", "crates/laterterm-local", "crates/laterterm-ssh", "crates/laterterm-termview", "crates/laterterm-transfer", "crates/laterterm-xshell", "crates/laterterm-deepin"]
+members = ["crates/laterterm-app", "crates/laterterm-config", "crates/laterterm-core", "crates/laterterm-deepin", "crates/laterterm-local", "crates/laterterm-secrets", "crates/laterterm-ssh", "crates/laterterm-termview", "crates/laterterm-transfer", "crates/laterterm-xshell"]
 
 [workspace.package]
 version = "0.1.0"
@@ -19,8 +19,17 @@ toml = "0.8"
 ropey = "1"
 flume = "0.12"
 arboard = { version = "3", features = ["wayland-data-control"] }
+hmac = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
+keyring = "4.2"
+base64 = "0.23"
+flate2 = "1"
+md5 = "0.8"
+serde_json = "1"
 laterterm-core = { path = "crates/laterterm-core" }
 laterterm-local = { path = "crates/laterterm-local" }
+laterterm-secrets = { path = "crates/laterterm-secrets" }
 laterterm-ssh = { path = "crates/laterterm-ssh" }
 laterterm-transfer = { path = "crates/laterterm-transfer" }
 laterterm-xshell = { path = "crates/laterterm-xshell" }

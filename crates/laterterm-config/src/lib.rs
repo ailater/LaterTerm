@@ -12,9 +12,11 @@ use std::path::{Path, PathBuf};
 
 pub mod commands;
 pub mod theme;
+pub mod totp;
 
 pub use commands::CommandTemplate;
 pub use theme::{DEFAULT_THEME, Theme, ThemeRegistry, themes_dir};
+pub use totp::{TotpAlgorithm, TotpConfig, TotpEntry, generate_code, parse_secret_input};
 
 pub const APP_DIR: &str = "laterterm";
 pub const SETTINGS_FILE: &str = "settings.toml";
@@ -27,6 +29,9 @@ pub struct Settings {
     /// 用户自定义快捷命令模板；缺字段的旧配置自动为空。
     #[serde(default)]
     pub commands: Vec<CommandTemplate>,
+    /// TOTP 动态码条目元数据；密钥本体在系统密钥环（laterterm-secrets），绝不落盘。
+    #[serde(default)]
+    pub totp: Vec<totp::TotpEntry>,
 }
 
 /// 外观项。数值范围与设置面板的步进按钮一致。
@@ -67,6 +72,65 @@ impl Default for Appearance {
 }
 
 impl Settings {
+    pub fn upsert_command(&mut self, command: CommandTemplate) -> Result<()> {
+        command.validate()?;
+        if let Some(existing) = self
+            .commands
+            .iter_mut()
+            .find(|item| item.name == command.name)
+        {
+            *existing = command;
+        } else {
+            self.commands.push(command);
+        }
+        Ok(())
+    }
+
+    pub fn remove_command(&mut self, name: &str) -> bool {
+        let before = self.commands.len();
+        self.commands.retain(|command| command.name != name);
+        before != self.commands.len()
+    }
+
+    pub fn command_shortcut_conflicts(&self) -> Vec<String> {
+        commands::shortcut_conflicts(self.commands.iter().filter_map(|command| {
+            command
+                .shortcut
+                .as_deref()
+                .map(|shortcut| (command.name.as_str(), shortcut))
+        }))
+    }
+
+    /// 新增或按名称替换 TOTP 条目；密钥本体由调用方负责写入密钥环。
+    pub fn upsert_totp(&mut self, entry: totp::TotpEntry) -> Result<()> {
+        entry.validate()?;
+        if let Some(existing) = self.totp.iter_mut().find(|item| item.name == entry.name) {
+            *existing = entry;
+        } else {
+            self.totp.push(entry);
+        }
+        Ok(())
+    }
+
+    pub fn remove_totp(&mut self, name: &str) -> bool {
+        let before = self.totp.len();
+        self.totp.retain(|entry| entry.name != name);
+        before != self.totp.len()
+    }
+
+    /// 把加载中的 TOTP 条目元数据修正到合法范围；无法挽救的条目直接丢弃。
+    fn sanitize_totp(&mut self) {
+        self.totp.retain_mut(|entry| {
+            entry.name = entry.name.trim().to_string();
+            if entry.name.is_empty() {
+                return false;
+            }
+            entry.digits = entry.digits.clamp(6, 8);
+            entry.period = entry.period.clamp(1, 3600);
+            true
+        });
+    }
+
     /// 用户配置目录下的设置文件路径。
     pub fn default_path() -> Option<PathBuf> {
         Some(config_dir()?.join(APP_DIR).join(SETTINGS_FILE))
@@ -84,6 +148,7 @@ impl Settings {
         let mut settings: Settings =
             toml::from_str(&raw).with_context(|| format!("解析设置失败: {}", path.display()))?;
         settings.appearance.sanitize();
+        settings.sanitize_totp();
         Ok(settings)
     }
 

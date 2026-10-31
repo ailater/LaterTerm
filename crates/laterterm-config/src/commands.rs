@@ -179,15 +179,51 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn validate_shortcut(shortcut: &str) -> Result<()> {
-    let normalized = shortcut.trim().to_ascii_lowercase();
-    if normalized.is_empty() || normalized.len() > 40 || !normalized.contains('+') {
+pub fn normalize_shortcut(shortcut: &str) -> Result<String> {
+    let normalized = shortcut
+        .split('+')
+        .map(|part| part.trim().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if normalized.len() < 2 || normalized.iter().any(String::is_empty) {
         bail!("快捷键格式应为 ctrl+alt+k 一类组合");
     }
-    if normalized.split('+').any(|part| part.is_empty()) {
-        bail!("快捷键包含空按键");
+    let key = normalized.last().expect("至少包含两个按键");
+    if key.len() > 20 || normalized.join("+").len() > 40 {
+        bail!("快捷键过长");
     }
-    Ok(())
+    let modifiers = ["ctrl", "control", "alt", "shift", "cmd", "super", "meta"];
+    if !modifiers.contains(&key.as_str())
+        && key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || "[]\\\\-_=;,./".contains(ch))
+    {
+        return Ok(normalized.join("+"));
+    }
+    if modifiers.contains(&key.as_str()) {
+        bail!("快捷键必须包含主按键");
+    }
+    bail!("快捷键包含非法按键")
+}
+
+fn validate_shortcut(shortcut: &str) -> Result<()> {
+    normalize_shortcut(shortcut).map(|_| ())
+}
+
+pub fn shortcut_conflicts<'a, I>(shortcuts: I) -> Vec<String>
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut seen = BTreeMap::new();
+    let mut conflicts = Vec::new();
+    for (name, shortcut) in shortcuts {
+        let Ok(normalized) = normalize_shortcut(shortcut) else {
+            continue;
+        };
+        if let Some(previous) = seen.insert(normalized.clone(), name.to_string()) {
+            conflicts.push(format!("{previous} 与 {name} 冲突: {normalized}"));
+        }
+    }
+    conflicts
 }
 
 #[cfg(test)]
@@ -248,6 +284,41 @@ mod tests {
         };
         let values = BTreeMap::from([("user".into(), "x\ny".into())]);
         assert!(command.expand(&values).is_err());
+    }
+
+    #[test]
+    fn normalizes_and_detects_shortcut_conflicts() {
+        assert_eq!(
+            normalize_shortcut(" Ctrl+Shift+K ").unwrap(),
+            "ctrl+shift+k"
+        );
+        assert!(normalize_shortcut("ctrl").is_err());
+        let conflicts = shortcut_conflicts([("a", "ctrl+k"), ("b", " Ctrl+K ")]);
+        assert_eq!(conflicts.len(), 1);
+    }
+
+    #[test]
+    fn settings_command_crud_replaces_and_removes() {
+        let mut settings = crate::Settings::default();
+        settings
+            .upsert_command(CommandTemplate {
+                name: "a".into(),
+                template: "echo a".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        settings
+            .upsert_command(CommandTemplate {
+                name: "a".into(),
+                template: "echo b".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(settings.commands.len(), 1);
+        assert_eq!(settings.commands[0].template, "echo b");
+        assert!(settings.remove_command("a"));
+        assert!(settings.commands.is_empty());
+        assert!(!settings.remove_command("a"));
     }
 
     #[test]

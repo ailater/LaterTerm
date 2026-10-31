@@ -1,9 +1,11 @@
 use gpui::{
-    Bounds, Context, ElementInputHandler, Entity, EntityInputHandler, FocusHandle,
+    Bounds, Context, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Render, Styled,
     UTF16Selection, Window, canvas, div, px,
 };
 use std::ops::Range;
+
+pub(crate) struct CommandTextChanged;
 
 /// 可复用的单行文本输入框。文本编辑使用 UTF-16 偏移，兼容 GPUI 输入法协议。
 pub(crate) struct CommandTextField {
@@ -14,6 +16,8 @@ pub(crate) struct CommandTextField {
     marked_text: String,
     placeholder: String,
 }
+
+impl EventEmitter<CommandTextChanged> for CommandTextField {}
 
 impl CommandTextField {
     pub(crate) fn new(
@@ -116,6 +120,7 @@ impl CommandTextField {
             }
             _ => return,
         }
+        cx.emit(CommandTextChanged);
         cx.notify();
     }
 }
@@ -212,6 +217,7 @@ impl EntityInputHandler for CommandTextField {
         }
         self.marked_text.clear();
         self.replace_selection(text);
+        cx.emit(CommandTextChanged);
         cx.notify();
     }
     fn replace_and_mark_text_in_range(

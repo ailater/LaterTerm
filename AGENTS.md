@@ -6,8 +6,9 @@
 
 - `crates/laterterm-app` — 主程序二进制 `laterterm`
 - `crates/laterterm-termview` — GPUI 终端网格视图（**内化自 zortax/gpui-terminal 0.1.0**，上游停更，由本仓库接管；改动需保持 MIT OR Apache-2.0 许可头）
-- `crates/laterterm-config` — 设置与主题持久化（TOML：`~/.config/laterterm/settings.toml` + `themes/*.toml`，自定义主题同名覆盖内置；app 层用 notify+flume 做热加载）
-- 后续里程碑再增：`laterterm-core`（TerminalSession 会话抽象/编码/trzsz）、`laterterm-local`、`laterterm-ssh`（russh）、`laterterm-secrets`
+- `crates/laterterm-config` — 设置与主题持久化（TOML：`~/.config/laterterm/settings.toml` + `themes/*.toml`，自定义主题同名覆盖内置；app 层用 notify+flume 做热加载）；内含快捷命令模板与 TOTP 算法（RFC 6238）
+- `crates/laterterm-secrets` — 系统密钥环封装（keyring v4 → Linux Secret Service）；TOTP/SSH 等密钥只进密钥环，绝不写 settings.toml
+- 后续里程碑再增：`laterterm-ssh`（russh）等远程传输相关 crate
 
 ## 命令
 

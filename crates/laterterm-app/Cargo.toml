@@ -16,7 +16,11 @@ laterterm-termview = { path = "../laterterm-termview" }
 laterterm-config = { path = "../laterterm-config" }
 laterterm-core.workspace = true
 laterterm-local.workspace = true
+laterterm-secrets.workspace = true
 anyhow.workspace = true
 parking_lot.workspace = true
 flume.workspace = true
 notify = "8"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
