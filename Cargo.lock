@@ -3760,6 +3760,7 @@ dependencies = [
  "laterterm-core",
  "laterterm-local",
  "laterterm-secrets",
+ "laterterm-ssh",
  "laterterm-termview",
  "notify",
  "parking_lot",

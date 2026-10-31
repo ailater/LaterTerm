@@ -4,6 +4,7 @@ use gpui::{
     KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, StatefulInteractiveElement,
     Styled, WeakEntity, Window, div, prelude::FluentBuilder, px, rgb,
 };
+use laterterm_config::servers::{ServerAuthKind, ServerEntry, ServerStore, password_account};
 use laterterm_config::{
     Appearance, CommandTemplate, Settings, Theme, ThemeRegistry, TotpAlgorithm, TotpConfig,
     TotpEntry, app_config_dir, generate_code, parse_secret_input,
@@ -11,6 +12,7 @@ use laterterm_config::{
 use laterterm_core::TerminalSession;
 use laterterm_local::{LocalOptions, LocalSession};
 use laterterm_secrets::{SecretStore, default_store, totp_account};
+use laterterm_ssh::{SessionEncoding, SshAuth, SshEndpoint, SshOptions, SshSession};
 use laterterm_termview::{ColorPalette, TerminalConfig, TerminalView};
 use notify::Watcher;
 use std::collections::BTreeMap;
@@ -185,6 +187,16 @@ enum CommandDialog {
     },
 }
 
+/// 服务器表单状态：auth/encoding 用循环选择，文本输入在 `server_fields`。
+#[derive(Clone, Debug)]
+struct ServerDialog {
+    /// 编辑时的旧名（重命名 = 删旧插新 + 密钥环账户搬迁）。
+    original: Option<String>,
+    auth: ServerAuthKind,
+    /// 0=UTF-8 1=GBK 2=GB18030。
+    encoding: usize,
+}
+
 /// TOTP 侧面板对话框。Preview 的 code 为 None 表示正在从密钥环读取并计算。
 #[derive(Clone, Debug)]
 enum TotpDialog {
@@ -250,6 +262,12 @@ pub struct WorkspaceView {
     totp_fields: Vec<(String, Entity<CommandTextField>)>,
     totp_meta_draft: TotpEntry,
     totp_delete_confirm: Option<String>,
+    servers: ServerStore,
+    server_fields: Vec<(&'static str, Entity<CommandTextField>)>,
+    server_dialog: Option<ServerDialog>,
+    server_connecting: Option<String>,
+    server_error: Option<String>,
+    server_delete_confirm: Option<String>,
     totp_error: Option<String>,
     totp_target: Option<PaneId>,
     totp_generating: bool,
@@ -299,6 +317,12 @@ impl WorkspaceView {
             totp_fields: Vec::new(),
             totp_meta_draft: TotpEntry::default(),
             totp_delete_confirm: None,
+            servers: ServerStore::load(),
+            server_fields: Vec::new(),
+            server_dialog: None,
+            server_connecting: None,
+            server_error: None,
+            server_delete_confirm: None,
             totp_error: None,
             totp_target: None,
             totp_generating: false,
@@ -1051,6 +1075,376 @@ impl WorkspaceView {
             original: entry.map(|item| item.name.clone()),
         });
         self.totp_error = None;
+        cx.notify();
+    }
+
+    // ───────────────────────── 服务器（M3）─────────────────────────
+
+    /// 打开服务器表单（None = 新建；编辑时回填，密码恒空 = 不改）。
+    fn edit_server(&mut self, entry: Option<&ServerEntry>, cx: &mut Context<Self>) {
+        let draft = entry.cloned();
+        self.server_fields.clear();
+        let (name, host, port, user, key_path) = match &draft {
+            Some(entry) => (
+                entry.name.clone(),
+                entry.host.clone(),
+                entry.port.to_string(),
+                entry.username.clone(),
+                match &entry.auth {
+                    ServerAuthKind::KeyFile(path) => path.clone(),
+                    _ => String::new(),
+                },
+            ),
+            None => (
+                String::new(),
+                String::new(),
+                "22".into(),
+                String::new(),
+                String::new(),
+            ),
+        };
+        let password_placeholder = if draft.is_some() {
+            "留空保持现有密码"
+        } else {
+            "密码（存系统密钥环，不落盘）"
+        };
+        for (value, label, placeholder) in [
+            (name, "名称", "显示名"),
+            (host, "主机", "host 或 IP"),
+            (port, "端口", "22"),
+            (user, "用户名", "登录用户"),
+            (key_path, "私钥路径", "密钥认证时填写"),
+            (String::new(), "密码", password_placeholder),
+        ] {
+            let field = cx.new(|cx| CommandTextField::new(value, placeholder, cx));
+            self.server_fields.push((label, field));
+        }
+        let (auth, encoding) = match &draft {
+            Some(entry) => (
+                entry.auth.clone(),
+                match entry.encoding.as_deref() {
+                    Some("GBK") => 1,
+                    Some("GB18030") => 2,
+                    _ => 0,
+                },
+            ),
+            None => (ServerAuthKind::Agent, 0),
+        };
+        self.server_dialog = Some(ServerDialog {
+            original: draft.as_ref().map(|entry| entry.name.clone()),
+            auth,
+            encoding,
+        });
+        self.server_error = None;
+        cx.notify();
+    }
+
+    fn cancel_server(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.server_dialog = None;
+        self.server_fields.clear();
+        cx.notify();
+    }
+
+    /// 认证方式三态循环：agent → 密钥 → 密码。
+    fn cycle_server_auth(&mut self, cx: &mut Context<Self>) {
+        if let Some(dialog) = &mut self.server_dialog {
+            dialog.auth = match &dialog.auth {
+                ServerAuthKind::Agent => ServerAuthKind::KeyFile(String::new()),
+                ServerAuthKind::KeyFile(_) => ServerAuthKind::Keyring,
+                ServerAuthKind::Keyring => ServerAuthKind::Agent,
+            };
+            cx.notify();
+        }
+    }
+
+    /// 编码三态循环：UTF-8 → GBK → GB18030。
+    fn cycle_server_encoding(&mut self, cx: &mut Context<Self>) {
+        if let Some(dialog) = &mut self.server_dialog {
+            dialog.encoding = (dialog.encoding + 1) % 3;
+            cx.notify();
+        }
+    }
+
+    fn server_field_value(&self, label: &str, cx: &Context<Self>) -> String {
+        self.server_fields
+            .iter()
+            .find(|(field_label, _)| *field_label == label)
+            .map(|(_, field)| field.read(cx).value().to_string())
+            .unwrap_or_default()
+    }
+
+    /// 保存服务器：文本校验前台做；密钥环写入/搬迁在后台线程（DBus 慢）。
+    fn save_server(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = self.server_dialog.clone() else {
+            return;
+        };
+        let name = self.server_field_value("名称", cx).trim().to_string();
+        let host = self.server_field_value("主机", cx).trim().to_string();
+        let port_text = self.server_field_value("端口", cx).trim().to_string();
+        let username = self.server_field_value("用户名", cx).trim().to_string();
+        let key_path = self.server_field_value("私钥路径", cx).trim().to_string();
+        let password = self.server_field_value("密码", cx);
+
+        if name.is_empty() || host.is_empty() || username.is_empty() {
+            self.server_error = Some("名称 / 主机 / 用户名不能为空".into());
+            cx.notify();
+            return;
+        }
+        let port: u16 = if port_text.is_empty() {
+            22
+        } else {
+            match port_text.parse() {
+                Ok(port) => port,
+                Err(_) => {
+                    self.server_error = Some(format!("端口不是数字: {port_text}"));
+                    cx.notify();
+                    return;
+                }
+            }
+        };
+        let auth = match &dialog.auth {
+            ServerAuthKind::Agent => ServerAuthKind::Agent,
+            ServerAuthKind::KeyFile(_) => {
+                if key_path.is_empty() {
+                    self.server_error = Some("密钥认证需要私钥路径".into());
+                    cx.notify();
+                    return;
+                }
+                ServerAuthKind::KeyFile(key_path.clone())
+            }
+            ServerAuthKind::Keyring => ServerAuthKind::Keyring,
+        };
+        let entry = ServerEntry {
+            name: name.clone(),
+            host,
+            port,
+            username,
+            auth,
+            encoding: match dialog.encoding {
+                1 => Some("GBK".into()),
+                2 => Some("GB18030".into()),
+                _ => None,
+            },
+        };
+
+        let store = self.secret_store.clone();
+        let original = dialog.original.clone();
+        let saved_entry = entry.clone();
+        let original_for_bg = original.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let entry = &saved_entry;
+                    let original = &original_for_bg;
+                    // 新密码：写密钥环（Keyring 认证才有意义，其他方式忽略）
+                    if matches!(entry.auth, ServerAuthKind::Keyring) && !password.is_empty() {
+                        store
+                            .set(&password_account(&entry.name), password.trim())
+                            .map_err(|e| e.to_string())?;
+                    }
+                    // 重命名 + Keyring：把旧账户密码搬到新账户再删旧（未填新密码时）
+                    if let Some(old) = &original
+                        && old != &entry.name
+                        && matches!(entry.auth, ServerAuthKind::Keyring)
+                        && password.trim().is_empty()
+                        && let Ok(Some(secret)) = store.get(&password_account(old))
+                    {
+                        store
+                            .set(&password_account(&entry.name), &secret)
+                            .map_err(|e| e.to_string())?;
+                        let _ = store.delete(&password_account(old));
+                    }
+                    Ok::<(), String>(())
+                })
+                .await;
+            this.update(cx, |workspace, cx| {
+                if let Err(error) = result {
+                    workspace.server_error = Some(format!("密钥环写入失败: {error}"));
+                    cx.notify();
+                    return;
+                }
+                if let Some(old) = &original {
+                    workspace.servers.remove(old);
+                }
+                workspace.servers.upsert(entry.clone());
+                if let Err(error) = workspace.servers.save() {
+                    workspace.server_error = Some(format!("保存 servers.toml 失败: {error}"));
+                } else {
+                    workspace.server_dialog = None;
+                    workspace.server_fields.clear();
+                    workspace.server_error = None;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 连接服务器：密码取密钥环 + SSH 握手都在后台（≤30s），成功即挂远程标签。
+    fn connect_server(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(entry) = self.servers.get(name).cloned() else {
+            return;
+        };
+        if self.server_connecting.is_some() {
+            return; // 单飞：一次一条连接建立中
+        }
+        self.server_connecting = Some(entry.name.clone());
+        self.server_error = None;
+        cx.notify();
+
+        let store = self.secret_store.clone();
+        let appearance = self.settings.appearance.clone();
+        let theme = self.themes.resolve(&self.settings.appearance.theme).clone();
+        let shortcut_tx = self.shortcut_tx.clone();
+        let entry_for_title = entry.name.clone();
+        cx.spawn(async move |this, cx| {
+            let spawn_result = cx
+                .background_executor()
+                .spawn(async move {
+                    let auth = match &entry.auth {
+                        ServerAuthKind::Agent => SshAuth::Agent,
+                        ServerAuthKind::KeyFile(path) => SshAuth::KeyFile {
+                            path: path.clone().into(),
+                            passphrase: None,
+                        },
+                        ServerAuthKind::Keyring => {
+                            let password = store
+                                .get(&password_account(&entry.name))
+                                .map_err(|error| format!("读取密钥环失败: {error}"))?
+                                .ok_or_else(|| "密钥环无该服务器密码，请编辑重填".to_string())?;
+                            SshAuth::Password(password)
+                        }
+                    };
+                    let encoding = match entry.encoding.as_deref() {
+                        Some("GBK") => SessionEncoding::Gbk,
+                        Some("GB18030") => SessionEncoding::Gb18030,
+                        _ => SessionEncoding::Utf8,
+                    };
+                    let session = SshSession::spawn(SshOptions {
+                        endpoint: SshEndpoint {
+                            host: entry.host.clone(),
+                            port: Some(entry.port),
+                            username: entry.username.clone(),
+                            auth,
+                            host_key_policy: laterterm_ssh::HostKeyPolicy::KnownHosts {
+                                path: None,
+                            },
+                            encoding,
+                        },
+                        jump: None,
+                        cols: 110,
+                        rows: 30,
+                    })
+                    .map_err(|error| error.to_string())?;
+                    Ok::<SshSession, String>(session)
+                })
+                .await;
+            this.update(cx, |workspace, cx| {
+                workspace.server_connecting = None;
+                match spawn_result {
+                    Ok(session) => {
+                        let title = match workspace.servers.get(&entry_for_title) {
+                            Some(entry) if entry.port == 22 => {
+                                format!("{}@{}", entry.username, entry.host)
+                            }
+                            Some(entry) => {
+                                format!("{}@{}:{}", entry.username, entry.host, entry.port)
+                            }
+                            None => entry_for_title.clone(),
+                        };
+                        workspace.attach_remote_pane(
+                            session,
+                            &title,
+                            &appearance,
+                            &theme,
+                            shortcut_tx,
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        workspace.server_error = Some(error);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 把已建立的远程会话挂成新标签（镜像 spawn_tab，窗口焦点留给用户点击）。
+    fn attach_remote_pane(
+        &mut self,
+        session: SshSession,
+        title: &str,
+        settings: &Appearance,
+        theme: &Theme,
+        shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
+        cx: &mut Context<Self>,
+    ) {
+        let pane_id = PaneId(self.next_pane_id);
+        self.next_pane_id += 1;
+        let tab_id = TabId(self.next_tab_id);
+        self.next_tab_id += 1;
+        let (terminal, control) = build_pane_terminal(
+            Arc::new(session),
+            pane_id,
+            cx.weak_entity(),
+            cx,
+            settings,
+            theme,
+            shortcut_tx,
+            title,
+        );
+        self.panes.push(Pane {
+            id: pane_id,
+            title: title.to_string(),
+            terminal,
+            session: control,
+            status: TabStatus::Running,
+        });
+        self.tabs.push(WorkspaceTab {
+            id: tab_id,
+            layout: LayoutNode::Leaf(pane_id),
+            focused_pane: pane_id,
+        });
+        self.active_tab = tab_id;
+        cx.notify();
+    }
+
+    /// 删除服务器（二次确认同 TOTP 口径）。
+    fn request_delete_server(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.server_delete_confirm.as_deref() == Some(name) {
+            // 第二次点击：真删（密钥环账户一并清理在后台）
+            let account = password_account(name);
+            let store = self.secret_store.clone();
+            let name_owned = name.to_string();
+            self.servers.remove(name);
+            if let Err(error) = self.servers.save() {
+                self.server_error = Some(format!("保存 servers.toml 失败: {error}"));
+            }
+            self.server_delete_confirm = None;
+            cx.spawn(async move |this, cx| {
+                let store = store;
+                cx.background_executor()
+                    .spawn(async move {
+                        let _ = store.delete(&account);
+                    })
+                    .await;
+                this.update(cx, |_, cx| cx.notify()).ok();
+                let _ = name_owned;
+            })
+            .detach();
+        } else {
+            self.server_delete_confirm = Some(name.to_string());
+        }
         cx.notify();
     }
 
@@ -2227,17 +2621,7 @@ fn settings_content(
                     .child(info_row("COLORTERM", "truecolor"))
                     .child(info_row("滚动", "自然滚动，支持历史回看")),
             ),
-        SettingsPage::Servers => div()
-            .pt_4()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(section_title("连接"))
-            .child(
-                setting_card()
-                    .child(info_row("本地 Shell", "已内置"))
-                    .child(info_row("SSH", "远程模块接入后可用")),
-            ),
+        SettingsPage::Servers => servers_panel(workspace, cx),
     };
     div()
         .id(gpui::SharedString::from(format!(
@@ -2252,6 +2636,158 @@ fn settings_content(
         .text_color(rgb(0xC0CAF5))
         .child(div().text_color(rgb(0xC0CAF5)).child(title))
         .child(body)
+}
+
+/// 服务器页：条目列表（连接/编辑/删除）+ 添加/编辑表单。
+fn servers_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
+    let entries = workspace.servers.servers.clone();
+    let connecting = workspace.server_connecting.clone();
+    let error = workspace.server_error.clone();
+    let delete_confirm = workspace.server_delete_confirm.clone();
+    let dialog = workspace.server_dialog.clone();
+    let fields = workspace.server_fields.clone();
+
+    let mut panel = div()
+        .pt_4()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(section_title("服务器"))
+        .child(setting_button(
+            "添加服务器",
+            true,
+            cx.listener(|this, _event, _window, cx| this.edit_server(None, cx)),
+        ))
+        .when_some(error, |panel, error| {
+            panel.child(div().text_color(rgb(0xF7768E)).child(error))
+        });
+
+    for entry in &entries {
+        let name = entry.name.clone();
+        let pending_delete = delete_confirm.as_deref() == Some(entry.name.as_str());
+        let busy = connecting.as_deref() == Some(entry.name.as_str());
+        let auth_label = match &entry.auth {
+            ServerAuthKind::Agent => "agent",
+            ServerAuthKind::KeyFile(_) => "密钥",
+            ServerAuthKind::Keyring => "密码",
+        };
+        let endpoint_label = if entry.port == 22 {
+            format!("{}@{}", entry.username, entry.host)
+        } else {
+            format!("{}@{}:{}", entry.username, entry.host, entry.port)
+        };
+        let encoding_label = entry.encoding.clone().unwrap_or_else(|| "UTF-8".into());
+        panel = panel.child(
+            setting_card()
+                .child(div().flex().items_center().gap_2().child(
+                    div().text_color(rgb(0xC0CAF5)).child(format!(
+                        "{} · {endpoint_label} · {auth_label} · {encoding_label}",
+                        entry.name
+                    )),
+                ))
+                .child(
+                    div()
+                        .pt_2()
+                        .flex()
+                        .gap_1()
+                        .child(setting_button(
+                            if busy { "连接中…" } else { "连接" },
+                            !busy,
+                            cx.listener({
+                                let name = name.clone();
+                                move |this, _event, _window, cx| this.connect_server(&name, cx)
+                            }),
+                        ))
+                        .child(setting_button(
+                            "编辑",
+                            false,
+                            cx.listener({
+                                let name = name.clone();
+                                move |this, _event, _window, cx| {
+                                    let entry = this.servers.get(&name).cloned();
+                                    this.edit_server(entry.as_ref(), cx);
+                                }
+                            }),
+                        ))
+                        .child(setting_button(
+                            if pending_delete {
+                                "确认删除"
+                            } else {
+                                "删除"
+                            },
+                            false,
+                            cx.listener({
+                                let name = name.clone();
+                                move |this, _event, _window, cx| {
+                                    this.request_delete_server(&name, cx);
+                                }
+                            }),
+                        )),
+                ),
+        );
+    }
+
+    // 添加/编辑表单
+    if let Some(dialog) = dialog {
+        let auth_label = match &dialog.auth {
+            ServerAuthKind::Agent => "ssh-agent",
+            ServerAuthKind::KeyFile(_) => "密钥文件",
+            ServerAuthKind::Keyring => "密码(密钥环)",
+        };
+        let encoding_label = ["UTF-8", "GBK", "GB18030"][dialog.encoding.min(2)];
+        panel = panel
+            .child(section_title(if dialog.original.is_some() {
+                "编辑服务器"
+            } else {
+                "新服务器"
+            }))
+            .children(fields.iter().map(|(label, field)| {
+                div()
+                    .pt_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(64.0)).text_color(rgb(0x7D829F)).child(*label))
+                    .child(field.clone())
+            }))
+            .child(
+                div()
+                    .pt_2()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(div().text_color(rgb(0x7D829F)).child("认证"))
+                    .child(setting_button(
+                        auth_label,
+                        false,
+                        cx.listener(|this, _event, _window, cx| this.cycle_server_auth(cx)),
+                    ))
+                    .child(div().text_color(rgb(0x7D829F)).child("编码"))
+                    .child(setting_button(
+                        encoding_label,
+                        false,
+                        cx.listener(|this, _event, _window, cx| this.cycle_server_encoding(cx)),
+                    )),
+            )
+            .child(
+                div()
+                    .pt_3()
+                    .flex()
+                    .gap_1()
+                    .child(setting_button(
+                        "保存",
+                        true,
+                        cx.listener(|this, _event, _window, cx| this.save_server(cx)),
+                    ))
+                    .child(setting_button(
+                        "取消",
+                        false,
+                        cx.listener(WorkspaceView::cancel_server),
+                    )),
+            );
+    }
+
+    panel
 }
 
 fn settings_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
@@ -2683,6 +3219,31 @@ fn create_local_terminal(
         })
         .expect("启动本地会话失败"),
     );
+    build_pane_terminal(
+        session,
+        id,
+        workspace,
+        cx,
+        settings,
+        theme,
+        shortcut_tx,
+        "本地终端",
+    )
+}
+
+/// 会话 → 窗格视图的装配线（本地/远程共用）：外观配置、工作台快捷键
+/// 拦截、OSC 标题回填与退出回收。`initial_title` 为无标题上报前的兜底。
+#[allow(clippy::too_many_arguments)]
+fn build_pane_terminal(
+    session: Arc<dyn TerminalSession>,
+    id: PaneId,
+    workspace: gpui::WeakEntity<WorkspaceView>,
+    cx: &mut Context<WorkspaceView>,
+    settings: &Appearance,
+    theme: &Theme,
+    shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
+    _initial_title: &str,
+) -> (Entity<TerminalView>, Arc<SessionControl>) {
     let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
 
     let config = TerminalConfig {
@@ -2743,6 +3304,9 @@ fn create_local_terminal(
                         window.set_window_title(if title.is_empty() { "LaterTerm" } else { title });
                     }
                 }
+            })
+            .with_exit_callback(move |window, cx| {
+                let _ = workspace.update(cx, |workspace, cx| workspace.mark_exited(id, window, cx));
             })
     });
     (terminal, session_control)

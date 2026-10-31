@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub mod commands;
+pub mod servers;
 pub mod theme;
 pub mod totp;
 
