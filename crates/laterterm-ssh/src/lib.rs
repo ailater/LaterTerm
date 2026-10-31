@@ -15,6 +15,9 @@
 //! GBK 转码与 trzsz 仍是 M3 后续：本层透传字节，编码转换挂在
 //! take_streams 返回的 reader/writer 装饰器上是既定演进位。
 
+pub mod encoding;
+
+pub use encoding::SessionEncoding;
 use laterterm_core::{BackendKind, SessionStreams, TerminalSession};
 use std::io;
 use std::path::PathBuf;
@@ -102,6 +105,8 @@ pub struct SshEndpoint {
     pub auth: SshAuth,
     /// 主机密钥策略（跳板机与目标机各自独立校验）。
     pub host_key_policy: HostKeyPolicy,
+    /// 会话字符编码（GBK/GB18030 遗留环境自动转 UTF-8；默认 UTF-8 直通）。
+    pub encoding: SessionEncoding,
 }
 
 impl SshEndpoint {
@@ -176,6 +181,8 @@ impl SshSession {
     /// 失败都返回错误，网络线程随之退出（不会泄漏半开连接）。
     pub fn spawn(options: SshOptions) -> io::Result<Self> {
         let title = options.title();
+        // 编码在 options move 进网络线程前取出（UTF-8 直通零开销）
+        let encoding = options.endpoint.encoding;
         let (ready_tx, ready_rx) = std_mpsc::channel::<SessionHandles>();
 
         let network = std::thread::Builder::new()
@@ -194,15 +201,16 @@ impl SshSession {
             .recv_timeout(std::time::Duration::from_secs(30))
             .map_err(|_| io::Error::other("SSH 连接超时（30s 无响应）"))??;
 
+        let streams = SessionStreams {
+            reader: Box::new(ChannelReader {
+                rx: data_rx,
+                pending: Vec::new(),
+            }),
+            writer: Box::new(ChannelWriter { tx: writer_tx }),
+        };
         Ok(Self {
             cmd_tx,
-            streams: Mutex::new(Some(SessionStreams {
-                reader: Box::new(ChannelReader {
-                    rx: data_rx,
-                    pending: Vec::new(),
-                }),
-                writer: Box::new(ChannelWriter { tx: writer_tx }),
-            })),
+            streams: Mutex::new(Some(encoding.apply(streams))),
             title,
             closing: AtomicBool::new(false),
         })
@@ -614,6 +622,7 @@ mod tests {
             username: "ops".into(),
             auth: SshAuth::Password("secret".into()),
             host_key_policy: HostKeyPolicy::AcceptAll,
+            encoding: SessionEncoding::Utf8,
         }
     }
 
@@ -802,6 +811,7 @@ mod tests {
                 username: user.into(),
                 auth: SshAuth::Password(pass.into()),
                 host_key_policy: HostKeyPolicy::AcceptAll,
+                encoding: SessionEncoding::Utf8,
             }
         };
 

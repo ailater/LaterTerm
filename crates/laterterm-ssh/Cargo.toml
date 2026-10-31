@@ -7,6 +7,7 @@ authors.workspace = true
 description = "LaterTerm SSH 会话后端：russh 实现 TerminalSession 契约"
 
 [dependencies]
+encoding_rs = "0.8.44"
 laterterm-core.workspace = true
 # ring 后端避开 aws-lc-rs 的 cmake 依赖；rsa 保留老服务器 ssh-rsa 主机密钥兼容
 russh = { version = "0.65", default-features = false, features = ["ring", "rsa"] }
