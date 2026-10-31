@@ -7,9 +7,14 @@ authors.workspace = true
 description = "LaterTerm 终端内文件传输：ZMODEM(rz/sz) 兼容通道，trzsz 协议后续演进"
 
 [dependencies]
+base64 = "0.23.1"
+flate2 = "1.1.10"
 laterterm-core.workspace = true
+md5 = "0.8.1"
 # 现代 lrzsz 重写的库形态；ZMODEM 状态机不自造（AGENTS「禁自造轮子」同纪律）
 rzsz = "0.1"
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1.0.154"
 
 [dev-dependencies]
 tempfile = "3"

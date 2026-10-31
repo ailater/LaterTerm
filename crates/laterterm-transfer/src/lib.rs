@@ -15,6 +15,8 @@
 //! 安全口径：`junk_path` 打开——远端路径一律剥离，仅按文件名落到
 //! `download_dir`，杜绝 `../../` 穿越。
 
+mod trzsz;
+
 use laterterm_core::SessionStreams;
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -43,11 +45,11 @@ pub struct TransferOptions {
 }
 
 /// ZMODEM ZRQINIT 触发序列：`** ␘(CAN) B 0`（lrzsz 同款检测串）。
-const TRIGGER: &[u8] = b"**\x18B0";
+const ZMODEM_TRIGGER: &[u8] = b"**\x18B0";
 
-/// 会话字节流的共享写端：UI 键入与 ZMODEM 协议应答同一出口。
+/// 会话字节流的共享写端：UI 键入与协议应答同一出口。
 #[derive(Clone)]
-struct SharedWriter {
+pub(crate) struct SharedWriter {
     inner: Arc<Mutex<Box<dyn Write + Send>>>,
 }
 
@@ -128,7 +130,7 @@ impl Read for TransferReader {
                 // 协议字节已转喂状态机，不进视图；报告消费以驱动读泵
                 Ok(n)
             }
-            ReaderState::Scanning => {
+            ReaderState::Scanning => loop {
                 let n = self.inner.read(buf)?;
                 if n == 0 {
                     // EOF：carry 里的候选前缀已无成触发可能，冲给视图
@@ -141,8 +143,13 @@ impl Read for TransferReader {
                     return Ok(take);
                 }
                 let chunk: Vec<u8> = buf[..n].to_vec();
-                self.scan_chunk(&chunk, buf)
-            }
+                let produced = self.scan_chunk(&chunk, buf)?;
+                // 无产出 = 整块进了 carry（触发尾巴/未齐行）：
+                // 必须继续拉内层，返回 0 会被调用方当 EOF
+                if produced > 0 || matches!(self.state, ReaderState::Active { .. }) {
+                    return Ok(produced);
+                }
+            },
         }
     }
 }
@@ -154,16 +161,52 @@ impl TransferReader {
         let mut window = std::mem::take(&mut self.carry);
         window.extend_from_slice(chunk);
 
-        if let Some(pos) = find_subslice(&window, TRIGGER) {
+        // 双触发扫描：取最早出现者；ZMODEM 从触发帧起全量导入，
+        // trzsz 吞掉整行触发串、从行尾起导入（触发行不是 # 帧）
+        let zmodem_at = find_subslice(&window, ZMODEM_TRIGGER);
+        let trzsz_at = find_subslice(&window, trzsz::TRZSZ_TRIGGER);
+        let route = match (zmodem_at, trzsz_at) {
+            (Some(z), Some(t)) if z <= t => Some((Route::Zmodem, z)),
+            (Some(_), Some(t)) => Some((Route::Trzsz, t)),
+            (Some(z), None) => Some((Route::Zmodem, z)),
+            (None, Some(t)) => Some((Route::Trzsz, t)),
+            (None, None) => None,
+        };
+
+        enum Route {
+            Zmodem,
+            Trzsz,
+        }
+
+        if let Some((route, pos)) = route {
             let _ = self.options.events.send(TransferEvent::Started);
-            match spawn_receiver(&self.options, self.reply.clone(), &window[pos..]) {
+            let spawned = match route {
+                Route::Zmodem => spawn_receiver(&self.options, self.reply.clone(), &window[pos..]),
+                Route::Trzsz => {
+                    // 触发行必须完整到达才能定位行尾；行未到齐则等下一块
+                    let after_trigger = &window[pos..];
+                    match after_trigger.iter().position(|b| *b == b'\n') {
+                        Some(nl) => {
+                            spawn_trzsz(&self.options, self.reply.clone(), &after_trigger[nl + 1..])
+                        }
+                        None => {
+                            // 触发行未到齐：前缀放行，触发行整体扣进 carry 等下轮
+                            let out_len = pos.min(buf.len());
+                            buf[..out_len].copy_from_slice(&window[..out_len]);
+                            self.carry = window[pos..].to_vec();
+                            // 前缀为空：返回 0 表示「已缓冲」，外层循环继续拉
+                            return Ok(0);
+                        }
+                    }
+                }
+            };
+            match spawned {
                 Some((pump, done)) => {
                     self.state = ReaderState::Active { pump, done };
                     // 触发帧在内全部转喂：本块不给视图
                     return Ok(chunk.len().max(1));
                 }
                 None => {
-                    // 起线程失败（极罕见）：当未触发穿透，远端会因超时自退
                     let _ = self
                         .options
                         .events
@@ -173,7 +216,7 @@ impl TransferReader {
         }
 
         // 未触发：放行「确定不可能是触发前缀」的部分，尾巴留待下轮
-        let keep = TRIGGER.len() - 1;
+        let keep = ZMODEM_TRIGGER.len().max(trzsz::TRZSZ_TRIGGER.len()) - 1;
         let safe_len = window.len().saturating_sub(keep);
         let out_len = safe_len.min(buf.len());
         buf[..out_len].copy_from_slice(&window[..out_len]);
@@ -247,6 +290,32 @@ fn spawn_receiver(
     Some((pump, done))
 }
 
+/// 起 trzsz 接收工作线程（与 ZMODEM 的 spawn_receiver 同骨架）。
+fn spawn_trzsz(
+    options: &TransferOptions,
+    reply: SharedWriter,
+    initial: &[u8],
+) -> Option<(UnixStream, Arc<AtomicBool>)> {
+    std::fs::create_dir_all(&options.download_dir).ok()?;
+    let (mut pump, feed) = UnixStream::pair().ok()?;
+    pump.write_all(initial).ok()?;
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done_flag = Arc::clone(&done);
+    let thread_options = TransferOptions {
+        download_dir: options.download_dir.clone(),
+        events: options.events.clone(),
+    };
+
+    std::thread::Builder::new()
+        .name("laterterm-trzsz".into())
+        .spawn(move || {
+            trzsz::run_trzsz_receive(&thread_options, reply, feed, done_flag);
+        })
+        .ok()?;
+    Some((pump, done))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,11 +323,12 @@ mod tests {
 
     #[test]
     fn subslice_finder_basics() {
-        assert_eq!(find_subslice(b"abc**\x18B0def", TRIGGER), Some(3));
-        assert_eq!(find_subslice(b"**\x18B0", TRIGGER), Some(0));
-        assert_eq!(find_subslice(b"nothing here", TRIGGER), None);
-        assert_eq!(find_subslice(b"xy**", TRIGGER), None);
-        assert_eq!(find_subslice(b"", TRIGGER), None);
+        assert_eq!(find_subslice(b"abc**\x18B0def", ZMODEM_TRIGGER), Some(3));
+        assert_eq!(find_subslice(b"**\x18B0", ZMODEM_TRIGGER), Some(0));
+        assert_eq!(find_subslice(b"nothing here", ZMODEM_TRIGGER), None);
+        assert_eq!(find_subslice(b"nothing here", trzsz::TRZSZ_TRIGGER), None);
+        assert_eq!(find_subslice(b"xy**", ZMODEM_TRIGGER), None);
+        assert_eq!(find_subslice(b"", ZMODEM_TRIGGER), None);
     }
 
     /// 真协议回环：sz（rzsz sender）发文件 → 本装饰器检测/分流/落盘，
