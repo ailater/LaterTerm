@@ -3736,6 +3736,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "laterterm-xshell"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

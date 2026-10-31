@@ -1,0 +1,12 @@
+[package]
+name = "laterterm-xshell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "XShell 会话导入（M3）：.xsh 会话文件与 Sessions 目录树解析为中性结构"
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = "3.27.0"

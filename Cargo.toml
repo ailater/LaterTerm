@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/laterterm-app", "crates/laterterm-config", "crates/laterterm-core", "crates/laterterm-local", "crates/laterterm-ssh", "crates/laterterm-termview", "crates/laterterm-transfer"]
+members = ["crates/laterterm-app", "crates/laterterm-config", "crates/laterterm-core", "crates/laterterm-local", "crates/laterterm-ssh", "crates/laterterm-termview", "crates/laterterm-transfer", "crates/laterterm-xshell"]
 
 [workspace.package]
 version = "0.1.0"
@@ -23,6 +23,7 @@ laterterm-core = { path = "crates/laterterm-core" }
 laterterm-local = { path = "crates/laterterm-local" }
 laterterm-ssh = { path = "crates/laterterm-ssh" }
 laterterm-transfer = { path = "crates/laterterm-transfer" }
+laterterm-xshell = { path = "crates/laterterm-xshell" }
 
 [patch.crates-io]
 # xattr 0.2.3 引用了新版 libc 已移除的 Linux ENOATTR；Linux 语义等价于 ENODATA。
