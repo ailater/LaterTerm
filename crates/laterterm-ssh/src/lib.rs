@@ -89,35 +89,56 @@ fn verify_host_key(
 }
 
 /// SSH 会话启动参数。
-pub struct SshOptions {
+/// 一个 SSH 端点（主机 + 凭据 + 主机密钥策略）：目标机与跳板机共用。
+#[derive(Clone, Debug)]
+pub struct SshEndpoint {
     /// 主机名或 IP。
     pub host: String,
-    /// 端口（默认 22 由 [`SshOptions::normalized`] 补齐）。
+    /// 端口（`None` = 默认 22）。
     pub port: Option<u16>,
     /// 登录用户名。
     pub username: String,
     /// 认证方式。
     pub auth: SshAuth,
-    /// 初始列数。
-    pub cols: u16,
-    /// 初始行数。
-    pub rows: u16,
-    /// 主机密钥策略。
+    /// 主机密钥策略（跳板机与目标机各自独立校验）。
     pub host_key_policy: HostKeyPolicy,
 }
 
-impl SshOptions {
+impl SshEndpoint {
     /// 端口补默认值。
     pub fn port(&self) -> u16 {
         self.port.unwrap_or(22)
     }
 
-    /// 标签标题：`user@host`（端口非 22 时带端口，与 ssh 命令行习惯一致）。
+    /// 端点标题：`user@host`（端口非 22 时带端口，与 ssh 命令行习惯一致）。
     pub fn title(&self) -> String {
         if self.port() == 22 {
             format!("{}@{}", self.username, self.host)
         } else {
             format!("{}@{}:{}", self.username, self.host, self.port())
+        }
+    }
+}
+
+/// SSH 会话启动参数。
+pub struct SshOptions {
+    /// 目标机（最终建立 shell 会话的主机）。
+    pub endpoint: SshEndpoint,
+    /// 跳板机（ProxyJump 语义：先连它，再经 direct-tcpip 通道到目标机；
+    /// `None` = 直连）。
+    pub jump: Option<Box<SshEndpoint>>,
+    /// 初始列数。
+    pub cols: u16,
+    /// 初始行数。
+    pub rows: u16,
+}
+
+impl SshOptions {
+    /// 标签标题：目标机为主；经跳板机时后缀 ` ⇢ 跳板机`，一眼区分直连/穿透。
+    pub fn title(&self) -> String {
+        match &self.jump {
+            None => self.endpoint.title(),
+            Some(jump) => format!("{} ⇢ {}", self.endpoint.title(), jump.title()),
         }
     }
 }
@@ -333,82 +354,154 @@ impl russh::client::Handler for ClientHandler {
     }
 }
 
-/// 网络线程主循环：连接 → 认证 → PTY/shell → 通知 spawn → 常驻收发。
+/// 连接并认证一个端点（直连 TCP；跳板机与目标机的第一跳共用）。
+async fn connect_and_auth(
+    endpoint: &SshEndpoint,
+) -> io::Result<russh::client::Handle<ClientHandler>> {
+    let handler = ClientHandler {
+        host_key_policy: endpoint.host_key_policy.clone(),
+        host: endpoint.host.clone(),
+        port: endpoint.port(),
+    };
+    let mut handle = russh::client::connect(
+        std::sync::Arc::new(russh::client::Config::default()),
+        (endpoint.host.as_str(), endpoint.port()),
+        handler,
+    )
+    .await
+    .map_err(|error| io::Error::other(format!("SSH 连接 {} 失败: {error}", endpoint.title())))?;
+    authenticate(&mut handle, endpoint).await?;
+    Ok(handle)
+}
+
+/// 认证阶段（三种方式，见 [`SshAuth`]）。
+async fn authenticate(
+    handle: &mut russh::client::Handle<ClientHandler>,
+    endpoint: &SshEndpoint,
+) -> io::Result<()> {
+    let authenticated = match &endpoint.auth {
+        SshAuth::Password(password) => handle
+            .authenticate_password(&endpoint.username, password)
+            .await
+            .map_err(|error| io::Error::other(format!("SSH 认证通信失败: {error}")))?
+            .success(),
+        SshAuth::KeyFile { path, passphrase } => {
+            let key =
+                russh::keys::load_secret_key(path, passphrase.as_deref()).map_err(|error| {
+                    io::Error::other(format!("加载私钥 {} 失败: {error}", path.display()))
+                })?;
+            let hash_alg = hash_alg_for(key.public_key());
+            handle
+                .authenticate_publickey(
+                    &endpoint.username,
+                    russh::keys::PrivateKeyWithHashAlg::new(std::sync::Arc::new(key), hash_alg),
+                )
+                .await
+                .map_err(|error| io::Error::other(format!("SSH 认证通信失败: {error}")))?
+                .success()
+        }
+        SshAuth::Agent => {
+            // 连接 ssh-agent（SSH_AUTH_SOCK），逐身份尝试，成功即止
+            let mut agent = russh::keys::agent::client::AgentClient::connect_env()
+                .await
+                .map_err(|error| io::Error::other(format!("连接 ssh-agent 失败: {error}")))?;
+            let identities = agent
+                .request_identities()
+                .await
+                .map_err(|error| io::Error::other(format!("ssh-agent 列举身份失败: {error}")))?;
+            let mut success = false;
+            for identity in &identities {
+                let public_key = identity.public_key().into_owned();
+                let result = handle
+                    .authenticate_publickey_with(
+                        &endpoint.username,
+                        public_key,
+                        hash_alg_for(identity.public_key().as_ref()),
+                        &mut agent,
+                    )
+                    .await;
+                if matches!(result, Ok(auth) if auth.success()) {
+                    success = true;
+                    break;
+                }
+            }
+            if !success {
+                return Err(io::Error::other(
+                    "ssh-agent 认证失败（agent 内无该服务器接受的密钥）",
+                ));
+            }
+            true
+        }
+    };
+    if !authenticated {
+        return Err(io::Error::other(format!(
+            "SSH 认证失败: {}（凭据不被服务器接受）",
+            endpoint.title()
+        )));
+    }
+    Ok(())
+}
+
+/// 网络线程主循环：（可选跳板机）→ 目标机 → PTY/shell → 通知 spawn → 常驻收发。
+///
+/// 跳板机穿透 = ProxyJump 语义：先与跳板机建立普通 SSH 连接并认证，
+/// 在其上开 direct-tcpip 通道指向目标机，把该通道当作目标机 SSH 会话的
+/// 传输流（`connect_stream`）——目标机的加密/认证独立于跳板机。
 ///
 /// 两个常驻任务：
 /// - 收发任务：`select` 上 SSH 通道消息（Data/ExtendedData → std 通道）
 ///   与控制指令（Resize → window_change；Shutdown → 断连并退出）
 /// - 写任务：tokio 通道的字节 → `make_writer` 异步写入
 async fn network_main(options: SshOptions, ready_tx: std_mpsc::Sender<SessionHandles>) {
-    let config = std::sync::Arc::new(russh::client::Config::default());
-    let handler = ClientHandler {
-        host_key_policy: options.host_key_policy.clone(),
-        host: options.host.clone(),
-        port: options.port(),
-    };
-    let addr = (options.host.as_str(), options.port());
-
     let connect_result: io::Result<()> = async {
-        let mut handle = russh::client::connect(config, addr, handler)
-            .await
-            .map_err(|error| io::Error::other(format!("SSH 连接失败: {error}")))?;
+        // 第一跳：跳板机（可选）。它的 Handle 必须存活到会话结束——
+        // drop 即断开转发通道，目标机连接随之消亡。
+        let bastion_handle = match &options.jump {
+            Some(jump) => {
+                let bastion = connect_and_auth(jump).await?;
+                Some(bastion)
+            }
+            None => None,
+        };
 
-        let authenticated = match &options.auth {
-            SshAuth::Password(password) => handle
-                .authenticate_password(&options.username, password)
-                .await
-                .map_err(|error| io::Error::other(format!("SSH 认证通信失败: {error}")))?
-                .success(),
-            SshAuth::KeyFile { path, passphrase } => {
-                let key =
-                    russh::keys::load_secret_key(path, passphrase.as_deref()).map_err(|error| {
-                        io::Error::other(format!("加载私钥 {} 失败: {error}", path.display()))
-                    })?;
-                let hash_alg = hash_alg_for(key.public_key());
-                handle
-                    .authenticate_publickey(
-                        &options.username,
-                        russh::keys::PrivateKeyWithHashAlg::new(std::sync::Arc::new(key), hash_alg),
+        // 目标机：直连，或经跳板机的 direct-tcpip 通道穿透
+        let handle = match &bastion_handle {
+            Some(bastion) => {
+                let endpoint = &options.endpoint;
+                let forward = bastion
+                    .channel_open_direct_tcpip(
+                        endpoint.host.as_str(),
+                        endpoint.port() as u32,
+                        "127.0.0.1",
+                        0,
                     )
                     .await
-                    .map_err(|error| io::Error::other(format!("SSH 认证通信失败: {error}")))?
-                    .success()
-            }
-            SshAuth::Agent => {
-                // 连接 ssh-agent（SSH_AUTH_SOCK），逐身份尝试，成功即止
-                let mut agent = russh::keys::agent::client::AgentClient::connect_env()
-                    .await
-                    .map_err(|error| io::Error::other(format!("连接 ssh-agent 失败: {error}")))?;
-                let identities = agent.request_identities().await.map_err(|error| {
-                    io::Error::other(format!("ssh-agent 列举身份失败: {error}"))
+                    .map_err(|error| {
+                        io::Error::other(format!(
+                            "跳板机开转发通道到 {} 失败: {error}",
+                            endpoint.title()
+                        ))
+                    })?;
+                let stream = forward.into_stream();
+                let handler = ClientHandler {
+                    host_key_policy: endpoint.host_key_policy.clone(),
+                    host: endpoint.host.clone(),
+                    port: endpoint.port(),
+                };
+                let mut handle = russh::client::connect_stream(
+                    std::sync::Arc::new(russh::client::Config::default()),
+                    stream,
+                    handler,
+                )
+                .await
+                .map_err(|error| {
+                    io::Error::other(format!("经跳板机连接 {} 失败: {error}", endpoint.title()))
                 })?;
-                let mut success = false;
-                for identity in &identities {
-                    let public_key = identity.public_key().into_owned();
-                    let result = handle
-                        .authenticate_publickey_with(
-                            &options.username,
-                            public_key,
-                            hash_alg_for(identity.public_key().as_ref()),
-                            &mut agent,
-                        )
-                        .await;
-                    if matches!(result, Ok(auth) if auth.success()) {
-                        success = true;
-                        break;
-                    }
-                }
-                if !success {
-                    return Err(io::Error::other(
-                        "ssh-agent 认证失败（agent 内无该服务器接受的密钥）",
-                    ));
-                }
-                true
+                authenticate(&mut handle, endpoint).await?;
+                handle
             }
+            None => connect_and_auth(&options.endpoint).await?,
         };
-        if !authenticated {
-            return Err(io::Error::other("SSH 认证失败（凭据不被服务器接受）"));
-        }
 
         let mut channel = handle
             .channel_open_session()
@@ -477,10 +570,16 @@ async fn network_main(options: SshOptions, ready_tx: std_mpsc::Sender<SessionHan
                 },
             }
         }
-        // 退出路径统一：先断连（尽力而为），drop data_tx 让视图读端收 EOF
+        // 退出路径统一：先断目标机，再断跳板机（尽力而为），
+        // drop data_tx 让视图读端收 EOF
         let _ = handle
             .disconnect(russh::Disconnect::ByApplication, "session closed", "en")
             .await;
+        if let Some(bastion) = bastion_handle {
+            let _ = bastion
+                .disconnect(russh::Disconnect::ByApplication, "session closed", "en")
+                .await;
+        }
         Ok(())
     }
     .await;
@@ -508,15 +607,22 @@ mod tests {
         russh::keys::PublicKey::from_openssh(line).expect("解析测试公钥")
     }
 
-    fn sample_options() -> SshOptions {
-        SshOptions {
-            host: "bastion.example.com".into(),
+    fn sample_endpoint(host: &str) -> SshEndpoint {
+        SshEndpoint {
+            host: host.into(),
             port: None,
             username: "ops".into(),
             auth: SshAuth::Password("secret".into()),
+            host_key_policy: HostKeyPolicy::AcceptAll,
+        }
+    }
+
+    fn sample_options() -> SshOptions {
+        SshOptions {
+            endpoint: sample_endpoint("bastion.example.com"),
+            jump: None,
             cols: 110,
             rows: 30,
-            host_key_policy: HostKeyPolicy::AcceptAll,
         }
     }
 
@@ -593,13 +699,30 @@ mod tests {
 
     #[test]
     fn title_follows_ssh_convention() {
-        let options = sample_options();
-        assert_eq!(options.title(), "ops@bastion.example.com");
-        assert_eq!(options.port(), 22);
+        let endpoint = sample_endpoint("bastion.example.com");
+        assert_eq!(endpoint.title(), "ops@bastion.example.com");
+        assert_eq!(endpoint.port(), 22);
 
+        let mut endpoint = sample_endpoint("bastion.example.com");
+        endpoint.port = Some(2222);
+        assert_eq!(endpoint.title(), "ops@bastion.example.com:2222");
+    }
+
+    /// 标签口径：直连只显示目标机；经跳板机穿透时后缀 ` ⇢ 跳板机`，
+    /// 一眼区分「我登的是内网机哪台、走的哪条链」。
+    #[test]
+    fn title_marks_jump_chain() {
         let mut options = sample_options();
-        options.port = Some(2222);
-        assert_eq!(options.title(), "ops@bastion.example.com:2222");
+        options.endpoint.host = "intranet.internal".into();
+        assert_eq!(options.title(), "ops@intranet.internal");
+
+        let mut jump = sample_endpoint("bastion.example.com");
+        jump.port = Some(2222);
+        options.jump = Some(Box::new(jump));
+        assert_eq!(
+            options.title(),
+            "ops@intranet.internal ⇢ ops@bastion.example.com:2222"
+        );
     }
 
     /// 读桥契约：分块送达 + 发送端全退后 EOF（termview 的 Exit 触发源）。
@@ -657,29 +780,40 @@ mod tests {
     }
 
     /// 真实主机集成测试（默认忽略）：
-    /// `LATERTERM_SSH_TEST=user:pass@host[:port] cargo test -p laterterm-ssh -- --ignored`
+    /// 直连：`LATERTERM_SSH_TEST=user:pass@host[:port] cargo test -p laterterm-ssh -- --ignored`
+    /// 穿透：再设 `LATERTERM_SSH_JUMP=user:pass@bastion[:port]`——目标机经跳板机 direct-tcpip 建立。
     #[test]
     #[ignore = "需要真实 SSH 主机，经 LATERTERM_SSH_TEST 环境变量注入"]
     fn connect_shell_roundtrip_against_real_host() {
         let spec = std::env::var("LATERTERM_SSH_TEST").expect("缺 LATERTERM_SSH_TEST");
         // user:pass@host[:port]
-        let (userinfo, hostport) = spec.rsplit_once('@').expect("格式 user:pass@host[:port]");
-        let (user, pass) = userinfo
-            .split_once(':')
-            .expect("格式 user:pass@host[:port]");
-        let (host, port) = match hostport.rsplit_once(':') {
-            Some((host, port)) => (host.to_string(), port.parse().ok()),
-            None => (hostport.to_string(), None),
+        let parse = |spec: &str| -> SshEndpoint {
+            let (userinfo, hostport) = spec.rsplit_once('@').expect("格式 user:pass@host[:port]");
+            let (user, pass) = userinfo
+                .split_once(':')
+                .expect("格式 user:pass@host[:port]");
+            let (host, port) = match hostport.rsplit_once(':') {
+                Some((host, port)) => (host.to_string(), port.parse().ok()),
+                None => (hostport.to_string(), None),
+            };
+            SshEndpoint {
+                host,
+                port,
+                username: user.into(),
+                auth: SshAuth::Password(pass.into()),
+                host_key_policy: HostKeyPolicy::AcceptAll,
+            }
         };
 
+        let jump = std::env::var("LATERTERM_SSH_JUMP")
+            .ok()
+            .map(|jump_spec| Box::new(parse(&jump_spec)));
+
         let session = SshSession::spawn(SshOptions {
-            host,
-            port,
-            username: user.into(),
-            auth: SshAuth::Password(pass.into()),
+            endpoint: parse(&spec),
+            jump,
             cols: 80,
             rows: 24,
-            host_key_policy: HostKeyPolicy::AcceptAll,
         })
         .expect("连接失败");
 
