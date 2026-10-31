@@ -1,9 +1,0 @@
-[package]
-name = "laterterm-deepin"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
-description = "deepin-terminal 配置导入（M3）：command/server 配置解析为中性结构，转换接线随面板落地"
-
-[dependencies]
