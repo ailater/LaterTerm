@@ -16,6 +16,7 @@
 //! take_streams 返回的 reader/writer 装饰器上是既定演进位。
 
 pub mod encoding;
+pub mod sftp;
 
 pub use encoding::SessionEncoding;
 use laterterm_core::{BackendKind, SessionStreams, TerminalSession};
