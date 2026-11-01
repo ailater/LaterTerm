@@ -24,6 +24,7 @@ notify = "8"
 laterterm-ssh.workspace = true
 laterterm-xshell.workspace = true
 laterterm-deepin.workspace = true
+shellexpand = "3.1.2"
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

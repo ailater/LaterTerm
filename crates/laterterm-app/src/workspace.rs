@@ -197,6 +197,20 @@ struct ServerDialog {
     encoding: usize,
 }
 
+/// 导入对话框状态：来源选择 → 路径输入 → 扫描预览 → 确认导入。
+struct ServerImportState {
+    /// 0=XShell 1=deepin。
+    source: usize,
+    /// 路径输入框。
+    path_field: Entity<CommandTextField>,
+    /// 扫描结果预览（空 = 未扫描）。
+    preview: Vec<ServerEntry>,
+    /// 跳过的条目（名+原因）。
+    skipped: Vec<(String, String)>,
+    /// deepin 命令模板（仅 deepin 来源）。
+    commands: Vec<CommandTemplate>,
+}
+
 /// TOTP 侧面板对话框。Preview 的 code 为 None 表示正在从密钥环读取并计算。
 #[derive(Clone, Debug)]
 enum TotpDialog {
@@ -268,6 +282,7 @@ pub struct WorkspaceView {
     server_connecting: Option<String>,
     server_error: Option<String>,
     server_delete_confirm: Option<String>,
+    server_import: Option<ServerImportState>,
     totp_error: Option<String>,
     totp_target: Option<PaneId>,
     totp_generating: bool,
@@ -323,6 +338,7 @@ impl WorkspaceView {
             server_connecting: None,
             server_error: None,
             server_delete_confirm: None,
+            server_import: None,
             totp_error: None,
             totp_target: None,
             totp_generating: false,
@@ -1147,6 +1163,135 @@ impl WorkspaceView {
     ) {
         self.server_dialog = None;
         self.server_fields.clear();
+        self.server_import = None;
+        cx.notify();
+    }
+
+    // ───────────────────── 导入（XShell / deepin）────────────────────
+
+    /// 打开导入对话框（0=XShell Sessions 目录 / 1=deepin 配置目录）。
+    fn open_import(&mut self, source: usize, cx: &mut Context<Self>) {
+        let default_path = if source == 0 {
+            // XShell Sessions 常见路径提示
+            "~/Documents/NetSarang Computer/Xshell/Sessions"
+        } else {
+            "~/.config/deepin/deepin-terminal"
+        };
+        let path_field = cx.new(|cx| CommandTextField::new(default_path.to_string(), "路径", cx));
+        self.server_import = Some(ServerImportState {
+            source,
+            path_field,
+            preview: Vec::new(),
+            skipped: Vec::new(),
+            commands: Vec::new(),
+        });
+        self.server_error = None;
+        cx.notify();
+    }
+
+    /// 切换来源（XShell ⇄ deepin），重置路径提示与预览。
+    fn cycle_import_source(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = &mut self.server_import {
+            state.source = 1 - state.source;
+            let default_path = if state.source == 0 {
+                "~/Documents/NetSarang Computer/Xshell/Sessions"
+            } else {
+                "~/.config/deepin/deepin-terminal"
+            };
+            // 重置路径与预览
+            let new_field =
+                cx.new(|cx| CommandTextField::new(default_path.to_string(), "路径", cx));
+            state.path_field = new_field;
+            state.preview.clear();
+            state.skipped.clear();
+            state.commands.clear();
+        }
+        cx.notify();
+    }
+
+    /// 扫描：解析 + 转换 → 预览列表。文件 I/O 短小（INI 文件），前台即可。
+    fn scan_import(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &mut self.server_import else {
+            return;
+        };
+        let raw_path = state.path_field.read(cx).value().trim().to_string();
+        let path = shellexpand::tilde(&raw_path).to_string();
+        let path = std::path::PathBuf::from(path);
+
+        if state.source == 0 {
+            // XShell：目录树扫描
+            match laterterm_xshell::load_sessions_dir(&path) {
+                Ok(sessions) => {
+                    let (entries, skipped) = crate::import::xshell_batch(&sessions);
+                    state.preview = entries;
+                    state.skipped = skipped;
+                }
+                Err(error) => {
+                    self.server_error = Some(format!("XShell 扫描失败: {error}"));
+                    cx.notify();
+                    return;
+                }
+            }
+        } else {
+            // deepin：读两份配置文件
+            let servers_file = path.join("server-config.conf");
+            let commands_file = path.join("command-config.conf");
+            if let Ok(text) = std::fs::read_to_string(&servers_file) {
+                match laterterm_deepin::parse_servers(&text) {
+                    Ok(servers) => {
+                        let (entries, skipped) = crate::import::deepin_servers_batch(&servers);
+                        state.preview = entries;
+                        state.skipped = skipped;
+                    }
+                    Err(error) => {
+                        self.server_error = Some(format!("deepin 服务器解析失败: {error}"));
+                    }
+                }
+            } else {
+                self.server_error = Some(format!("读不到 {}: 请确认路径", servers_file.display()));
+            }
+            if let Ok(text) = std::fs::read_to_string(&commands_file)
+                && let Ok(commands) = laterterm_deepin::parse_commands(&text)
+            {
+                state.commands = crate::import::deepin_commands_batch(&commands);
+            }
+        }
+        self.server_error = None;
+        cx.notify();
+    }
+
+    /// 确认导入：把预览条目全部 upsert 进 ServerStore 并落盘。
+    fn confirm_import(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = &self.server_import else {
+            return;
+        };
+        let count = state.preview.len();
+        let command_count = state.commands.len();
+        for entry in &state.preview {
+            self.servers.upsert(entry.clone());
+        }
+        if let Err(error) = self.servers.save() {
+            self.server_error = Some(format!("保存 servers.toml 失败: {error}"));
+            cx.notify();
+            return;
+        }
+        // deepin 命令模板也一并导入（按名去重：已存在的跳过）
+        if !state.commands.is_empty() {
+            for template in &state.commands {
+                if !self
+                    .settings
+                    .commands
+                    .iter()
+                    .any(|existing| existing.name == template.name)
+                {
+                    self.settings.commands.push(template.clone());
+                }
+            }
+            self.settings.save();
+        }
+        self.server_import = None;
+        self.server_error = None;
+        let _ = (count, command_count);
         cx.notify();
     }
 
@@ -2653,11 +2798,26 @@ fn servers_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>)
         .flex_col()
         .gap_3()
         .child(section_title("服务器"))
-        .child(setting_button(
-            "添加服务器",
-            true,
-            cx.listener(|this, _event, _window, cx| this.edit_server(None, cx)),
-        ))
+        .child(
+            div()
+                .flex()
+                .gap_1()
+                .child(setting_button(
+                    "添加服务器",
+                    true,
+                    cx.listener(|this, _event, _window, cx| this.edit_server(None, cx)),
+                ))
+                .child(setting_button(
+                    "从 XShell 导入",
+                    false,
+                    cx.listener(|this, _event, _window, cx| this.open_import(0, cx)),
+                ))
+                .child(setting_button(
+                    "从 deepin 导入",
+                    false,
+                    cx.listener(|this, _event, _window, cx| this.open_import(1, cx)),
+                )),
+        )
         .when_some(error, |panel, error| {
             panel.child(div().text_color(rgb(0xF7768E)).child(error))
         });
@@ -2785,6 +2945,102 @@ fn servers_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>)
                         cx.listener(WorkspaceView::cancel_server),
                     )),
             );
+    }
+
+    // 导入对话框（XShell / deepin）
+    if let Some(import) = &workspace.server_import {
+        let source_label = if import.source == 0 {
+            "XShell"
+        } else {
+            "deepin-terminal"
+        };
+        let path_field = import.path_field.clone();
+        let preview_count = import.preview.len();
+        let skipped_count = import.skipped.len();
+        let command_count = import.commands.len();
+
+        panel = panel
+            .child(
+                div()
+                    .pt_4()
+                    .text_color(rgb(0x7DCFFF))
+                    .child(format!("从 {} 导入", source_label)),
+            )
+            .child(
+                div()
+                    .pt_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(64.0)).text_color(rgb(0x7D829F)).child("路径"))
+                    .child(path_field),
+            )
+            .child(
+                div()
+                    .pt_2()
+                    .flex()
+                    .gap_1()
+                    .child(setting_button(
+                        if import.source == 0 {
+                            "XShell"
+                        } else {
+                            "deepin"
+                        },
+                        false,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.cycle_import_source(cx);
+                        }),
+                    ))
+                    .child(setting_button(
+                        "扫描",
+                        true,
+                        cx.listener(|this, _event, _window, cx| this.scan_import(cx)),
+                    ))
+                    .when(preview_count > 0, |panel| {
+                        panel.child(setting_button(
+                            format!("导入全部（{} 台）", preview_count),
+                            true,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.confirm_import(cx);
+                            }),
+                        ))
+                    }),
+            );
+
+        if preview_count > 0 || skipped_count > 0 || command_count > 0 {
+            panel = panel.child(div().pt_2().text_color(rgb(0x7D829F)).child(format!(
+                "服务器 {} 台，跳过 {}，命令模板 {} 条",
+                preview_count, skipped_count, command_count
+            )));
+            // 预览列表（最多显示 10 条防溢出）
+            for entry in import.preview.iter().take(10) {
+                let endpoint = if entry.port == 22 {
+                    format!("{}@{}", entry.username, entry.host)
+                } else {
+                    format!("{}@{}:{}", entry.username, entry.host, entry.port)
+                };
+                let encoding = entry.encoding.clone().unwrap_or_else(|| "UTF-8".into());
+                panel = panel.child(
+                    div()
+                        .text_color(rgb(0x9ECE6A))
+                        .child(format!("✓ {} · {} · {}", entry.name, endpoint, encoding)),
+                );
+            }
+            if preview_count > 10 {
+                panel = panel.child(
+                    div()
+                        .text_color(rgb(0x7D829F))
+                        .child(format!("… 共 {} 台", preview_count)),
+                );
+            }
+            for (name, reason) in import.skipped.iter().take(3) {
+                panel = panel.child(
+                    div()
+                        .text_color(rgb(0xF7768E))
+                        .child(format!("✗ {} — {}", name, reason)),
+                );
+            }
+        }
     }
 
     panel
