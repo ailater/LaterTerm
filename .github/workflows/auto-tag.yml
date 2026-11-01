@@ -1,0 +1,55 @@
+# LaterTerm auto-tag：版本号变化 → 自动打 tag → 派发 release.yml
+#
+# 与 LaterMD 同款发版模型（零人工 tag push）：
+# - PR 把 Cargo.toml workspace.package.version 提到新值 + CHANGELOG 对应小节
+# - 合入 main 且 CI 绿后，本 workflow 自动打 tag 并触发完整发布链
+# - 版本号不变地合入不会重复发版
+#
+# 前提：GH_TOKEN 有 contents:write 权限（GITHUB_TOKEN 的 default 权限够用）。
+
+name: Auto Tag
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  tag-and-dispatch:
+    # 只在 CI 成功后跑；跳过不含 Cargo.toml 变更的合入（纯文档等）
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 需要拉全部 tag 做比对
+          fetch-depth: 0
+
+      - name: 比对版本号并打 tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          TAG="v${VERSION}"
+          echo "Cargo.toml 版本: $VERSION → tag: $TAG"
+
+          # 已有同名 tag = 版本未变，跳过（不重复发版）
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "tag $TAG 已存在，版本未变，跳过"
+            exit 0
+          fi
+
+          # tag 指向当前 main HEAD（CI 已绿）
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "LaterTerm $TAG"
+          git push origin "$TAG"
+          echo "已打 tag $TAG"
+
+          # 派发 release workflow
+          gh workflow run release.yml --ref "$TAG"
+          echo "已 dispatch release.yml @ $TAG"
