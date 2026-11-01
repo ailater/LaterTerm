@@ -45,7 +45,7 @@ jobs:
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           mkdir -p laterterm-${VERSION}
-          cp target/release/latermd laterterm-${VERSION}/
+          cp target/release/laterterm laterterm-${VERSION}/
           cp README.md laterterm-${VERSION}/
           tar -cJf laterterm-${VERSION}-x86_64-unknown-linux-gnu.tar.xz laterterm-${VERSION}/
           sha256sum laterterm-${VERSION}-x86_64-unknown-linux-gnu.tar.xz > laterterm-${VERSION}-x86_64-unknown-linux-gnu.tar.xz.sha256
@@ -74,17 +74,17 @@ jobs:
 
       - name: 构建双架构
         run: |
-          cargo build --release -p laterterm-app --bin latermd --target aarch64-apple-darwin
-          cargo build --release -p laterterm-app --bin latermd --target x86_64-apple-darwin
+          cargo build --release -p laterterm-app --bin laterterm --target aarch64-apple-darwin
+          cargo build --release -p laterterm-app --bin laterterm --target x86_64-apple-darwin
 
       - name: lipo 合一
         run: |
           lipo -create \
-            -output latermd-universal \
-            target/x86_64-apple-darwin/release/latermd \
-            target/aarch64-apple-darwin/release/latermd
-          lipo -archs latermd-universal | tee /dev/stderr | grep -q x86_64
-          lipo -archs latermd-universal | tee /dev/stderr | grep -q arm64
+            -output laterterm-universal \
+            target/x86_64-apple-darwin/release/laterterm \
+            target/aarch64-apple-darwin/release/laterterm
+          lipo -archs laterterm-universal | tee /dev/stderr | grep -q x86_64
+          lipo -archs laterterm-universal | tee /dev/stderr | grep -q arm64
 
       - name: 清理构建产物腾磁盘
         run: |
@@ -98,10 +98,10 @@ jobs:
         run: |
           VERSION_NUM="${VERSION#v}"
           # 最小 .app bundle（Info.plist 后续补齐）
-          mkdir -p LaterMD.app/Contents/MacOS
-          cp latermd-universal LaterMD.app/Contents/MacOS/latermd
-          DMG="latermd-${VERSION_NUM}-universal2-apple-darwin.dmg"
-          hdiutil create -volname "LaterTerm" -srcfolder LaterMD.app \
+          mkdir -p LaterTerm.app/Contents/MacOS
+          cp laterterm-universal LaterTerm.app/Contents/MacOS/laterterm
+          DMG="laterterm-${VERSION_NUM}-universal2-apple-darwin.dmg"
+          hdiutil create -volname "LaterTerm" -srcfolder LaterTerm.app \
             -ov -format UDZO "$DMG"
           shasum -a 256 "$DMG" > "$DMG.sha256"
 
