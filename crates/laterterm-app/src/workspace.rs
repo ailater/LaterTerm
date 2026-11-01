@@ -5,12 +5,13 @@ use gpui::{
     Styled, WeakEntity, Window, div, prelude::FluentBuilder, px, rgb,
 };
 use laterterm_config::{
-    Appearance, CommandTemplate, Settings, Theme, ThemeRegistry, TotpAlgorithm, TotpConfig,
-    TotpEntry, app_config_dir, generate_code, parse_secret_input,
+    Appearance, CommandTemplate, ServerAuthKind, ServerEntry, Settings, Theme, ThemeRegistry,
+    TotpAlgorithm, TotpConfig, TotpEntry, app_config_dir, generate_code, parse_secret_input,
 };
 use laterterm_core::TerminalSession;
 use laterterm_local::{LocalOptions, LocalSession};
-use laterterm_secrets::{SecretStore, default_store, totp_account};
+use laterterm_secrets::{SecretStore, default_store, ssh_account, totp_account};
+use laterterm_ssh::{AuthMethod, SshOptions, SshSession};
 use laterterm_termview::{ColorPalette, TerminalConfig, TerminalView};
 use notify::Watcher;
 use std::collections::BTreeMap;
@@ -199,6 +200,39 @@ enum TotpDialog {
     },
 }
 
+/// 右面板分区。三个区各成一页，避免面板无限拉长。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RightPanelTab {
+    #[default]
+    Commands,
+    Totp,
+    Servers,
+}
+
+impl RightPanelTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Commands => "命令",
+            Self::Totp => "动态码",
+            Self::Servers => "服务器",
+        }
+    }
+
+    const ALL: [Self; 3] = [Self::Commands, Self::Totp, Self::Servers];
+}
+
+/// 服务器侧面板对话框。Connect 用于缺凭据时补输（可选择记住入密钥环）。
+#[derive(Clone, Debug)]
+enum ServerDialog {
+    Edit {
+        original: Option<String>,
+    },
+    Connect {
+        name: String,
+        remember: bool,
+    },
+}
+
 struct Pane {
     id: PaneId,
     title: String,
@@ -253,6 +287,16 @@ pub struct WorkspaceView {
     totp_error: Option<String>,
     totp_target: Option<PaneId>,
     totp_generating: bool,
+    right_panel_tab: RightPanelTab,
+    server_dialog: Option<ServerDialog>,
+    server_fields: Vec<(String, Entity<CommandTextField>)>,
+    server_meta_draft: ServerEntry,
+    server_delete_confirm: Option<String>,
+    server_error: Option<String>,
+    /// 正在连接中的服务器名（None 表示空闲；期间禁止并发连接）。
+    ssh_connecting: Option<String>,
+    /// SSH 连接结果暂存：后台线程产物在 render 期统一消费（需要 window 开新标签）。
+    pending_ssh_results: Vec<(String, anyhow::Result<Arc<dyn TerminalSession>>)>,
     secret_store: Arc<dyn SecretStore>,
 }
 
@@ -302,6 +346,14 @@ impl WorkspaceView {
             totp_error: None,
             totp_target: None,
             totp_generating: false,
+            right_panel_tab: RightPanelTab::Commands,
+            server_dialog: None,
+            server_fields: Vec::new(),
+            server_meta_draft: ServerEntry::default(),
+            server_delete_confirm: None,
+            server_error: None,
+            ssh_connecting: None,
+            pending_ssh_results: Vec::new(),
             secret_store: default_store(),
             settings_page: SettingsPage::Appearance,
             panes: vec![Pane {
@@ -430,20 +482,26 @@ impl WorkspaceView {
         self.spawn_tab(window, cx);
     }
 
-    /// 新建标签：一个标签一个全新窗格与分屏树根。
-    fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 统一窗格装配：建视图、订阅退出事件、登记 Pane，返回 pane id。
+    /// 本地 PTY 与 SSH 会话共用；调用方自行决定挂到新标签还是分屏。
+    fn attach_pane(
+        &mut self,
+        title: String,
+        session: Arc<dyn TerminalSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> PaneId {
         let pane_id = PaneId(self.next_pane_id);
         self.next_pane_id += 1;
-        let tab_id = TabId(self.next_tab_id);
-        self.next_tab_id += 1;
         let theme = self.themes.resolve(&self.settings.appearance.theme).clone();
-        let (terminal, session) = create_local_terminal(
+        let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
+        let terminal = create_terminal_view(
             pane_id,
+            session,
+            terminal_config_for(&self.settings.appearance, &theme),
             cx.weak_entity(),
-            cx,
-            &self.settings.appearance,
-            &theme,
             self.shortcut_tx.clone(),
+            cx,
         );
         cx.subscribe_in(
             &terminal,
@@ -455,11 +513,21 @@ impl WorkspaceView {
         .detach();
         self.panes.push(Pane {
             id: pane_id,
-            title: format!("终端 {}", pane_id.0),
+            title,
             terminal,
-            session,
+            session: session_control,
             status: TabStatus::Running,
         });
+        pane_id
+    }
+
+    /// 新建标签：一个标签一个全新窗格与分屏树根。
+    fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let title = format!("终端 {}", self.next_pane_id);
+        let session = spawn_local_session();
+        let pane_id = self.attach_pane(title, session, window, cx);
+        let tab_id = TabId(self.next_tab_id);
+        self.next_tab_id += 1;
         self.tabs.push(WorkspaceTab {
             id: tab_id,
             layout: LayoutNode::Leaf(pane_id),
@@ -476,32 +544,9 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         let old = self.focused_pane_id();
-        let pane_id = PaneId(self.next_pane_id);
-        self.next_pane_id += 1;
-        let theme = self.themes.resolve(&self.settings.appearance.theme).clone();
-        let (terminal, session) = create_local_terminal(
-            pane_id,
-            cx.weak_entity(),
-            cx,
-            &self.settings.appearance,
-            &theme,
-            self.shortcut_tx.clone(),
-        );
-        cx.subscribe_in(
-            &terminal,
-            window,
-            move |this, _, _: &laterterm_termview::view::TerminalExited, window, cx| {
-                this.mark_exited(pane_id, window, cx);
-            },
-        )
-        .detach();
-        self.panes.push(Pane {
-            id: pane_id,
-            title: format!("终端 {}", pane_id.0),
-            terminal,
-            session,
-            status: TabStatus::Running,
-        });
+        let title = format!("终端 {}", self.next_pane_id);
+        let session = spawn_local_session();
+        let pane_id = self.attach_pane(title, session, window, cx);
         let tab_index = self.active_tab_index();
         let replacement = LayoutNode::Split {
             direction,
@@ -509,7 +554,10 @@ impl WorkspaceView {
             second: Box::new(LayoutNode::Leaf(pane_id)),
         };
         if !self.tabs[tab_index].layout.replace_leaf(old, replacement) {
-            self.panes.pop();
+            // 布局替换失败：回滚刚登记的窗格
+            if let Some(index) = self.panes.iter().position(|pane| pane.id == pane_id) {
+                self.panes.remove(index);
+            }
             return;
         }
         self.focus_pane(pane_id, window, cx);
@@ -1289,6 +1337,386 @@ impl WorkspaceView {
         .detach();
     }
 
+    // ---------- 服务器区（M3 服务器管理）----------
+
+    fn edit_server(&mut self, entry: Option<&ServerEntry>, cx: &mut Context<Self>) {
+        self.server_meta_draft = entry.cloned().unwrap_or_default();
+        self.server_fields.clear();
+        let meta = self.server_meta_draft.clone();
+        // 编辑时凭据框留空表示不改动；凭据本体只进密钥环
+        let secret_placeholder = if entry.is_some() {
+            "留空保持现有凭据"
+        } else {
+            match meta.auth {
+                ServerAuthKind::Password => "密码（可选，存密钥环）",
+                ServerAuthKind::KeyboardInteractive => "口令（可选，存密钥环）",
+                ServerAuthKind::PrivateKey => "passphrase（可选）",
+            }
+        };
+        let rows: [(&str, String, &str); 7] = [
+            ("名称", meta.name, "如 跳板机A"),
+            ("主机", meta.host, "host 或 IP"),
+            ("端口", meta.port.to_string(), "22"),
+            ("用户名", meta.username, "登录用户"),
+            (
+                "私钥路径",
+                meta.key_path.unwrap_or_default(),
+                "仅密钥认证需要，如 ~/.ssh/id_ed25519",
+            ),
+            ("备注", meta.note, "备注（可选）"),
+            ("凭据", String::new(), secret_placeholder),
+        ];
+        for (label, value, placeholder) in rows {
+            let field = cx.new(|cx| CommandTextField::new(value, placeholder, cx));
+            self.server_fields.push((label.into(), field));
+        }
+        self.server_dialog = Some(ServerDialog::Edit {
+            original: entry.map(|item| item.name.clone()),
+        });
+        self.server_error = None;
+        cx.notify();
+    }
+
+    /// 保存服务器：校验与凭据写入（改名迁移）都在后台线程，避免密钥环 DBus 阻塞。
+    fn save_server(&mut self, original: Option<String>, cx: &mut Context<Self>) {
+        let values = self
+            .server_fields
+            .iter()
+            .map(|(name, field)| (name.as_str(), field.read(cx).value().to_string()))
+            .collect::<BTreeMap<_, _>>();
+        let mut meta = self.server_meta_draft.clone();
+        meta.name = values.get("名称").map(|v| v.trim().to_string()).unwrap_or_default();
+        meta.host = values.get("主机").map(|v| v.trim().to_string()).unwrap_or_default();
+        meta.port = values
+            .get("端口")
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .unwrap_or(0);
+        meta.username = values
+            .get("用户名")
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+        meta.key_path = values
+            .get("私钥路径")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        meta.note = values.get("备注").map(|v| v.trim().to_string()).unwrap_or_default();
+        let secret = values
+            .get("凭据")
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+        if let Err(error) = meta.validate() {
+            self.server_error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        // 同名冲突（改名撞上既有条目）
+        if original.as_deref() != Some(meta.name.as_str())
+            && self.settings.servers.iter().any(|item| item.name == meta.name)
+        {
+            self.server_error = Some(format!("已存在同名服务器: {}", meta.name));
+            cx.notify();
+            return;
+        }
+        let store = self.secret_store.clone();
+        let original_bg = original.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let account = ssh_account(&meta.name)?;
+                    if !secret.is_empty() {
+                        store.set(&account, &secret)?;
+                    } else if let Some(previous) = &original_bg {
+                        // 改名不重录凭据：从旧账户迁移，失败则保持原状
+                        let previous_account = ssh_account(previous)?;
+                        if previous_account != account {
+                            match store.get(&previous_account)? {
+                                Some(existing) => {
+                                    store.set(&account, &existing)?;
+                                    store.delete(&previous_account)?;
+                                }
+                                None => store.delete(&previous_account)?,
+                            }
+                        }
+                    }
+                    Ok::<_, anyhow::Error>(meta)
+                })
+                .await;
+            let _ = this.update(cx, |workspace, cx| match result {
+                Ok(meta) => {
+                    let previous_settings = workspace.settings.clone();
+                    if let Some(previous) = &original
+                        && previous != &meta.name
+                    {
+                        workspace.settings.remove_server(previous);
+                    }
+                    if let Err(error) = workspace.settings.upsert_server(meta) {
+                        workspace.settings = previous_settings;
+                        workspace.server_error = Some(error.to_string());
+                    } else if let Some(path) = Settings::default_path()
+                        && let Err(error) = workspace.settings.save_to(&path)
+                    {
+                        workspace.settings = previous_settings;
+                        workspace.server_error = Some(format!("保存服务器失败: {error:#}"));
+                    } else {
+                        workspace.server_dialog = None;
+                        workspace.server_fields.clear();
+                        workspace.server_error = None;
+                    }
+                    cx.notify();
+                }
+                Err(error) => {
+                    workspace.server_error = Some(format!("保存服务器失败: {error:#}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn cancel_server(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        self.server_dialog = None;
+        self.server_error = None;
+        self.server_fields.clear();
+        self.server_delete_confirm = None;
+        cx.notify();
+    }
+
+    /// 二次点击确认后删除：密钥环凭据一并清理（后台线程）。
+    fn delete_server(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.server_delete_confirm.as_deref() != Some(name) {
+            self.server_delete_confirm = Some(name.to_string());
+            cx.notify();
+            return;
+        }
+        let store = self.secret_store.clone();
+        let Ok(account) = ssh_account(name) else {
+            self.server_error = Some("服务器名称非法".into());
+            cx.notify();
+            return;
+        };
+        let name = name.to_string();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { store.delete(&account) })
+                .await;
+            let _ = this.update(cx, |workspace, cx| match result {
+                Ok(()) => {
+                    workspace.settings.remove_server(&name);
+                    if let Some(path) = Settings::default_path()
+                        && let Err(error) = workspace.settings.save_to(&path)
+                    {
+                        workspace.server_error = Some(format!("删除服务器失败: {error:#}"));
+                    } else {
+                        workspace.server_delete_confirm = None;
+                        workspace.server_error = None;
+                    }
+                    cx.notify();
+                }
+                Err(error) => {
+                    workspace.server_error = Some(format!("删除凭据失败: {error:#}"));
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 点「连接」：后台读密钥环；密码/交互认证缺凭据时弹补输框，否则直接连。
+    fn connect_server(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.ssh_connecting.is_some() {
+            return;
+        }
+        let Some(entry) = self
+            .settings
+            .servers
+            .iter()
+            .find(|item| item.name == name)
+            .cloned()
+        else {
+            return;
+        };
+        let store = self.secret_store.clone();
+        let entry_name = entry.name.clone();
+        cx.spawn(async move |this, cx| {
+            let secret = cx
+                .background_executor()
+                .spawn(async move {
+                    let account = ssh_account(&entry_name)?;
+                    anyhow::Ok(store.get(&account)?)
+                })
+                .await;
+            let _ = this.update(cx, |workspace, cx| {
+                match secret {
+                    Err(error) => {
+                        workspace.server_error = Some(format!("读取凭据失败: {error:#}"));
+                    }
+                    Ok(secret) => {
+                        let needs_secret =
+                            entry.auth != ServerAuthKind::PrivateKey && secret.is_none();
+                        if needs_secret {
+                            let placeholder = match entry.auth {
+                                ServerAuthKind::KeyboardInteractive => "口令 / 动态码",
+                                _ => "密码",
+                            };
+                            workspace.server_fields.clear();
+                            let field = cx.new(|cx| {
+                                CommandTextField::new(String::new(), placeholder, cx)
+                            });
+                            workspace.server_fields.push(("凭据".into(), field));
+                            workspace.server_dialog = Some(ServerDialog::Connect {
+                                name: entry.name.clone(),
+                                remember: true,
+                            });
+                        } else {
+                            workspace.start_ssh_connect(entry, secret, cx);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Connect 对话框提交：勾选记住则先写密钥环（后台），随后发起连接。
+    fn submit_server_connect(&mut self, cx: &mut Context<Self>) {
+        let Some(ServerDialog::Connect { name, remember }) = self.server_dialog.clone() else {
+            return;
+        };
+        let Some(entry) = self
+            .settings
+            .servers
+            .iter()
+            .find(|item| item.name == name)
+            .cloned()
+        else {
+            return;
+        };
+        let secret = self
+            .server_fields
+            .first()
+            .map(|(_, field)| field.read(cx).value().to_string())
+            .unwrap_or_default();
+        if secret.trim().is_empty() {
+            self.server_error = Some("凭据不能为空".into());
+            cx.notify();
+            return;
+        }
+        if !remember {
+            self.server_dialog = None;
+            self.server_fields.clear();
+            self.server_error = None;
+            self.start_ssh_connect(entry, Some(secret), cx);
+            return;
+        }
+        let store = self.secret_store.clone();
+        let entry_name = entry.name.clone();
+        let secret_for_store = secret.clone();
+        cx.spawn(async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    let account = ssh_account(&entry_name)?;
+                    store.set(&account, secret_for_store.trim())?;
+                    anyhow::Ok(())
+                })
+                .await;
+            let _ = this.update(cx, |workspace, cx| {
+                match outcome {
+                    Ok(()) => {
+                        workspace.server_dialog = None;
+                        workspace.server_fields.clear();
+                        workspace.server_error = None;
+                        workspace.start_ssh_connect(entry, Some(secret), cx);
+                    }
+                    Err(error) => {
+                        workspace.server_error = Some(format!("保存凭据失败: {error:#}"));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 起后台线程执行 SSH 连接（阻塞式，含 15s 超时）；结果入队，render 期消费。
+    fn start_ssh_connect(
+        &mut self,
+        entry: ServerEntry,
+        secret: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ssh_connecting.is_some() {
+            return;
+        }
+        self.ssh_connecting = Some(entry.name.clone());
+        self.server_error = None;
+        let (tx, rx) =
+            flume::unbounded::<(String, anyhow::Result<Arc<dyn TerminalSession>>)>();
+        let entry_for_thread = entry.clone();
+        std::thread::spawn(move || {
+            let result = connect_ssh_session(&entry_for_thread, secret.as_deref());
+            let _ = tx.send((entry_for_thread.name.clone(), result));
+        });
+        cx.spawn(async move |this, cx| {
+            while let Ok((name, result)) = rx.recv_async().await {
+                let _ = this.update(cx, |workspace, cx| {
+                    workspace.pending_ssh_results.push((name, result));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// 连接收尾（render 期调用，可拿 window）：成功开新标签，失败提示错误文案。
+    fn finish_ssh_connect(
+        &mut self,
+        name: String,
+        result: anyhow::Result<Arc<dyn TerminalSession>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ssh_connecting.as_deref() != Some(name.as_str()) {
+            return; // 过期结果（会话已被替换）
+        }
+        self.ssh_connecting = None;
+        match result {
+            Ok(session) => {
+                let pane_id = self.attach_pane(name.clone(), session, window, cx);
+                let tab_id = TabId(self.next_tab_id);
+                self.next_tab_id += 1;
+                self.tabs.push(WorkspaceTab {
+                    id: tab_id,
+                    layout: LayoutNode::Leaf(pane_id),
+                    focused_pane: pane_id,
+                });
+                self.focus_pane(pane_id, window, cx);
+            }
+            Err(error) => {
+                self.server_error = Some(format!("连接 {name} 失败: {error:#}"));
+            }
+        }
+        cx.notify();
+    }
+
+    /// 消费后台 SSH 连接结果（模式同 process_shortcuts：render 期处理窗口操作）。
+    fn process_ssh_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let pending = std::mem::take(&mut self.pending_ssh_results);
+        for (name, result) in pending {
+            self.finish_ssh_connect(name, result, window, cx);
+        }
+    }
+
     fn close_window(
         &mut self,
         _event: &MouseDownEvent,
@@ -1311,7 +1739,8 @@ impl WorkspaceView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.command_dialog.is_some() || self.totp_dialog.is_some() {
+        if self.command_dialog.is_some() || self.totp_dialog.is_some() || self.server_dialog.is_some()
+        {
             return;
         }
         if let Some(command) = self
@@ -1416,6 +1845,7 @@ impl WorkspaceView {
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_shortcuts(window, cx);
+        self.process_ssh_results(window, cx);
         let active_tab_id = self.active_tab;
         let active_layout = self.active_tab().layout.clone();
         let focused_pane = self.active_tab().focused_pane;
@@ -1667,6 +2097,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
     let dialog = workspace.command_dialog.clone();
     let fields = workspace.command_fields.clone();
     let error = workspace.command_error.clone();
+    let active_tab = workspace.right_panel_tab;
 
     let mut panel = div()
         .w(px(PANEL_WIDTH))
@@ -1674,72 +2105,84 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
         .bg(rgb(0x202132))
         .p_3()
         .text_color(rgb(0xC0CAF5))
-        .child(div().child("快捷命令"))
-        .child(setting_button(
-            "新建命令",
-            true,
-            cx.listener(|this, _event, _window, cx| this.edit_command(None, cx)),
-        ))
-        .child(
-            div()
-                .pt_2()
-                .text_color(rgb(0x7D829F))
-                .child("模板和快捷键保存在 settings.toml"),
-        )
-        .when_some(error, |panel, error| {
-            panel.child(div().text_color(rgb(0xF7768E)).child(error))
-        })
-        .children(commands.into_iter().map(|command| {
-            let shortcut = command.shortcut.clone();
-            let label = if command.template == command.name {
-                command.name.clone()
-            } else {
-                format!("{}  ·  {}", command.name, command.template)
-            };
-            let open_command = command.clone();
-            div()
-                .py_2()
-                .text_color(rgb(0xA9B1D6))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _event, window, cx| {
-                        this.open_command(&open_command, window, cx);
+        // 分区切换：命令 / 动态码 / 服务器
+        .child(div().flex().gap_1().pb_2().children(
+            RightPanelTab::ALL.map(|tab| {
+                setting_button(
+                    tab.label(),
+                    tab == active_tab,
+                    cx.listener(move |this, _event, _window, cx| {
+                        this.right_panel_tab = tab;
+                        this.server_delete_confirm = None;
+                        cx.notify();
                     }),
                 )
-                .child(label)
+            }),
+        ));
+
+    panel = match active_tab {
+        RightPanelTab::Commands => {
+            panel
                 .child(setting_button(
-                    "编辑",
-                    false,
-                    cx.listener({
-                        let command = command.clone();
-                        move |this, _event, _window, cx| {
-                            this.edit_command(Some(command.clone()), cx)
-                        }
-                    }),
-                ))
-                .child(setting_button(
-                    "删",
-                    false,
-                    cx.listener({
-                        let name = command.name.clone();
-                        move |this, _event, _window, cx| this.delete_command(&name, cx)
-                    }),
+                    "新建命令",
+                    true,
+                    cx.listener(|this, _event, _window, cx| this.edit_command(None, cx)),
                 ))
                 .child(
-                    shortcut
-                        .map(|key| format!("  [{}]", key))
-                        .unwrap_or_default(),
+                    div()
+                        .pt_2()
+                        .text_color(rgb(0x7D829F))
+                        .child("模板和快捷键保存在 settings.toml"),
                 )
-        }))
-        .child(div().pt_4().child("快捷服务器"))
-        .child(div().pt_2().text_color(rgb(0x7D829F)).child("本地 Shell"))
-        .child(
-            div()
-                .pt_2()
-                .text_color(rgb(0x565A78))
-                .child("SSH 服务器将在 SSH 模块接入后可用"),
-        );
-    panel = render_totp_section(workspace, panel, cx);
+                .when_some(error, |panel, error| {
+                    panel.child(div().text_color(rgb(0xF7768E)).child(error))
+                })
+                .children(commands.into_iter().map(|command| {
+                    let shortcut = command.shortcut.clone();
+                    let label = if command.template == command.name {
+                        command.name.clone()
+                    } else {
+                        format!("{}  ·  {}", command.name, command.template)
+                    };
+                    let open_command = command.clone();
+                    div()
+                        .py_2()
+                        .text_color(rgb(0xA9B1D6))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event, window, cx| {
+                                this.open_command(&open_command, window, cx);
+                            }),
+                        )
+                        .child(label)
+                        .child(setting_button(
+                            "编辑",
+                            false,
+                            cx.listener({
+                                let command = command.clone();
+                                move |this, _event, _window, cx| {
+                                    this.edit_command(Some(command.clone()), cx)
+                                }
+                            }),
+                        ))
+                        .child(setting_button(
+                            "删",
+                            false,
+                            cx.listener({
+                                let name = command.name.clone();
+                                move |this, _event, _window, cx| this.delete_command(&name, cx)
+                            }),
+                        ))
+                        .child(
+                            shortcut
+                                .map(|key| format!("  [{}]", key))
+                                .unwrap_or_default(),
+                        )
+                }))
+        }
+        RightPanelTab::Totp => render_totp_section(workspace, panel, cx),
+        RightPanelTab::Servers => render_server_section(workspace, panel, cx),
+    };
     if let Some(CommandDialog::Edit { original_name }) = dialog.clone() {
         panel = panel.child(
             div()
@@ -2060,6 +2503,237 @@ fn render_totp_section(
                             "取消",
                             false,
                             cx.listener(WorkspaceView::cancel_totp),
+                        )),
+                ),
+        );
+    }
+    panel
+}
+
+/// 右面板「服务器」区：条目列表 + 编辑/连接覆盖层。
+fn render_server_section(
+    workspace: &mut WorkspaceView,
+    panel: gpui::Div,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let servers = workspace.settings.servers.clone();
+    let dialog = workspace.server_dialog.clone();
+    let fields = workspace.server_fields.clone();
+    let meta_draft = workspace.server_meta_draft.clone();
+    let delete_confirm = workspace.server_delete_confirm.clone();
+    let error = workspace.server_error.clone();
+    let connecting = workspace.ssh_connecting.clone();
+
+    let mut panel = panel
+        .child(setting_button(
+            "新建服务器",
+            true,
+            cx.listener(|this, _event, _window, cx| this.edit_server(None, cx)),
+        ))
+        .child(
+            div()
+                .pt_2()
+                .text_color(rgb(0x7D829F))
+                .child("凭据只存密钥环；连接在新标签打开"),
+        )
+        .when_some(connecting, |panel, connecting| {
+            panel.child(
+                div()
+                    .pt_2()
+                    .text_color(rgb(0xBB9AF7))
+                    .child(format!("正在连接 {connecting} …（最长 15s）")),
+            )
+        })
+        .when_some(error, |panel, error| {
+            panel.child(div().text_color(rgb(0xF7768E)).child(error))
+        })
+        .children(servers.iter().map(|entry| {
+            let auth_label = match entry.auth {
+                ServerAuthKind::Password => "密码",
+                ServerAuthKind::KeyboardInteractive => "交互",
+                ServerAuthKind::PrivateKey => "密钥",
+            };
+            let pending_delete = delete_confirm.as_deref() == Some(entry.name.as_str());
+            div()
+                .pt_2()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_color(rgb(0xA9B1D6))
+                        .child(format!(
+                            "{} · {}@{}:{} [{}]",
+                            entry.name, entry.username, entry.host, entry.port, auth_label
+                        )),
+                )
+                .child(setting_button(
+                    "连接",
+                    false,
+                    cx.listener({
+                        let name = entry.name.clone();
+                        move |this, _event, _window, cx| this.connect_server(&name, cx)
+                    }),
+                ))
+                .child(setting_button(
+                    "编辑",
+                    false,
+                    cx.listener({
+                        let entry = entry.clone();
+                        move |this, _event, _window, cx| this.edit_server(Some(&entry), cx)
+                    }),
+                ))
+                .child(setting_button(
+                    if pending_delete { "确认?" } else { "删" },
+                    pending_delete,
+                    cx.listener({
+                        let name = entry.name.clone();
+                        move |this, _event, _window, cx| this.delete_server(&name, cx)
+                    }),
+                ))
+        }));
+
+    if let Some(ServerDialog::Edit { original }) = dialog.clone() {
+        panel = panel.child(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.98))
+                .p_3()
+                .child(
+                    div()
+                        .text_color(rgb(0x7DCFFF))
+                        .child(if original.is_some() {
+                            "编辑服务器"
+                        } else {
+                            "新建服务器"
+                        }),
+                )
+                .children(fields.clone().into_iter().map(|(name, field)| {
+                    div()
+                        .pt_2()
+                        .child(div().text_color(rgb(0x7D829F)).child(name))
+                        .child(field)
+                }))
+                .child(
+                    div()
+                        .pt_2()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(div().text_color(rgb(0x7D829F)).child("认证"))
+                        .children(
+                            [
+                                (ServerAuthKind::Password, "密码"),
+                                (ServerAuthKind::KeyboardInteractive, "交互"),
+                                (ServerAuthKind::PrivateKey, "密钥"),
+                            ]
+                            .into_iter()
+                            .map(|(kind, label)| {
+                                setting_button(
+                                    label,
+                                    meta_draft.auth == kind,
+                                    cx.listener(move |this, _event, _window, cx| {
+                                        this.server_meta_draft.auth = kind;
+                                        cx.notify();
+                                    }),
+                                )
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .pt_3()
+                        .flex()
+                        .gap_1()
+                        .child(setting_button(
+                            "保存",
+                            true,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.save_server(original.clone(), cx)
+                            }),
+                        ))
+                        .child(setting_button(
+                            "取消",
+                            false,
+                            cx.listener(WorkspaceView::cancel_server),
+                        )),
+                ),
+        );
+    }
+
+    if let Some(ServerDialog::Connect { name, remember }) = dialog {
+        panel = panel.child(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .bottom_0()
+                .left_0()
+                .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.98))
+                .p_3()
+                .child(
+                    div()
+                        .text_color(rgb(0x7DCFFF))
+                        .child(format!("连接 {name}")),
+                )
+                .child(
+                    div()
+                        .pt_2()
+                        .text_color(rgb(0x7D829F))
+                        .child("密钥环中没有该服务器的凭据，请补输一次"),
+                )
+                .children(fields.clone().into_iter().map(|(name, field)| {
+                    div()
+                        .pt_2()
+                        .child(div().text_color(rgb(0x7D829F)).child(name))
+                        .child(field)
+                }))
+                .child(
+                    div()
+                        .pt_2()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(setting_button(
+                            if remember { "记住凭据 ✓" } else { "记住凭据" },
+                            remember,
+                            cx.listener(move |this, _event, _window, cx| {
+                                if let Some(ServerDialog::Connect { remember, .. }) =
+                                    &mut this.server_dialog
+                                {
+                                    *remember = !*remember;
+                                }
+                                cx.notify();
+                            }),
+                        ))
+                        .child(
+                            div()
+                                .text_color(rgb(0x565A78))
+                                .child("写入系统密钥环"),
+                        ),
+                )
+                .child(
+                    div()
+                        .pt_3()
+                        .flex()
+                        .gap_1()
+                        .child(setting_button(
+                            "连接",
+                            true,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.submit_server_connect(cx)
+                            }),
+                        ))
+                        .child(setting_button(
+                            "取消",
+                            false,
+                            cx.listener(WorkspaceView::cancel_server),
                         )),
                 ),
         );
@@ -2684,8 +3358,65 @@ fn create_local_terminal(
         .expect("启动本地会话失败"),
     );
     let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
+    let terminal = create_terminal_view(
+        id,
+        session,
+        terminal_config_for(settings, theme),
+        workspace,
+        shortcut_tx,
+        cx,
+    );
+    (terminal, session_control)
+}
 
-    let config = TerminalConfig {
+/// 服务器条目 → SSH 会话。阻塞式（含连接超时），必须放在后台线程调用。
+/// 凭据由调用方从密钥环取出后传入，本函数不做任何持久化。
+fn connect_ssh_session(
+    entry: &ServerEntry,
+    secret: Option<&str>,
+) -> anyhow::Result<Arc<dyn TerminalSession>> {
+    let auth = match entry.auth {
+        ServerAuthKind::PrivateKey => AuthMethod::PrivateKey {
+            key_path: entry.key_path.clone().unwrap_or_default().into(),
+            passphrase: secret.filter(|value| !value.is_empty()).map(String::from),
+        },
+        // 密码/交互认证必须有凭据（连接入口已保证，此处兜底报错）
+        ServerAuthKind::Password => AuthMethod::Password {
+            password: secret
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("缺少密码，请在服务器条目中补填凭据"))?
+                .to_string(),
+        },
+        ServerAuthKind::KeyboardInteractive => AuthMethod::KeyboardInteractive {
+            secret: secret
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("缺少口令，请在服务器条目中补填凭据"))?
+                .to_string(),
+        },
+    };
+    let options = SshOptions::new(entry.host.as_str(), entry.port, entry.username.as_str(), auth);
+    let session = SshSession::connect(options).map_err(|error| anyhow::anyhow!("{error}"))?;
+    Ok(Arc::new(session))
+}
+
+/// 开一个本地 shell 会话（attach_pane 之外仅差标题命名，故独立成函数）。
+fn spawn_local_session() -> Arc<dyn TerminalSession> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    Arc::new(
+        LocalSession::spawn(LocalOptions {
+            shell,
+            args: vec![],
+            env: vec![],
+            cols: 110,
+            rows: 30,
+        })
+        .expect("启动本地会话失败"),
+    )
+}
+
+/// 外观设置 → 终端视图配置（本地与 SSH 会话共用）。
+fn terminal_config_for(settings: &Appearance, theme: &Theme) -> TerminalConfig {
+    TerminalConfig {
         font_family: settings.font_family.clone(),
         font_size: px(settings.font_size),
         cols: 110,
@@ -2696,12 +3427,22 @@ fn create_local_terminal(
         colors: palette_for(theme),
         ligatures: settings.ligatures,
         font_fallbacks: settings.font_fallbacks.clone(),
-    };
+    }
+}
 
-    let terminal = cx.new(|cx| {
-        // resize 由视图默认回调转发给会话，无需在此另接
+/// 装配终端视图：分屏/焦点快捷键与 OSC 标题回调对所有后端一致。
+/// resize 由视图默认回调转发给会话，无需在此另接。
+fn create_terminal_view(
+    id: PaneId,
+    session: Arc<dyn TerminalSession>,
+    config: TerminalConfig,
+    workspace: gpui::WeakEntity<WorkspaceView>,
+    shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
+    cx: &mut Context<WorkspaceView>,
+) -> Entity<TerminalView> {
+    cx.new(|cx| {
         let shortcut_tx = shortcut_tx.clone();
-        TerminalView::new(Arc::clone(&session), config, cx)
+        TerminalView::new(session, config, cx)
             .with_key_handler(move |event| {
                 let shortcut = if event.keystroke.modifiers.control
                     && event.keystroke.modifiers.shift
@@ -2744,8 +3485,7 @@ fn create_local_terminal(
                     }
                 }
             })
-    });
-    (terminal, session_control)
+    })
 }
 
 /// laterterm_config 主题 → termview 调色板。

@@ -80,10 +80,10 @@ impl ServerEntry {
         if username.len() > 64 || username.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
             bail!("用户名不能包含空白或超过 64 字符");
         }
-        if let Some(key_path) = &self.key_path {
-            if key_path.chars().count() > 1024 || key_path.chars().any(char::is_control) {
-                bail!("私钥路径不合法");
-            }
+        if let Some(key_path) = &self.key_path
+            && (key_path.chars().count() > 1024 || key_path.chars().any(char::is_control))
+        {
+            bail!("私钥路径不合法");
         }
         if self.auth == ServerAuthKind::PrivateKey && self.key_path.as_deref().unwrap_or("").trim().is_empty() {
             bail!("私钥认证必须填写私钥文件路径");
