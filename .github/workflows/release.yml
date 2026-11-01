@@ -58,8 +58,9 @@ jobs:
             *.sha256
 
   build-windows:
-    name: Windows x64 构建
+    name: Windows x64 构建（尽力而为）
     runs-on: windows-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 

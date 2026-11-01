@@ -60,7 +60,7 @@
 |------|------|
 | Linux x64 | `laterterm-*-x86_64-unknown-linux-gnu.tar.xz` |
 | macOS（Intel + Apple Silicon） | `laterterm-*-universal2-apple-darwin.dmg` |
-| Windows x64 | `laterterm-*-x86_64-pc-windows-msvc.zip` |
+| Windows x64 | `laterterm-*-x86_64-pc-windows-msvc.zip`（🧪 实验性） |
 
 ```bash
 tar -xJf laterterm-*-linux-gnu.tar.xz

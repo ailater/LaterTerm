@@ -64,7 +64,7 @@ jobs:
         with:
           key: ci-windows
 
-      # GPUI 在 Windows 用 DX12，runner 预装 Windows SDK；只做编译检查，
-      # 不跑测试（GPUI 测试可能需要图形上下文）
-      - name: 编译检查
-        run: cargo check --workspace
+      # Windows 编译面：transfer（UnixStream/rzsz）与 ssh（UnixStream）
+      # 尚未跨平台，先检查其余核心 crate；全量 Windows 支持是 M4 后续
+      - name: 编译检查（跨平台核心 crate）
+        run: cargo check -p laterterm-core -p laterterm-config -p laterterm-local -p laterterm-secrets
