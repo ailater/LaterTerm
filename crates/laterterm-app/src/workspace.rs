@@ -287,6 +287,7 @@ pub struct WorkspaceView {
     server_delete_confirm: Option<String>,
     server_import: Option<ServerImportState>,
     broadcast: bool,
+    welcome_visible: bool,
     totp_error: Option<String>,
     totp_target: Option<PaneId>,
     totp_generating: bool,
@@ -297,6 +298,8 @@ impl WorkspaceView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let weak_workspace = cx.weak_entity();
         let settings = Settings::load_or_default();
+        // 首启检测：settings 文件在加载前不存在 → 首次运行
+        let first_run = !settings.settings_file_exists();
         settings.ensure_settings_file();
         let themes = ThemeRegistry::load();
         let (shortcut_tx, shortcut_rx) = flume::unbounded();
@@ -348,6 +351,7 @@ impl WorkspaceView {
             server_delete_confirm: None,
             server_import: None,
             broadcast: false,
+            welcome_visible: first_run,
             totp_error: None,
             totp_target: None,
             totp_generating: false,
@@ -442,6 +446,17 @@ impl WorkspaceView {
                 cx.notify();
             }
         }
+    }
+
+    /// 关闭欢迎覆盖层。
+    fn dismiss_welcome(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.welcome_visible = false;
+        cx.notify();
     }
 
     fn active_tab_index(&self) -> usize {
@@ -2169,7 +2184,113 @@ impl Render for WorkspaceView {
                     settings_content(self.settings_page, self, cx),
                 ))
             })
+            .when(self.welcome_visible, |root| {
+                root.child(welcome_overlay(
+                    cx.listener(Self::dismiss_welcome),
+                    cx.listener(Self::dismiss_welcome),
+                ))
+            })
     }
+}
+
+/// 首启欢迎覆盖层：快捷键速查 + 开始按钮。
+fn welcome_overlay(
+    scrim_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    button_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Div {
+    div()
+        .absolute()
+        .top_0()
+        .right_0()
+        .bottom_0()
+        .left_0()
+        .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.96))
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_mouse_down(MouseButton::Left, scrim_listener)
+        .child(
+            div()
+                .w(px(520.0))
+                .p_8()
+                .bg(rgb(0x1A1B26))
+                .flex()
+                .flex_col()
+                .gap_4()
+                .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                .child(
+                    div()
+                        .text_size(px(28.0))
+                        .text_color(rgb(0x7DCFFF))
+                        .child("LaterTerm"),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(0xA9B1D6))
+                        .child("跨平台 GPU 终端 · 为中文开发者打造"),
+                )
+                .child(
+                    div()
+                        .pt_4()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_color(rgb(0xC0CAF5))
+                                .text_size(px(14.0))
+                                .child("常用快捷键"),
+                        )
+                        .child(welcome_shortcut("新建标签", "Ctrl+T"))
+                        .child(welcome_shortcut("分屏（横向 / 纵向）", "Ctrl+Shift+E / O"))
+                        .child(welcome_shortcut("窗格切换", "Ctrl+Shift+[ / ]"))
+                        .child(welcome_shortcut("搜索回滚", "Ctrl+Shift+F"))
+                        .child(welcome_shortcut("广播输入（多窗格同步）", "Ctrl+Shift+B"))
+                        .child(welcome_shortcut("设置 / 服务器管理", "Ctrl+,")),
+                )
+                .child(
+                    div()
+                        .pt_4()
+                        .text_color(rgb(0x565A78))
+                        .text_size(px(12.0))
+                        .child("提示：设置 → 服务器 可添加 SSH 连接或从 XShell / deepin 导入"),
+                )
+                .child(
+                    div().pt_4().child(
+                        div()
+                            .px_6()
+                            .py_2()
+                            .bg(rgb(0x7AA2F7))
+                            .text_color(rgb(0x1A1B26))
+                            .text_size(px(16.0))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, button_listener)
+                            .child("开始使用"),
+                    ),
+                ),
+        )
+}
+
+fn welcome_shortcut(label: &str, keys: &str) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .w(px(220.0))
+                .text_color(rgb(0xA9B1D6))
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .px_2()
+                .py_1()
+                .bg(rgb(0x24283B))
+                .text_color(rgb(0x7DCFFF))
+                .text_size(px(12.0))
+                .child(keys.to_string()),
+        )
 }
 
 fn render_layout(

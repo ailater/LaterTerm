@@ -205,6 +205,11 @@ impl Settings {
             _ => false,
         }
     }
+
+    /// 配置文件是否已存在（首启检测：不存在 = 第一次运行）。
+    pub fn settings_file_exists(&self) -> bool {
+        Self::default_path().is_some_and(|path| path.exists())
+    }
 }
 
 impl Appearance {
