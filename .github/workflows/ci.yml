@@ -49,3 +49,22 @@ jobs:
 
       - name: test
         run: cargo test --workspace --lib --bins
+
+  windows-check:
+    name: Windows 编译检查
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-windows
+
+      # GPUI 在 Windows 用 DX12，runner 预装 Windows SDK；只做编译检查，
+      # 不跑测试（GPUI 测试可能需要图形上下文）
+      - name: 编译检查
+        run: cargo check --workspace
