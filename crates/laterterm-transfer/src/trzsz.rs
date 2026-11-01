@@ -26,6 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// 触发串（`S` = 远端推送；前缀不含 `\x1b7`，兼容不回显 ESC7 的环境）。
 pub const TRZSZ_TRIGGER: &[u8] = b"::TRZSZ:TRANSFER:S:";
 
+/// 触发串（`R` = 远端要收文件，本端上传）。
+pub const TRZSZ_R_TRIGGER: &[u8] = b"::TRZSZ:TRANSFER:R:";
+
 /// 载荷编码：base64(zlib(data))；解码为其逆。
 fn encode_payload(data: &[u8]) -> String {
     use base64::Engine as _;
@@ -252,6 +255,157 @@ fn recv_one_file(
     Ok(Some(target))
 }
 
+// ───────────────────────── R 方向（上传）─────────────────────────
+
+/// 工作线程主体：完整上传流程（R 触发：本端推文件到远端）。
+pub(crate) fn run_trzsz_upload(
+    options: &TransferOptions,
+    reply: SharedWriter,
+    feed: UnixStream,
+    done: Arc<AtomicBool>,
+) {
+    let result = trzsz_upload_loop(options, reply, feed);
+    let event = match result {
+        Ok(_count) => TransferEvent::Finished(vec![]), // 上传无落盘路径
+        Err(error) => TransferEvent::Failed(format!("trzsz 上传: {error}")),
+    };
+    let _ = options.events.send(event);
+    done.store(true, Ordering::Release);
+}
+
+/// R 方向上传主循环：ACT→CFG→NUM→逐文件(NAME/SIZE/DATA×n/MD5)→EXIT。
+/// 文件列表来自 `TransferOptions.upload_files`；None 则发 ERRO 并退出
+/// （远端 trz 会显示错误并恢复终端）。
+fn trzsz_upload_loop(
+    options: &TransferOptions,
+    reply: SharedWriter,
+    mut feed: UnixStream,
+) -> io::Result<usize> {
+    // 无可上传文件：优雅拒绝（不让远端挂在等 ACT 的状态）
+    let Some(files) = &options.upload_files else {
+        send_line(
+            &reply,
+            "ACT",
+            r#"{"lang":"rs","confirm":true,"protocol":1}"#,
+        )?;
+        // 等 CFG 再回 ERRO（远端 trz 在等 ACT 后进入 CFG 交换）
+        let _frame = recv_frame(&mut feed)?;
+        send_line(&reply, "ERRO", &encode_payload(b"no files to upload"))?;
+        return Err(io::Error::other("无可上传文件（upload_files 未设置）"));
+    };
+    if files.is_empty() {
+        send_line(
+            &reply,
+            "ACT",
+            r#"{"lang":"rs","confirm":true,"protocol":1}"#,
+        )?;
+        let _frame = recv_frame(&mut feed)?;
+        send_line(&reply, "ERRO", &encode_payload(b"file list is empty"))?;
+        return Err(io::Error::other("上传文件列表为空"));
+    }
+
+    // ① ACT
+    let action = serde_json::json!({
+        "lang": "rs",
+        "confirm": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "support_dir": false,
+        "protocol": 1,
+    });
+    send_line(&reply, "ACT", &action.to_string())?;
+
+    // ② 收服务端 CFG
+    let frame = recv_frame(&mut feed)?;
+    if frame.typ != "CFG" {
+        return Err(io::Error::other(format!("期望 CFG，收到 {}", frame.typ)));
+    }
+    // ③ 回客户端 CFG（上传不开目录——只传文件）
+    let config = serde_json::json!({
+        "lang": "rs",
+        "quiet": true,
+        "binary": true,
+        "escape_chars": false,
+        "directory": false,
+        "bufsize": 131_072,
+        "timeout": 60,
+        "overwrite": true,
+        "tmux_output_junk": true,
+        "tmux_pane_width": 120,
+        "protocol": 1,
+    });
+    send_line(&reply, "CFG", &config.to_string())?;
+
+    // ④ 文件数
+    send_line(&reply, "NUM", &files.len().to_string())?;
+    expect_succ(&mut feed, &files.len().to_string())?;
+
+    // ⑤ 逐文件
+    for path in files {
+        upload_one_file(&reply, &mut feed, path)?;
+    }
+
+    // ⑥ EXIT
+    send_line(&reply, "EXIT", &encode_payload(b"Done"))?;
+    Ok(files.len())
+}
+
+/// 上传单个文件：NAME→SIZE→DATA×n→MD5（每步等 SUCC 确认）。
+fn upload_one_file(
+    reply: &SharedWriter,
+    feed: &mut UnixStream,
+    path: &std::path::Path,
+) -> io::Result<()> {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .ok_or_else(|| io::Error::other(format!("路径无文件名: {}", path.display())))?;
+    let data =
+        std::fs::read(path).map_err(|e| io::Error::other(format!("读 {}: {e}", path.display())))?;
+
+    // NAME（文件名）
+    send_line(reply, "NAME", &encode_payload(name.as_bytes()))?;
+    expect_succ(feed, &encode_payload(name.as_bytes()))?;
+
+    // SIZE
+    send_line(reply, "SIZE", &data.len().to_string())?;
+    expect_succ(feed, &data.len().to_string())?;
+
+    // DATA 分块（64KiB）
+    for chunk in data.chunks(64 * 1024) {
+        send_line(reply, "DATA", &encode_payload(chunk))?;
+        expect_succ(feed, &chunk.len().to_string())?;
+    }
+
+    // MD5
+    let digest = {
+        let mut ctx = md5::Context::new();
+        let _ = ctx.write(&data);
+        ctx.finalize()
+    };
+    send_line(reply, "MD5", &encode_payload(&digest.0))?;
+    expect_succ(feed, &encode_payload(&digest.0))?;
+
+    Ok(())
+}
+
+/// 收一帧并断言 SUCC 载荷与期望一致。
+fn expect_succ(feed: &mut UnixStream, expect: &str) -> io::Result<()> {
+    let frame = recv_frame(feed)?;
+    if frame.typ == "SUCC" && frame.payload == expect {
+        Ok(())
+    } else if frame.typ == "ERRO" {
+        let decoded = decode_payload(&frame.payload)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|_| frame.payload.clone());
+        Err(io::Error::other(format!("远端拒绝: {decoded}")))
+    } else {
+        Err(io::Error::other(format!(
+            "期望 SUCC:{expect}，收到 {}:{}",
+            frame.typ, frame.payload
+        )))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +432,7 @@ mod tests {
         let options = TransferOptions {
             download_dir: download.clone(),
             events: std::sync::mpsc::Sender::clone(&events_tx),
+            upload_files: None,
         };
 
         // 管道：伪远端帧 → 工作线程
@@ -295,6 +450,7 @@ mod tests {
             let options = TransferOptions {
                 download_dir: options.download_dir.clone(),
                 events: events_tx.clone(),
+                upload_files: None,
             };
             let reply = reply.clone();
             let done = done.clone();
@@ -388,6 +544,149 @@ mod tests {
             std::fs::read(&paths[0]).unwrap(),
             content.to_vec(),
             "字节级一致"
+        );
+    }
+
+    /// 协议回放（上传）：伪造远端 tsz 收文件（R 触发），本端推送一个文件，
+    /// 断言协议交互序列（ACT→CFG→NUM→NAME/SIZE/DATA/MD5→EXIT）。
+    #[test]
+    fn trzsz_protocol_replay_upload() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let content = b"upload payload test 0123456789abcdef".repeat(32);
+        let upload_file = dir.path().join("上传测试.txt");
+        std::fs::write(&upload_file, &content).expect("写源文件");
+
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<TransferEvent>();
+        let options = TransferOptions {
+            download_dir: dir.path().join("dl"),
+            events: events_tx,
+            upload_files: Some(vec![upload_file.clone()]),
+        };
+
+        let (mut pump, feed) = UnixStream::pair().expect("pair");
+        let (reply_w, mut reply_r) = UnixStream::pair().expect("reply pair");
+        let reply = SharedWriter {
+            inner: Arc::new(std::sync::Mutex::new(
+                Box::new(reply_w) as Box<dyn Write + Send>
+            )),
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let options = TransferOptions {
+                download_dir: options.download_dir.clone(),
+                events: std::sync::mpsc::Sender::clone(&options.events),
+                upload_files: options.upload_files.clone(),
+            };
+            let reply = reply.clone();
+            let done = done.clone();
+            std::thread::Builder::new()
+                .name("test-trzsz-up".into())
+                .spawn(move || run_trzsz_upload(&options, reply, feed, done))
+                .expect("起线程")
+        };
+
+        // 伪远端逐步应答
+        let read_line = |reply_r: &mut UnixStream| -> String {
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                assert_eq!(reply_r.read(&mut byte).unwrap(), 1);
+                if byte[0] == b'\n' {
+                    break;
+                }
+                line.push(byte[0]);
+            }
+            String::from_utf8(line).unwrap()
+        };
+        let succ = |pump: &mut UnixStream, reply_r: &mut UnixStream, expect: &str| {
+            let line = read_line(reply_r);
+            assert!(line.starts_with('#'), "帧格式: {line}");
+            let (typ, payload) = line[1..].split_once(':').expect("帧格式");
+            pump.write_all(format!("#SUCC:{payload}\n").as_bytes())
+                .unwrap();
+            pump.flush().unwrap();
+            assert_eq!(typ, expect, "帧类型");
+        };
+
+        // ① 收 ACT → 回 CFG
+        let act = read_line(&mut reply_r);
+        assert!(act.starts_with("#ACT:") && act.contains("lang"), "{act}");
+        pump.write_all(b"#CFG:{\"binary\":true}\n").unwrap();
+        pump.flush().unwrap();
+
+        // ② 收客户端 CFG
+        let cfg = read_line(&mut reply_r);
+        assert!(cfg.starts_with("#CFG:"), "{cfg}");
+
+        // ③ NUM=1 → SUCC
+        let num = read_line(&mut reply_r);
+        assert!(num.starts_with("#NUM:1"), "{num}");
+        pump.write_all(b"#SUCC:1\n").unwrap();
+        pump.flush().unwrap();
+
+        // ④ NAME → SUCC 回显
+        succ(&mut pump, &mut reply_r, "NAME");
+        // ⑤ SIZE → SUCC
+        succ(&mut pump, &mut reply_r, "SIZE");
+        // ⑥ DATA（≤64KiB 一块）→ SUCC 回**解码长度**（非编码载荷回显！）
+        {
+            let line = read_line(&mut reply_r);
+            let (typ, payload) = line[1..].split_once(':').expect("帧格式");
+            assert_eq!(typ, "DATA");
+            let decoded = decode_payload(payload).expect("解码 DATA 载荷");
+            pump.write_all(format!("#SUCC:{}\n", decoded.len()).as_bytes())
+                .unwrap();
+            pump.flush().unwrap();
+        }
+        // ⑦ MD5 → SUCC
+        succ(&mut pump, &mut reply_r, "MD5");
+        // ⑧ EXIT
+        let exit = read_line(&mut reply_r);
+        assert!(exit.starts_with("#EXIT:"), "{exit}");
+
+        worker.join().expect("工作线程");
+        let event = events_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("事件");
+        assert!(
+            matches!(event, TransferEvent::Finished(ref paths) if paths.is_empty()),
+            "上传完成事件: {event:?}"
+        );
+    }
+
+    /// R 触发 + 无文件列表 → 优雅拒绝（ERRO 帧，远端恢复终端）。
+    #[test]
+    fn trzsz_upload_no_files_graceful_reject() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<TransferEvent>();
+        let options = TransferOptions {
+            download_dir: dir.path().join("dl"),
+            events: events_tx,
+            upload_files: None,
+        };
+
+        let (mut pump, feed) = UnixStream::pair().expect("pair");
+        // 预写一帧 CFG：无文件路径先发 ACT 再等 CFG，管道里得有数据才不挂
+        pump.write_all(b"#CFG:{\"binary\":true}\n")
+            .expect("预写 CFG");
+        pump.flush().expect("flush");
+        drop(pump); // 关写端让 recv_frame 在读完缓冲后能感知 EOF
+
+        let (reply_w, _reply_r) = UnixStream::pair().expect("reply");
+        let reply = SharedWriter {
+            inner: Arc::new(std::sync::Mutex::new(
+                Box::new(reply_w) as Box<dyn Write + Send>
+            )),
+        };
+        let done = Arc::new(AtomicBool::new(false));
+        run_trzsz_upload(&options, reply, feed, done);
+
+        let event = events_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("事件");
+        assert!(
+            matches!(&event, TransferEvent::Failed(msg) if msg.contains("无可上传")),
+            "拒绝事件: {event:?}"
         );
     }
 }

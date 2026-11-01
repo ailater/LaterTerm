@@ -42,6 +42,8 @@ pub struct TransferOptions {
     pub download_dir: PathBuf,
     /// 事件接收端。
     pub events: std_mpsc::Sender<TransferEvent>,
+    /// 上传文件列表（R 触发时推送给远端；None = 优雅拒绝）。
+    pub upload_files: Option<Vec<PathBuf>>,
 }
 
 /// ZMODEM ZRQINIT 触发序列：`** ␘(CAN) B 0`（lrzsz 同款检测串）。
@@ -161,46 +163,59 @@ impl TransferReader {
         let mut window = std::mem::take(&mut self.carry);
         window.extend_from_slice(chunk);
 
-        // 双触发扫描：取最早出现者；ZMODEM 从触发帧起全量导入，
-        // trzsz 吞掉整行触发串、从行尾起导入（触发行不是 # 帧）
+        // 三触发扫描：取最早出现者；ZMODEM 从触发帧起全量导入，
+        // trzsz S/R 吞掉整行触发串、从行尾起导入（触发行不是 # 帧）
         let zmodem_at = find_subslice(&window, ZMODEM_TRIGGER);
-        let trzsz_at = find_subslice(&window, trzsz::TRZSZ_TRIGGER);
-        let route = match (zmodem_at, trzsz_at) {
-            (Some(z), Some(t)) if z <= t => Some((Route::Zmodem, z)),
-            (Some(_), Some(t)) => Some((Route::Trzsz, t)),
-            (Some(z), None) => Some((Route::Zmodem, z)),
-            (None, Some(t)) => Some((Route::Trzsz, t)),
-            (None, None) => None,
-        };
+        let trzsz_s_at = find_subslice(&window, trzsz::TRZSZ_TRIGGER);
+        let trzsz_r_at = find_subslice(&window, trzsz::TRZSZ_R_TRIGGER);
+        // 按位置排序取最早
+        let route = [
+            zmodem_at.map(|p| (Route::Zmodem, p)),
+            trzsz_s_at.map(|p| (Route::TrzszReceive, p)),
+            trzsz_r_at.map(|p| (Route::TrzszUpload, p)),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|(_, pos)| *pos);
 
         enum Route {
             Zmodem,
-            Trzsz,
+            TrzszReceive,
+            TrzszUpload,
         }
 
         if let Some((route, pos)) = route {
             let _ = self.options.events.send(TransferEvent::Started);
-            let spawned = match route {
-                Route::Zmodem => spawn_receiver(&self.options, self.reply.clone(), &window[pos..]),
-                Route::Trzsz => {
-                    // 触发行必须完整到达才能定位行尾；行未到齐则等下一块
-                    let after_trigger = &window[pos..];
+            // trzsz 系触发行需完整到达才能定位行尾；行未到齐则等下一块
+            let after_trigger = &window[pos..];
+            let divert = match route {
+                Route::Zmodem => spawn_receiver(&self.options, self.reply.clone(), after_trigger),
+                Route::TrzszReceive | Route::TrzszUpload => {
                     match after_trigger.iter().position(|b| *b == b'\n') {
-                        Some(nl) => {
-                            spawn_trzsz(&self.options, self.reply.clone(), &after_trigger[nl + 1..])
-                        }
+                        Some(nl) => match route {
+                            Route::TrzszReceive => spawn_trzsz(
+                                &self.options,
+                                self.reply.clone(),
+                                &after_trigger[nl + 1..],
+                            ),
+                            Route::TrzszUpload => spawn_trzsz_upload(
+                                &self.options,
+                                self.reply.clone(),
+                                &after_trigger[nl + 1..],
+                            ),
+                            Route::Zmodem => unreachable!(),
+                        },
                         None => {
                             // 触发行未到齐：前缀放行，触发行整体扣进 carry 等下轮
                             let out_len = pos.min(buf.len());
                             buf[..out_len].copy_from_slice(&window[..out_len]);
                             self.carry = window[pos..].to_vec();
-                            // 前缀为空：返回 0 表示「已缓冲」，外层循环继续拉
-                            return Ok(0);
+                            return Ok(out_len);
                         }
                     }
                 }
             };
-            match spawned {
+            match divert {
                 Some((pump, done)) => {
                     self.state = ReaderState::Active { pump, done };
                     // 触发帧在内全部转喂：本块不给视图
@@ -216,7 +231,11 @@ impl TransferReader {
         }
 
         // 未触发：放行「确定不可能是触发前缀」的部分，尾巴留待下轮
-        let keep = ZMODEM_TRIGGER.len().max(trzsz::TRZSZ_TRIGGER.len()) - 1;
+        let keep = ZMODEM_TRIGGER
+            .len()
+            .max(trzsz::TRZSZ_TRIGGER.len())
+            .max(trzsz::TRZSZ_R_TRIGGER.len())
+            - 1;
         let safe_len = window.len().saturating_sub(keep);
         let out_len = safe_len.min(buf.len());
         buf[..out_len].copy_from_slice(&window[..out_len]);
@@ -305,12 +324,39 @@ fn spawn_trzsz(
     let thread_options = TransferOptions {
         download_dir: options.download_dir.clone(),
         events: options.events.clone(),
+        upload_files: None,
     };
 
     std::thread::Builder::new()
         .name("laterterm-trzsz".into())
         .spawn(move || {
             trzsz::run_trzsz_receive(&thread_options, reply, feed, done_flag);
+        })
+        .ok()?;
+    Some((pump, done))
+}
+
+/// 起 trzsz 上传工作线程（R 触发：本端推文件到远端）。
+fn spawn_trzsz_upload(
+    options: &TransferOptions,
+    reply: SharedWriter,
+    initial: &[u8],
+) -> Option<(UnixStream, Arc<AtomicBool>)> {
+    let (mut pump, feed) = UnixStream::pair().ok()?;
+    pump.write_all(initial).ok()?;
+
+    let done = Arc::new(AtomicBool::new(false));
+    let done_flag = Arc::clone(&done);
+    let thread_options = TransferOptions {
+        download_dir: options.download_dir.clone(),
+        events: options.events.clone(),
+        upload_files: options.upload_files.clone(),
+    };
+
+    std::thread::Builder::new()
+        .name("laterterm-trzsz-up".into())
+        .spawn(move || {
+            trzsz::run_trzsz_upload(&thread_options, reply, feed, done_flag);
         })
         .ok()?;
     Some((pump, done))
@@ -384,6 +430,7 @@ mod tests {
             TransferOptions {
                 download_dir: download_dir.clone(),
                 events: events_tx,
+                upload_files: None,
             },
         );
 
@@ -449,6 +496,7 @@ mod tests {
             TransferOptions {
                 download_dir: PathBuf::from("/tmp/laterterm-transfer-test"),
                 events: events_tx,
+                upload_files: None,
             },
         );
         let mut out = Vec::new();
