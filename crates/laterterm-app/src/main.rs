@@ -1,6 +1,7 @@
 //! LaterTerm — 跨平台 GPU 终端。
 
 mod command_text_field;
+mod import;
 mod workspace;
 #[cfg(test)]
 mod workspace_tests;

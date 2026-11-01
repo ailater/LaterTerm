@@ -3758,10 +3758,12 @@ dependencies = [
  "gpui",
  "laterterm-config",
  "laterterm-core",
+ "laterterm-deepin",
  "laterterm-local",
  "laterterm-secrets",
  "laterterm-ssh",
  "laterterm-termview",
+ "laterterm-xshell",
  "notify",
  "parking_lot",
 ]
