@@ -50,6 +50,7 @@ enum WorkspaceShortcut {
     Split(SplitDirection),
     FocusPrevious,
     FocusNext,
+    ToggleBroadcast,
 }
 
 /// 标签内的分屏布局树，叶子是 PaneId。
@@ -264,6 +265,8 @@ pub struct WorkspaceView {
     themes: ThemeRegistry,
     shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
     shortcut_rx: flume::Receiver<(PaneId, WorkspaceShortcut)>,
+    broadcast_tx: flume::Sender<Vec<u8>>,
+    broadcast_rx: flume::Receiver<Vec<u8>>,
     pending_shortcuts: Vec<(PaneId, WorkspaceShortcut)>,
     command_values: BTreeMap<String, String>,
     command_dialog: Option<CommandDialog>,
@@ -283,6 +286,7 @@ pub struct WorkspaceView {
     server_error: Option<String>,
     server_delete_confirm: Option<String>,
     server_import: Option<ServerImportState>,
+    broadcast: bool,
     totp_error: Option<String>,
     totp_target: Option<PaneId>,
     totp_generating: bool,
@@ -296,6 +300,7 @@ impl WorkspaceView {
         settings.ensure_settings_file();
         let themes = ThemeRegistry::load();
         let (shortcut_tx, shortcut_rx) = flume::unbounded();
+        let (broadcast_tx, broadcast_rx) = flume::unbounded::<Vec<u8>>();
         let first_pane = PaneId(1);
         let first_tab = TabId(1);
         let theme = themes.resolve(&settings.appearance.theme).clone();
@@ -306,6 +311,7 @@ impl WorkspaceView {
             &settings.appearance,
             &theme,
             shortcut_tx.clone(),
+            broadcast_tx.clone(),
         );
         cx.subscribe_in(
             &terminal,
@@ -320,6 +326,8 @@ impl WorkspaceView {
             themes,
             shortcut_tx,
             shortcut_rx,
+            broadcast_tx,
+            broadcast_rx,
             pending_shortcuts: Vec::new(),
             command_values: BTreeMap::new(),
             command_dialog: None,
@@ -339,6 +347,7 @@ impl WorkspaceView {
             server_error: None,
             server_delete_confirm: None,
             server_import: None,
+            broadcast: false,
             totp_error: None,
             totp_target: None,
             totp_generating: false,
@@ -393,7 +402,27 @@ impl WorkspaceView {
             {
                 self.active_tab = self.tabs[tab_index].id;
                 self.tabs[tab_index].focused_pane = pane_id;
-                self.handle_shortcut(shortcut, window, cx);
+            }
+            self.handle_shortcut(shortcut, window, cx);
+        }
+    }
+
+    /// 广播泵：非阻塞排空 broadcast_rx，把字节写入所有非聚焦的运行中窗格。
+    /// 与快捷键泵同点位调用（render 首行），每帧零或几条，无性能影响。
+    /// 注意：Entity::read 需要 cx，但 pump_broadcast 无窗口上下文——
+    /// 改为在 render 的有 cx 上下文处调用。
+    fn pump_broadcast(&mut self, cx: &mut Context<Self>) {
+        if !self.broadcast {
+            // 广播关闭时仍排空通道（防止积压后突然打开广播倾泻旧按键）
+            while self.broadcast_rx.try_recv().is_ok() {}
+            return;
+        }
+        let focused = self.focused_pane_id();
+        while let Ok(bytes) = self.broadcast_rx.try_recv() {
+            for pane in &self.panes {
+                if pane.id != focused && pane.status == TabStatus::Running {
+                    pane.terminal.read(cx).write_input(&bytes);
+                }
             }
         }
     }
@@ -408,6 +437,10 @@ impl WorkspaceView {
             WorkspaceShortcut::Split(direction) => self.split_focused(direction, window, cx),
             WorkspaceShortcut::FocusPrevious => self.cycle_focus(false, window, cx),
             WorkspaceShortcut::FocusNext => self.cycle_focus(true, window, cx),
+            WorkspaceShortcut::ToggleBroadcast => {
+                self.broadcast = !self.broadcast;
+                cx.notify();
+            }
         }
     }
 
@@ -484,6 +517,7 @@ impl WorkspaceView {
             &self.settings.appearance,
             &theme,
             self.shortcut_tx.clone(),
+            self.broadcast_tx.clone(),
         );
         cx.subscribe_in(
             &terminal,
@@ -526,6 +560,7 @@ impl WorkspaceView {
             &self.settings.appearance,
             &theme,
             self.shortcut_tx.clone(),
+            self.broadcast_tx.clone(),
         );
         cx.subscribe_in(
             &terminal,
@@ -1546,6 +1581,7 @@ impl WorkspaceView {
             settings,
             theme,
             shortcut_tx,
+            self.broadcast_tx.clone(),
             title,
         );
         self.panes.push(Pane {
@@ -1955,6 +1991,7 @@ impl WorkspaceView {
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_shortcuts(window, cx);
+        self.pump_broadcast(cx);
         let active_tab_id = self.active_tab;
         let active_layout = self.active_tab().layout.clone();
         let focused_pane = self.active_tab().focused_pane;
@@ -1971,6 +2008,7 @@ impl Render for WorkspaceView {
         let left_panel = self.left_panel;
         let right_panel = self.right_panel;
         let settings_open = self.settings_open;
+        let broadcast_on = self.broadcast;
 
         div()
             .size_full()
@@ -1993,7 +2031,16 @@ impl Render for WorkspaceView {
                             .gap_1()
                             .px_2()
                             .child(button("☰", cx.listener(Self::toggle_left_panel)))
-                            .child(div().text_color(rgb(0xC0CAF5)).child("LaterTerm")),
+                            .child(div().text_color(rgb(0xC0CAF5)).child("LaterTerm"))
+                            .when(broadcast_on, |bar| {
+                                bar.child(
+                                    div()
+                                        .px_2()
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(0xE0AF68))
+                                        .child("📢 广播"),
+                                )
+                            }),
                     )
                     .child(
                         div()
@@ -3462,6 +3509,7 @@ fn create_local_terminal(
     settings: &Appearance,
     theme: &Theme,
     shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
+    broadcast_tx: flume::Sender<Vec<u8>>,
 ) -> (Entity<TerminalView>, Arc<SessionControl>) {
     // 会话的开启/spawn/回收线程全部内聚在 LocalSession（laterterm-local）
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
@@ -3483,6 +3531,7 @@ fn create_local_terminal(
         settings,
         theme,
         shortcut_tx,
+        broadcast_tx,
         "本地终端",
     )
 }
@@ -3498,6 +3547,7 @@ fn build_pane_terminal(
     settings: &Appearance,
     theme: &Theme,
     shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
+    broadcast_tx: flume::Sender<Vec<u8>>,
     _initial_title: &str,
 ) -> (Entity<TerminalView>, Arc<SessionControl>) {
     let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
@@ -3518,6 +3568,7 @@ fn build_pane_terminal(
     let terminal = cx.new(|cx| {
         // resize 由视图默认回调转发给会话，无需在此另接
         let shortcut_tx = shortcut_tx.clone();
+        let broadcast_tx = broadcast_tx.clone();
         TerminalView::new(Arc::clone(&session), config, cx)
             .with_key_handler(move |event| {
                 let shortcut = if event.keystroke.modifiers.control
@@ -3540,6 +3591,11 @@ fn build_pane_terminal(
                     && event.keystroke.key == "]"
                 {
                     Some(WorkspaceShortcut::FocusNext)
+                } else if event.keystroke.modifiers.control
+                    && event.keystroke.modifiers.shift
+                    && event.keystroke.key.eq_ignore_ascii_case("b")
+                {
+                    Some(WorkspaceShortcut::ToggleBroadcast)
                 } else {
                     None
                 };
@@ -3547,6 +3603,32 @@ fn build_pane_terminal(
                     let _ = shortcut_tx.send((id, shortcut));
                     true
                 } else {
+                    // 广播模式：把可打印按键的原始字节镜像到广播通道
+                    // （工作台泵把它们写入非聚焦窗格的会话）
+                    if !event.keystroke.modifiers.control
+                        && !event.keystroke.modifiers.alt
+                        && !event.keystroke.modifiers.function
+                    {
+                        let key = &event.keystroke.key;
+                        let bytes = match key.as_str() {
+                            "enter" => b"\r".to_vec(),
+                            "backspace" => b"\x7f".to_vec(),
+                            "tab" => b"\t".to_vec(),
+                            "space" => b" ".to_vec(),
+                            "escape" => b"\x1b".to_vec(),
+                            _ => {
+                                let chars: Vec<char> = key.chars().collect();
+                                if chars.len() == 1 && !chars[0].is_control() {
+                                    chars[0].to_string().into_bytes()
+                                } else {
+                                    Vec::new()
+                                }
+                            }
+                        };
+                        if !bytes.is_empty() {
+                            let _ = broadcast_tx.send(bytes);
+                        }
+                    }
                     false
                 }
             })

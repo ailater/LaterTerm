@@ -802,6 +802,14 @@ impl TerminalView {
         }
     }
 
+    /// 会话写端克隆（广播输入用）：把字节写入底层 PTY/SSH 通道。
+    pub fn write_input(&self, bytes: &[u8]) {
+        let mut writer = self.stdin_writer.lock();
+        if let Err(error) = writer.write_all(bytes).and_then(|_| writer.flush()) {
+            eprintln!("广播写入失败: {error}");
+        }
+    }
+
     /// Handle mouse down events.
     ///
     /// Currently a placeholder for future mouse selection and interaction support.
