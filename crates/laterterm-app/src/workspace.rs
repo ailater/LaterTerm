@@ -3531,6 +3531,45 @@ fn setting_card() -> gpui::Div {
         .rounded_md()
 }
 
+/// 会话包装器：在 take_streams 时自动挂上 ZMODEM/trzsz 传输装饰器。
+/// 所有终端（本地/远程）都经过这层包装——rz/sz、trz/tsz 全线可用。
+struct TransferWrappedSession {
+    inner: Arc<dyn TerminalSession>,
+    download_dir: std::path::PathBuf,
+}
+
+impl TerminalSession for TransferWrappedSession {
+    fn backend(&self) -> laterterm_core::BackendKind {
+        self.inner.backend()
+    }
+
+    fn title(&self) -> String {
+        self.inner.title()
+    }
+
+    fn take_streams(&self) -> std::io::Result<laterterm_core::SessionStreams> {
+        let streams = self.inner.take_streams()?;
+        // 事件通道：接收端 drop 后 send 静默失败——传输仍正常工作，只是没有 UI 通知
+        let (events, _observer) = std::sync::mpsc::channel();
+        Ok(laterterm_transfer::wrap(
+            streams,
+            laterterm_transfer::TransferOptions {
+                download_dir: self.download_dir.clone(),
+                events,
+                upload_files: None,
+            },
+        ))
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+        self.inner.resize(cols, rows)
+    }
+
+    fn kill(&self) {
+        self.inner.kill();
+    }
+}
+
 fn setting_row(label: &str, chip: gpui::Div, controls: gpui::Div) -> gpui::Div {
     div()
         .flex()
@@ -3671,6 +3710,18 @@ fn build_pane_terminal(
     broadcast_tx: flume::Sender<Vec<u8>>,
     _initial_title: &str,
 ) -> (Entity<TerminalView>, Arc<SessionControl>) {
+    // 接线文件传输层：包装会话，take_streams 时自动挂上 ZMODEM/trzsz 装饰器
+    let download_dir = if settings.downloads_dir.is_empty() {
+        std::env::var("HOME")
+            .map(|home| std::path::PathBuf::from(home).join("Downloads"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+    } else {
+        std::path::PathBuf::from(&settings.downloads_dir)
+    };
+    let session: Arc<dyn TerminalSession> = Arc::new(TransferWrappedSession {
+        inner: session,
+        download_dir,
+    });
     let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
 
     let config = TerminalConfig {

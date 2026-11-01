@@ -3763,6 +3763,7 @@ dependencies = [
  "laterterm-secrets",
  "laterterm-ssh",
  "laterterm-termview",
+ "laterterm-transfer",
  "laterterm-xshell",
  "notify",
  "parking_lot",
