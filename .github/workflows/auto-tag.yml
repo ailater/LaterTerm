@@ -5,7 +5,7 @@
 # - 合入 main 且 CI 绿后，本 workflow 自动打 tag 并触发完整发布链
 # - 版本号不变地合入不会重复发版
 #
-# 前提：GH_TOKEN 有 contents:write 权限（GITHUB_TOKEN 的 default 权限够用）。
+# 前提：需要 contents:write（打 tag）+ actions:write（dispatch release）。
 
 name: Auto Tag
 
@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   tag-and-dispatch:
