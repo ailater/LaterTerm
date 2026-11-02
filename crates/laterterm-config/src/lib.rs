@@ -42,6 +42,9 @@ pub struct Settings {
     /// 服务器连接元数据；凭据同样只在密钥环。
     #[serde(default)]
     pub servers: Vec<servers::ServerEntry>,
+    /// 旧主线 servers.toml 只迁移一次，避免已删除条目重启后复活。
+    #[serde(default)]
+    pub legacy_servers_migrated: bool,
 }
 
 /// 内置面板的快捷键覆盖；`None` 表示使用默认绑定，原始文本保持不变。
@@ -83,6 +86,8 @@ pub struct Appearance {
     /// 备选字体链（主字体缺字时按序回退，如 CJK）；空表示用系统默认回退。
     #[serde(default)]
     pub font_fallbacks: Vec<String>,
+    /// 接收目录；空 = ~/Downloads。
+    pub downloads_dir: String,
 }
 
 fn default_true() -> bool {
@@ -101,11 +106,32 @@ impl Default for Appearance {
             theme: DEFAULT_THEME.into(),
             ligatures: true,
             font_fallbacks: Vec::new(),
+            downloads_dir: String::new(),
         }
     }
 }
 
 impl Settings {
+    /// 保留当前同名配置，迁移标记与条目在同一 settings.toml 中原子保存。
+    pub fn migrate_legacy_servers(&mut self, legacy: servers::ServerStore) -> bool {
+        if self.legacy_servers_migrated {
+            return false;
+        }
+        for entry in legacy.servers {
+            let entry: servers::ServerEntry = entry.into();
+            if let Some(entry) = entry.sanitized()
+                && !self
+                    .servers
+                    .iter()
+                    .any(|current| current.name == entry.name)
+            {
+                self.servers.push(entry);
+            }
+        }
+        self.legacy_servers_migrated = true;
+        true
+    }
+
     pub fn upsert_command(&mut self, command: CommandTemplate) -> Result<()> {
         command.validate()?;
         if let Some(existing) = self

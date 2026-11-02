@@ -257,6 +257,9 @@ pub type ResizeCallback = Box<dyn Fn(usize, usize) + Send + Sync>;
 /// ```
 pub type KeyHandler = Box<dyn Fn(&KeyDownEvent) -> bool + Send + Sync>;
 
+/// 实际用户输入写入成功后的观察口（控制键与文本/IME 提交共用，预编辑不触发）。
+pub type InputCallback = Box<dyn Fn(&[u8]) + Send + Sync>;
+
 /// Callback for terminal bell events.
 ///
 /// This callback is invoked when the terminal bell is triggered (BEL character,
@@ -430,6 +433,9 @@ pub struct TerminalView {
 
     /// Optional callback to intercept key events before terminal processing
     key_handler: Option<Arc<KeyHandler>>,
+
+    /// 用户输入提交观察口；广播目标 write_input 不触发，避免递归广播。
+    input_callback: Option<InputCallback>,
 
     /// Callback for terminal bell events
     bell_callback: Option<BellCallback>,
@@ -631,6 +637,7 @@ impl TerminalView {
                 })))
             },
             key_handler: None,
+            input_callback: None,
             bell_callback: None,
             title_callback: None,
             clipboard_store_callback: None,
@@ -686,6 +693,13 @@ impl TerminalView {
         handler: impl Fn(&KeyDownEvent) -> bool + Send + Sync + 'static,
     ) -> Self {
         self.key_handler = Some(Arc::new(Box::new(handler)));
+        self
+    }
+
+    /// 观察实际写入成功的控制键、普通文本与 IME 提交，用于广播输入。
+    /// 回调在释放写端锁后执行；预编辑、搜索及 write_input 广播目标不触发。
+    pub fn with_input_callback(mut self, callback: impl Fn(&[u8]) + Send + Sync + 'static) -> Self {
+        self.input_callback = Some(Box::new(callback));
         self
     }
 
@@ -877,10 +891,31 @@ impl TerminalView {
         }
 
         if let Some(bytes) = keystroke_to_bytes(keystroke, self.state.mode()) {
+            self.commit_input(&bytes);
+        }
+    }
+
+    /// 真实用户输入的统一提交口；先写本端，再在锁外观察，失败不广播。
+    fn commit_input(&self, bytes: &[u8]) {
+        let result = {
             let mut writer = self.stdin_writer.lock();
-            if let Err(error) = writer.write_all(&bytes).and_then(|_| writer.flush()) {
-                eprintln!("写入终端输入失败: {error}");
+            writer.write_all(bytes).and_then(|_| writer.flush())
+        };
+        match result {
+            Ok(()) => {
+                if let Some(callback) = &self.input_callback {
+                    callback(bytes);
+                }
             }
+            Err(error) => eprintln!("写入终端输入失败: {error}"),
+        }
+    }
+
+    /// 会话写端克隆（广播输入用）：把字节写入底层 PTY/SSH 通道。
+    pub fn write_input(&self, bytes: &[u8]) {
+        let mut writer = self.stdin_writer.lock();
+        if let Err(error) = writer.write_all(bytes).and_then(|_| writer.flush()) {
+            eprintln!("广播写入失败: {error}");
         }
     }
 
@@ -1326,13 +1361,7 @@ impl EntityInputHandler for TerminalView {
             return;
         }
         self.marked_text.clear();
-        let mut writer = self.stdin_writer.lock();
-        if let Err(error) = writer
-            .write_all(text.as_bytes())
-            .and_then(|_| writer.flush())
-        {
-            eprintln!("写入输入法文本失败: {error}");
-        }
+        self.commit_input(text.as_bytes());
         cx.notify();
     }
 
@@ -1694,16 +1723,204 @@ mod tests {
             TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
         });
         terminal.update_in(cx, |terminal, window, cx| {
+            for key in ["ctrl-alt-shift-f", "ctrl-shift-super-f", "ctrl-shift-fn-f"] {
+                terminal.on_key_down(
+                    &gpui::KeyDownEvent {
+                        keystroke: gpui::Keystroke::parse(key).unwrap(),
+                        is_held: false,
+                    },
+                    window,
+                    cx,
+                );
+                assert!(terminal.search.is_none(), "额外修饰键不能打开搜索: {key}");
+            }
             terminal.on_key_down(
                 &gpui::KeyDownEvent {
-                    keystroke: gpui::Keystroke::parse("ctrl-alt-shift-f").unwrap(),
+                    keystroke: gpui::Keystroke::parse("ctrl-shift-f").unwrap(),
                     is_held: false,
                 },
                 window,
                 cx,
             );
-            assert!(terminal.search.is_none(), "额外修饰键不能打开搜索");
+            assert!(terminal.search.is_some(), "精确 Ctrl+Shift+F 必须打开搜索");
         });
+    }
+
+    #[gpui::test]
+    fn committed_keyboard_and_ime_input_share_one_callback(cx: &mut TestAppContext) {
+        let input = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let received = input.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+                .with_input_callback(move |bytes| received.lock().unwrap().push(bytes.to_vec()))
+        });
+        terminal.update_in(cx, |terminal, window, cx| {
+            use gpui::EntityInputHandler;
+
+            terminal.on_key_down(
+                &gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke::parse("enter").unwrap(),
+                    is_held: false,
+                },
+                window,
+                cx,
+            );
+            terminal.on_key_down(
+                &gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke::parse("a").unwrap(),
+                    is_held: false,
+                },
+                window,
+                cx,
+            );
+            assert_eq!(input.lock().unwrap().len(), 1, "普通按键等待文本提交");
+            terminal.replace_text_in_range(None, "a", window, cx);
+            terminal.replace_and_mark_text_in_range(None, "zhong", None, window, cx);
+            assert_eq!(input.lock().unwrap().len(), 2, "预编辑不能广播");
+            terminal.replace_text_in_range(None, "中文", window, cx);
+            assert!(terminal.marked_text.is_empty());
+
+            // 广播目标入口不可再次广播；搜索态只改本地查询。
+            terminal.write_input(b"remote broadcast");
+            terminal.open_search(cx);
+            terminal.replace_text_in_range(None, "query", window, cx);
+            terminal.on_key_down(
+                &gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke::parse("ctrl-c").unwrap(),
+                    is_held: false,
+                },
+                window,
+                cx,
+            );
+        });
+        assert_eq!(
+            *input.lock().unwrap(),
+            vec![b"\r".to_vec(), b"a".to_vec(), "中文".as_bytes().to_vec()],
+            "控制键、ASCII 与 IME 提交各广播一次"
+        );
+    }
+
+    #[gpui::test]
+    fn input_callback_runs_outside_writer_lock_and_respects_key_handler(cx: &mut TestAppContext) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let terminal =
+                TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx);
+            let writer = terminal.stdin_writer.clone();
+            terminal
+                .with_key_handler(|event| event.keystroke.key == "escape")
+                .with_input_callback(move |_| {
+                    assert!(writer.try_lock().is_some(), "回调前必须释放本端写锁");
+                    observed.fetch_add(1, Ordering::SeqCst);
+                })
+        });
+        terminal.update_in(cx, |terminal, window, cx| {
+            for key in ["escape", "enter"] {
+                terminal.on_key_down(
+                    &gpui::KeyDownEvent {
+                        keystroke: gpui::Keystroke::parse(key).unwrap(),
+                        is_held: false,
+                    },
+                    window,
+                    cx,
+                );
+            }
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "拦截的按键不广播");
+    }
+
+    #[gpui::test]
+    fn input_callback_ignores_write_and_flush_failures(cx: &mut TestAppContext) {
+        struct FailingWriter {
+            fail_on_flush: bool,
+        }
+        impl std::io::Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.fail_on_flush {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+                .with_input_callback(move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                })
+        });
+        terminal.update_in(cx, |terminal, window, cx| {
+            use gpui::EntityInputHandler;
+
+            for fail_on_flush in [false, true] {
+                *terminal.stdin_writer.lock() = Box::new(FailingWriter { fail_on_flush });
+                terminal.on_key_down(
+                    &gpui::KeyDownEvent {
+                        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+                        is_held: false,
+                    },
+                    window,
+                    cx,
+                );
+                terminal.replace_text_in_range(None, "中文", window, cx);
+            }
+        });
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "失败输入不广播");
+    }
+
+    #[gpui::test]
+    fn scroll_callback_stays_debounced_and_only_reports_changes(cx: &mut TestAppContext) {
+        use std::time::Duration;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let terminal = cx.new(|cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+                .with_scroll_callback(move |_| {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                })
+        });
+        cx.background_executor.allow_parking();
+        terminal.update(cx, |terminal, cx| {
+            for _ in 0..10 {
+                terminal.schedule_scroll_report(cx);
+            }
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(Duration::from_millis(149));
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "150ms 内不刷新宿主");
+        cx.background_executor
+            .advance_clock(Duration::from_millis(1));
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "同一洪峰只报告一次");
+
+        terminal.update(cx, |terminal, cx| terminal.schedule_scroll_report(cx));
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(Duration::from_millis(150));
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "摘要未变不重复报告");
+
+        terminal.update(cx, |terminal, cx| {
+            terminal
+                .state
+                .process_bytes("line\r\n".repeat(40).as_bytes());
+            terminal.schedule_scroll_report(cx);
+        });
+        cx.run_until_parked();
+        cx.background_executor
+            .advance_clock(Duration::from_millis(150));
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "历史变化必须上报");
     }
 
     #[gpui::test]

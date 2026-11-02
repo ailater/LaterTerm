@@ -104,6 +104,11 @@ pub fn parse_deepin_servers(body: &str) -> Vec<ServerEntry> {
             key_path,
             note,
             shortcut: None,
+            encoding: match encode.to_ascii_uppercase().as_str() {
+                "GBK" => Some("GBK".into()),
+                "GB18030" => Some("GB18030".into()),
+                _ => None,
+            },
         };
         if entry.validate().is_ok() {
             out.push(entry);
@@ -224,6 +229,7 @@ pub fn parse_xshell_session(file_stem: &str, body: &str) -> Option<ServerEntry> 
         key_path,
         note,
         shortcut: None,
+        encoding: None,
     };
     (entry.validate().is_ok()).then_some(entry)
 }

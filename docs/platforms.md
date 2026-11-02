@@ -52,6 +52,7 @@ bash script/install-linux-desktop.sh --binary "$PWD/target/debug/laterterm"
 - 原生 release 构建需要 MSVC、Windows SDK 的 `rc.exe` 和 `fxc.exe`；GPUI 使用 `GPUI_FXC_PATH`。不能把 Linux 上 `cargo clippy --all-targets` 称作 Windows 构建通过。
 - 默认 shell 集中在 `laterterm-local::default_shell()`：优先绝对 `COMSPEC`，再 `SystemRoot\\System32\\cmd.exe`，最终 `cmd.exe`；不再无条件寻找 `/bin/bash`。路径允许合法空格，不把可执行文件和参数拼成 shell 命令。
 - 本地 PTY 测试使用平台对应的命令，Windows 不运行 Unix 的 `printf`/`sleep` 参数。
+- 主线整合的自动 ZMODEM/trzsz 实现依赖 Unix；Windows 下传输包装透明返回原会话流，不拦截或吞掉协议字节，暂不提供自动文件传输。单独 transfer crate 的 Windows GNU 离线编译已在额外 stable 工具链检查过，不代表 MSVC 整个应用或 Windows 原生运行通过。
 - 原生构建工作流手动触发，包含 release 构建、EXE 中 `RT_GROUP_ICON` ID 1 校验及本地 PTY 测试；仅添加配置，未在本轮触发。
 - Explorer、Alt-Tab、任务栏、100/125/150/200% 缩放及跨屏均待 Windows 原生验收。不把资源嵌入等同于固定 AppUserModelID、MSI 或发布签名。
 

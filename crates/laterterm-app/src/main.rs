@@ -2,6 +2,7 @@
 
 mod branding;
 mod command_text_field;
+mod import;
 mod pane_navigation;
 mod server_connection;
 mod shortcut_recorder;

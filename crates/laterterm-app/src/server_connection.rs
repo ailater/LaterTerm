@@ -6,7 +6,8 @@ use laterterm_config::{ServerAuthKind, ServerEntry};
 use laterterm_core::TerminalSession;
 use laterterm_secrets::{SecretStore, ssh_account, ssh_passphrase_account};
 use laterterm_ssh::{
-    AuthMethod, PrivateKeyPassphraseRequired, SshOptions, SshSession, prepare_private_key,
+    AuthMethod, HostKeyPolicy, PrivateKeyPassphraseRequired, SessionEncoding, SshAuth, SshEndpoint,
+    SshOptions, SshSession, prepare_private_key,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -64,8 +65,55 @@ pub(crate) fn connect(
         active,
         prepare_private_key,
         |auth| {
-            let options = SshOptions::new(&entry.host, entry.port, &entry.username, auth);
-            Ok(Arc::new(SshSession::connect(options)?) as Arc<dyn TerminalSession>)
+            let auth = match auth {
+                AuthMethod::Agent => SshAuth::Agent,
+                AuthMethod::Password { password } => SshAuth::Password(password),
+                AuthMethod::KeyboardInteractive { secret } => SshAuth::KeyboardInteractive(secret),
+                AuthMethod::PrivateKey {
+                    key_path,
+                    passphrase,
+                } => SshAuth::KeyFile {
+                    path: key_path,
+                    passphrase,
+                },
+                AuthMethod::PreparedPrivateKey { keys } => SshAuth::PreparedPrivateKey { keys },
+            };
+            let primary = laterterm_config::app_config_dir()
+                .map(|dir| dir.join("known_hosts"))
+                .ok_or_else(|| anyhow::anyhow!("无法确定 known_hosts 路径"))?;
+            let mut fallback_paths = Vec::new();
+            if let Some(home) = std::env::home_dir() {
+                for path in [
+                    home.join(".config/laterterm/known_hosts"),
+                    home.join(".ssh/known_hosts"),
+                ] {
+                    if path != primary && !fallback_paths.contains(&path) {
+                        fallback_paths.push(path);
+                    }
+                }
+            }
+            let endpoint = SshEndpoint {
+                host: entry.host.clone(),
+                port: Some(entry.port),
+                username: entry.username.clone(),
+                auth,
+                host_key_policy: HostKeyPolicy::KnownHostsWithFallback {
+                    path: primary,
+                    fallback_paths,
+                },
+                encoding: match entry.encoding.as_deref() {
+                    Some("gbk") => SessionEncoding::Gbk,
+                    Some("gb18030") => SessionEncoding::Gb18030,
+                    _ => SessionEncoding::Utf8,
+                },
+            };
+            let options = SshOptions {
+                endpoint,
+                jump: None,
+                cols: 110,
+                rows: 30,
+            };
+            Ok(Arc::new(SshSession::spawn(options)?) as Arc<dyn TerminalSession>)
         },
     )
 }
@@ -99,6 +147,7 @@ where
     anyhow::ensure!(active.load(Ordering::Acquire), "连接已取消");
     let mut to_remember = None;
     let auth = match supplied {
+        _ if entry.auth == ServerAuthKind::Agent => AuthMethod::Agent,
         Some((CredentialKind::PrivateKey { key_path, context }, secret)) => {
             match prepare(Some(&key_path), Some(&secret)) {
                 Ok(auth) => {
@@ -150,7 +199,16 @@ where
                 Err(outcome) => return Ok(outcome),
             }
         }
-        None => match get_secret(&store, ssh_account(&entry.name)?) {
+        None => match get_secret(&store, ssh_account(&entry.name)?).and_then(|secret| {
+            if secret.as_ref().is_some_and(|s| !s.is_empty()) {
+                Ok(secret)
+            } else {
+                get_secret(
+                    &store,
+                    laterterm_config::servers::password_account(&entry.name),
+                )
+            }
+        }) {
             Ok(Some(secret)) if !secret.is_empty() => login_auth(entry.auth, &secret),
             Ok(_) => return Ok(prompt(CredentialKind::Login, None)),
             Err(_) => {
@@ -513,6 +571,80 @@ mod tests {
                 },
             ))
         }
+    }
+
+    #[test]
+    fn agent_bypasses_keyring_and_private_keys() {
+        let store = Arc::new(MemoryStore::default());
+        store.fail.store(true, Ordering::SeqCst);
+        let outcome = connect_with(
+            &entry(ServerAuthKind::Agent),
+            None,
+            true,
+            store.clone(),
+            active(),
+            |_, _| panic!("Agent 不读取私钥"),
+            |auth| {
+                assert!(matches!(auth, AuthMethod::Agent));
+                Ok(Arc::new(Session::default()))
+            },
+        )
+        .unwrap();
+        assert!(matches!(outcome, ConnectionOutcome::Connected { .. }));
+        assert!(store.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn old_password_account_is_login_only_readonly_fallback() {
+        let store = Arc::new(MemoryStore::default());
+        let old = laterterm_config::servers::password_account("test");
+        store
+            .values
+            .lock()
+            .unwrap()
+            .insert(old.clone(), "old-login".into());
+        connect_with(
+            &entry(ServerAuthKind::Password),
+            None,
+            true,
+            store.clone(),
+            active(),
+            |_, _| panic!("不读取私钥"),
+            |auth| {
+                assert!(
+                    matches!(auth, AuthMethod::Password { password } if password == "old-login")
+                );
+                Ok(Arc::new(Session::default()))
+            },
+        )
+        .unwrap();
+        assert!(
+            !store
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c.starts_with("set:"))
+        );
+        store.calls.lock().unwrap().clear();
+        let outcome = connect_with(
+            &entry(ServerAuthKind::PrivateKey),
+            None,
+            false,
+            store.clone(),
+            active(),
+            |path, password| encrypted(path.unwrap(), password),
+            |_| panic!("必须询问私钥口令"),
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ConnectionOutcome::Prompt {
+                kind: CredentialKind::PrivateKey { .. },
+                ..
+            }
+        ));
+        assert!(!store.calls.lock().unwrap().contains(&format!("get:{old}")));
     }
 
     #[test]

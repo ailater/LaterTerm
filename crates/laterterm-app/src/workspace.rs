@@ -60,6 +60,7 @@ enum WorkspaceShortcut {
     Split(SplitDirection),
     FocusPrevious,
     FocusNext,
+    ToggleBroadcast,
 }
 
 /// 仅读取或打开配置不会触发热加载，避免重读自身产生监听事件的循环。
@@ -327,6 +328,7 @@ const BUILTIN_SHORTCUTS: &[(&str, &str)] = &[
     ("ctrl+shift+[", "上一个窗格"),
     ("ctrl+shift+]", "下一个窗格"),
     ("ctrl+shift+f", "回滚搜索"),
+    ("ctrl+shift+b", "广播输入"),
 ];
 
 /// 快捷键绑定归属：内置项不可编辑；其余以「类别:名称」唯一标识。
@@ -434,6 +436,10 @@ pub struct WorkspaceView {
     left_panel: bool,
     right_panel: bool,
     settings_open: bool,
+    broadcast: bool,
+    welcome_visible: bool,
+    broadcast_tx: flume::Sender<(PaneId, Vec<u8>)>,
+    broadcast_rx: flume::Receiver<(PaneId, Vec<u8>)>,
     settings_page: SettingsPage,
     shortcut_editor: Option<ShortcutEditor>,
     panel_shortcut_dialog: Option<BindingOwner>,
@@ -483,10 +489,17 @@ pub struct WorkspaceView {
 impl WorkspaceView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let weak_workspace = cx.weak_entity();
-        let settings = Settings::load_or_default();
+        let first_run = !Settings::default_path().is_some_and(|path| path.exists());
+        let mut settings = Settings::load_or_default();
+        if !settings.legacy_servers_migrated
+            && settings.migrate_legacy_servers(laterterm_config::servers::ServerStore::load())
+        {
+            settings.save();
+        }
         settings.ensure_settings_file();
         let themes = ThemeRegistry::load();
         let (shortcut_tx, shortcut_rx) = flume::unbounded();
+        let (broadcast_tx, broadcast_rx) = flume::unbounded();
         let first_pane = PaneId(1);
         let first_tab = TabId(1);
         let theme = themes.resolve(&settings.appearance.theme).clone();
@@ -497,6 +510,7 @@ impl WorkspaceView {
             &settings.appearance,
             &theme,
             shortcut_tx.clone(),
+            broadcast_tx.clone(),
         );
         cx.subscribe_in(
             &terminal,
@@ -567,9 +581,14 @@ impl WorkspaceView {
             left_panel: false,
             right_panel: false,
             settings_open: false,
+            broadcast: false,
+            welcome_visible: first_run,
+            broadcast_tx,
+            broadcast_rx,
         };
         Self::watch_config_files(cx);
         view.start_shortcut_pump(cx);
+        view.start_broadcast_pump(cx);
         view.start_totp_ticker(cx);
         view
     }
@@ -603,6 +622,41 @@ impl WorkspaceView {
         }
     }
 
+    fn start_broadcast_pump(&self, cx: &mut Context<Self>) {
+        let rx = self.broadcast_rx.clone();
+        cx.spawn(async move |this, cx| {
+            while let Ok((source, bytes)) = rx.recv_async().await {
+                if this
+                    .update(cx, |workspace, cx| {
+                        if !workspace.broadcast
+                            || !workspace
+                                .panes
+                                .iter()
+                                .any(|pane| pane.id == source && pane.status == TabStatus::Running)
+                        {
+                            return;
+                        }
+                        for pane in &workspace.panes {
+                            if pane.id != source && pane.status == TabStatus::Running {
+                                pane.terminal.read(cx).write_input(&bytes);
+                            }
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn toggle_broadcast(&mut self, cx: &mut Context<Self>) {
+        while self.broadcast_rx.try_recv().is_ok() {}
+        self.broadcast = !self.broadcast;
+        cx.notify();
+    }
+
     fn handle_shortcut(
         &mut self,
         shortcut: WorkspaceShortcut,
@@ -613,7 +667,19 @@ impl WorkspaceView {
             WorkspaceShortcut::Split(direction) => self.split_focused(direction, window, cx),
             WorkspaceShortcut::FocusPrevious => self.cycle_focus(false, window, cx),
             WorkspaceShortcut::FocusNext => self.cycle_focus(true, window, cx),
+            WorkspaceShortcut::ToggleBroadcast => self.toggle_broadcast(cx),
         }
+    }
+
+    /// 关闭欢迎覆盖层。
+    fn dismiss_welcome(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.welcome_visible = false;
+        cx.notify();
     }
 
     fn active_tab_index(&self) -> usize {
@@ -715,6 +781,7 @@ impl WorkspaceView {
         let pane_id = PaneId(self.next_pane_id);
         self.next_pane_id += 1;
         let theme = self.themes.resolve(&self.settings.appearance.theme).clone();
+        let session = wrap_transfer(session, &self.settings.appearance);
         let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
         let terminal = create_terminal_view(
             pane_id,
@@ -722,6 +789,7 @@ impl WorkspaceView {
             terminal_config_for(&self.settings.appearance, &theme),
             cx.weak_entity(),
             self.shortcut_tx.clone(),
+            self.broadcast_tx.clone(),
             cx,
         );
         cx.subscribe_in(
@@ -1745,9 +1813,10 @@ impl WorkspaceView {
                 ServerAuthKind::Password => "密码（可选，存密钥环）",
                 ServerAuthKind::KeyboardInteractive => "口令（可选，存密钥环）",
                 ServerAuthKind::PrivateKey => "passphrase（可选）",
+                ServerAuthKind::Agent => "Agent（无需密码）",
             }
         };
-        let rows: [(&str, String, &str); 7] = [
+        let rows: [(&str, String, &str); 8] = [
             ("名称", meta.name, "如 跳板机A"),
             ("主机", meta.host, "host 或 IP"),
             ("端口", meta.port.to_string(), "22"),
@@ -1756,6 +1825,11 @@ impl WorkspaceView {
                 "私钥路径",
                 meta.key_path.unwrap_or_default(),
                 "可选；留空查找 ~/.ssh/id_ed25519、id_rsa",
+            ),
+            (
+                "编码",
+                meta.encoding.unwrap_or_else(|| "UTF-8".into()),
+                "UTF-8 / GBK / GB18030",
             ),
             ("备注", meta.note, "备注（可选）"),
             ("凭据", String::new(), secret_placeholder),
@@ -1810,6 +1884,20 @@ impl WorkspaceView {
             .get("私钥路径")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
+        meta.encoding = match values
+            .get("编码")
+            .map(|value| value.trim().to_ascii_uppercase())
+            .as_deref()
+        {
+            None | Some("") | Some("UTF-8") | Some("UTF8") => None,
+            Some("GBK") => Some("GBK".into()),
+            Some("GB18030") => Some("GB18030".into()),
+            _ => {
+                self.server_error = Some("编码仅支持 UTF-8 / GBK / GB18030".into());
+                cx.notify();
+                return;
+            }
+        };
         meta.note = values
             .get("备注")
             .map(|v| v.trim().to_string())
@@ -2173,6 +2261,22 @@ impl WorkspaceView {
         };
         match load_deepin_servers(&path) {
             Ok(entries) => {
+                if let Some(parent) = path.parent()
+                    && let Ok(text) = std::fs::read_to_string(parent.join("command-config.conf"))
+                    && let Ok(commands) = laterterm_deepin::parse_commands(&text)
+                {
+                    for command in crate::import::deepin_commands_batch(&commands) {
+                        if !self
+                            .settings
+                            .commands
+                            .iter()
+                            .any(|entry| entry.name == command.name)
+                        {
+                            self.settings.commands.push(command);
+                        }
+                    }
+                    self.settings.save();
+                }
                 self.merge_server_entries(entries, &path.display().to_string(), cx);
             }
             Err(error) => {
@@ -2186,9 +2290,9 @@ impl WorkspaceView {
     fn import_servers_xshell(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
-            directories: false,
+            directories: true,
             multiple: true,
-            prompt: Some("选择 Xshell 会话文件（.xsh）".into()),
+            prompt: Some("选择 Xshell 会话文件或目录".into()),
         });
         cx.spawn(async move |this, cx| {
             let picked = receiver
@@ -2215,7 +2319,27 @@ impl WorkspaceView {
             Ok(None) => return,
             Ok(Some(paths)) => paths,
         };
-        match load_xshell_sessions(&paths) {
+        let mut imported = Vec::new();
+        let mut rejected = 0;
+        for path in &paths {
+            let sessions = if path.is_dir() {
+                laterterm_xshell::load_sessions_dir(path)
+            } else {
+                laterterm_xshell::load_session(path).map(|session| vec![session])
+            };
+            if let Ok(sessions) = sessions {
+                let (entries, skipped) = crate::import::xshell_batch(&sessions);
+                imported.extend(entries.into_iter().map(ServerEntry::from));
+                rejected += skipped.len();
+            } else if let Ok((entries, skipped)) = load_xshell_sessions(std::slice::from_ref(path))
+            {
+                imported.extend(entries);
+                rejected += skipped;
+            } else {
+                rejected += 1;
+            }
+        }
+        match Ok::<_, anyhow::Error>((imported, rejected)) {
             Ok((entries, skipped)) if entries.is_empty() => {
                 self.server_error = Some(format!(
                     "所选文件中没有可识别的 .xsh 会话（跳过 {skipped} 个文件）"
@@ -2804,6 +2928,13 @@ impl WorkspaceView {
         if self.settings_open {
             return;
         }
+        if keystroke_matches_shortcut(event, "ctrl+shift+b") {
+            if !event.is_held {
+                self.toggle_broadcast(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         for (tab, shortcut) in [
             (
                 RightPanelTab::Commands,
@@ -3013,7 +3144,11 @@ impl Render for WorkspaceView {
                             .when(cfg!(target_os = "macos"), |brand| brand.pl(px(82.0)))
                             .child(button("☰", cx.listener(Self::toggle_left_panel)))
                             .child(titlebar_logo())
-                            .child(div().text_color(rgb(0xC0CAF5)).child("LaterTerm")),
+                            .child(div().text_color(rgb(0xC0CAF5)).child(if self.broadcast {
+                                "LaterTerm · 广播中"
+                            } else {
+                                "LaterTerm"
+                            })),
                     )
                     .child(
                         div()
@@ -3154,6 +3289,12 @@ impl Render for WorkspaceView {
                     settings_content(self.settings_page, self, cx),
                 ))
             })
+            .when(self.welcome_visible, |root| {
+                root.child(welcome_overlay(
+                    cx.listener(Self::dismiss_welcome),
+                    cx.listener(Self::dismiss_welcome),
+                ))
+            })
             // 命令/动态码/服务器对话框：窗口级模态弹窗（最上层）
             .when_some(render_active_dialog(self, cx), |root, overlay| {
                 root.child(overlay)
@@ -3207,6 +3348,106 @@ impl Render for WorkspaceView {
                 },
             ))
     }
+}
+
+/// 首启欢迎覆盖层：快捷键速查 + 开始按钮。
+fn welcome_overlay(
+    scrim_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    button_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Div {
+    div()
+        .absolute()
+        .top_0()
+        .right_0()
+        .bottom_0()
+        .left_0()
+        .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.96))
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_mouse_down(MouseButton::Left, scrim_listener)
+        .child(
+            div()
+                .w(px(520.0))
+                .p_8()
+                .bg(rgb(0x1A1B26))
+                .flex()
+                .flex_col()
+                .gap_4()
+                .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                .child(
+                    div()
+                        .text_size(px(28.0))
+                        .text_color(rgb(0x7DCFFF))
+                        .child("LaterTerm"),
+                )
+                .child(
+                    div()
+                        .text_color(rgb(0xA9B1D6))
+                        .child("跨平台 GPU 终端 · 为中文开发者打造"),
+                )
+                .child(
+                    div()
+                        .pt_4()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_color(rgb(0xC0CAF5))
+                                .text_size(px(14.0))
+                                .child("常用快捷键"),
+                        )
+                        .child(welcome_shortcut("新建标签", "Ctrl+T"))
+                        .child(welcome_shortcut("分屏（横向 / 纵向）", "Ctrl+J / K"))
+                        .child(welcome_shortcut("窗格切换", "Ctrl+Shift+[ / ]"))
+                        .child(welcome_shortcut("搜索回滚", "Ctrl+Shift+F"))
+                        .child(welcome_shortcut("广播输入（多窗格同步）", "Ctrl+Shift+B"))
+                        .child(welcome_shortcut("设置 / 服务器管理", "Ctrl+,")),
+                )
+                .child(
+                    div()
+                        .pt_4()
+                        .text_color(rgb(0x565A78))
+                        .text_size(px(12.0))
+                        .child("提示：右侧面板 → 服务器 可添加 SSH 连接或从 XShell / deepin 导入"),
+                )
+                .child(
+                    div().pt_4().child(
+                        div()
+                            .px_6()
+                            .py_2()
+                            .bg(rgb(0x7AA2F7))
+                            .text_color(rgb(0x1A1B26))
+                            .text_size(px(16.0))
+                            .cursor_pointer()
+                            .on_mouse_down(MouseButton::Left, button_listener)
+                            .child("开始使用"),
+                    ),
+                ),
+        )
+}
+
+fn welcome_shortcut(label: &str, keys: &str) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .w(px(220.0))
+                .text_color(rgb(0xA9B1D6))
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .px_2()
+                .py_1()
+                .bg(rgb(0x24283B))
+                .text_color(rgb(0x7DCFFF))
+                .text_size(px(12.0))
+                .child(keys.to_string()),
+        )
 }
 
 fn render_layout(
@@ -4139,6 +4380,7 @@ fn server_edit_modal(
                         (ServerAuthKind::Password, "密码"),
                         (ServerAuthKind::KeyboardInteractive, "交互口令"),
                         (ServerAuthKind::PrivateKey, "私钥（免登录密码）"),
+                        (ServerAuthKind::Agent, "Agent"),
                     ]
                     .into_iter()
                     .map(|(kind, label)| {
@@ -4153,7 +4395,7 @@ fn server_edit_modal(
                     }),
                 ),
         )
-        .child(div().pt_2().text_size(px(11.0)).text_color(rgb(0x7D829F)).child("私钥模式凭据为本机私钥的解锁口令，可留空。客户端仍需与服务端公钥配对的私钥；暂不使用 ssh-agent。"))
+        .child(div().pt_2().text_size(px(11.0)).text_color(rgb(0x7D829F)).child("私钥模式凭据为本机私钥的解锁口令，可留空。客户端仍需与服务端公钥配对的私钥；选择 Agent 时使用系统 SSH agent，不读取密码密钥环。"))
         .child(dialog_footer(vec![
             setting_button(
                 "保存",
@@ -4484,6 +4726,7 @@ fn render_server_section(
                 ServerAuthKind::Password => "密码",
                 ServerAuthKind::KeyboardInteractive => "交互",
                 ServerAuthKind::PrivateKey => "密钥",
+                ServerAuthKind::Agent => "Agent",
             };
             let pending_delete = delete_confirm.as_deref() == Some(entry.name.as_str());
             entry_card()
@@ -5447,6 +5690,60 @@ fn button_with_color(
         .child(label)
 }
 
+struct TransferWrappedSession {
+    inner: Arc<dyn TerminalSession>,
+    download_dir: std::path::PathBuf,
+}
+
+impl TerminalSession for TransferWrappedSession {
+    fn backend(&self) -> laterterm_core::BackendKind {
+        self.inner.backend()
+    }
+
+    fn title(&self) -> String {
+        self.inner.title()
+    }
+
+    fn take_streams(&self) -> std::io::Result<laterterm_core::SessionStreams> {
+        let streams = self.inner.take_streams()?;
+        // 事件通道：接收端 drop 后 send 静默失败——传输仍正常工作，只是没有 UI 通知
+        let (events, _observer) = std::sync::mpsc::channel();
+        Ok(laterterm_transfer::wrap(
+            streams,
+            laterterm_transfer::TransferOptions {
+                download_dir: self.download_dir.clone(),
+                events,
+                upload_files: None,
+            },
+        ))
+    }
+
+    fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+        self.inner.resize(cols, rows)
+    }
+
+    fn kill(&self) {
+        self.inner.kill();
+    }
+}
+
+fn wrap_transfer(
+    session: Arc<dyn TerminalSession>,
+    settings: &Appearance,
+) -> Arc<dyn TerminalSession> {
+    let download_dir = if settings.downloads_dir.is_empty() {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("Downloads")
+    } else {
+        PathBuf::from(&settings.downloads_dir)
+    };
+    Arc::new(TransferWrappedSession {
+        inner: session,
+        download_dir,
+    })
+}
 fn create_local_terminal(
     id: PaneId,
     workspace: gpui::WeakEntity<WorkspaceView>,
@@ -5454,6 +5751,7 @@ fn create_local_terminal(
     settings: &Appearance,
     theme: &Theme,
     shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
+    broadcast_tx: flume::Sender<(PaneId, Vec<u8>)>,
 ) -> (Entity<TerminalView>, Arc<SessionControl>) {
     // 会话的开启/spawn/回收线程全部内聚在 LocalSession（laterterm-local）
     let shell = laterterm_local::default_shell();
@@ -5467,6 +5765,7 @@ fn create_local_terminal(
         })
         .expect("启动本地会话失败"),
     );
+    let session = wrap_transfer(session, settings);
     let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
     let terminal = create_terminal_view(
         id,
@@ -5474,6 +5773,7 @@ fn create_local_terminal(
         terminal_config_for(settings, theme),
         workspace,
         shortcut_tx,
+        broadcast_tx,
         cx,
     );
     (terminal, session_control)
@@ -5537,6 +5837,7 @@ fn create_terminal_view(
     config: TerminalConfig,
     workspace: gpui::WeakEntity<WorkspaceView>,
     shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
+    broadcast_tx: flume::Sender<(PaneId, Vec<u8>)>,
     cx: &mut Context<WorkspaceView>,
 ) -> Entity<TerminalView> {
     cx.new(|cx| {
@@ -5551,6 +5852,8 @@ fn create_terminal_view(
                     Some(WorkspaceShortcut::FocusPrevious)
                 } else if keystroke_matches_shortcut(event, "ctrl+shift+]") {
                     Some(WorkspaceShortcut::FocusNext)
+                } else if keystroke_matches_shortcut(event, "ctrl+shift+b") {
+                    Some(WorkspaceShortcut::ToggleBroadcast)
                 } else {
                     None
                 };
@@ -5560,6 +5863,9 @@ fn create_terminal_view(
                 } else {
                     false
                 }
+            })
+            .with_input_callback(move |bytes| {
+                let _ = broadcast_tx.send((id, bytes.to_vec()));
             })
             .with_title_callback({
                 let workspace = workspace.clone();
@@ -5762,6 +6068,35 @@ mod exit_regression_tests {
         workspace.read_with(cx, |view, _| {
             assert_eq!(view.panes.len(), 1, "备用分屏处理也必须精确匹配");
             assert_eq!(view.tabs.len(), 1, "额外修饰键不能被内置 Ctrl+T 抢走");
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn merged_broadcast_shortcut_is_exact_and_modal_safe(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            view.welcome_visible = false;
+            view.focus_active(window, cx);
+            window.activate_window();
+        });
+        cx.simulate_keystrokes("ctrl-shift-b");
+        workspace.update_in(cx, |view, window, cx| {
+            assert!(view.broadcast);
+            view.edit_command(None, window, cx);
+        });
+        cx.simulate_keystrokes("ctrl-shift-b");
+        workspace.update_in(cx, |view, window, cx| {
+            assert!(view.broadcast, "弹窗输入不能切换广播");
+            view.dismiss_command(window, cx);
+        });
+        cx.simulate_keystrokes("ctrl-alt-shift-b");
+        workspace.read_with(cx, |view, _| assert!(view.broadcast));
+        cx.simulate_keystrokes("ctrl-shift-b");
+        workspace.read_with(cx, |view, _| {
+            assert!(!view.broadcast);
             for pane in &view.panes {
                 pane.session.close();
             }

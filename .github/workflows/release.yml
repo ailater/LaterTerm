@@ -1,0 +1,191 @@
+# LaterTerm release：tag → 三平台构建 → GitHub Release
+#
+# 由 auto-tag.yml 在版本号变化时自动 dispatch，也可手动 workflow_dispatch。
+# 产物：Linux x64 tar.xz + macOS 双架构 dmg（M4 首版；Windows 后续）。
+
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Linux x64 构建
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+
+      - name: 安装 GPUI 系统依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev \
+            libxcb1-dev libasound2-dev libudev-dev libfontconfig1-dev pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux
+
+      - name: 构建
+        run: cargo build --release -p laterterm-app --bin laterterm
+
+      - name: 打包 tar.xz
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          mkdir -p laterterm-${VERSION}
+          cp target/release/laterterm laterterm-${VERSION}/
+          cp README.md laterterm-${VERSION}/
+          tar -cJf laterterm-${VERSION}-x86_64-unknown-linux-gnu.tar.xz laterterm-${VERSION}/
+          sha256sum laterterm-${VERSION}-x86_64-unknown-linux-gnu.tar.xz > laterterm-${VERSION}-x86_64-unknown-linux-gnu.tar.xz.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: |
+            *.tar.xz
+            *.sha256
+
+  build-windows:
+    name: Windows x64 构建（尽力而为）
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows
+
+      - name: 构建
+        run: cargo build --release -p laterterm-app --bin laterterm
+
+      - name: 打包 zip
+        shell: bash
+        run: |
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          mkdir -p laterterm-${VERSION}
+          cp target/release/laterterm.exe laterterm-${VERSION}/
+          cp README.md laterterm-${VERSION}/
+          7z a -tzip laterterm-${VERSION}-x86_64-pc-windows-msvc.zip laterterm-${VERSION}/
+          sha256sum laterterm-${VERSION}-x86_64-pc-windows-msvc.zip > laterterm-${VERSION}-x86_64-pc-windows-msvc.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: |
+            *.zip
+            *.sha256
+
+  build-macos:
+    name: macOS dmg（双架构）
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-macos
+
+      - name: 构建双架构
+        run: |
+          cargo build --release -p laterterm-app --bin laterterm --target aarch64-apple-darwin
+          cargo build --release -p laterterm-app --bin laterterm --target x86_64-apple-darwin
+
+      - name: lipo 合一
+        run: |
+          lipo -create \
+            -output laterterm-universal \
+            target/x86_64-apple-darwin/release/laterterm \
+            target/aarch64-apple-darwin/release/laterterm
+          lipo -archs laterterm-universal | tee /dev/stderr | grep -q x86_64
+          lipo -archs laterterm-universal | tee /dev/stderr | grep -q arm64
+
+      - name: 清理构建产物腾磁盘
+        run: |
+          rm -rf target/aarch64-apple-darwin/release
+          rm -rf target/x86_64-apple-darwin/release
+          df -h /
+
+      - name: 组装 .app + dmg
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          VERSION_NUM="${VERSION#v}"
+          # 最小 .app bundle（Info.plist 后续补齐）
+          mkdir -p LaterTerm.app/Contents/MacOS
+          cp laterterm-universal LaterTerm.app/Contents/MacOS/laterterm
+          DMG="laterterm-${VERSION_NUM}-universal2-apple-darwin.dmg"
+          hdiutil create -volname "LaterTerm" -srcfolder LaterTerm.app \
+            -ov -format UDZO "$DMG"
+          shasum -a 256 "$DMG" > "$DMG.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal2
+          path: |
+            *.dmg
+            *.sha256
+
+  release:
+    name: 创建 Release
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 收集产物
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f \( -name "*.tar.xz" -o -name "*.dmg" -o -name "*.zip" -o -name "*.sha256" \) \
+            -exec cp {} release-assets/ \;
+          ls -la release-assets/
+
+      - name: 提取 CHANGELOG 小节作为 Release 正文
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          # 取 ## v<版本> 到下一个 ## 之间的小节
+          awk -v ver="## ${TAG}" '
+            $0 ~ "^"ver { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md || true
+          # 兜底：无小节就给一行说明
+          if [ ! -s release-notes.md ]; then
+            echo "LaterTerm ${TAG}" > release-notes.md
+          fi
+
+      - name: 创建 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            --title "LaterTerm ${TAG}" \
+            --notes-file release-notes.md \
+            release-assets/*
