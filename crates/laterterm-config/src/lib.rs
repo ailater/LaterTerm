@@ -16,7 +16,7 @@ pub mod servers;
 pub mod theme;
 pub mod totp;
 
-pub use commands::CommandTemplate;
+pub use commands::{normalize_shortcut, shortcut_conflicts, CommandTemplate};
 pub use importers::{deepin_default_path, load_deepin_servers, load_xshell_sessions};
 pub use servers::{ServerAuthKind, ServerEntry, ServersFile};
 pub use theme::{DEFAULT_THEME, Theme, ThemeRegistry, themes_dir};

@@ -119,3 +119,45 @@ fn split_ratio_updates_target_node_only() {
     };
     assert!(matches!(second.as_ref(), LayoutNode::Split { ratio: 0.3, .. }));
 }
+
+#[test]
+fn unified_shortcut_conflicts_detect_cross_kind() {
+    use super::workspace::{BindingOwner, ShortcutBinding, shortcut_conflict_with};
+
+    let bindings = vec![
+        ShortcutBinding {
+            owner: BindingOwner::Builtin,
+            normalized: "ctrl+t".into(),
+            label: "新建标签".into(),
+        },
+        ShortcutBinding {
+            owner: BindingOwner::Command("ssh".into()),
+            normalized: "ctrl+alt+1".into(),
+            label: "运行命令 ssh".into(),
+        },
+    ];
+    // 撞内置
+    assert_eq!(
+        shortcut_conflict_with(&bindings, "Ctrl+T", None).as_deref(),
+        Some("内置快捷键")
+    );
+    // 撞命令
+    assert_eq!(
+        shortcut_conflict_with(&bindings, "ctrl+alt+1", None).as_deref(),
+        Some("命令「ssh」")
+    );
+    // 编辑自身豁免
+    assert!(shortcut_conflict_with(
+        &bindings,
+        "ctrl+alt+1",
+        Some(&BindingOwner::Command("ssh".into()))
+    )
+    .is_none());
+    // 大小写与空格等价
+    assert_eq!(
+        shortcut_conflict_with(&bindings, " CTRL + ALT + 1 ", None).as_deref(),
+        Some("命令「ssh」")
+    );
+    // 非法格式返回 None：格式校验由保存路径先行的 normalize 报错承担
+    assert!(shortcut_conflict_with(&bindings, "ctrl", None).is_none());
+}

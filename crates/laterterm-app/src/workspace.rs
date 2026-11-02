@@ -10,7 +10,8 @@ use laterterm_termview::view::ScrollSummary;
 use laterterm_config::{
     Appearance, CommandTemplate, ServerAuthKind, ServerEntry, ServersFile, Settings, Theme,
     ThemeRegistry, TotpAlgorithm, TotpConfig, TotpEntry, app_config_dir, deepin_default_path,
-    generate_code, load_deepin_servers, load_xshell_sessions, parse_secret_input,
+    generate_code, load_deepin_servers, load_xshell_sessions, normalize_shortcut,
+    parse_secret_input,
 };
 use laterterm_core::TerminalSession;
 use laterterm_local::{LocalOptions, LocalSession};
@@ -267,6 +268,63 @@ enum ServerDialog {
         name: String,
         remember: bool,
     },
+}
+
+/// 内置快捷键（不可改，但参与全局冲突检测）。
+const BUILTIN_SHORTCUTS: &[(&str, &str)] = &[
+    ("ctrl+t", "新建标签"),
+    ("ctrl+w", "关闭窗格 / 标签"),
+    ("ctrl+shift+e", "左右分屏"),
+    ("ctrl+shift+o", "上下分屏"),
+    ("ctrl+shift+[", "上一个窗格"),
+    ("ctrl+shift+]", "下一个窗格"),
+    ("ctrl+shift+f", "回滚搜索"),
+];
+
+/// 快捷键绑定归属：内置项不可编辑；其余以「类别:名称」唯一标识。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BindingOwner {
+    Builtin,
+    Command(String),
+    Server(String),
+    Totp(String),
+}
+
+impl BindingOwner {
+    /// 冲突提示里的可读名。
+    fn describe(&self) -> String {
+        match self {
+            Self::Builtin => "内置快捷键".into(),
+            Self::Command(name) => format!("命令「{name}」"),
+            Self::Server(name) => format!("服务器「{name}」"),
+            Self::Totp(name) => format!("动态码「{name}」"),
+        }
+    }
+
+}
+
+/// 一条快捷键绑定。
+#[derive(Clone, Debug)]
+pub(crate) struct ShortcutBinding {
+    pub(crate) owner: BindingOwner,
+    /// 归一化后的组合键（ctrl+shift+k 形态）。
+    pub(crate) normalized: String,
+    /// 动作描述（设置页展示）。
+    pub(crate) label: String,
+}
+
+/// 候选快捷键与现有绑定的冲突查找；ignore_owner 用于编辑自身时豁免。
+pub(crate) fn shortcut_conflict_with(
+    bindings: &[ShortcutBinding],
+    candidate: &str,
+    ignore_owner: Option<&BindingOwner>,
+) -> Option<String> {
+    let normalized = normalize_shortcut(candidate).ok()?;
+    bindings
+        .iter()
+        .filter(|binding| Some(&binding.owner) != ignore_owner)
+        .find(|binding| binding.normalized == normalized)
+        .map(|binding| binding.owner.describe())
 }
 
 /// 服务器导入来源。
@@ -1065,14 +1123,17 @@ impl WorkspaceView {
             shortcut,
             confirm: true,
         };
+        if let Some(conflict) = self.check_shortcut_conflict(
+            command.shortcut.as_deref(),
+            original_name.clone().map(BindingOwner::Command),
+        ) {
+            self.command_error = Some(conflict);
+            return;
+        }
         if let Some(original) = original_name
             && original != command.name
         {
             self.settings.remove_command(&original);
-        }
-        if !self.settings.command_shortcut_conflicts().is_empty() {
-            self.command_error = Some("快捷键与已有命令冲突".into());
-            return;
         }
         self.save_command(command, cx);
         if self.command_error.is_none() {
@@ -1216,6 +1277,7 @@ impl WorkspaceView {
             algorithm: draft.algorithm,
             digits: draft.digits,
             period: draft.period,
+            shortcut: draft.shortcut.clone(),
         };
         self.totp_fields.clear();
         // 编辑时密钥框留空表示不改动；新建时必须填。
@@ -1227,8 +1289,12 @@ impl WorkspaceView {
         let name_field = cx.new(|cx| CommandTextField::new(draft.name.clone(), "名称", cx));
         let secret_field =
             cx.new(|cx| CommandTextField::new(String::new(), secret_placeholder, cx));
+        let shortcut_field = cx.new(|cx| {
+            CommandTextField::new(draft.shortcut.clone().unwrap_or_default(), "如 ctrl+alt+2", cx)
+        });
         self.totp_fields.push(("名称".into(), name_field));
         self.totp_fields.push(("密钥".into(), secret_field));
+        self.totp_fields.push(("快捷键".into(), shortcut_field));
         self.totp_dialog = Some(TotpDialog::Edit {
             original: entry.map(|item| item.name.clone()),
         });
@@ -1254,6 +1320,18 @@ impl WorkspaceView {
             .unwrap_or_default();
         let mut meta = self.totp_meta_draft.clone();
         meta.name = name.clone();
+        meta.shortcut = values
+            .get("快捷键")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        if let Some(conflict) = self.check_shortcut_conflict(
+            meta.shortcut.as_deref(),
+            original.clone().map(BindingOwner::Totp),
+        ) {
+            self.totp_error = Some(conflict);
+            cx.notify();
+            return;
+        }
         if let Err(error) = meta.validate() {
             self.totp_error = Some(error.to_string());
             cx.notify();
@@ -1501,7 +1579,7 @@ impl WorkspaceView {
                 ServerAuthKind::PrivateKey => "passphrase（可选）",
             }
         };
-        let rows: [(&str, String, &str); 7] = [
+        let rows: [(&str, String, &str); 8] = [
             ("名称", meta.name, "如 跳板机A"),
             ("主机", meta.host, "host 或 IP"),
             ("端口", meta.port.to_string(), "22"),
@@ -1513,6 +1591,11 @@ impl WorkspaceView {
             ),
             ("备注", meta.note, "备注（可选）"),
             ("凭据", String::new(), secret_placeholder),
+            (
+                "快捷键",
+                meta.shortcut.unwrap_or_default(),
+                "如 ctrl+alt+1（可选）",
+            ),
         ];
         for (label, value, placeholder) in rows {
             let field = cx.new(|cx| CommandTextField::new(value, placeholder, cx));
@@ -1549,10 +1632,22 @@ impl WorkspaceView {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
         meta.note = values.get("备注").map(|v| v.trim().to_string()).unwrap_or_default();
+        meta.shortcut = values
+            .get("快捷键")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         let secret = values
             .get("凭据")
             .map(|v| v.trim().to_string())
             .unwrap_or_default();
+        if let Some(conflict) = self.check_shortcut_conflict(
+            meta.shortcut.as_deref(),
+            original.clone().map(BindingOwner::Server),
+        ) {
+            self.server_error = Some(conflict);
+            cx.notify();
+            return;
+        }
         if let Err(error) = meta.validate() {
             self.server_error = Some(error.to_string());
             cx.notify();
@@ -2147,6 +2242,72 @@ impl WorkspaceView {
             .focus(window);
     }
 
+    /// 全量快捷键绑定：内置 + 命令 + 服务器 + 动态码（设置页总览与冲突检测共用）。
+    fn all_shortcut_bindings(&self) -> Vec<ShortcutBinding> {
+        let mut bindings = Vec::new();
+        for (keystroke, label) in BUILTIN_SHORTCUTS {
+            if let Ok(normalized) = normalize_shortcut(keystroke) {
+                bindings.push(ShortcutBinding {
+                    owner: BindingOwner::Builtin,
+                    normalized,
+                    label: (*label).to_string(),
+                });
+            }
+        }
+        for command in &self.settings.commands {
+            if let Some(shortcut) = &command.shortcut
+                && let Ok(normalized) = normalize_shortcut(shortcut)
+            {
+                bindings.push(ShortcutBinding {
+                    owner: BindingOwner::Command(command.name.clone()),
+                    normalized,
+                    label: format!("运行命令 {}", command.name),
+                });
+            }
+        }
+        for server in &self.settings.servers {
+            if let Some(shortcut) = &server.shortcut
+                && let Ok(normalized) = normalize_shortcut(shortcut)
+            {
+                bindings.push(ShortcutBinding {
+                    owner: BindingOwner::Server(server.name.clone()),
+                    normalized,
+                    label: format!("连接服务器 {}", server.name),
+                });
+            }
+        }
+        for entry in &self.settings.totp {
+            if let Some(shortcut) = &entry.shortcut
+                && let Ok(normalized) = normalize_shortcut(shortcut)
+            {
+                bindings.push(ShortcutBinding {
+                    owner: BindingOwner::Totp(entry.name.clone()),
+                    normalized,
+                    label: format!("生成动态码 {}", entry.name),
+                });
+            }
+        }
+        bindings
+    }
+
+    /// 保存前检查：候选快捷键是否撞上其他绑定（编辑自身时豁免）。
+    fn check_shortcut_conflict(
+        &self,
+        candidate: Option<&str>,
+        ignore_owner: Option<BindingOwner>,
+    ) -> Option<String> {
+        let candidate = candidate?.trim();
+        if candidate.is_empty() {
+            return None;
+        }
+        if normalize_shortcut(candidate).is_err() {
+            return Some("格式不合法（应为 ctrl+alt+k 一类组合）".into());
+        }
+        let bindings = self.all_shortcut_bindings();
+        shortcut_conflict_with(&bindings, candidate, ignore_owner.as_ref())
+            .map(|owner| format!("快捷键与{owner}冲突"))
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.command_dialog.is_some()
             || self.totp_dialog.is_some()
@@ -2168,6 +2329,7 @@ impl WorkspaceView {
             }
             return;
         }
+        // 统一绑定分发：命令（打开参数预览）→ 服务器（连接）→ 动态码（打开预览）
         if let Some(command) = self
             .settings
             .commands
@@ -2181,6 +2343,38 @@ impl WorkspaceView {
             .cloned()
         {
             self.open_command(&command, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(server) = self
+            .settings
+            .servers
+            .iter()
+            .find(|server| {
+                server
+                    .shortcut
+                    .as_deref()
+                    .is_some_and(|shortcut| keystroke_matches_shortcut(event, shortcut))
+            })
+            .cloned()
+        {
+            self.connect_server(&server.name, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(entry) = self
+            .settings
+            .totp
+            .iter()
+            .find(|entry| {
+                entry
+                    .shortcut
+                    .as_deref()
+                    .is_some_and(|shortcut| keystroke_matches_shortcut(event, shortcut))
+            })
+            .cloned()
+        {
+            self.open_totp(&entry, cx);
             cx.stop_propagation();
             return;
         }
@@ -3359,7 +3553,12 @@ fn render_totp_section(
                                 move |this, _event, _window, cx| this.open_totp(&entry, cx)
                             }),
                         )
-                        .child(format!("{} · {}s", entry.name, remaining)),
+                        .child(match &entry.shortcut {
+                            Some(shortcut) => {
+                                format!("{}  [{}]", entry.name, shortcut)
+                            }
+                            None => format!("{} · {}s", entry.name, remaining),
+                        }),
                 )
                 .child(setting_button(
                     "编辑",
@@ -3458,7 +3657,10 @@ fn render_server_section(
                                 .min_w(px(0.0))
                                 .truncate()
                                 .text_color(rgb(0xC0CAF5))
-                                .child(entry.name.clone()),
+                                .child(match &entry.shortcut {
+                                    Some(shortcut) => format!("{}  [{}]", entry.name, shortcut),
+                                    None => entry.name.clone(),
+                                }),
                         )
                         .child(setting_button(
                             "连接",
@@ -3530,7 +3732,7 @@ fn settings_overlay(
         .child(
             div()
                 .w(px(640.0))
-                .max_h(px(520.0))
+                .h(px(560.0))
                 .flex()
                 .flex_col()
                 .overflow_hidden()
@@ -3640,23 +3842,7 @@ fn settings_content(
     };
     let body = match page {
         SettingsPage::Appearance => settings_panel(workspace, cx),
-        SettingsPage::Shortcuts => div()
-            .pt_4()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(section_title("标签"))
-            .child(
-                setting_card()
-                    .child(shortcut_row("新建标签", "Ctrl+T"))
-                    .child(shortcut_row("关闭标签", "Ctrl+W")),
-            )
-            .child(section_title("终端"))
-            .child(
-                setting_card()
-                    .child(shortcut_row("搜索回滚", "Ctrl+Shift+F"))
-                    .child(shortcut_row("下一个 / 上一个", "Enter / Shift+Enter")),
-            ),
+        SettingsPage::Shortcuts => shortcuts_page(workspace),
         SettingsPage::Terminal => div()
             .pt_4()
             .flex()
@@ -3695,6 +3881,76 @@ fn settings_content(
         .text_color(rgb(0xC0CAF5))
         .child(div().text_color(rgb(0xC0CAF5)).child(title))
         .child(body)
+}
+
+/// 设置→快捷键：全量绑定总览（内置 + 命令 + 服务器 + 动态码），冲突标红。
+fn shortcuts_page(workspace: &WorkspaceView) -> gpui::Div {
+    let bindings = workspace.all_shortcut_bindings();
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for binding in &bindings {
+        *counts.entry(binding.normalized.as_str()).or_default() += 1;
+    }
+    let row = |binding: &ShortcutBinding| {
+        let conflicted = counts.get(binding.normalized.as_str()).copied().unwrap_or(1) > 1;
+        setting_card()
+            .child(shortcut_row(
+                &binding.label,
+                &binding.normalized,
+                conflicted,
+            ))
+    };
+    let mut page = div().pt_4().flex().flex_col().gap_3();
+    page = page.child(section_title("内置"));
+    for binding in bindings.iter().filter(|b| matches!(b.owner, BindingOwner::Builtin)) {
+        page = page.child(row(binding));
+    }
+    let dynamic = [
+        ("命令（编辑弹窗里绑定）", BindingKind::Command),
+        ("服务器（编辑弹窗里绑定）", BindingKind::Server),
+        ("动态码（编辑弹窗里绑定）", BindingKind::Totp),
+    ];
+    // 下面用小枚举避免闭包里 match owner 的借用问题
+    #[derive(Clone, Copy)]
+    enum BindingKind {
+        Command,
+        Server,
+        Totp,
+    }
+    for (title, kind) in dynamic {
+        let matched: Vec<&ShortcutBinding> = bindings
+            .iter()
+            .filter(|binding| {
+                matches!(
+                    (kind, &binding.owner),
+                    (BindingKind::Command, BindingOwner::Command(_))
+                        | (BindingKind::Server, BindingOwner::Server(_))
+                        | (BindingKind::Totp, BindingOwner::Totp(_))
+                )
+            })
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        page = page.child(section_title(title));
+        for binding in matched {
+            page = page.child(row(binding));
+        }
+    }
+    let has_conflict = counts.values().any(|count| *count > 1);
+    page.child(
+        div()
+            .pt_2()
+            .text_color(if has_conflict {
+                rgb(0xF7768E)
+            } else {
+                rgb(0x565A78)
+            })
+            .child(if has_conflict {
+                "存在冲突绑定：请在对应编辑弹窗里修改（保存时也会被拦截）"
+            } else {
+                "绑定在命令 / 服务器 / 动态码的编辑弹窗里设置，保存时自动查重"
+            }),
+    )
 }
 
 fn settings_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
@@ -3971,14 +4227,18 @@ fn theme_controls(
         }))
 }
 
-fn shortcut_row(label: &str, keys: &str) -> gpui::Div {
+fn shortcut_row(label: &str, keys: &str, conflicted: bool) -> gpui::Div {
     div()
         .flex()
         .items_center()
         .justify_between()
         .py_2()
-        .text_color(rgb(0xA9B1D6))
-        .child(label.to_string())
+        .text_color(if conflicted {
+            rgb(0xF7768E)
+        } else {
+            rgb(0xA9B1D6)
+        })
+        .child(format!("{}{}", label, if conflicted { " ⚠ 冲突" } else { "" }))
         .child(value_chip(keys))
 }
 

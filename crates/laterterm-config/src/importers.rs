@@ -96,6 +96,7 @@ pub fn parse_deepin_servers(body: &str) -> Vec<ServerEntry> {
             auth,
             key_path,
             note,
+            shortcut: None,
         };
         if entry.validate().is_ok() {
             out.push(entry);
@@ -215,6 +216,7 @@ pub fn parse_xshell_session(file_stem: &str, body: &str) -> Option<ServerEntry> 
         auth,
         key_path,
         note,
+        shortcut: None,
     };
     (entry.validate().is_ok()).then_some(entry)
 }

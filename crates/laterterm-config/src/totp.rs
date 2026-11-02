@@ -7,7 +7,8 @@
 //!
 //! 密码学原语不自造：HMAC/SHA 走 RustCrypto（hmac、sha1、sha2）。
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, Context as _};
+use crate::commands::normalize_shortcut;
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
@@ -92,6 +93,9 @@ pub struct TotpEntry {
     pub algorithm: TotpAlgorithm,
     pub digits: u32,
     pub period: u64,
+    /// 应用内快捷键（ctrl+alt+k 一类），可选；统一注册表查重。
+    #[serde(default)]
+    pub shortcut: Option<String>,
 }
 
 impl Default for TotpEntry {
@@ -101,6 +105,7 @@ impl Default for TotpEntry {
             algorithm: TotpAlgorithm::Sha1,
             digits: 6,
             period: 30,
+            shortcut: None,
         }
     }
 }
@@ -108,6 +113,9 @@ impl Default for TotpEntry {
 impl TotpEntry {
     pub fn validate(&self) -> Result<()> {
         validate_name(&self.name)?;
+        if let Some(shortcut) = &self.shortcut {
+            normalize_shortcut(shortcut).context("快捷键格式不合法")?;
+        }
         TotpConfig {
             algorithm: self.algorithm,
             digits: self.digits,
@@ -544,6 +552,7 @@ mod tests {
                 algorithm: TotpAlgorithm::Sha256,
                 digits: 8,
                 period: 60,
+                ..Default::default()
             })
             .unwrap();
         let raw = toml::to_string(&settings).unwrap();

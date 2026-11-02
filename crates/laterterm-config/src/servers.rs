@@ -2,6 +2,7 @@
 //! 密钥环（laterterm-secrets），本模块与 settings.toml 里都不出现密钥本体。
 
 use anyhow::{Result, bail, Context as _};
+use crate::commands::normalize_shortcut;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -32,6 +33,9 @@ pub struct ServerEntry {
     pub key_path: Option<String>,
     /// 备注（纯展示）。
     pub note: String,
+    /// 应用内快捷键（ctrl+alt+k 一类），可选；统一注册表查重。
+    #[serde(default)]
+    pub shortcut: Option<String>,
 }
 
 impl Default for ServerEntry {
@@ -44,6 +48,7 @@ impl Default for ServerEntry {
             auth: ServerAuthKind::Password,
             key_path: None,
             note: String::new(),
+            shortcut: None,
         }
     }
 }
@@ -92,6 +97,9 @@ impl ServerEntry {
         if self.note.chars().count() > 200 {
             bail!("备注过长（最多 200 字）");
         }
+        if let Some(shortcut) = &self.shortcut {
+            normalize_shortcut(shortcut).context("快捷键格式不合法")?;
+        }
         Ok(())
     }
 
@@ -102,6 +110,11 @@ impl ServerEntry {
         self.username = self.username.trim().to_string();
         self.note = self.note.trim().to_string();
         self.key_path = self.key_path.take().map(|p| p.trim().to_string());
+        self.shortcut = self
+            .shortcut
+            .take()
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty());
         if self.validate().is_ok() {
             Some(self)
         } else {
@@ -264,6 +277,7 @@ username = "u"
             auth: ServerAuthKind::KeyboardInteractive,
             key_path: None,
             note: "导出测试".into(),
+            shortcut: Some("ctrl+alt+1".into()),
         }]);
         file.save_to(&path).unwrap();
         let loaded = ServersFile::load_from(&path).unwrap();
