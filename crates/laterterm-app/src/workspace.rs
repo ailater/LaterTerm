@@ -1190,7 +1190,8 @@ impl WorkspaceView {
                 cx.background_executor().timer(Duration::from_secs(1)).await;
                 if this
                     .update(cx, |workspace, cx| {
-                        if workspace.right_panel {
+                        // 倒计时只在「动态码」页签展示；其余页签不为此付费
+                        if workspace.right_panel && workspace.right_panel_tab == RightPanelTab::Totp {
                             cx.notify();
                         }
                     })
@@ -2662,6 +2663,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
     let mut panel = div()
         .w(px(PANEL_WIDTH))
         .h_full()
+        .overflow_hidden()
         .bg(rgb(0x202132))
         .p_3()
         .text_color(rgb(0xC0CAF5))
@@ -3434,6 +3436,7 @@ fn render_server_section(
         .when_some(error, |panel, error| {
             panel.child(div().text_color(rgb(0xF7768E)).child(error))
         })
+        // 两行式条目：220px 面板放不下「长文本 + 三个按钮」单行排布（会被压到逐字换行）
         .children(servers.iter().map(|entry| {
             let auth_label = match entry.auth {
                 ServerAuthKind::Password => "密码",
@@ -3443,43 +3446,67 @@ fn render_server_section(
             let pending_delete = delete_confirm.as_deref() == Some(entry.name.as_str());
             div()
                 .pt_2()
-                .flex()
-                .items_center()
-                .gap_1()
+                // 第一行：名称 + 连接
                 .child(
                     div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .text_color(rgb(0xA9B1D6))
-                        .child(format!(
-                            "{} · {}@{}:{} [{}]",
-                            entry.name, entry.username, entry.host, entry.port, auth_label
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_color(rgb(0xC0CAF5))
+                                .child(entry.name.clone()),
+                        )
+                        .child(setting_button(
+                            "连接",
+                            false,
+                            cx.listener({
+                                let name = entry.name.clone();
+                                move |this, _event, _window, cx| this.connect_server(&name, cx)
+                            }),
                         )),
                 )
-                .child(setting_button(
-                    "连接",
-                    false,
-                    cx.listener({
-                        let name = entry.name.clone();
-                        move |this, _event, _window, cx| this.connect_server(&name, cx)
-                    }),
-                ))
-                .child(setting_button(
-                    "编辑",
-                    false,
-                    cx.listener({
-                        let entry = entry.clone();
-                        move |this, _event, window, cx| this.edit_server(Some(&entry), window, cx)
-                    }),
-                ))
-                .child(setting_button(
-                    if pending_delete { "确认?" } else { "删" },
-                    pending_delete,
-                    cx.listener({
-                        let name = entry.name.clone();
-                        move |this, _event, _window, cx| this.delete_server(&name, cx)
-                    }),
-                ))
+                // 第二行：地址信息（小字）+ 编辑/删
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .pt_1()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(12.0))
+                                .text_color(rgb(0x7D829F))
+                                .child(format!(
+                                    "{}@{}:{} [{}]",
+                                    entry.username, entry.host, entry.port, auth_label
+                                )),
+                        )
+                        .child(setting_button(
+                            "编辑",
+                            false,
+                            cx.listener({
+                                let entry = entry.clone();
+                                move |this, _event, window, cx| {
+                                    this.edit_server(Some(&entry), window, cx)
+                                }
+                            }),
+                        ))
+                        .child(setting_button(
+                            if pending_delete { "确认?" } else { "删" },
+                            pending_delete,
+                            cx.listener({
+                                let name = entry.name.clone();
+                                move |this, _event, _window, cx| this.delete_server(&name, cx)
+                            }),
+                        )),
+                )
         }))
 }
 

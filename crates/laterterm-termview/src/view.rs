@@ -52,6 +52,7 @@ use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
 use alacritty_terminal::grid::Dimensions;
 use gpui::{Edges, ElementInputHandler, EntityInputHandler, UTF16Selection, *};
+use std::time::Duration;
 use laterterm_core::TerminalSession;
 use std::io::{Read, Write};
 use std::ops::Range;
@@ -417,6 +418,8 @@ pub struct TerminalView {
 
     /// 上次上报的滚动摘要；与当前值不同才触发回调，防止 notify 风暴。
     last_scroll: Option<ScrollSummary>,
+    /// 防抖在途标记：输出洪峰时合并为每 150ms 至多一次宿主刷新。
+    scroll_report_scheduled: bool,
 
     /// Text currently being composed by the system input method.
     marked_text: String,
@@ -603,6 +606,7 @@ impl TerminalView {
             exit_callback: None,
             scroll_callback: None,
             last_scroll: None,
+            scroll_report_scheduled: false,
             marked_text: String::new(),
             search: None,
         }
@@ -1007,15 +1011,29 @@ impl TerminalView {
         self
     }
 
-    /// 滚动摘要变化时触发一次 scroll 回调；经 render 后的 defer 执行防循环。
-    fn report_scroll_change(&mut self, cx: &mut Context<Self>) {
-        let summary = self.scroll_summary();
-        if self.last_scroll != Some(summary) {
-            self.last_scroll = Some(summary);
-            if let Some(callback) = &self.scroll_callback {
-                callback(cx);
-            }
+    /// 滚动摘要变化时触发一次 scroll 回调；150ms 防抖合并输出洪峰，
+    /// 避免高频输出把宿主（整个工作区）拖进逐批次重渲染。
+    fn schedule_scroll_report(&mut self, cx: &mut Context<Self>) {
+        if self.scroll_callback.is_none() || self.scroll_report_scheduled {
+            return;
         }
+        self.scroll_report_scheduled = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.scroll_report_scheduled = false;
+                let summary = this.scroll_summary();
+                if this.last_scroll != Some(summary) {
+                    this.last_scroll = Some(summary);
+                    if let Some(callback) = &this.scroll_callback {
+                        callback(cx);
+                    }
+                }
+            });
+        })
+        .detach();
     }
 
     /// Resize the terminal to new dimensions.
@@ -1334,10 +1352,8 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Process any pending events
         self.process_events(window, cx);
-        // 滚动位置/历史行数变化时通知宿主（defer 到 render 后，避免 render 期 notify）
-        if self.scroll_callback.is_some() {
-            cx.defer_in(window, |this, _window, cx| this.report_scroll_change(cx));
-        }
+        // 滚动位置/历史行数变化时通知宿主（防抖定时器，不在 render 期直接 notify）
+        self.schedule_scroll_report(cx);
 
         // Get terminal state and renderer for rendering
         let state_arc = self.state.term_arc();
