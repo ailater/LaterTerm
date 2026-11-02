@@ -100,7 +100,10 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 > + 缺凭据补输（可选记住）+ 连接在新标签打开（后台线程连接，结果 render 期消费）。
 > 导入/导出已就绪：ServersFile TOML 格式（带版本号，未来版本拒载），系统文件对话框
 > （xdg-desktop-portal）选择目标；凭据永不落盘，导入条目首次连接走既有补输流程，
-> 同名跳过、无效丢弃并回报计数。Deepin server-config.conf 一键导入仍按任务 7 节奏。
+> 同名跳过、无效丢弃并回报计数。导入来源弹窗三选一：LaterTerm TOML / Deepin 终端
+> （一键读 ~/.config/deepin/deepin-terminal/server-config.conf，任务 7 服务器部分提前
+> 落地，本机 3 台真机验证）/ Xshell 会话（.xsh 多选，UTF-16 BOM 解码，密码绑定原机器
+> 加密不迁移）；三类解析器在 laterterm-config::importers，附真机自跳过冒烟测试。
 
 **目标**：远程不是"另一个功能"——同一个 termview，换 backend。
 
@@ -112,7 +115,7 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 | 4 | SFTP 面板 | 双栏文件传输，进度与断点续传 |
 | 5 | 编码 | GBK 远程会话转码（中文老服务器刚需） |
 | 6 | trzsz | rz/sz 兼容协议，ZMODEM 类传输 |
-| 7 | Deepin 配置一键导入 | `command-config.conf` / `server-config.conf` 已逆向（见 architecture.md），M3 收官时做迁移工具 |
+| 7 | Deepin 配置一键导入 | `command-config.conf` / `server-config.conf` 已逆向（见 architecture.md）；server-config 导入已提前落地（含 Xshell .xsh 来源），命令模板迁移待续 | 🚧
 
 **验收**：从 LaterTerm 完成一次「跳板机 → 内网机 → GBK 环境 → rz 拉文件」全链路操作。
 

@@ -11,11 +11,13 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub mod commands;
+pub mod importers;
 pub mod servers;
 pub mod theme;
 pub mod totp;
 
 pub use commands::CommandTemplate;
+pub use importers::{deepin_default_path, load_deepin_servers, load_xshell_sessions};
 pub use servers::{ServerAuthKind, ServerEntry, ServersFile};
 pub use theme::{DEFAULT_THEME, Theme, ThemeRegistry, themes_dir};
 pub use totp::{TotpAlgorithm, TotpConfig, TotpEntry, generate_code, parse_secret_input};

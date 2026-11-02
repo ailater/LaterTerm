@@ -9,8 +9,8 @@ use gpui::{
 use laterterm_termview::view::ScrollSummary;
 use laterterm_config::{
     Appearance, CommandTemplate, ServerAuthKind, ServerEntry, ServersFile, Settings, Theme,
-    ThemeRegistry, TotpAlgorithm, TotpConfig, TotpEntry, app_config_dir, generate_code,
-    parse_secret_input,
+    ThemeRegistry, TotpAlgorithm, TotpConfig, TotpEntry, app_config_dir, deepin_default_path,
+    generate_code, load_deepin_servers, load_xshell_sessions, parse_secret_input,
 };
 use laterterm_core::TerminalSession;
 use laterterm_local::{LocalOptions, LocalSession};
@@ -269,6 +269,17 @@ enum ServerDialog {
     },
 }
 
+/// 服务器导入来源。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServerImportSource {
+    /// 本程序导出的 TOML 文件。
+    LaterTerm,
+    /// 本机 Deepin 终端的远程管理列表（一键读取默认路径）。
+    Deepin,
+    /// Xshell 会话文件（.xsh，可多选）。
+    Xshell,
+}
+
 struct Pane {
     id: PaneId,
     title: String,
@@ -334,6 +345,8 @@ pub struct WorkspaceView {
     server_error: Option<String>,
     /// 服务器区的一次性提示（导入/导出结果等），下次操作时清除。
     server_notice: Option<String>,
+    /// 导入来源选择弹窗（Some(已选来源) = 打开中）。
+    server_import_dialog: Option<ServerImportSource>,
     /// 正在连接中的服务器名（None 表示空闲；期间禁止并发连接）。
     ssh_connecting: Option<String>,
     /// SSH 连接结果暂存：后台线程产物在 render 期统一消费（需要 window 开新标签）。
@@ -396,6 +409,7 @@ impl WorkspaceView {
             server_delete_confirm: None,
             server_error: None,
             server_notice: None,
+            server_import_dialog: None,
             ssh_connecting: None,
             pending_ssh_results: Vec::new(),
             pending_focus: None,
@@ -1718,10 +1732,47 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    /// 从用户选择的 TOML 文件导入服务器元数据：同名跳过、无效丢弃，其余合并落盘。
-    fn import_servers(&mut self, cx: &mut Context<Self>) {
+    /// 打开导入来源选择弹窗（LaterTerm 文件 / Deepin / Xshell）。
+    fn open_server_import(&mut self, cx: &mut Context<Self>) {
         self.server_error = None;
         self.server_notice = None;
+        self.server_import_dialog = Some(ServerImportSource::LaterTerm);
+        cx.notify();
+    }
+
+    fn cancel_server_import(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        self.dismiss_server_import(window, cx);
+    }
+
+    fn dismiss_server_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.server_import_dialog = None;
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// 按所选来源执行导入并关闭弹窗。
+    fn start_server_import(&mut self, cx: &mut Context<Self>) {
+        let Some(source) = self.server_import_dialog.take() else {
+            return;
+        };
+        self.server_error = None;
+        self.server_notice = None;
+        match source {
+            ServerImportSource::LaterTerm => self.import_servers(cx),
+            ServerImportSource::Deepin => self.import_servers_deepin(cx),
+            ServerImportSource::Xshell => self.import_servers_xshell(cx),
+        }
+        cx.notify();
+    }
+
+    /// 来源一：本程序导出的 TOML 文件（文件对话框选择）。
+    fn import_servers(&mut self, cx: &mut Context<Self>) {
         let receiver = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -1752,19 +1803,96 @@ impl WorkspaceView {
         let Some(path) = paths.into_iter().next() else {
             return;
         };
-        let file = match ServersFile::load_from(&path) {
-            Ok(file) => file,
+        match ServersFile::load_from(&path) {
+            Ok(file) => self.merge_server_entries(file.servers, &path.display().to_string(), cx),
             Err(error) => {
                 self.server_error = Some(format!("导入失败: {error:#}"));
                 cx.notify();
+            }
+        }
+    }
+
+    /// 来源二：Deepin 终端远程管理列表，一键读取默认路径（无需选文件）。
+    fn import_servers_deepin(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = deepin_default_path() else {
+            self.server_error = Some("无法定位 HOME 目录，Deepin 导入失败".into());
+            cx.notify();
+            return;
+        };
+        match load_deepin_servers(&path) {
+            Ok(entries) => {
+                self.merge_server_entries(entries, &path.display().to_string(), cx);
+            }
+            Err(error) => {
+                self.server_error = Some(format!("Deepin 导入失败: {error:#}"));
+                cx.notify();
+            }
+        }
+    }
+
+    /// 来源三：Xshell 会话文件（.xsh，可多选；密码绑定原机器加密，不迁移）。
+    fn import_servers_xshell(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("选择 Xshell 会话文件（.xsh）".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = receiver.await.unwrap_or_else(|_| Err(anyhow::anyhow!("对话框已关闭")));
+            let _ = this.update(cx, |workspace, cx| workspace.finish_import_xshell(picked, cx));
+        })
+        .detach();
+    }
+
+    fn finish_import_xshell(
+        &mut self,
+        picked: anyhow::Result<Option<Vec<PathBuf>>>,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = match picked {
+            Err(error) => {
+                self.server_error = Some(format!("打开文件对话框失败: {error:#}"));
+                cx.notify();
                 return;
             }
+            Ok(None) => return,
+            Ok(Some(paths)) => paths,
         };
+        match load_xshell_sessions(&paths) {
+            Ok((entries, skipped)) if entries.is_empty() => {
+                self.server_error = Some(format!(
+                    "所选文件中没有可识别的 .xsh 会话（跳过 {skipped} 个文件）"
+                ));
+                cx.notify();
+            }
+            Ok((entries, skipped)) => {
+                let context = if skipped > 0 {
+                    format!("另有 {skipped} 个文件无法识别")
+                } else {
+                    String::new()
+                };
+                self.merge_server_entries(entries, &context, cx);
+            }
+            Err(error) => {
+                self.server_error = Some(format!("Xshell 导入失败: {error:#}"));
+                cx.notify();
+            }
+        }
+    }
+
+    /// 合并导入条目：同名跳过、无效丢弃，计数回报；有新增则落盘。
+    fn merge_server_entries(
+        &mut self,
+        entries: Vec<ServerEntry>,
+        source_desc: &str,
+        cx: &mut Context<Self>,
+    ) {
         let previous = self.settings.clone();
         let mut added = 0usize;
         let mut skipped_dup = 0usize;
         let mut skipped_bad = 0usize;
-        for entry in file.servers {
+        for entry in entries {
             let Some(entry) = entry.sanitized() else {
                 skipped_bad += 1;
                 continue;
@@ -1794,7 +1922,7 @@ impl WorkspaceView {
         }
         if added == 0 {
             if skipped_dup == 0 && skipped_bad == 0 {
-                self.server_error = Some(format!("文件中没有可导入的服务器（{}）", path.display()));
+                self.server_error = Some(format!("没有可导入的服务器条目（{source_desc}）"));
             } else {
                 self.server_error = Some(notice);
             }
@@ -2019,7 +2147,10 @@ impl WorkspaceView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.command_dialog.is_some() || self.totp_dialog.is_some() || self.server_dialog.is_some()
+        if self.command_dialog.is_some()
+            || self.totp_dialog.is_some()
+            || self.server_dialog.is_some()
+            || self.server_import_dialog.is_some()
         {
             // Esc 关闭当前弹窗（焦点归还终端由各 dismiss 负责）
             if event.keystroke.key.eq_ignore_ascii_case("escape") {
@@ -2027,8 +2158,10 @@ impl WorkspaceView {
                     self.dismiss_command(window, cx);
                 } else if self.totp_dialog.is_some() {
                     self.dismiss_totp(window, cx);
-                } else {
+                } else if self.server_dialog.is_some() {
                     self.dismiss_server(window, cx);
+                } else {
+                    self.dismiss_server_import(window, cx);
                 }
                 cx.stop_propagation();
             }
@@ -2621,6 +2754,9 @@ fn render_active_dialog(
     workspace: &mut WorkspaceView,
     cx: &mut Context<WorkspaceView>,
 ) -> Option<gpui::Div> {
+    if let Some(source) = workspace.server_import_dialog {
+        return Some(server_import_modal(source, cx));
+    }
     if let Some(CommandDialog::Edit { original_name }) = workspace.command_dialog.clone() {
         return Some(command_edit_modal(workspace, original_name, cx));
     }
@@ -3088,6 +3224,75 @@ fn server_connect_modal(
         dismiss_listener(cx, WorkspaceView::dismiss_server),
     )
 }
+
+fn server_import_modal(source: ServerImportSource, cx: &mut Context<WorkspaceView>) -> gpui::Div {
+    let options = [
+        (
+            ServerImportSource::LaterTerm,
+            "LaterTerm 文件",
+            "选择本程序导出的 TOML 文件",
+        ),
+        (
+            ServerImportSource::Deepin,
+            "Deepin 终端",
+            "一键读取本机 Deepin 终端的远程管理列表",
+        ),
+        (
+            ServerImportSource::Xshell,
+            "Xshell 会话",
+            "选择一个或多个 .xsh 会话文件",
+        ),
+    ];
+    let body = div()
+        .flex()
+        .flex_col()
+        .p_4()
+        .children(options.into_iter().map(|(kind, label, desc)| {
+            div()
+                .pt_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(setting_button(
+                    label,
+                    source == kind,
+                    cx.listener(move |this, _event, _window, cx| {
+                        this.server_import_dialog = Some(kind);
+                        cx.notify();
+                    }),
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_color(rgb(0x7D829F))
+                        .child(desc),
+                )
+        }))
+        .child(
+            div()
+                .pt_3()
+                .text_color(rgb(0x565A78))
+                .child("任何来源都不迁移凭据：首次连接补输一次即可（可记住入密钥环）"),
+        )
+        .child(dialog_footer(vec![
+            setting_button(
+                "开始导入",
+                true,
+                cx.listener(|this, _event, _window, cx| this.start_server_import(cx)),
+            ),
+            setting_button(
+                "取消",
+                false,
+                cx.listener(WorkspaceView::cancel_server_import),
+            ),
+        ]));
+    modal_dialog(
+        "导入服务器",
+        body,
+        dismiss_listener(cx, WorkspaceView::dismiss_server_import),
+    )
+}
 /// 当前时间窗口的剩余秒数（条目行内的轮换提示，随 ticker 每秒刷新）。
 fn totp_window_remaining(period: u64) -> u64 {
     let now = SystemTime::now()
@@ -3196,7 +3401,7 @@ fn render_server_section(
                 .child(setting_button(
                     "导入",
                     false,
-                    cx.listener(|this, _event, _window, cx| this.import_servers(cx)),
+                    cx.listener(|this, _event, _window, cx| this.open_server_import(cx)),
                 ))
                 .child(setting_button(
                     "导出",
