@@ -1,8 +1,9 @@
 //! 服务器连接配置：只存连接元数据，凭据（密码/口令/passphrase）一律入系统
 //! 密钥环（laterterm-secrets），本模块与 settings.toml 里都不出现密钥本体。
 
-use anyhow::{Result, bail};
+use anyhow::{Result, bail, Context as _};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// 认证方式元数据；凭据本体按 `laterterm_secrets::ssh_account(name)` 取自密钥环。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +93,59 @@ impl ServerEntry {
             bail!("备注过长（最多 200 字）");
         }
         Ok(())
+    }
+
+    /// 导入前整理：去除首尾空白，返回是否值得保留。
+    pub fn sanitized(mut self) -> Option<Self> {
+        self.name = self.name.trim().to_string();
+        self.host = self.host.trim().to_string();
+        self.username = self.username.trim().to_string();
+        self.note = self.note.trim().to_string();
+        self.key_path = self.key_path.take().map(|p| p.trim().to_string());
+        if self.validate().is_ok() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+}
+
+/// 服务器导入/导出文件格式。只含连接元数据——凭据在系统密钥环里，永不落盘；
+/// 导入后的条目首次连接时补输凭据（可勾选记住）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServersFile {
+    /// 文件格式版本；缺省按当前版本解析（向前兼容旧文件）。
+    #[serde(default)]
+    pub version: u32,
+    #[serde(default)]
+    pub servers: Vec<ServerEntry>,
+}
+
+impl ServersFile {
+    pub const CURRENT_VERSION: u32 = 1;
+
+    pub fn new(servers: Vec<ServerEntry>) -> Self {
+        Self {
+            version: Self::CURRENT_VERSION,
+            servers,
+        }
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        let body =
+            toml::to_string_pretty(self).context("序列化服务器导出文件失败")?;
+        std::fs::write(path, body).with_context(|| format!("写入 {} 失败", path.display()))
+    }
+
+    pub fn load_from(path: &Path) -> Result<Self> {
+        let body = std::fs::read_to_string(path)
+            .with_context(|| format!("读取 {} 失败", path.display()))?;
+        let mut file: Self = toml::from_str(&body).context("解析服务器文件失败（需 [[servers]] 格式）")?;
+        if file.version > Self::CURRENT_VERSION {
+            bail!("文件版本 v{} 高于当前支持 v{}，请升级 LaterTerm", file.version, Self::CURRENT_VERSION);
+        }
+        file.version = Self::CURRENT_VERSION;
+        Ok(file)
     }
 }
 
@@ -196,5 +250,52 @@ username = "u"
         assert_eq!(settings.servers[0].name, "跳板");
         assert_eq!(settings.servers[0].host, "jump.example.com");
         assert_eq!(settings.servers[0].username, "root");
+    }
+
+    #[test]
+    fn servers_file_roundtrip_and_version_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("servers-export.toml");
+        let file = ServersFile::new(vec![ServerEntry {
+            name: "跳板".into(),
+            host: "jump.example.com".into(),
+            port: 2222,
+            username: "ops".into(),
+            auth: ServerAuthKind::KeyboardInteractive,
+            key_path: None,
+            note: "导出测试".into(),
+        }]);
+        file.save_to(&path).unwrap();
+        let loaded = ServersFile::load_from(&path).unwrap();
+        assert_eq!(loaded.version, ServersFile::CURRENT_VERSION);
+        assert_eq!(loaded.servers, file.servers);
+        assert!(loaded.servers[0].validate().is_ok());
+
+        // 缺 version 的旧文件按当前版本解析
+        let legacy: ServersFile =
+            toml::from_str("[[servers]]\nname = 'x'\nhost = 'h'\nusername = 'u'\n").unwrap();
+        assert_eq!(legacy.version, 0);
+        assert_eq!(legacy.servers.len(), 1);
+
+        // 未来版本拒绝导入（version 必须在 [[servers]] 之前的文件顶层）
+        let future = "version = 99\n[[servers]]\nname = 'x'\nhost = 'h'\nusername = 'u'\n";
+        std::fs::write(&path, future).unwrap();
+        assert!(ServersFile::load_from(&path).is_err());
+    }
+
+    #[test]
+    fn entry_sanitized_trims_and_drops_invalid() {
+        let ok = ServerEntry {
+            name: " 跳板 ".into(),
+            host: " h ".into(),
+            username: " ops ".into(),
+            ..Default::default()
+        }
+        .sanitized()
+        .unwrap();
+        assert_eq!(ok.name, "跳板");
+        assert_eq!(ok.host, "h");
+        assert_eq!(ok.username, "ops");
+        assert!(ServerEntry::default().sanitized().is_none(), "空条目丢弃");
     }
 }

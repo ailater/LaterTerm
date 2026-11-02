@@ -1,14 +1,16 @@
 use crate::command_text_field::CommandTextField;
 use gpui::{
     App, AppContext, AsyncApp, Bounds, Context, CursorStyle, DispatchPhase, Edges, Entity,
+    PathPromptOptions,
     FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, Render, StatefulInteractiveElement, Styled,
     WeakEntity, Window, canvas, div, prelude::FluentBuilder, px, relative, rgb,
 };
 use laterterm_termview::view::ScrollSummary;
 use laterterm_config::{
-    Appearance, CommandTemplate, ServerAuthKind, ServerEntry, Settings, Theme, ThemeRegistry,
-    TotpAlgorithm, TotpConfig, TotpEntry, app_config_dir, generate_code, parse_secret_input,
+    Appearance, CommandTemplate, ServerAuthKind, ServerEntry, ServersFile, Settings, Theme,
+    ThemeRegistry, TotpAlgorithm, TotpConfig, TotpEntry, app_config_dir, generate_code,
+    parse_secret_input,
 };
 use laterterm_core::TerminalSession;
 use laterterm_local::{LocalOptions, LocalSession};
@@ -19,6 +21,7 @@ use notify::Watcher;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TITLEBAR_HEIGHT: f32 = 34.0;
@@ -329,6 +332,8 @@ pub struct WorkspaceView {
     server_meta_draft: ServerEntry,
     server_delete_confirm: Option<String>,
     server_error: Option<String>,
+    /// 服务器区的一次性提示（导入/导出结果等），下次操作时清除。
+    server_notice: Option<String>,
     /// 正在连接中的服务器名（None 表示空闲；期间禁止并发连接）。
     ssh_connecting: Option<String>,
     /// SSH 连接结果暂存：后台线程产物在 render 期统一消费（需要 window 开新标签）。
@@ -390,6 +395,7 @@ impl WorkspaceView {
             server_meta_draft: ServerEntry::default(),
             server_delete_confirm: None,
             server_error: None,
+            server_notice: None,
             ssh_connecting: None,
             pending_ssh_results: Vec::new(),
             pending_focus: None,
@@ -1618,6 +1624,7 @@ impl WorkspaceView {
     fn dismiss_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.server_dialog = None;
         self.server_error = None;
+        self.server_notice = None;
         self.server_fields.clear();
         self.server_delete_confirm = None;
         self.focus_active(window, cx);
@@ -1663,6 +1670,138 @@ impl WorkspaceView {
             });
         })
         .detach();
+    }
+
+    /// 导出服务器元数据到用户选择的 TOML 文件。
+    /// 凭据在系统密钥环里，永不写入导出文件；导入端首次连接时补输即可。
+    fn export_servers(&mut self, cx: &mut Context<Self>) {
+        self.server_error = None;
+        self.server_notice = None;
+        if self.settings.servers.is_empty() {
+            self.server_error = Some("没有可导出的服务器".into());
+            cx.notify();
+            return;
+        }
+        let file = ServersFile::new(self.settings.servers.clone());
+        let receiver = cx.prompt_for_new_path(
+            &app_config_dir().unwrap_or_else(|| PathBuf::from(".")),
+            Some("laterterm-servers.toml"),
+        );
+        cx.spawn(async move |this, cx| {
+            // oneshot 双层 Result：外层是通道关闭，内层是平台对话框错误（已是 anyhow）
+            let picked = receiver.await.unwrap_or_else(|_| Err(anyhow::anyhow!("对话框已关闭")));
+            let _ = this.update(cx, |workspace, cx| workspace.finish_export(&file, picked, cx));
+        })
+        .detach();
+    }
+
+    fn finish_export(
+        &mut self,
+        file: &ServersFile,
+        picked: anyhow::Result<Option<PathBuf>>,
+        cx: &mut Context<Self>,
+    ) {
+        match picked {
+            Err(error) => self.server_error = Some(format!("打开保存对话框失败: {error:#}")),
+            Ok(None) => {}
+            Ok(Some(path)) => match file.save_to(&path) {
+                Ok(()) => {
+                    self.server_notice = Some(format!(
+                        "已导出 {} 台服务器到 {}（不含凭据）",
+                        file.servers.len(),
+                        path.display()
+                    ));
+                }
+                Err(error) => self.server_error = Some(format!("导出失败: {error:#}")),
+            },
+        }
+        cx.notify();
+    }
+
+    /// 从用户选择的 TOML 文件导入服务器元数据：同名跳过、无效丢弃，其余合并落盘。
+    fn import_servers(&mut self, cx: &mut Context<Self>) {
+        self.server_error = None;
+        self.server_notice = None;
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("选择服务器文件".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = receiver.await.unwrap_or_else(|_| Err(anyhow::anyhow!("对话框已关闭")));
+            let _ = this.update(cx, |workspace, cx| workspace.finish_import(picked, cx));
+        })
+        .detach();
+    }
+
+    fn finish_import(
+        &mut self,
+        picked: anyhow::Result<Option<Vec<PathBuf>>>,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = match picked {
+            Err(error) => {
+                self.server_error = Some(format!("打开文件对话框失败: {error:#}"));
+                cx.notify();
+                return;
+            }
+            Ok(None) => return,
+            Ok(Some(paths)) => paths,
+        };
+        let Some(path) = paths.into_iter().next() else {
+            return;
+        };
+        let file = match ServersFile::load_from(&path) {
+            Ok(file) => file,
+            Err(error) => {
+                self.server_error = Some(format!("导入失败: {error:#}"));
+                cx.notify();
+                return;
+            }
+        };
+        let previous = self.settings.clone();
+        let mut added = 0usize;
+        let mut skipped_dup = 0usize;
+        let mut skipped_bad = 0usize;
+        for entry in file.servers {
+            let Some(entry) = entry.sanitized() else {
+                skipped_bad += 1;
+                continue;
+            };
+            if self.settings.servers.iter().any(|item| item.name == entry.name) {
+                skipped_dup += 1;
+                continue;
+            }
+            self.settings.servers.push(entry);
+            added += 1;
+        }
+        if added > 0
+            && let Some(config_path) = Settings::default_path()
+            && let Err(error) = self.settings.save_to(&config_path)
+        {
+            self.settings = previous;
+            self.server_error = Some(format!("导入失败: {error:#}"));
+            cx.notify();
+            return;
+        }
+        let mut notice = format!("导入 {added} 台服务器");
+        if skipped_dup > 0 {
+            notice += &format!("，跳过同名 {skipped_dup}");
+        }
+        if skipped_bad > 0 {
+            notice += &format!("，无效条目 {skipped_bad}");
+        }
+        if added == 0 {
+            if skipped_dup == 0 && skipped_bad == 0 {
+                self.server_error = Some(format!("文件中没有可导入的服务器（{}）", path.display()));
+            } else {
+                self.server_error = Some(notice);
+            }
+        } else {
+            self.server_notice = Some(notice);
+        }
+        cx.notify();
     }
 
     /// 点「连接」：后台读密钥环；密码/交互认证缺凭据时弹补输框，否则直接连。
@@ -3040,6 +3179,7 @@ fn render_server_section(
     let servers = workspace.settings.servers.clone();
     let delete_confirm = workspace.server_delete_confirm.clone();
     let error = workspace.server_error.clone();
+    let notice = workspace.server_notice.clone();
     let connecting = workspace.ssh_connecting.clone();
 
     panel
@@ -3051,9 +3191,33 @@ fn render_server_section(
         .child(
             div()
                 .pt_2()
+                .flex()
+                .gap_1()
+                .child(setting_button(
+                    "导入",
+                    false,
+                    cx.listener(|this, _event, _window, cx| this.import_servers(cx)),
+                ))
+                .child(setting_button(
+                    "导出",
+                    false,
+                    cx.listener(|this, _event, _window, cx| this.export_servers(cx)),
+                )),
+        )
+        .child(
+            div()
+                .pt_2()
                 .text_color(rgb(0x7D829F))
                 .child("凭据只存密钥环；连接在新标签打开"),
         )
+        .when_some(notice, |panel, notice| {
+            panel.child(
+                div()
+                    .pt_2()
+                    .text_color(rgb(0x9ECE6A))
+                    .child(notice),
+            )
+        })
         .when_some(connecting, |panel, connecting| {
             panel.child(
                 div()

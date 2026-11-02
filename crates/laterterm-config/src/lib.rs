@@ -16,7 +16,7 @@ pub mod theme;
 pub mod totp;
 
 pub use commands::CommandTemplate;
-pub use servers::{ServerAuthKind, ServerEntry};
+pub use servers::{ServerAuthKind, ServerEntry, ServersFile};
 pub use theme::{DEFAULT_THEME, Theme, ThemeRegistry, themes_dir};
 pub use totp::{TotpAlgorithm, TotpConfig, TotpEntry, generate_code, parse_secret_input};
 
