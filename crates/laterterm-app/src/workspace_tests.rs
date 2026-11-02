@@ -109,15 +109,24 @@ fn split_ratio_updates_target_node_only() {
     let LayoutNode::Split { first, second, .. } = &layout else {
         panic!("根节点应是分割");
     };
-    assert!(matches!(first.as_ref(), LayoutNode::Leaf(_)), "未命中的子树不变");
-    assert!(matches!(second.as_ref(), LayoutNode::Split { ratio: 0.3, .. }));
+    assert!(
+        matches!(first.as_ref(), LayoutNode::Leaf(_)),
+        "未命中的子树不变"
+    );
+    assert!(matches!(
+        second.as_ref(),
+        LayoutNode::Split { ratio: 0.3, .. }
+    ));
 
     // 不存在的 id：静默跳过，树保持不变
     apply_split_ratio(&mut layout, 99, 0.9);
     let LayoutNode::Split { second, .. } = &layout else {
         panic!("根节点应是分割");
     };
-    assert!(matches!(second.as_ref(), LayoutNode::Split { ratio: 0.3, .. }));
+    assert!(matches!(
+        second.as_ref(),
+        LayoutNode::Split { ratio: 0.3, .. }
+    ));
 }
 
 #[test]
@@ -147,12 +156,14 @@ fn unified_shortcut_conflicts_detect_cross_kind() {
         Some("命令「ssh」")
     );
     // 编辑自身豁免
-    assert!(shortcut_conflict_with(
-        &bindings,
-        "ctrl+alt+1",
-        Some(&BindingOwner::Command("ssh".into()))
-    )
-    .is_none());
+    assert!(
+        shortcut_conflict_with(
+            &bindings,
+            "ctrl+alt+1",
+            Some(&BindingOwner::Command("ssh".into()))
+        )
+        .is_none()
+    );
     // 大小写与空格等价
     assert_eq!(
         shortcut_conflict_with(&bindings, " CTRL + ALT + 1 ", None).as_deref(),

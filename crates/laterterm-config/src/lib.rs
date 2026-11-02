@@ -16,7 +16,7 @@ pub mod servers;
 pub mod theme;
 pub mod totp;
 
-pub use commands::{normalize_shortcut, shortcut_conflicts, CommandTemplate};
+pub use commands::{CommandTemplate, normalize_shortcut, shortcut_conflicts};
 pub use importers::{deepin_default_path, load_deepin_servers, load_xshell_sessions};
 pub use servers::{ServerAuthKind, ServerEntry, ServersFile};
 pub use theme::{DEFAULT_THEME, Theme, ThemeRegistry, themes_dir};
@@ -30,6 +30,9 @@ pub const SETTINGS_FILE: &str = "settings.toml";
 #[serde(default)]
 pub struct Settings {
     pub appearance: Appearance,
+    /// 内置面板快捷键覆盖；缺字段时沿用现有默认绑定。
+    #[serde(default)]
+    pub shortcuts: PanelShortcuts,
     /// 用户自定义快捷命令模板；缺字段的旧配置自动为空。
     #[serde(default)]
     pub commands: Vec<CommandTemplate>,
@@ -39,6 +42,29 @@ pub struct Settings {
     /// 服务器连接元数据；凭据同样只在密钥环。
     #[serde(default)]
     pub servers: Vec<servers::ServerEntry>,
+}
+
+/// 内置面板的快捷键覆盖；`None` 表示使用默认绑定，原始文本保持不变。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PanelShortcuts {
+    pub commands_panel: Option<String>,
+    pub servers_panel: Option<String>,
+}
+
+impl PanelShortcuts {
+    /// 保存前复用统一快捷键校验；不归一化或清空已保存的绑定。
+    pub fn validate(&self) -> Result<()> {
+        for (panel, shortcut) in [
+            ("快捷命令面板", &self.commands_panel),
+            ("服务器面板", &self.servers_panel),
+        ] {
+            if let Some(shortcut) = shortcut {
+                normalize_shortcut(shortcut).with_context(|| format!("{panel}快捷键格式不合法"))?;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 外观项。数值范围与设置面板的步进按钮一致。
@@ -142,7 +168,11 @@ impl Settings {
     /// 新增或按名称替换服务器条目。
     pub fn upsert_server(&mut self, server: servers::ServerEntry) -> Result<()> {
         server.validate()?;
-        if let Some(existing) = self.servers.iter_mut().find(|item| item.name == server.name) {
+        if let Some(existing) = self
+            .servers
+            .iter_mut()
+            .find(|item| item.name == server.name)
+        {
             *existing = server;
         } else {
             self.servers.push(server);
@@ -156,7 +186,7 @@ impl Settings {
         before != self.servers.len()
     }
 
-    /// 把加载中的服务器条目修正到合法范围；无法挽救的条目直接丢弃。
+    /// 修正加载中的连接信息；错误快捷键保留原值供用户修正。
     fn sanitize_servers(&mut self) {
         self.servers.retain_mut(|server| {
             server.name = server.name.trim().to_string();
@@ -167,7 +197,11 @@ impl Settings {
                 let trimmed = key_path.trim().to_string();
                 server.key_path = (!trimmed.is_empty()).then_some(trimmed);
             }
-            server.validate().is_ok()
+            if server.validate_connection().is_err() {
+                return false;
+            }
+            server.warn_invalid_shortcut();
+            true
         });
     }
 
@@ -330,6 +364,107 @@ mod tests {
         assert_eq!(settings.appearance.font_size, 15.0);
         assert_eq!(settings.appearance.font_family, "JetBrainsMono Nerd Font");
         assert_eq!(settings.appearance.scrollback, 100_000);
+    }
+
+    #[test]
+    fn panel_shortcuts_default_when_legacy_settings_omit_them() {
+        for raw in ["", "[appearance]\nfont_size = 15.0\n", "[shortcuts]\n"] {
+            let settings: Settings = toml::from_str(raw).unwrap();
+            assert_eq!(settings.shortcuts, PanelShortcuts::default());
+            assert_eq!(settings.shortcuts.commands_panel, None);
+            assert_eq!(settings.shortcuts.servers_panel, None);
+            settings.shortcuts.validate().unwrap();
+            let saved = toml::to_string_pretty(&settings).unwrap();
+            assert_eq!(toml::from_str::<Settings>(&saved).unwrap(), settings);
+        }
+        for raw in [
+            "[shortcuts]\ncommands_panel = 'ctrl+shift+k'\n",
+            "[shortcuts]\nservers_panel = 'ctrl+shift+s'\n",
+        ] {
+            let settings: Settings = toml::from_str(raw).unwrap();
+            assert_ne!(settings.shortcuts, PanelShortcuts::default());
+            settings.shortcuts.validate().unwrap();
+            let saved = toml::to_string_pretty(&settings).unwrap();
+            assert_eq!(toml::from_str::<Settings>(&saved).unwrap(), settings);
+        }
+    }
+
+    #[test]
+    fn panel_shortcuts_validate_using_normalizer_without_rewriting_text() {
+        let shortcuts = PanelShortcuts {
+            commands_panel: Some("  Control + Shift + K  ".into()),
+            servers_panel: Some(" Super + Alt + S ".into()),
+        };
+        let original = shortcuts.clone();
+        shortcuts.validate().unwrap();
+        assert_eq!(shortcuts, original);
+        assert_eq!(
+            normalize_shortcut(shortcuts.commands_panel.as_deref().unwrap()).unwrap(),
+            "ctrl+shift+k"
+        );
+        assert_eq!(
+            normalize_shortcut(shortcuts.servers_panel.as_deref().unwrap()).unwrap(),
+            "alt+cmd+s"
+        );
+    }
+
+    #[test]
+    fn panel_shortcuts_reject_each_invalid_override_without_rewriting_it() {
+        for shortcut in ["", "   ", "ctrl", "ctrl+control+k", "alt++k", "unknown+k"] {
+            for shortcuts in [
+                PanelShortcuts {
+                    commands_panel: Some(shortcut.into()),
+                    ..Default::default()
+                },
+                PanelShortcuts {
+                    servers_panel: Some(shortcut.into()),
+                    ..Default::default()
+                },
+            ] {
+                let original = shortcuts.clone();
+                assert!(shortcuts.validate().is_err(), "{shortcuts:?}");
+                assert_eq!(shortcuts, original);
+            }
+        }
+    }
+
+    #[test]
+    fn settings_load_save_preserves_panel_and_legacy_shortcut_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let raw = r#"
+[shortcuts]
+commands_panel = "  Control + Shift + K  "
+servers_panel = "   "
+
+[[commands]]
+name = "命令"
+template = "pwd"
+shortcut = "  Ctrl + Shift + L  "
+
+[[totp]]
+name = "动态码"
+shortcut = "   "
+
+[[servers]]
+name = "服务器"
+host = "example.com"
+username = "ops"
+shortcut = "  legacy shortcut  "
+"#;
+        std::fs::write(&path, raw).unwrap();
+        let settings = Settings::load(&path).unwrap();
+        settings.save_to(&path).unwrap();
+        let original: toml::Value = toml::from_str(raw).unwrap();
+        let saved: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.get("shortcuts"), original.get("shortcuts"));
+        for collection in ["commands", "totp", "servers"] {
+            assert_eq!(
+                saved[collection][0]["shortcut"], original[collection][0]["shortcut"],
+                "{collection} 的历史快捷键必须保留原值"
+            );
+        }
+        assert_eq!(Settings::load(&path).unwrap(), settings);
     }
 
     #[test]

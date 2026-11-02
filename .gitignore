@@ -5,6 +5,10 @@
 # cargo-dist 产物
 /dist
 
+# Python 资源工具测试缓存
+__pycache__/
+*.py[cod]
+
 # 系统与编辑器
 .DS_Store
 *.log

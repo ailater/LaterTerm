@@ -2,7 +2,7 @@
 //! 只迁移连接元数据——两类来源的密码要么不存、要么绑定原机器加密，均不可迁移；
 //! 导入后的条目在 LaterTerm 首次连接时补输凭据（可记住入密钥环）。
 
-use anyhow::{Result, Context as _, bail};
+use anyhow::{Context as _, Result, bail};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -10,7 +10,10 @@ use crate::servers::{ServerAuthKind, ServerEntry};
 
 /// Deepin 终端远程管理的默认配置路径。
 pub fn deepin_default_path() -> Option<std::path::PathBuf> {
-    Some(std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config/deepin/deepin-terminal/server-config.conf"))
+    Some(
+        std::path::PathBuf::from(std::env::var_os("HOME")?)
+            .join(".config/deepin/deepin-terminal/server-config.conf"),
+    )
 }
 
 /// 解析 Deepin server-config.conf 全文。
@@ -25,8 +28,8 @@ pub fn parse_deepin_servers(body: &str) -> Vec<ServerEntry> {
     let mut extras: BTreeMap<String, String> = BTreeMap::new();
 
     let flush = |header: &mut Option<(String, String, String, String)>,
-                     extras: &mut BTreeMap<String, String>,
-                     out: &mut Vec<ServerEntry>| {
+                 extras: &mut BTreeMap<String, String>,
+                 out: &mut Vec<ServerEntry>| {
         let Some((user, host, port_text, header_name)) = header.take() else {
             extras.clear();
             return;
@@ -52,7 +55,11 @@ pub fn parse_deepin_servers(body: &str) -> Vec<ServerEntry> {
         };
         let mut name = {
             let from_key = get("Name");
-            if from_key.is_empty() { header_name } else { from_key }
+            if from_key.is_empty() {
+                header_name
+            } else {
+                from_key
+            }
         };
         if name.is_empty() {
             name = host.clone();
@@ -133,8 +140,8 @@ pub fn load_deepin_servers(path: &Path) -> Result<Vec<ServerEntry>> {
             path.display()
         );
     }
-    let body = std::fs::read_to_string(path)
-        .with_context(|| format!("读取 {} 失败", path.display()))?;
+    let body =
+        std::fs::read_to_string(path).with_context(|| format!("读取 {} 失败", path.display()))?;
     Ok(parse_deepin_servers(&body))
 }
 
@@ -229,8 +236,7 @@ pub fn load_xshell_sessions(paths: &[std::path::PathBuf]) -> Result<(Vec<ServerE
     let mut out: Vec<ServerEntry> = Vec::new();
     let mut skipped = 0usize;
     for path in paths {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("读取 {} 失败", path.display()))?;
+        let bytes = std::fs::read(path).with_context(|| format!("读取 {} 失败", path.display()))?;
         let stem = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -285,10 +291,17 @@ userName = root
         assert_eq!(entries[0].port, 2222);
         assert_eq!(entries[0].username, "jilikun");
         assert_eq!(entries[0].auth, ServerAuthKind::Password);
-        assert!(entries[0].note.contains("目录 /data/wwwroot/"), "{}", entries[0].note);
+        assert!(
+            entries[0].note.contains("目录 /data/wwwroot/"),
+            "{}",
+            entries[0].note
+        );
         // UTF-8 编码不进备注，GBK 编码要进（GBK 转码迁移的线索）
         assert_eq!(entries[1].auth, ServerAuthKind::PrivateKey);
-        assert_eq!(entries[1].key_path.as_deref(), Some("/home/me/.ssh/id_ed25519"));
+        assert_eq!(
+            entries[1].key_path.as_deref(),
+            Some("/home/me/.ssh/id_ed25519")
+        );
         assert!(entries[1].note.contains("分组 other"));
         assert!(entries[1].note.contains("编码 GBK"));
     }
@@ -370,7 +383,10 @@ mod real_machine_tests {
         let entries = load_deepin_servers(&path).expect("真机 Deepin 配置应可解析");
         println!("真机 Deepin 条目 {} 台：", entries.len());
         for entry in &entries {
-            println!("  {} · {}@{}:{} [note: {}]", entry.name, entry.username, entry.host, entry.port, entry.note);
+            println!(
+                "  {} · {}@{}:{} [note: {}]",
+                entry.name, entry.username, entry.host, entry.port, entry.note
+            );
         }
         assert!(!entries.is_empty(), "本机样例应至少解析出一台");
     }

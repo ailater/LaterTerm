@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=LaterTerm
+Comment=GPU terminal
+Comment[zh_CN]=GPU 加速终端
+Exec=laterterm
+Icon=laterterm
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupWMClass=laterterm
+StartupNotify=true

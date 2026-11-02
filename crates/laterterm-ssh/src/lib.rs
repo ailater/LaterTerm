@@ -22,12 +22,12 @@ mod stream;
 use laterterm_core::{BackendKind, SessionStreams, TerminalSession};
 use policy::HostKeyPolicy;
 use russh::client::{self, AuthResult, Handle, KeyboardInteractiveAuthResponse};
-use russh::keys::{HashAlg, PrivateKeyWithHashAlg, load_secret_key};
+use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, decode_secret_key};
 use russh::{ChannelMsg, Disconnect};
 use std::io::{self, ErrorKind};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use stream::{StreamRx, StreamTx};
 use tokio::runtime::Runtime;
@@ -38,22 +38,262 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const KBD_INT_MAX_ROUNDS: usize = 8;
 
 /// SSH 认证方式。凭据由调用方从密钥环取出后传入，本 crate 不做任何持久化。
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum AuthMethod {
     /// 密码认证。
-    Password {
-        password: String,
-    },
+    Password { password: String },
     /// keyboard-interactive 认证（跳板机二次验证常见）：
     /// 远端的每个 prompt 都以 `secret` 应答。
-    KeyboardInteractive {
-        secret: String,
-    },
+    KeyboardInteractive { secret: String },
     /// 私钥文件认证；`passphrase` 仅在私钥本体加密时需要。
     PrivateKey {
         key_path: PathBuf,
         passphrase: Option<String>,
     },
+    /// 调用线程预加载的私钥，按顺序尝试；不再读取文件或解密。
+    PreparedPrivateKey { keys: Vec<Arc<PrivateKey>> },
+}
+
+impl std::fmt::Debug for AuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Password { .. } => f.write_str("Password { password: [REDACTED] }"),
+            Self::KeyboardInteractive { .. } => {
+                f.write_str("KeyboardInteractive { secret: [REDACTED] }")
+            }
+            Self::PrivateKey { .. } => {
+                f.write_str("PrivateKey { key_path: [REDACTED], passphrase: [REDACTED] }")
+            }
+            Self::PreparedPrivateKey { .. } => {
+                f.write_str("PreparedPrivateKey { keys: [REDACTED] }")
+            }
+        }
+    }
+}
+
+/// 加密私钥缺少口令或口令错误。可从 `io::Error::get_ref()` downcast。
+#[derive(Debug)]
+pub struct PrivateKeyPassphraseRequired {
+    pub key_path: PathBuf,
+}
+
+impl std::fmt::Display for PrivateKeyPassphraseRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("私钥需要正确的解密口令")
+    }
+}
+
+impl std::error::Error for PrivateKeyPassphraseRequired {}
+
+/// 在调用线程准备私钥；应由 app 后台线程调用，不访问密钥环。
+///
+/// 指定路径仅加载该文件，仅支持 `~/` 展开；未指定时严格按
+/// `~/.ssh/id_ed25519`、`~/.ssh/id_rsa` 顺序加载存在的文件，不扫描目录。
+/// 任一存在的候选无法加载时立即返回错误（不静默跳过加密/损坏文件）。
+pub fn prepare_private_key(
+    key_path: Option<&std::path::Path>,
+    passphrase: Option<&str>,
+) -> io::Result<AuthMethod> {
+    // 绝对路径不依赖 HOME 是否存在。
+    if let Some(path) = key_path
+        && !path.starts_with("~/")
+    {
+        return Ok(AuthMethod::PreparedPrivateKey {
+            keys: vec![Arc::new(read_private_key(path, passphrase)?)],
+        });
+    }
+    let home = std::env::home_dir()
+        .ok_or_else(|| io::Error::new(ErrorKind::NotFound, "无法确定用户主目录"))?;
+    prepare_private_key_in(key_path, passphrase, &home)
+}
+
+fn prepare_private_key_in(
+    key_path: Option<&std::path::Path>,
+    passphrase: Option<&str>,
+    home: &std::path::Path,
+) -> io::Result<AuthMethod> {
+    let paths = match key_path {
+        Some(path) => vec![match path.strip_prefix("~/") {
+            Ok(relative) => home.join(relative),
+            Err(_) => path.to_path_buf(),
+        }],
+        None => vec![home.join(".ssh/id_ed25519"), home.join(".ssh/id_rsa")],
+    };
+    let mut keys = Vec::new();
+    for path in paths {
+        match read_private_key(&path, passphrase) {
+            Ok(key) => keys.push(Arc::new(key)),
+            Err(error) if key_path.is_none() && error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    if keys.is_empty() {
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            "未找到默认 SSH 私钥（id_ed25519 / id_rsa）",
+        ));
+    }
+    Ok(AuthMethod::PreparedPrivateKey { keys })
+}
+
+fn read_private_key(path: &std::path::Path, passphrase: Option<&str>) -> io::Result<PrivateKey> {
+    let secret = std::fs::read_to_string(path)?;
+    // 先识别加密容器，避免损坏的普通私钥被误判为需要口令。
+    let encrypted = PrivateKey::from_openssh(&secret)
+        .map(|key| key.is_encrypted())
+        .unwrap_or(false)
+        || secret.contains("-----BEGIN ENCRYPTED PRIVATE KEY-----")
+        || secret.contains("Proc-Type: 4,ENCRYPTED")
+        || (secret.starts_with("PuTTY-User-Key-File-")
+            && secret
+                .lines()
+                .any(|line| line.starts_with("Encryption: ") && line != "Encryption: none"));
+    decode_secret_key(&secret, passphrase).map_err(|_| {
+        if encrypted {
+            io::Error::new(
+                ErrorKind::PermissionDenied,
+                PrivateKeyPassphraseRequired {
+                    key_path: path.to_path_buf(),
+                },
+            )
+        } else {
+            // 不传播解析器的错误文本，避免凭据内容进入日志。
+            io::Error::new(ErrorKind::InvalidData, "读取私钥失败：格式无效或不支持")
+        }
+    })
+}
+
+#[cfg(test)]
+mod private_key_tests {
+    use super::*;
+    use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
+    use std::path::Path;
+
+    fn write_key(path: &Path, password: Option<&str>) -> PrivateKey {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+        let stored = match password {
+            Some(password) => key.encrypt(&mut rand::rng(), password).unwrap(),
+            None => key.clone(),
+        };
+        std::fs::write(path, stored.to_openssh(LineEnding::LF).unwrap().as_bytes()).unwrap();
+        key
+    }
+
+    #[test]
+    fn credentials_debug_is_redacted() {
+        for auth in [
+            AuthMethod::Password {
+                password: "sensitive-password".into(),
+            },
+            AuthMethod::KeyboardInteractive {
+                secret: "sensitive-password".into(),
+            },
+            AuthMethod::PrivateKey {
+                key_path: "test-key".into(),
+                passphrase: Some("sensitive-password".into()),
+            },
+        ] {
+            assert!(!format!("{auth:?}").contains("sensitive-password"));
+        }
+    }
+
+    #[test]
+    fn discovery_expansion_explicit_and_missing_paths() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            prepare_private_key_in(None, None, home.path())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+        let first = write_key(&home.path().join(".ssh/id_ed25519"), None);
+        let second = write_key(&home.path().join(".ssh/id_rsa"), None);
+        // 不扫描任意名称，即使该文件不是有效私钥。
+        std::fs::write(home.path().join(".ssh/other"), "invalid").unwrap();
+        let AuthMethod::PreparedPrivateKey { keys } =
+            prepare_private_key_in(None, None, home.path()).unwrap()
+        else {
+            panic!("应预加载")
+        };
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].public_key(), first.public_key());
+        assert_eq!(keys[1].public_key(), second.public_key());
+        for path in [
+            PathBuf::from("~/.ssh/id_rsa"),
+            home.path().join(".ssh/id_rsa"),
+        ] {
+            let AuthMethod::PreparedPrivateKey { keys } =
+                prepare_private_key_in(Some(&path), None, home.path()).unwrap()
+            else {
+                panic!("应预加载")
+            };
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0].public_key(), second.public_key());
+        }
+        for path in [
+            "~/.ssh/missing",
+            "$HOME/.ssh/id_ed25519",
+            "~someone/.ssh/id_ed25519",
+        ] {
+            assert_eq!(
+                prepare_private_key_in(Some(Path::new(path)), None, home.path())
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::NotFound
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_keys_require_correct_exact_passphrase() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("encrypted");
+        let expected = write_key(&path, Some("  real secret  "));
+        for password in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("wrong-secret"),
+            Some("real secret"),
+        ] {
+            let error = prepare_private_key_in(Some(&path), password, home.path()).unwrap_err();
+            let required = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<PrivateKeyPassphraseRequired>()
+                .expect("可识别口令错误");
+            assert_eq!(required.key_path, path);
+            assert!(!format!("{error:?}").contains("wrong-secret"));
+            assert!(!error.to_string().contains("real secret"));
+        }
+        let auth =
+            prepare_private_key_in(Some(&path), Some("  real secret  "), home.path()).unwrap();
+        assert!(!format!("{auth:?}").contains("PRIVATE KEY"));
+        let AuthMethod::PreparedPrivateKey { keys } = auth else {
+            panic!("应预加载")
+        };
+        assert_eq!(keys[0].public_key(), expected.public_key());
+        // 空白是合法口令，不能 trim。
+        write_key(&path, Some("   "));
+        assert!(prepare_private_key_in(Some(&path), Some("   "), home.path()).is_ok());
+    }
+
+    #[test]
+    fn invalid_key_is_not_a_passphrase_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("invalid");
+        std::fs::write(&path, "not a private key").unwrap();
+        let error = prepare_private_key_in(Some(&path), None, home.path()).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<PrivateKeyPassphraseRequired>()
+                .is_none()
+        );
+    }
 }
 
 /// SSH 会话启动参数。
@@ -70,7 +310,12 @@ pub struct SshOptions {
 }
 
 impl SshOptions {
-    pub fn new(host: impl Into<String>, port: u16, username: impl Into<String>, auth: AuthMethod) -> Self {
+    pub fn new(
+        host: impl Into<String>,
+        port: u16,
+        username: impl Into<String>,
+        auth: AuthMethod,
+    ) -> Self {
         Self {
             host: host.into(),
             port,
@@ -124,7 +369,8 @@ impl SshSession {
     /// 建立连接、认证并请求 PTY + shell。
     pub fn connect(options: SshOptions) -> io::Result<Self> {
         // multi_thread 必需：泵任务要在 block_on 返回之后持续运行
-        let runtime = Runtime::new().map_err(|error| io::Error::other(format!("创建运行时失败: {error}")))?;
+        let runtime =
+            Runtime::new().map_err(|error| io::Error::other(format!("创建运行时失败: {error}")))?;
         let title = format!("{}@{}", options.username, options.host);
 
         let established = runtime.block_on(async {
@@ -136,7 +382,11 @@ impl SshSession {
                 )),
             }
         })?;
-        let Established { handle, mut read_half, write_half } = established;
+        let Established {
+            handle,
+            mut read_half,
+            write_half,
+        } = established;
 
         // 输入泵：视图写端 → 通道。键盘流量极小，无界队列即可。
         let (in_tx, in_rx) = flume::unbounded::<Vec<u8>>();
@@ -162,7 +412,8 @@ impl SshSession {
                     _ = shutdown_rx.recv_async() => break,
                 };
                 let chunk = match message {
-                    Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => data,
+                    Some(ChannelMsg::Data { data })
+                    | Some(ChannelMsg::ExtendedData { data, .. }) => data,
                     // 远端 EOF/CLOSE/会话断开：读端自然结束
                     Some(ChannelMsg::Eof | ChannelMsg::Close) | None => break,
                     Some(_) => continue,
@@ -180,7 +431,10 @@ impl SshSession {
             while let Ok(command) = control_rx.recv_async().await {
                 match command {
                     ControlCommand::Resize { cols, rows } => {
-                        if let Err(error) = write_half.window_change(cols as u32, rows as u32, 0, 0).await {
+                        if let Err(error) = write_half
+                            .window_change(cols as u32, rows as u32, 0, 0)
+                            .await
+                        {
                             eprintln!("SSH 窗口变更失败: {error}");
                         }
                     }
@@ -222,18 +476,33 @@ async fn establish(options: &SshOptions) -> io::Result<Established> {
         port: options.port,
         known_hosts: options.known_hosts.clone(),
     };
-    let mut handle: Handle<HostKeyPolicy> = client::connect(config, (options.host.as_str(), options.port), policy)
-        .await
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut handle: Handle<HostKeyPolicy> =
+        client::connect(config, (options.host.as_str(), options.port), policy)
+            .await
+            .map_err(|error| io::Error::other(error.to_string()))?;
 
     authenticate(&mut handle, options).await?;
 
-    let channel = handle.channel_open_session().await.map_err(io::Error::other)?;
-    channel
-        .request_pty(true, "xterm-256color", options.cols as u32, options.rows as u32, 0, 0, &[])
+    let channel = handle
+        .channel_open_session()
         .await
         .map_err(io::Error::other)?;
-    channel.request_shell(true).await.map_err(io::Error::other)?;
+    channel
+        .request_pty(
+            true,
+            "xterm-256color",
+            options.cols as u32,
+            options.rows as u32,
+            0,
+            0,
+            &[],
+        )
+        .await
+        .map_err(io::Error::other)?;
+    channel
+        .request_shell(true)
+        .await
+        .map_err(io::Error::other)?;
 
     // want_reply=true：逐个等待 Success，任一 Failure 立即报错
     let mut confirmed = 0;
@@ -247,14 +516,20 @@ async fn establish(options: &SshOptions) -> io::Result<Established> {
                 }
             }
             Some(ChannelMsg::Failure) => {
-                return Err(io::Error::other("远端拒绝启动 shell（检查账号权限或登录 shell 配置）"));
+                return Err(io::Error::other(
+                    "远端拒绝启动 shell（检查账号权限或登录 shell 配置）",
+                ));
             }
             Some(_) => continue,
             None => return Err(io::Error::other("连接在 shell 就绪前被远端关闭")),
         }
     }
     let (read_half, write_half) = channel.split();
-    Ok(Established { handle, read_half, write_half })
+    Ok(Established {
+        handle,
+        read_half,
+        write_half,
+    })
 }
 
 /// 按配置执行认证；失败时给出可操作的错误信息。
@@ -282,7 +557,10 @@ async fn authenticate(handle: &mut Handle<HostKeyPolicy>, options: &SshOptions) 
                     KeyboardInteractiveAuthResponse::Failure { .. } => {
                         return Err(io::Error::new(
                             ErrorKind::PermissionDenied,
-                            format!("keyboard-interactive 认证被远端拒绝（用户 {}）", options.username),
+                            format!(
+                                "keyboard-interactive 认证被远端拒绝（用户 {}）",
+                                options.username
+                            ),
                         ));
                     }
                     KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
@@ -299,24 +577,42 @@ async fn authenticate(handle: &mut Handle<HostKeyPolicy>, options: &SshOptions) 
                 "keyboard-interactive 超过 {KBD_INT_MAX_ROUNDS} 轮仍未通过"
             )))
         }
-        AuthMethod::PrivateKey { key_path, passphrase } => {
-            let key = load_secret_key(key_path, passphrase.as_deref())
-                .map_err(|error| io::Error::new(ErrorKind::InvalidInput, format!("读取私钥失败: {error}")))?;
-            // RSA 固定 sha256 签名（None 会退回 SHA-1 的 ssh-rsa，新服务器多已禁用）
-            let key = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
-            match handle
-                .authenticate_publickey(&options.username, key)
-                .await
-                .map_err(io::Error::other)?
-            {
-                AuthResult::Success => Ok(()),
-                AuthResult::Failure { .. } => Err(io::Error::new(
-                    ErrorKind::PermissionDenied,
-                    "公钥认证被远端拒绝（确认远端 authorized_keys 已收录对应公钥）",
-                )),
-            }
+        AuthMethod::PrivateKey {
+            key_path,
+            passphrase,
+        } => {
+            let auth = prepare_private_key(Some(key_path), passphrase.as_deref())?;
+            let AuthMethod::PreparedPrivateKey { keys } = auth else {
+                unreachable!()
+            };
+            authenticate_keys(handle, &options.username, &keys).await
+        }
+        AuthMethod::PreparedPrivateKey { keys } => {
+            authenticate_keys(handle, &options.username, keys).await
         }
     }
+}
+
+async fn authenticate_keys(
+    handle: &mut Handle<HostKeyPolicy>,
+    username: &str,
+    keys: &[Arc<PrivateKey>],
+) -> io::Result<()> {
+    for key in keys {
+        // RSA 固定 sha256 签名，拒绝后仍尝试下一把默认私钥。
+        let key = PrivateKeyWithHashAlg::new(Arc::clone(key), Some(HashAlg::Sha256));
+        if let AuthResult::Success = handle
+            .authenticate_publickey(username, key)
+            .await
+            .map_err(io::Error::other)?
+        {
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        ErrorKind::PermissionDenied,
+        "公钥认证被远端拒绝（确认远端 authorized_keys 已收录对应公钥）",
+    ))
 }
 
 impl TerminalSession for SshSession {

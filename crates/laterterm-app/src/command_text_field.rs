@@ -1,10 +1,12 @@
 use gpui::{
     Bounds, Context, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Render, Styled,
-    UTF16Selection, Window, canvas, div, px, rgb,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
+    Pixels, Render, Styled, UTF16Selection, Window, anchored, canvas, deferred, div,
+    prelude::FluentBuilder, px, rgb,
 };
-
+use std::cell::Cell;
 use std::ops::Range;
+use std::rc::Rc;
 use std::time::Duration;
 
 pub(crate) struct CommandTextChanged;
@@ -22,10 +24,14 @@ pub(crate) struct CommandTextField {
     text: String,
     selection: Range<usize>,
     reversed: bool,
-    marked_text: String,
+    marked_range: Option<Range<usize>>,
     placeholder: String,
     /// 掩码模式（密码/密钥输入）：显示圆点，占位提示保持明文。
     masked: bool,
+    /// 字段在窗口中的几何（paint 期由 canvas 回写）；点击定位与右键菜单换算用。
+    bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    /// 右键菜单原点（相对字段左上角）；None = 关闭。
+    context_menu: Option<gpui::Point<Pixels>>,
     /// 焦点态缓存：render 时与 `focus_handle.is_focused(window)` 对账。
     focused: bool,
     /// 光标可见相位（闪烁用）；输入动作会重置为可见。
@@ -50,9 +56,11 @@ impl CommandTextField {
             text,
             selection: end..end,
             reversed: false,
-            marked_text: String::new(),
+            marked_range: None,
             placeholder: placeholder.into(),
             masked: false,
+            bounds: Rc::new(Cell::new(None)),
+            context_menu: None,
             focused: false,
             caret_on: true,
             blink_scheduled: false,
@@ -61,6 +69,16 @@ impl CommandTextField {
 
     pub(crate) fn value(&self) -> &str {
         &self.text
+    }
+
+    pub(crate) fn has_context_menu(&self) -> bool {
+        self.context_menu.is_some()
+    }
+
+    pub(crate) fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// 把焦点交给这个输入框（打开弹窗后调用，光标随即闪烁）。
@@ -72,6 +90,130 @@ impl CommandTextField {
     pub(crate) fn masked(mut self) -> Self {
         self.masked = true;
         self
+    }
+
+    fn selection_text(&self) -> Option<String> {
+        let (start, end) = (
+            self.selection.start.min(self.selection.end),
+            self.selection.start.max(self.selection.end),
+        );
+        if start == end {
+            return None;
+        }
+        Some(self.text[self.byte_offset(start)..self.byte_offset(end)].to_string())
+    }
+
+    fn copy_selection(&self, cx: &Context<Self>) {
+        if !self.masked
+            && let Some(text) = self.selection_text()
+        {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
+    }
+
+    fn cut_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.masked
+            && let Some(text) = self.selection_text()
+        {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            self.delete_backward();
+            self.caret_on = true;
+            cx.emit(CommandTextChanged);
+            cx.notify();
+        }
+    }
+
+    fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        // 单行输入框：换行折叠为空格，避免静默吞字
+        let text = text.replace("\r\n", "\n").replace(['\r', '\n'], " ");
+        self.replace_selection(&text);
+        cx.emit(CommandTextChanged);
+        cx.notify();
+    }
+
+    /// 根据屏幕坐标计算最近的 UTF-16 字符边界。
+    fn caret_offset_at(&self, position: gpui::Point<Pixels>, window: &mut Window) -> Option<usize> {
+        let bounds = self.bounds.get()?;
+        let style = window.text_style();
+        let font_size = match style.font_size {
+            gpui::AbsoluteLength::Pixels(size) => size,
+            gpui::AbsoluteLength::Rems(rems) => window.rem_size() * rems.0,
+        };
+        let display = self.display_text();
+        let run = gpui::TextRun {
+            len: display.len(),
+            font: style.font(),
+            color: style.color,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let shaped =
+            window
+                .text_system()
+                .shape_line(display.clone().into(), font_size, &[run], None);
+        // 单行输入框只需按 x 求最近字符边界（utf8 字节下标）
+        let byte_index = shaped.closest_index_for_x(position.x - bounds.origin.x - px(8.0));
+        // 掩码后字符数与原文一致，按字符数换算回真实 UTF-16 偏移
+        let char_count = display[..byte_index.min(display.len())].chars().count();
+        let offset = self
+            .text
+            .chars()
+            .take(char_count)
+            .map(char::len_utf16)
+            .sum::<usize>();
+        Some(offset)
+    }
+
+    fn place_caret_at(&mut self, position: gpui::Point<Pixels>, window: &mut Window) {
+        if let Some(offset) = self.caret_offset_at(position, window) {
+            self.selection = offset..offset;
+            self.reversed = false;
+            self.caret_on = true;
+        }
+    }
+
+    /// 渲染用文本（掩码模式返回等量圆点；字符数与原文一致）。
+    fn display_text(&self) -> String {
+        if self.masked {
+            "\u{2022}".repeat(self.text.chars().count())
+        } else {
+            self.text.clone()
+        }
+    }
+
+    fn on_field_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        self.focus_handle.focus(window);
+        self.caret_on = true;
+        let had_menu = self.context_menu.take().is_some();
+        if !had_menu {
+            self.place_caret_at(event.position, window);
+        }
+        cx.notify();
+    }
+
+    fn on_field_right_click(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        self.focus_handle.focus(window);
+        if self.selection.start == self.selection.end {
+            self.place_caret_at(event.position, window);
+        }
+        self.context_menu = Some(event.position);
+        cx.notify();
     }
 
     fn utf16_len(&self) -> usize {
@@ -102,13 +244,11 @@ impl CommandTextField {
         if self.selection.start == 0 {
             return;
         }
-        let mut chars = self.text[..self.byte_offset(self.selection.start)].char_indices();
-        chars.next_back();
-        let start = chars.next_back().map(|(i, _)| i).unwrap_or(0);
+        let start = previous_char_start(&self.text, self.byte_offset(self.selection.start));
         let end = self.byte_offset(self.selection.start);
         self.text.replace_range(start..end, "");
-        self.selection =
-            self.selection.start.saturating_sub(1)..self.selection.start.saturating_sub(1);
+        let offset = self.text[..start].encode_utf16().count();
+        self.selection = offset..offset;
     }
     fn delete_forward(&mut self) {
         if self.selection.start != self.selection.end {
@@ -127,23 +267,56 @@ impl CommandTextField {
     }
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let k = event.keystroke.key.as_str();
-        if event.keystroke.modifiers.control && k.eq_ignore_ascii_case("a") {
+        let ctrl = event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.alt
+            && !event.keystroke.modifiers.shift;
+        if ctrl && matches!(k.to_ascii_lowercase().as_str(), "a" | "c" | "x" | "v") {
+            cx.stop_propagation();
+        }
+        if ctrl && k.eq_ignore_ascii_case("a") {
             self.selection = 0..self.utf16_len();
             self.reversed = false;
             self.caret_on = true;
             cx.notify();
             return;
         }
+        // 剪贴板：Ctrl+C 复制选区 / Ctrl+X 剪切 / Ctrl+V 粘贴（多行折叠为空格）
+        if ctrl && k.eq_ignore_ascii_case("c") {
+            self.copy_selection(cx);
+            return;
+        }
+        if ctrl && k.eq_ignore_ascii_case("x") {
+            self.cut_selection(cx);
+            return;
+        }
+        if ctrl && k.eq_ignore_ascii_case("v") {
+            self.paste_clipboard(cx);
+            return;
+        }
         if k == "enter" {
             cx.emit(FieldSubmit);
             return;
         }
+        if k == "escape" && self.context_menu.take().is_some() {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        let previous_text = self.text.clone();
         match k {
             "backspace" => self.delete_backward(),
             "delete" => self.delete_forward(),
             "left" => {
                 let p = self.selection.start.min(self.selection.end);
-                self.selection = p.saturating_sub(1)..p.saturating_sub(1);
+                let pos = if self.selection.start != self.selection.end {
+                    p
+                } else {
+                    self.text[..self.byte_offset(p)]
+                        .chars()
+                        .next_back()
+                        .map_or(0, |c| p.saturating_sub(c.len_utf16()))
+                };
+                self.selection = pos..pos;
                 self.reversed = false;
             }
             "right" => {
@@ -152,7 +325,15 @@ impl CommandTextField {
                     .end
                     .max(self.selection.start)
                     .min(self.utf16_len());
-                self.selection = (p + 1).min(self.utf16_len())..(p + 1).min(self.utf16_len());
+                let pos = if self.selection.start != self.selection.end {
+                    p
+                } else {
+                    self.text[self.byte_offset(p)..]
+                        .chars()
+                        .next()
+                        .map_or(p, |c| p + c.len_utf16())
+                };
+                self.selection = pos..pos;
                 self.reversed = false;
             }
             "home" => self.selection = 0..0,
@@ -163,7 +344,10 @@ impl CommandTextField {
             _ => return,
         }
         self.caret_on = true;
-        cx.emit(CommandTextChanged);
+        if self.text != previous_text {
+            cx.emit(CommandTextChanged);
+        }
+        cx.stop_propagation();
         cx.notify();
     }
 
@@ -173,23 +357,23 @@ impl CommandTextField {
             return;
         }
         self.blink_scheduled = true;
-        cx.spawn(async move |this, cx| loop {
-            cx.background_executor()
-                .timer(CARET_BLINK_INTERVAL)
-                .await;
-            let Ok(alive) = this.update(cx, |field, cx| {
-                if !field.focused {
-                    field.blink_scheduled = false;
-                    return false;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(CARET_BLINK_INTERVAL).await;
+                let Ok(alive) = this.update(cx, |field, cx| {
+                    if !field.focused {
+                        field.blink_scheduled = false;
+                        return false;
+                    }
+                    field.caret_on = !field.caret_on;
+                    cx.notify();
+                    true
+                }) else {
+                    break;
+                };
+                if !alive {
+                    break;
                 }
-                field.caret_on = !field.caret_on;
-                cx.notify();
-                true
-            }) else {
-                break;
-            };
-            if !alive {
-                break;
             }
         })
         .detach();
@@ -203,21 +387,25 @@ impl Render for CommandTextField {
         let focused = focus.is_focused(window);
         if focused != self.focused {
             self.focused = focused;
-            // 重新获得焦点时光标立即可见，从头开始闪。
+            // 重新获得焦点时光标立即可见；失焦时关闭右键菜单。
             self.caret_on = true;
+            if !focused {
+                self.context_menu = None;
+            }
         }
         if focused {
             self.schedule_caret_blink(cx);
         }
 
-        let marked = self.marked_text.clone();
-        let composing = !marked.is_empty();
+        let composing = self.marked_range.is_some();
         let show_caret = focused && self.caret_on && !composing;
         let sel_start = self.selection.start.min(self.selection.end);
         let sel_end = self.selection.start.max(self.selection.end);
 
+        let bounds_cell = self.bounds.clone();
         let mut field = div()
             .track_focus(&focus)
+            .relative()
             .h(px(30.0))
             .w_full()
             .px_2()
@@ -235,27 +423,81 @@ impl Render for CommandTextField {
             } else {
                 rgb(0x343750)
             })
-            .child(canvas(
-                move |bounds, _window, _cx| bounds,
-                move |bounds, _, window, cx| {
-                    window.handle_input(
-                        &focus,
-                        ElementInputHandler::new(bounds, entity.clone()),
-                        cx,
-                    );
-                },
-            ))
-            .on_key_down(cx.listener(Self::on_key_down));
+            .child(
+                div().absolute().inset_0().child(
+                    canvas(
+                        move |bounds, _window, _cx| bounds,
+                        move |bounds, _, window, cx| {
+                            bounds_cell.set(Some(bounds));
+                            window.handle_input(
+                                &focus,
+                                ElementInputHandler::new(bounds, entity.clone()),
+                                cx,
+                            );
+                        },
+                    )
+                    .size_full(),
+                ),
+            )
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_field_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_field_right_click));
 
-        if composing {
-            // 输入法组词期间整体展示 原文+预编辑，不画光标（与终端 IME 行为一致）。
-            let shown = if self.masked {
-                "\u{2022}".repeat(self.text.chars().count() + marked.chars().count())
-            } else {
-                format!("{}{}", self.text, marked)
+        if let Some(pos) = self.context_menu {
+            let item = |cx: &mut Context<Self>,
+                        label: &'static str,
+                        action: fn(&mut Self, &mut Context<Self>)| {
+                div()
+                    .h(px(26.0))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .text_size(px(12.0))
+                    .text_color(rgb(0xC0CAF5))
+                    .hover(|style| style.bg(rgb(0x2F3147)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |field, _event, _window, cx| {
+                            cx.stop_propagation();
+                            action(field, cx);
+                            field.context_menu = None;
+                            cx.notify();
+                        }),
+                    )
+                    .child(label)
             };
-            field = field.text_color(rgb(0xC0CAF5)).child(shown);
-            return field;
+            field = field.child(
+                deferred(
+                    anchored().position(pos).snap_to_window().child(
+                        div()
+                            .w(px(136.0))
+                            .flex()
+                            .flex_col()
+                            .py_1()
+                            .bg(rgb(0x252837))
+                            .border_1()
+                            .border_color(rgb(0x3B3F5C))
+                            .rounded_md()
+                            .on_mouse_down_out(cx.listener(|field, _, _, cx| {
+                                field.close_context_menu(cx);
+                            }))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                            .child(item(cx, "粘贴", |field, cx| field.paste_clipboard(cx)))
+                            .when(!self.masked, |menu| {
+                                menu.child(item(cx, "复制", |field, cx| field.copy_selection(cx)))
+                                    .child(item(cx, "剪切", |field, cx| field.cut_selection(cx)))
+                            })
+                            .child(item(cx, "全选", |field, cx| {
+                                field.selection = 0..field.utf16_len();
+                                field.reversed = false;
+                                field.caret_on = true;
+                                cx.notify();
+                            })),
+                    ),
+                )
+                .with_priority(1),
+            );
         }
 
         if self.text.is_empty() {
@@ -294,12 +536,7 @@ impl Render for CommandTextField {
             field = field.child(caret_bar());
         }
         if !collapsed {
-            field = field.child(
-                div()
-                    .bg(rgb(0x3B4661))
-                    .text_color(rgb(0xE0E6F5))
-                    .child(mid),
-            );
+            field = field.child(div().bg(rgb(0x3B4661)).text_color(rgb(0xE0E6F5)).child(mid));
         }
         if show_caret && !caret_leading {
             field = field.child(caret_bar());
@@ -322,8 +559,11 @@ impl EntityInputHandler for CommandTextField {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
+        if self.masked {
+            return None;
+        }
         let utf16: Vec<u16> = self.text.encode_utf16().collect();
-        if range.end <= utf16.len() {
+        if range.start <= range.end && range.end <= utf16.len() {
             adjusted.replace(range.clone());
             String::from_utf16(&utf16[range]).ok()
         } else {
@@ -346,14 +586,10 @@ impl EntityInputHandler for CommandTextField {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        if self.marked_text.is_empty() {
-            None
-        } else {
-            Some(0..self.marked_text.encode_utf16().count())
-        }
+        self.marked_range.clone()
     }
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.marked_text.clear();
+        self.marked_range = None;
         cx.notify();
     }
     fn replace_text_in_range(
@@ -363,10 +599,10 @@ impl EntityInputHandler for CommandTextField {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(range) = range {
+        if let Some(range) = range.or_else(|| self.marked_range.take()) {
             self.selection = range;
         }
-        self.marked_text.clear();
+        self.marked_range = None;
         self.replace_selection(text);
         cx.emit(CommandTextChanged);
         cx.notify();
@@ -375,14 +611,20 @@ impl EntityInputHandler for CommandTextField {
         &mut self,
         range: Option<Range<usize>>,
         text: &str,
-        _selected: Option<Range<usize>>,
+        selected: Option<Range<usize>>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(range) = range {
+        if let Some(range) = range.or_else(|| self.marked_range.take()) {
             self.selection = range;
         }
-        self.marked_text = text.to_string();
+        let start = self.selection.start.min(self.selection.end);
+        self.replace_selection(text);
+        let end = self.selection.end;
+        self.marked_range = (!text.is_empty()).then_some(start..end);
+        if let Some(selected) = selected {
+            self.selection = (start + selected.start).min(end)..(start + selected.end).min(end);
+        }
         cx.notify();
     }
     fn bounds_for_range(
@@ -392,14 +634,121 @@ impl EntityInputHandler for CommandTextField {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        Some(bounds)
+        let _ = bounds;
+        self.bounds.get().map(|mut bounds| {
+            bounds.origin.x += px(8.0);
+            bounds
+        })
     }
     fn character_index_for_point(
         &mut self,
-        _point: gpui::Point<Pixels>,
-        _window: &mut Window,
+        point: gpui::Point<Pixels>,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        Some(self.selection.start)
+        self.caret_offset_at(point, window)
+    }
+}
+
+/// 返回光标之前一个 Unicode 标量的 UTF-8 起点。
+fn previous_char_start(text: &str, end: usize) -> usize {
+    text[..end]
+        .char_indices()
+        .next_back()
+        .map_or(0, |(index, _)| index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommandTextField, previous_char_start};
+    use gpui::{ClipboardItem, TestAppContext};
+
+    #[gpui::test]
+    fn clipboard_shortcuts_replace_selection_and_respect_mask(cx: &mut TestAppContext) {
+        let (field, cx) = cx.add_window_view(|_, cx| CommandTextField::new("旧文本", "", cx));
+        cx.update(|window, cx| {
+            field.read(cx).focus_handle().focus(window);
+            window.activate_window();
+        });
+        cx.write_to_clipboard(ClipboardItem::new_string("新😀\n内容".into()));
+        cx.simulate_keystrokes("ctrl-a ctrl-v");
+        field.read_with(cx, |field, _| assert_eq!(field.value(), "新😀 内容"));
+
+        cx.simulate_keystrokes("ctrl-a ctrl-c");
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("新😀 内容")
+        );
+        cx.simulate_keystrokes("ctrl-x");
+        field.read_with(cx, |field, _| assert!(field.value().is_empty()));
+
+        field.update(cx, |field, _| {
+            field.text = "私密😀".into();
+            field.selection = 0..field.utf16_len();
+            field.masked = true;
+        });
+        cx.write_to_clipboard(ClipboardItem::new_string("保留剪贴板".into()));
+        cx.simulate_keystrokes("ctrl-c ctrl-x");
+        field.read_with(cx, |field, _| assert_eq!(field.value(), "私密😀"));
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some("保留剪贴板")
+        );
+    }
+
+    #[gpui::test]
+    fn right_click_menu_pastes_into_field(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseButton, point, px};
+
+        let (field, cx) = cx.add_window_view(|_, cx| CommandTextField::new("", "", cx));
+        cx.update(|window, cx| {
+            field.read(cx).focus_handle().focus(window);
+            window.activate_window();
+        });
+        cx.write_to_clipboard(ClipboardItem::new_string("粘贴测试😀".into()));
+        cx.simulate_mouse_down(
+            point(px(20.0), px(15.0)),
+            MouseButton::Right,
+            Modifiers::none(),
+        );
+        field.read_with(cx, |field, _| assert!(field.has_context_menu()));
+        cx.simulate_click(point(px(30.0), px(25.0)), Modifiers::none());
+        field.read_with(cx, |field, _| {
+            assert_eq!(field.value(), "粘贴测试😀");
+            assert!(!field.has_context_menu());
+        });
+    }
+
+    #[gpui::test]
+    fn ime_composition_replaces_marked_range_without_losing_text(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler;
+
+        let (field, cx) = cx.add_window_view(|_, cx| CommandTextField::new("你好AB", "", cx));
+        field.update_in(cx, |field, window, cx| {
+            field.selection = 2..4;
+            field.replace_and_mark_text_in_range(None, "zhong", None, window, cx);
+            assert_eq!(field.value(), "你好zhong");
+            assert_eq!(field.marked_text_range(window, cx), Some(2..7));
+            field.replace_and_mark_text_in_range(None, "中", None, window, cx);
+            assert_eq!(field.value(), "你好中");
+            assert_eq!(field.marked_text_range(window, cx), Some(2..3));
+            field.replace_text_in_range(None, "中", window, cx);
+            assert_eq!(field.value(), "你好中");
+            assert!(field.marked_text_range(window, cx).is_none());
+        });
+    }
+
+    #[test]
+    fn backward_deletion_locates_one_unicode_scalar() {
+        let text = "中😀a";
+        assert_eq!(&text[previous_char_start(text, text.len())..], "a");
+        let end = "中😀".len();
+        assert_eq!(&text[previous_char_start(text, end)..end], "😀");
+        assert_eq!(previous_char_start(text, "中".len()), 0);
+        assert_eq!(previous_char_start(text, 0), 0);
     }
 }

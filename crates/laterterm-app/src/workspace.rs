@@ -1,12 +1,15 @@
+use crate::branding::titlebar_logo;
 use crate::command_text_field::{CommandTextChanged, CommandTextField, FieldSubmit};
+use crate::pane_navigation::{Direction as PaneDirection, PaneRect, neighbor};
+use crate::server_connection::{self, ConnectionOutcome, CredentialKind};
+use crate::shortcut_recorder::{ShortcutChanged, ShortcutRecorder};
 use gpui::{
     App, AppContext, AsyncApp, Bounds, Context, CursorStyle, DispatchPhase, Edges, Entity,
-    PathPromptOptions,
     FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, Render, StatefulInteractiveElement, Styled,
-    WeakEntity, Window, canvas, div, prelude::FluentBuilder, px, relative, rgb,
+    MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Render,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, canvas, div, prelude::FluentBuilder,
+    px, relative, rgb,
 };
-use laterterm_termview::view::ScrollSummary;
 use laterterm_config::{
     Appearance, CommandTemplate, ServerAuthKind, ServerEntry, ServersFile, Settings, Theme,
     ThemeRegistry, TotpAlgorithm, TotpConfig, TotpEntry, app_config_dir, deepin_default_path,
@@ -15,18 +18,20 @@ use laterterm_config::{
 };
 use laterterm_core::TerminalSession;
 use laterterm_local::{LocalOptions, LocalSession};
-use laterterm_secrets::{SecretStore, default_store, ssh_account, totp_account};
-use laterterm_ssh::{AuthMethod, SshOptions, SshSession};
+use laterterm_secrets::{SecretStore, default_store, totp_account};
+use laterterm_termview::view::ScrollSummary;
 use laterterm_termview::{ColorPalette, TerminalConfig, TerminalView};
 use notify::Watcher;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TITLEBAR_HEIGHT: f32 = 34.0;
-const PANEL_WIDTH: f32 = 220.0;
+const PANEL_WIDTH: f32 = 240.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SettingsPage {
@@ -57,6 +62,20 @@ enum WorkspaceShortcut {
     FocusNext,
 }
 
+/// 仅读取或打开配置不会触发热加载，避免重读自身产生监听事件的循环。
+fn config_event_requires_reload(kind: &notify::EventKind) -> bool {
+    use notify::event::{AccessKind, AccessMode};
+    matches!(
+        kind,
+        notify::EventKind::Any
+            | notify::EventKind::Create(_)
+            | notify::EventKind::Modify(_)
+            | notify::EventKind::Remove(_)
+            | notify::EventKind::Other
+            | notify::EventKind::Access(AccessKind::Close(AccessMode::Write))
+    )
+}
+
 /// 标签内的分屏布局树，叶子是 PaneId。
 /// Split 带 id（拖拽定位）与 ratio（首个子树占比，0.0–1.0）。
 #[derive(Clone, Debug, PartialEq)]
@@ -75,7 +94,9 @@ pub(crate) enum LayoutNode {
 pub(crate) fn apply_split_ratio(node: &mut LayoutNode, split_id: u64, ratio: f32) {
     match node {
         LayoutNode::Split {
-            id, ratio: node_ratio, ..
+            id,
+            ratio: node_ratio,
+            ..
         } if *id == split_id => *node_ratio = ratio,
         LayoutNode::Split { first, second, .. } => {
             apply_split_ratio(first, split_id, ratio);
@@ -91,6 +112,15 @@ struct SplitDrag {
     split_id: u64,
     direction: SplitDirection,
     geometry: Bounds<gpui::Pixels>,
+}
+
+/// 当前完成绘制的可见窗格几何；同一帧内的坐标不会与其他窗口混用。
+struct PaneGeometry {
+    tab_id: TabId,
+    viewport: gpui::Size<gpui::Pixels>,
+    panels: (bool, bool),
+    layout: LayoutNode,
+    panes: Vec<PaneRect>,
 }
 
 thread_local! {
@@ -264,11 +294,25 @@ enum ServerDialog {
     Edit {
         original: Option<String>,
     },
+    Connecting {
+        name: String,
+    },
     Connect {
         name: String,
         remember: bool,
+        kind: CredentialKind,
+        request_id: u64,
     },
 }
+
+struct SshRequest {
+    id: u64,
+    entry: ServerEntry,
+    active: Arc<AtomicBool>,
+    running: bool,
+}
+
+type PendingSshResult = (u64, ServerEntry, anyhow::Result<ConnectionOutcome>);
 
 /// 内置快捷键（不可改，但参与全局冲突检测）。
 const BUILTIN_SHORTCUTS: &[(&str, &str)] = &[
@@ -276,6 +320,10 @@ const BUILTIN_SHORTCUTS: &[(&str, &str)] = &[
     ("ctrl+w", "关闭窗格 / 标签"),
     ("ctrl+j", "左右分屏"),
     ("ctrl+k", "上下分屏"),
+    ("ctrl+left", "切换到左侧窗格"),
+    ("ctrl+right", "切换到右侧窗格"),
+    ("ctrl+up", "切换到上方窗格"),
+    ("ctrl+down", "切换到下方窗格"),
     ("ctrl+shift+[", "上一个窗格"),
     ("ctrl+shift+]", "下一个窗格"),
     ("ctrl+shift+f", "回滚搜索"),
@@ -285,6 +333,8 @@ const BUILTIN_SHORTCUTS: &[(&str, &str)] = &[
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BindingOwner {
     Builtin,
+    CommandsPanel,
+    ServersPanel,
     Command(String),
     Server(String),
     Totp(String),
@@ -295,12 +345,19 @@ impl BindingOwner {
     fn describe(&self) -> String {
         match self {
             Self::Builtin => "内置快捷键".into(),
+            Self::CommandsPanel => "命令面板开关".into(),
+            Self::ServersPanel => "服务器面板开关".into(),
             Self::Command(name) => format!("命令「{name}」"),
             Self::Server(name) => format!("服务器「{name}」"),
             Self::Totp(name) => format!("动态码「{name}」"),
         }
     }
+}
 
+struct ShortcutEditor {
+    owner: Option<BindingOwner>,
+    recorder: Entity<ShortcutRecorder>,
+    _subscription: gpui::Subscription,
 }
 
 /// 一条快捷键绑定。
@@ -370,12 +427,17 @@ pub struct WorkspaceView {
     next_pane_id: u64,
     next_tab_id: u64,
     next_split_id: u64,
+    /// 窗口级可见窗格的最近一帧几何，仅供方向导航使用。
+    pane_geometry: Rc<RefCell<Option<PaneGeometry>>>,
     /// 进行中的分割线拖拽（None = 空闲）。
     split_drag: Option<SplitDrag>,
     left_panel: bool,
     right_panel: bool,
     settings_open: bool,
     settings_page: SettingsPage,
+    shortcut_editor: Option<ShortcutEditor>,
+    panel_shortcut_dialog: Option<BindingOwner>,
+    shortcut_error: Option<String>,
     settings: Settings,
     themes: ThemeRegistry,
     shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
@@ -399,6 +461,7 @@ pub struct WorkspaceView {
     server_dialog: Option<ServerDialog>,
     server_fields: Vec<(String, Entity<CommandTextField>)>,
     server_field_subscriptions: Vec<gpui::Subscription>,
+    server_save: Option<Arc<AtomicBool>>,
     server_meta_draft: ServerEntry,
     server_delete_confirm: Option<String>,
     server_error: Option<String>,
@@ -408,8 +471,10 @@ pub struct WorkspaceView {
     server_import_dialog: Option<ServerImportSource>,
     /// 正在连接中的服务器名（None 表示空闲；期间禁止并发连接）。
     ssh_connecting: Option<String>,
-    /// SSH 连接结果暂存：后台线程产物在 render 期统一消费（需要 window 开新标签）。
-    pending_ssh_results: Vec<(String, anyhow::Result<Arc<dyn TerminalSession>>)>,
+    ssh_request: Option<SshRequest>,
+    next_ssh_request_id: u64,
+    /// 后台结果按请求标识校验，过期成功会话立即关闭。
+    pending_ssh_results: Vec<PendingSshResult>,
     /// 待生效的焦点请求：异步上下文拿不到 window，先记下 handle，render 期统一 focus。
     pending_focus: Option<FocusHandle>,
     secret_store: Arc<dyn SecretStore>,
@@ -465,18 +530,25 @@ impl WorkspaceView {
             server_dialog: None,
             server_fields: Vec::new(),
             server_field_subscriptions: Vec::new(),
+            server_save: None,
             server_meta_draft: ServerEntry::default(),
             server_delete_confirm: None,
             server_error: None,
             server_notice: None,
             server_import_dialog: None,
             ssh_connecting: None,
+            ssh_request: None,
+            next_ssh_request_id: 1,
             pending_ssh_results: Vec::new(),
             pending_focus: None,
             next_split_id: 1,
+            pane_geometry: Rc::new(RefCell::new(None)),
             split_drag: None,
             secret_store: default_store(),
             settings_page: SettingsPage::Appearance,
+            shortcut_editor: None,
+            panel_shortcut_dialog: None,
+            shortcut_error: None,
             panes: vec![Pane {
                 id: first_pane,
                 title: "本地终端".into(),
@@ -598,6 +670,34 @@ impl WorkspaceView {
         self.focus_pane(leaves[next], window, cx);
     }
 
+    fn focus_pane_direction(
+        &mut self,
+        direction: PaneDirection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab = self.active_tab();
+        let geometry = self.pane_geometry.borrow();
+        let Some(snapshot) = geometry.as_ref().filter(|snapshot| {
+            snapshot.tab_id == tab.id
+                && snapshot.layout == tab.layout
+                && snapshot.viewport == window.viewport_size()
+                && snapshot.panels == (self.left_panel, self.right_panel)
+                && snapshot.panes.len() == tab.layout.leaf_count()
+                && snapshot
+                    .panes
+                    .iter()
+                    .all(|pane| tab.layout.contains(pane.id))
+        }) else {
+            return;
+        };
+        let target = neighbor(tab.focused_pane, direction, &snapshot.panes);
+        drop(geometry);
+        if let Some(id) = target {
+            self.focus_pane(id, window, cx);
+        }
+    }
+
     fn new_tab(&mut self, _event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         self.spawn_tab(window, cx);
@@ -691,7 +791,12 @@ impl WorkspaceView {
     /// 按下分割线：记录目标节点与容器几何，进入拖拽。
     /// 移动/松开由 render 期注册的窗口级鼠标监听处理（on_mouse_event 仅下一帧有效，
     /// canvas paint 回调逐帧重挂，见 render）。
-    fn start_split_drag(&mut self, split_id: u64, direction: SplitDirection, cx: &mut Context<Self>) {
+    fn start_split_drag(
+        &mut self,
+        split_id: u64,
+        direction: SplitDirection,
+        cx: &mut Context<Self>,
+    ) {
         let geometry = SPLIT_GEOMETRY.with_borrow(|map| map.get(&split_id).copied());
         let Some(geometry) = geometry else {
             return;
@@ -883,9 +988,26 @@ impl WorkspaceView {
         change: impl FnOnce(&mut Appearance),
     ) {
         cx.stop_propagation();
+        let previous = self.settings.appearance.clone();
         change(&mut self.settings.appearance);
+        if self.settings.appearance == previous {
+            return;
+        }
+        let trace =
+            std::env::var_os("LATERTERM_FONT_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"));
+        let save_started = trace.then(std::time::Instant::now);
         self.settings.save();
+        let save_elapsed = save_started.map(|started| started.elapsed());
+        let apply_started = trace.then(std::time::Instant::now);
         self.apply_appearance(cx);
+        if let (Some(save), Some(apply_started)) = (save_elapsed, apply_started) {
+            eprintln!(
+                "[font-trace] phase=settings-save-and-apply panes={} save_us={} apply_us={}",
+                self.panes.len(),
+                save.as_micros(),
+                apply_started.elapsed().as_micros(),
+            );
+        }
     }
 
     /// 把当前设置（外观五项 + 主题）应用到所有窗格，不重建终端。
@@ -935,8 +1057,12 @@ impl WorkspaceView {
         let (event_tx, event_rx) = flume::unbounded::<()>();
         let Ok(mut watcher) =
             notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
-                if event.is_ok() {
-                    let _ = event_tx.send(());
+                match event {
+                    Ok(event) if config_event_requires_reload(&event.kind) => {
+                        let _ = event_tx.send(());
+                    }
+                    Err(error) => eprintln!("配置监听失败: {error}"),
+                    _ => {}
                 }
             })
         else {
@@ -1035,6 +1161,7 @@ impl WorkspaceView {
     fn delete_command(&mut self, name: &str, cx: &mut Context<Self>) {
         if self.command_delete_confirm.as_deref() != Some(name) {
             self.command_delete_confirm = Some(name.to_string());
+            cx.notify();
             return;
         }
         let previous = self.settings.clone();
@@ -1080,10 +1207,16 @@ impl WorkspaceView {
         let draft = command.clone().unwrap_or_default();
         self.command_fields.clear();
         self.command_field_subscriptions.clear();
+        self.begin_shortcut_edit(
+            draft.shortcut.clone(),
+            command
+                .as_ref()
+                .map(|item| BindingOwner::Command(item.name.clone())),
+            cx,
+        );
         for (name, value) in [
             ("名称", draft.name.clone()),
             ("模板", draft.template.clone()),
-            ("快捷键", draft.shortcut.clone().unwrap_or_default()),
         ] {
             let field = cx.new(|cx| CommandTextField::new(value, name, cx));
             self.command_fields.push((name.to_string(), field));
@@ -1115,10 +1248,7 @@ impl WorkspaceView {
             .get("模板")
             .map(|value| value.to_string())
             .unwrap_or_default();
-        let shortcut = values
-            .get("快捷键")
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| value.to_string());
+        let shortcut = self.shortcut_value(cx);
         let command = CommandTemplate {
             name,
             template,
@@ -1132,6 +1262,23 @@ impl WorkspaceView {
             self.command_error = Some(conflict);
             return;
         }
+        let previous = self.settings.clone();
+        if let Err(error) = command.validate() {
+            self.command_error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        if original_name.as_deref() != Some(command.name.as_str())
+            && self
+                .settings
+                .commands
+                .iter()
+                .any(|item| item.name == command.name)
+        {
+            self.command_error = Some("已存在同名命令".into());
+            cx.notify();
+            return;
+        }
         if let Some(original) = original_name
             && original != command.name
         {
@@ -1141,7 +1288,10 @@ impl WorkspaceView {
         if self.command_error.is_none() {
             self.command_dialog = None;
             self.command_fields.clear();
+            self.shortcut_editor = None;
             self.focus_active(window, cx);
+        } else {
+            self.settings = previous;
         }
     }
 
@@ -1155,6 +1305,7 @@ impl WorkspaceView {
             template: command.clone(),
             preview: None,
         });
+        self.shortcut_editor = None;
         self.command_target = Some(self.focused_pane_id());
         self.command_fields.clear();
         self.command_field_subscriptions.clear();
@@ -1239,6 +1390,7 @@ impl WorkspaceView {
         self.command_dialog = None;
         self.command_error = None;
         self.command_target = None;
+        self.shortcut_editor = None;
         self.command_fields.clear();
         self.command_field_subscriptions.clear();
         self.command_values.clear();
@@ -1254,7 +1406,8 @@ impl WorkspaceView {
                 if this
                     .update(cx, |workspace, cx| {
                         // 倒计时只在「动态码」页签展示；其余页签不为此付费
-                        if workspace.right_panel && workspace.right_panel_tab == RightPanelTab::Totp {
+                        if workspace.right_panel && workspace.right_panel_tab == RightPanelTab::Totp
+                        {
                             cx.notify();
                         }
                     })
@@ -1290,13 +1443,14 @@ impl WorkspaceView {
         };
         let name_field = cx.new(|cx| CommandTextField::new(draft.name.clone(), "名称", cx));
         let secret_field =
-            cx.new(|cx| CommandTextField::new(String::new(), secret_placeholder, cx));
-        let shortcut_field = cx.new(|cx| {
-            CommandTextField::new(draft.shortcut.clone().unwrap_or_default(), "如 ctrl+alt+2", cx)
-        });
+            cx.new(|cx| CommandTextField::new(String::new(), secret_placeholder, cx).masked());
+        self.begin_shortcut_edit(
+            draft.shortcut.clone(),
+            entry.map(|item| BindingOwner::Totp(item.name.clone())),
+            cx,
+        );
         self.totp_fields.push(("名称".into(), name_field));
         self.totp_fields.push(("密钥".into(), secret_field));
-        self.totp_fields.push(("快捷键".into(), shortcut_field));
         self.totp_dialog = Some(TotpDialog::Edit {
             original: entry.map(|item| item.name.clone()),
         });
@@ -1322,10 +1476,7 @@ impl WorkspaceView {
             .unwrap_or_default();
         let mut meta = self.totp_meta_draft.clone();
         meta.name = name.clone();
-        meta.shortcut = values
-            .get("快捷键")
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty());
+        meta.shortcut = self.shortcut_value(cx);
         if let Some(conflict) = self.check_shortcut_conflict(
             meta.shortcut.as_deref(),
             original.clone().map(BindingOwner::Totp),
@@ -1519,6 +1670,7 @@ impl WorkspaceView {
     /// 关闭动态码对话框（取消/Esc 共用），焦点归还终端。
     fn dismiss_totp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.totp_dialog = None;
+        self.shortcut_editor = None;
         self.totp_error = None;
         self.totp_target = None;
         self.totp_fields.clear();
@@ -1575,7 +1727,13 @@ impl WorkspaceView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_ssh_request();
         self.server_meta_draft = entry.cloned().unwrap_or_default();
+        self.begin_shortcut_edit(
+            self.server_meta_draft.shortcut.clone(),
+            entry.map(|item| BindingOwner::Server(item.name.clone())),
+            cx,
+        );
         self.server_fields.clear();
         self.server_field_subscriptions.clear();
         let meta = self.server_meta_draft.clone();
@@ -1589,7 +1747,7 @@ impl WorkspaceView {
                 ServerAuthKind::PrivateKey => "passphrase（可选）",
             }
         };
-        let rows: [(&str, String, &str); 8] = [
+        let rows: [(&str, String, &str); 7] = [
             ("名称", meta.name, "如 跳板机A"),
             ("主机", meta.host, "host 或 IP"),
             ("端口", meta.port.to_string(), "22"),
@@ -1597,18 +1755,20 @@ impl WorkspaceView {
             (
                 "私钥路径",
                 meta.key_path.unwrap_or_default(),
-                "仅密钥认证需要，如 ~/.ssh/id_ed25519",
+                "可选；留空查找 ~/.ssh/id_ed25519、id_rsa",
             ),
             ("备注", meta.note, "备注（可选）"),
             ("凭据", String::new(), secret_placeholder),
-            (
-                "快捷键",
-                meta.shortcut.unwrap_or_default(),
-                "如 ctrl+alt+1（可选）",
-            ),
         ];
         for (label, value, placeholder) in rows {
-            let field = cx.new(|cx| CommandTextField::new(value, placeholder, cx));
+            let field = cx.new(|cx| {
+                let field = CommandTextField::new(value, placeholder, cx);
+                if label == "凭据" {
+                    field.masked()
+                } else {
+                    field
+                }
+            });
             self.server_fields.push((label.into(), field));
         }
         self.server_dialog = Some(ServerDialog::Edit {
@@ -1621,14 +1781,23 @@ impl WorkspaceView {
 
     /// 保存服务器：校验与凭据写入（改名迁移）都在后台线程，避免密钥环 DBus 阻塞。
     fn save_server(&mut self, original: Option<String>, cx: &mut Context<Self>) {
+        if self.server_save.is_some() {
+            return;
+        }
         let values = self
             .server_fields
             .iter()
             .map(|(name, field)| (name.as_str(), field.read(cx).value().to_string()))
             .collect::<BTreeMap<_, _>>();
         let mut meta = self.server_meta_draft.clone();
-        meta.name = values.get("名称").map(|v| v.trim().to_string()).unwrap_or_default();
-        meta.host = values.get("主机").map(|v| v.trim().to_string()).unwrap_or_default();
+        meta.name = values
+            .get("名称")
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
+        meta.host = values
+            .get("主机")
+            .map(|v| v.trim().to_string())
+            .unwrap_or_default();
         meta.port = values
             .get("端口")
             .and_then(|v| v.trim().parse::<u16>().ok())
@@ -1641,15 +1810,12 @@ impl WorkspaceView {
             .get("私钥路径")
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
-        meta.note = values.get("备注").map(|v| v.trim().to_string()).unwrap_or_default();
-        meta.shortcut = values
-            .get("快捷键")
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let secret = values
-            .get("凭据")
+        meta.note = values
+            .get("备注")
             .map(|v| v.trim().to_string())
             .unwrap_or_default();
+        meta.shortcut = self.shortcut_value(cx);
+        let secret = values.get("凭据").cloned().unwrap_or_default();
         if let Some(conflict) = self.check_shortcut_conflict(
             meta.shortcut.as_deref(),
             original.clone().map(BindingOwner::Server),
@@ -1665,72 +1831,126 @@ impl WorkspaceView {
         }
         // 同名冲突（改名撞上既有条目）
         if original.as_deref() != Some(meta.name.as_str())
-            && self.settings.servers.iter().any(|item| item.name == meta.name)
+            && self
+                .settings
+                .servers
+                .iter()
+                .any(|item| item.name == meta.name)
         {
             self.server_error = Some(format!("已存在同名服务器: {}", meta.name));
             cx.notify();
             return;
         }
         let store = self.secret_store.clone();
-        let original_bg = original.clone();
+        let original_entry = original
+            .as_ref()
+            .and_then(|name| {
+                self.settings
+                    .servers
+                    .iter()
+                    .find(|entry| &entry.name == name)
+            })
+            .cloned();
+        let original_bg = original_entry.clone();
+        let active = Arc::new(AtomicBool::new(true));
+        self.server_save = Some(active.clone());
+        self.pending_focus = Some(self.focused_terminal().read(cx).focus_handle().clone());
+        let active_bg = active.clone();
+        let dialog_field = self.server_fields.first().map(|(_, field)| field.clone());
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let account = ssh_account(&meta.name)?;
-                    if !secret.is_empty() {
-                        let store = store.clone();
-                        let secret = secret.clone();
-                        run_secret_op(move || store.set(&account, &secret))?;
-                    } else if let Some(previous) = &original_bg {
-                        // 改名不重录凭据：从旧账户迁移，失败则保持原状
-                        let previous_account = ssh_account(previous)?;
-                        if previous_account != account {
-                            let store = store.clone();
-                            let previous_account = previous_account.clone();
-                            run_secret_op(move || -> anyhow::Result<()> {
-                                match store.get(&previous_account)? {
-                                    Some(existing) => {
-                                        store.set(&account, &existing)?;
-                                        store.delete(&previous_account)?;
-                                    }
-                                    None => store.delete(&previous_account)?,
-                                }
-                                Ok(())
-                            })?;
-                        }
-                    }
+                    server_connection::update_server_secrets(
+                        store,
+                        original_bg.as_ref(),
+                        &meta,
+                        &secret,
+                        active_bg,
+                    )?;
                     Ok::<_, anyhow::Error>(meta)
                 })
                 .await;
-            let _ = this.update(cx, |workspace, cx| match result {
-                Ok(meta) => {
-                    let previous_settings = workspace.settings.clone();
-                    if let Some(previous) = &original
-                        && previous != &meta.name
-                    {
-                        workspace.settings.remove_server(previous);
-                    }
-                    if let Err(error) = workspace.settings.upsert_server(meta) {
-                        workspace.settings = previous_settings;
-                        workspace.server_error = Some(error.to_string());
-                    } else if let Some(path) = Settings::default_path()
-                        && let Err(error) = workspace.settings.save_to(&path)
-                    {
-                        workspace.settings = previous_settings;
-                        workspace.server_error = Some(format!("保存服务器失败: {error:#}"));
-                    } else {
-                        workspace.server_dialog = None;
-                        workspace.server_fields.clear();
-                        workspace.server_error = None;
-                        workspace.pending_focus =
-                            Some(workspace.focused_terminal().read(cx).focus_handle().clone());
-                    }
-                    cx.notify();
+            let _ = this.update(cx, |workspace, cx| {
+                if !active.load(Ordering::Acquire)
+                    || !workspace
+                        .server_save
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &active))
+                    || workspace.server_fields.first().map(|(_, field)| field)
+                        != dialog_field.as_ref()
+                {
+                    return;
                 }
-                Err(error) => {
-                    workspace.server_error = Some(format!("保存服务器失败: {error:#}"));
+                workspace.server_save = None;
+                if let Some(previous) = &original_entry
+                    && !workspace
+                        .settings
+                        .servers
+                        .iter()
+                        .any(|item| item == previous)
+                {
+                    workspace.server_error =
+                        Some("保存期间服务器配置已变化，请重新打开后编辑".into());
                     cx.notify();
+                    return;
+                }
+                match result {
+                    Ok(meta) => {
+                        if let Some(error) = workspace.check_shortcut_conflict(
+                            meta.shortcut.as_deref(),
+                            original.clone().map(BindingOwner::Server),
+                        ) {
+                            workspace.server_error = Some(error);
+                            cx.notify();
+                            return;
+                        }
+                        let cleanup_meta = meta.clone();
+                        let previous_settings = workspace.settings.clone();
+                        if let Some(previous) = &original
+                            && previous != &meta.name
+                        {
+                            workspace.settings.remove_server(previous);
+                        }
+                        if let Err(error) = workspace.settings.upsert_server(meta) {
+                            workspace.settings = previous_settings;
+                            workspace.server_error = Some(error.to_string());
+                        } else if let Some(path) = Settings::default_path()
+                            && let Err(error) = workspace.settings.save_to(&path)
+                        {
+                            workspace.settings = previous_settings;
+                            workspace.server_error = Some(format!("保存服务器失败: {error:#}"));
+                        } else {
+                            workspace.shortcut_editor = None;
+                            if let Some(previous) =
+                                original_entry.filter(|entry| entry.name != cleanup_meta.name)
+                            {
+                                let store = workspace.secret_store.clone();
+                                cx.background_executor()
+                                    .spawn(async move {
+                                        let _ = run_secret_op(move || {
+                                            server_connection::cleanup_renamed_server_secrets(
+                                                store.as_ref(),
+                                                &previous,
+                                                &cleanup_meta,
+                                            )
+                                        });
+                                    })
+                                    .detach();
+                            }
+                            workspace.server_dialog = None;
+                            workspace.server_fields.clear();
+                            workspace.server_error = None;
+                            workspace.pending_focus =
+                                Some(workspace.focused_terminal().read(cx).focus_handle().clone());
+                        }
+                        cx.notify();
+                    }
+                    Err(error) => {
+                        workspace.server_error = Some(format!("保存服务器失败: {error:#}"));
+                        cx.notify();
+                    }
                 }
             });
         })
@@ -1749,6 +1969,11 @@ impl WorkspaceView {
 
     /// 关闭服务器对话框（取消/Esc 共用），焦点归还终端。
     fn dismiss_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_ssh_request();
+        if let Some(save) = self.server_save.take() {
+            save.store(false, Ordering::Release);
+        }
+        self.shortcut_editor = None;
         self.server_dialog = None;
         self.server_error = None;
         self.server_notice = None;
@@ -1766,17 +1991,24 @@ impl WorkspaceView {
             cx.notify();
             return;
         }
+        if self
+            .ssh_request
+            .as_ref()
+            .is_some_and(|request| request.entry.name == name)
+        {
+            self.cancel_ssh_request();
+        }
         let store = self.secret_store.clone();
-        let Ok(account) = ssh_account(name) else {
-            self.server_error = Some("服务器名称非法".into());
-            cx.notify();
-            return;
-        };
         let name = name.to_string();
+        let name_bg = name.clone();
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { run_secret_op(move || store.delete(&account)) })
+                .spawn(async move {
+                    run_secret_op(move || {
+                        server_connection::delete_server_secrets(store.as_ref(), &name_bg)
+                    })
+                })
                 .await;
             let _ = this.update(cx, |workspace, cx| match result {
                 Ok(()) => {
@@ -1817,8 +2049,12 @@ impl WorkspaceView {
         );
         cx.spawn(async move |this, cx| {
             // oneshot 双层 Result：外层是通道关闭，内层是平台对话框错误（已是 anyhow）
-            let picked = receiver.await.unwrap_or_else(|_| Err(anyhow::anyhow!("对话框已关闭")));
-            let _ = this.update(cx, |workspace, cx| workspace.finish_export(&file, picked, cx));
+            let picked = receiver
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("对话框已关闭")));
+            let _ = this.update(cx, |workspace, cx| {
+                workspace.finish_export(&file, picked, cx)
+            });
         })
         .detach();
     }
@@ -1894,7 +2130,9 @@ impl WorkspaceView {
             prompt: Some("选择服务器文件".into()),
         });
         cx.spawn(async move |this, cx| {
-            let picked = receiver.await.unwrap_or_else(|_| Err(anyhow::anyhow!("对话框已关闭")));
+            let picked = receiver
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("对话框已关闭")));
             let _ = this.update(cx, |workspace, cx| workspace.finish_import(picked, cx));
         })
         .detach();
@@ -1953,8 +2191,12 @@ impl WorkspaceView {
             prompt: Some("选择 Xshell 会话文件（.xsh）".into()),
         });
         cx.spawn(async move |this, cx| {
-            let picked = receiver.await.unwrap_or_else(|_| Err(anyhow::anyhow!("对话框已关闭")));
-            let _ = this.update(cx, |workspace, cx| workspace.finish_import_xshell(picked, cx));
+            let picked = receiver
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("对话框已关闭")));
+            let _ = this.update(cx, |workspace, cx| {
+                workspace.finish_import_xshell(picked, cx)
+            });
         })
         .detach();
     }
@@ -2011,7 +2253,12 @@ impl WorkspaceView {
                 skipped_bad += 1;
                 continue;
             };
-            if self.settings.servers.iter().any(|item| item.name == entry.name) {
+            if self
+                .settings
+                .servers
+                .iter()
+                .any(|item| item.name == entry.name)
+            {
                 skipped_dup += 1;
                 continue;
             }
@@ -2046,9 +2293,9 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    /// 点「连接」：后台读密钥环；密码/交互认证缺凭据时弹补输框，否则直接连。
+    /// 点连接立即占用请求槽，准备私钥和密钥环操作都在后台进行。
     fn connect_server(&mut self, name: &str, cx: &mut Context<Self>) {
-        if self.ssh_connecting.is_some() {
+        if self.ssh_request.is_some() {
             return;
         }
         let Some(entry) = self
@@ -2060,75 +2307,40 @@ impl WorkspaceView {
         else {
             return;
         };
-        let store = self.secret_store.clone();
-        let entry_name = entry.name.clone();
-        cx.spawn(async move |this, cx| {
-            let secret = cx
-                .background_executor()
-                .spawn(async move {
-                    let account = ssh_account(&entry_name)?;
-                    let store = store.clone();
-                    run_secret_op(move || store.get(&account))
-                })
-                .await;
-            let _ = this.update(cx, |workspace, cx| {
-                match secret {
-                    Err(error) => {
-                        workspace.server_error = Some(format!("读取凭据失败: {error:#}"));
-                    }
-                    Ok(secret) => {
-                        let needs_secret =
-                            entry.auth != ServerAuthKind::PrivateKey && secret.is_none();
-                        if needs_secret {
-                            let placeholder = match entry.auth {
-                                ServerAuthKind::KeyboardInteractive => "口令 / 动态码",
-                                _ => "密码",
-                            };
-                            // 只显示本条目自己的错误，不带上一台的失败残留
-                            workspace.server_error = None;
-                            workspace.server_notice = None;
-                            workspace.server_fields.clear();
-                            workspace.server_field_subscriptions.clear();
-                            let field = cx.new(|cx| {
-                                CommandTextField::new(String::new(), placeholder, cx).masked()
-                            });
-                            // Enter 直接触发连接
-                            workspace.server_field_subscriptions.push(cx.subscribe(
-                                &field,
-                                |workspace, _field, _: &FieldSubmit, cx| {
-                                    workspace.submit_server_connect(cx);
-                                },
-                            ));
-                            // 异步上下文拿不到 window，焦点请求入队 render 期生效
-                            workspace.pending_focus =
-                                Some(field.read(cx).focus_handle().clone());
-                            workspace.server_fields.push(("凭据".into(), field));
-                            workspace.server_dialog = Some(ServerDialog::Connect {
-                                name: entry.name.clone(),
-                                remember: true,
-                            });
-                        } else {
-                            workspace.start_ssh_connect(entry, secret, cx);
-                        }
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.shortcut_editor = None;
+        self.server_notice = None;
+        self.server_error = None;
+        self.server_fields.clear();
+        self.server_field_subscriptions.clear();
+        let id = self.next_ssh_request_id;
+        self.next_ssh_request_id += 1;
+        self.ssh_request = Some(SshRequest {
+            id,
+            entry: entry.clone(),
+            active: Arc::new(AtomicBool::new(true)),
+            running: false,
+        });
+        self.server_dialog = Some(ServerDialog::Connecting {
+            name: entry.name.clone(),
+        });
+        self.start_ssh_connect(id, None, false, cx);
     }
 
-    /// Connect 对话框提交：勾选记住则先写密钥环（后台），随后发起连接。
+    fn cancel_ssh_request(&mut self) {
+        if let Some(request) = self.ssh_request.take() {
+            request.active.store(false, Ordering::Release);
+        }
+        self.ssh_connecting = None;
+    }
+
+    /// 空登录密码显式选择私钥，不向服务器发送空密码；口令原样保留。
     fn submit_server_connect(&mut self, cx: &mut Context<Self>) {
-        let Some(ServerDialog::Connect { name, remember }) = self.server_dialog.clone() else {
-            return;
-        };
-        let Some(entry) = self
-            .settings
-            .servers
-            .iter()
-            .find(|item| item.name == name)
-            .cloned()
+        let Some(ServerDialog::Connect {
+            kind,
+            remember,
+            request_id,
+            ..
+        }) = self.server_dialog.clone()
         else {
             return;
         };
@@ -2137,97 +2349,98 @@ impl WorkspaceView {
             .first()
             .map(|(_, field)| field.read(cx).value().to_string())
             .unwrap_or_default();
-        if secret.trim().is_empty() {
-            self.server_error = Some("凭据不能为空".into());
-            cx.notify();
-            return;
-        }
-        if !remember {
-            self.server_dialog = None;
-            self.server_fields.clear();
-            self.server_error = None;
-            self.start_ssh_connect(entry, Some(secret), cx);
-            return;
-        }
-        let store = self.secret_store.clone();
-        let entry_name = entry.name.clone();
-        let secret_for_store = secret.clone();
-        cx.spawn(async move |this, cx| {
-            let outcome = cx
-                .background_executor()
-                .spawn(async move {
-                    let account = ssh_account(&entry_name)?;
-                    let store = store.clone();
-                    let secret_for_store = secret_for_store.clone();
-                    run_secret_op(move || store.set(&account, secret_for_store.trim()))
-                })
-                .await;
-            let _ = this.update(cx, |workspace, cx| {
-                match outcome {
-                    Ok(()) => {
-                        workspace.server_dialog = None;
-                        workspace.server_fields.clear();
-                        workspace.server_error = None;
-                        workspace.pending_focus =
-                            Some(workspace.focused_terminal().read(cx).focus_handle().clone());
-                        workspace.start_ssh_connect(entry, Some(secret), cx);
-                    }
-                    Err(error) => {
-                        workspace.server_error = Some(format!("保存凭据失败: {error:#}"));
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+        self.start_ssh_connect(request_id, Some((kind, secret)), remember, cx);
     }
 
-    /// 起后台线程执行 SSH 连接（阻塞式，含 15s 超时）；结果入队，render 期消费。
     fn start_ssh_connect(
         &mut self,
-        entry: ServerEntry,
-        secret: Option<String>,
+        request_id: u64,
+        supplied: Option<(CredentialKind, String)>,
+        remember: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.ssh_connecting.is_some() {
+        let Some(request) = &mut self.ssh_request else {
+            return;
+        };
+        if request.id != request_id || request.running {
             return;
         }
+        request.running = true;
+        let entry = request.entry.clone();
+        let active = request.active.clone();
         self.ssh_connecting = Some(entry.name.clone());
         self.server_error = None;
-        let (tx, rx) =
-            flume::unbounded::<(String, anyhow::Result<Arc<dyn TerminalSession>>)>();
-        let entry_for_thread = entry.clone();
+        let store = self.secret_store.clone();
+        let (tx, rx) = flume::bounded(1);
         std::thread::spawn(move || {
-            let result = connect_ssh_session(&entry_for_thread, secret.as_deref());
-            let _ = tx.send((entry_for_thread.name.clone(), result));
+            let result = server_connection::connect(&entry, supplied, remember, store, active);
+            if let Err(error) = tx.send((request_id, entry, result))
+                && let Ok(ConnectionOutcome::Connected { session, .. }) = error.0.2
+            {
+                session.kill();
+            }
         });
         cx.spawn(async move |this, cx| {
-            while let Ok((name, result)) = rx.recv_async().await {
-                let _ = this.update(cx, |workspace, cx| {
-                    workspace.pending_ssh_results.push((name, result));
-                    cx.notify();
-                });
+            if let Ok(result) = rx.recv_async().await {
+                let mut result = Some(result);
+                if this
+                    .update(cx, |workspace, cx| {
+                        workspace
+                            .pending_ssh_results
+                            .push(result.take().expect("连接结果只消费一次"));
+                        cx.notify();
+                    })
+                    .is_err()
+                    && let Some((_, _, Ok(ConnectionOutcome::Connected { session, .. }))) = result
+                {
+                    session.kill();
+                }
             }
         })
         .detach();
         cx.notify();
     }
 
-    /// 连接收尾（render 期调用，可拿 window）：成功开新标签，失败提示错误文案。
     fn finish_ssh_connect(
         &mut self,
-        name: String,
-        result: anyhow::Result<Arc<dyn TerminalSession>>,
+        request_id: u64,
+        entry: ServerEntry,
+        result: anyhow::Result<ConnectionOutcome>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.ssh_connecting.as_deref() != Some(name.as_str()) {
-            return; // 过期结果（会话已被替换）
+        let current = self.ssh_request.as_ref().is_some_and(|request| {
+            request.id == request_id && request.active.load(Ordering::Acquire)
+        }) && self.settings.servers.iter().any(|item| item == &entry);
+        if !current {
+            if let Ok(ConnectionOutcome::Connected { session, .. }) = result {
+                session.kill();
+            }
+            if self
+                .ssh_request
+                .as_ref()
+                .is_some_and(|request| request.id == request_id)
+            {
+                self.cancel_ssh_request();
+                self.server_dialog = None;
+                self.server_fields.clear();
+                self.server_field_subscriptions.clear();
+            }
+            return;
+        }
+        if let Some(request) = &mut self.ssh_request {
+            request.running = false;
         }
         self.ssh_connecting = None;
         match result {
-            Ok(session) => {
-                let pane_id = self.attach_pane(name.clone(), session, window, cx);
+            Ok(ConnectionOutcome::Connected { session, warning }) => {
+                self.ssh_request = None;
+                self.server_dialog = None;
+                self.server_fields.clear();
+                self.server_field_subscriptions.clear();
+                self.server_error = None;
+                self.server_notice = warning;
+                let pane_id = self.attach_pane(entry.name, session, window, cx);
                 let tab_id = TabId(self.next_tab_id);
                 self.next_tab_id += 1;
                 self.tabs.push(WorkspaceTab {
@@ -2237,18 +2450,48 @@ impl WorkspaceView {
                 });
                 self.focus_pane(pane_id, window, cx);
             }
+            Ok(ConnectionOutcome::Prompt { kind, warning }) => {
+                self.server_fields.clear();
+                self.server_field_subscriptions.clear();
+                self.server_error = warning;
+                let label = if matches!(kind, CredentialKind::PrivateKey { .. }) {
+                    "私钥解锁口令"
+                } else {
+                    "登录密码 / 交互口令（可留空使用私钥）"
+                };
+                let field = cx.new(|cx| CommandTextField::new(String::new(), label, cx).masked());
+                self.server_field_subscriptions.push(
+                    cx.subscribe(&field, |workspace, _, _: &FieldSubmit, cx| {
+                        workspace.submit_server_connect(cx)
+                    }),
+                );
+                field.read(cx).focus_handle().focus(window);
+                self.server_fields.push((label.into(), field));
+                self.server_dialog = Some(ServerDialog::Connect {
+                    name: entry.name,
+                    kind,
+                    request_id,
+                    remember: false,
+                });
+            }
             Err(error) => {
-                self.server_error = Some(format!("连接 {name} 失败: {error:#}"));
+                self.server_error = Some(format!("连接 {} 失败: {error:#}", entry.name));
+                if matches!(self.server_dialog, Some(ServerDialog::Connecting { .. })) {
+                    self.cancel_ssh_request();
+                    self.server_dialog = None;
+                    self.right_panel = true;
+                    self.right_panel_tab = RightPanelTab::Servers;
+                    self.focus_active(window, cx);
+                }
             }
         }
         cx.notify();
     }
 
-    /// 消费后台 SSH 连接结果（模式同 process_shortcuts：render 期处理窗口操作）。
+    /// 需要 window 的结果在 render 期消费。
     fn process_ssh_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let pending = std::mem::take(&mut self.pending_ssh_results);
-        for (name, result) in pending {
-            self.finish_ssh_connect(name, result, window, cx);
+        for (request_id, entry, result) in std::mem::take(&mut self.pending_ssh_results) {
+            self.finish_ssh_connect(request_id, entry, result, window, cx);
         }
     }
 
@@ -2259,11 +2502,24 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        // 退出前向所有会话发送关闭请求；SessionControl.close 幂等，wait 线程负责回收子进程
+        self.shutdown();
+        cx.quit();
+    }
+
+    /// 自绘与原生关闭入口共用；重复调用不会重复终止会话。
+    pub(crate) fn shutdown(&mut self) {
+        self.cancel_ssh_request();
+        if let Some(save) = self.server_save.take() {
+            save.store(false, Ordering::Release);
+        }
+        for (_, _, result) in self.pending_ssh_results.drain(..) {
+            if let Ok(ConnectionOutcome::Connected { session, .. }) = result {
+                session.kill();
+            }
+        }
         for pane in &self.panes {
             pane.session.close();
         }
-        cx.quit();
     }
 
     pub fn focus_active(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2273,7 +2529,111 @@ impl WorkspaceView {
             .focus(window);
     }
 
-    /// 全量快捷键绑定：内置 + 命令 + 服务器 + 动态码（设置页总览与冲突检测共用）。
+    fn begin_shortcut_edit(
+        &mut self,
+        value: Option<String>,
+        owner: Option<BindingOwner>,
+        cx: &mut Context<Self>,
+    ) {
+        let recorder = cx.new(|cx| ShortcutRecorder::new(value, cx));
+        let subscription = cx.subscribe(&recorder, |workspace, _, _: &ShortcutChanged, cx| {
+            workspace.refresh_shortcut_error(cx);
+        });
+        self.shortcut_editor = Some(ShortcutEditor {
+            owner,
+            recorder,
+            _subscription: subscription,
+        });
+        self.refresh_shortcut_error(cx);
+    }
+
+    fn shortcut_value(&self, cx: &App) -> Option<String> {
+        self.shortcut_editor
+            .as_ref()
+            .and_then(|editor| editor.recorder.read(cx).value().map(str::to_string))
+    }
+
+    fn refresh_shortcut_error(&mut self, cx: &mut Context<Self>) {
+        if let Some(editor) = &self.shortcut_editor {
+            let error = self
+                .check_shortcut_conflict(editor.recorder.read(cx).value(), editor.owner.clone());
+            editor
+                .recorder
+                .update(cx, |recorder, cx| recorder.set_error(error, cx));
+        }
+    }
+
+    fn start_shortcut_recording(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(editor) = &self.shortcut_editor {
+            editor
+                .recorder
+                .update(cx, |recorder, cx| recorder.start(window, cx));
+        }
+    }
+
+    fn toggle_panel_tab(&mut self, tab: RightPanelTab, cx: &mut Context<Self>) {
+        self.right_panel = !self.right_panel || self.right_panel_tab != tab;
+        self.right_panel_tab = tab;
+        cx.notify();
+    }
+
+    fn edit_panel_shortcut(
+        &mut self,
+        owner: BindingOwner,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = match owner {
+            BindingOwner::CommandsPanel => self.settings.shortcuts.commands_panel.clone(),
+            BindingOwner::ServersPanel => self.settings.shortcuts.servers_panel.clone(),
+            _ => return,
+        };
+        self.begin_shortcut_edit(value, Some(owner.clone()), cx);
+        self.panel_shortcut_dialog = Some(owner);
+        self.shortcut_error = None;
+        self.start_shortcut_recording(window, cx);
+        cx.notify();
+    }
+
+    fn dismiss_panel_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.panel_shortcut_dialog = None;
+        self.shortcut_editor = None;
+        self.shortcut_error = None;
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    fn save_panel_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(owner) = self.panel_shortcut_dialog.clone() else {
+            return;
+        };
+        let value = self.shortcut_value(cx);
+        if let Some(error) = self.check_shortcut_conflict(value.as_deref(), Some(owner.clone())) {
+            self.shortcut_error = Some(error);
+            cx.notify();
+            return;
+        }
+        let previous = self.settings.clone();
+        match owner {
+            BindingOwner::CommandsPanel => self.settings.shortcuts.commands_panel = value,
+            BindingOwner::ServersPanel => self.settings.shortcuts.servers_panel = value,
+            _ => return,
+        }
+        let result = self.settings.shortcuts.validate().and_then(|()| {
+            let path =
+                Settings::default_path().ok_or_else(|| anyhow::anyhow!("无法确定配置目录"))?;
+            self.settings.save_to(&path)
+        });
+        if let Err(error) = result {
+            self.settings = previous;
+            self.shortcut_error = Some(format!("保存快捷键失败: {error:#}"));
+            cx.notify();
+        } else {
+            self.dismiss_panel_shortcut(window, cx);
+        }
+    }
+
+    /// 全量快捷键绑定：内置、面板与条目共用同一冲突注册表。
     fn all_shortcut_bindings(&self) -> Vec<ShortcutBinding> {
         let mut bindings = Vec::new();
         for (keystroke, label) in BUILTIN_SHORTCUTS {
@@ -2282,6 +2642,26 @@ impl WorkspaceView {
                     owner: BindingOwner::Builtin,
                     normalized,
                     label: (*label).to_string(),
+                });
+            }
+        }
+        for (owner, shortcut) in [
+            (
+                BindingOwner::CommandsPanel,
+                &self.settings.shortcuts.commands_panel,
+            ),
+            (
+                BindingOwner::ServersPanel,
+                &self.settings.shortcuts.servers_panel,
+            ),
+        ] {
+            if let Some(shortcut) = shortcut
+                && let Ok(normalized) = normalize_shortcut(shortcut)
+            {
+                bindings.push(ShortcutBinding {
+                    label: owner.describe(),
+                    owner,
+                    normalized,
                 });
             }
         }
@@ -2340,13 +2720,51 @@ impl WorkspaceView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let plain_escape = event.keystroke.key.eq_ignore_ascii_case("escape")
+            && event.keystroke.modifiers == gpui::Modifiers::default();
+        if self.server_save.is_some() {
+            if plain_escape {
+                self.dismiss_server(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if let Some(editor) = &self.shortcut_editor
+            && editor.recorder.read(cx).focus_handle().is_focused(window)
+            && (editor.recorder.read(cx).is_recording() || !plain_escape)
+        {
+            editor.recorder.update(cx, |recorder, cx| {
+                recorder.handle_key_down(event, window, cx)
+            });
+            cx.stop_propagation();
+            return;
+        }
+        if self.panel_shortcut_dialog.is_some() {
+            if plain_escape {
+                self.dismiss_panel_shortcut(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         if self.command_dialog.is_some()
             || self.totp_dialog.is_some()
             || self.server_dialog.is_some()
             || self.server_import_dialog.is_some()
         {
-            // Esc 关闭当前弹窗（焦点归还终端由各 dismiss 负责）
-            if event.keystroke.key.eq_ignore_ascii_case("escape") {
+            // 输入框右键菜单优先消费 Esc，避免同时关闭外层弹窗。
+            if plain_escape {
+                let field_with_menu = self
+                    .command_fields
+                    .iter()
+                    .chain(self.totp_fields.iter())
+                    .chain(self.server_fields.iter())
+                    .find(|(_, field)| field.read(cx).has_context_menu())
+                    .map(|(_, field)| field.clone());
+                if let Some(field) = field_with_menu {
+                    field.update(cx, |field, cx| field.close_context_menu(cx));
+                    cx.stop_propagation();
+                    return;
+                }
                 if self.command_dialog.is_some() {
                     self.dismiss_command(window, cx);
                 } else if self.totp_dialog.is_some() {
@@ -2358,7 +2776,54 @@ impl WorkspaceView {
                 }
                 cx.stop_propagation();
             }
+            // 没有输入框的预览弹窗可能仍保留终端焦点；不要将方向快捷键透传到 shell。
+            if pane_direction_for_keystroke(&event.keystroke).is_some()
+                && self
+                    .focused_terminal()
+                    .read(cx)
+                    .focus_handle()
+                    .is_focused(window)
+            {
+                cx.stop_propagation();
+            }
             return;
+        }
+        // 仅在真实终端焦点上捕获；设置与输入框应保留自己的方向键行为。
+        if !self.settings_open
+            && self
+                .focused_terminal()
+                .read(cx)
+                .focus_handle()
+                .is_focused(window)
+            && let Some(direction) = pane_direction_for_keystroke(&event.keystroke)
+        {
+            self.focus_pane_direction(direction, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        if self.settings_open {
+            return;
+        }
+        for (tab, shortcut) in [
+            (
+                RightPanelTab::Commands,
+                self.settings.shortcuts.commands_panel.clone(),
+            ),
+            (
+                RightPanelTab::Servers,
+                self.settings.shortcuts.servers_panel.clone(),
+            ),
+        ] {
+            if shortcut
+                .as_deref()
+                .is_some_and(|key| keystroke_matches_shortcut(event, key))
+            {
+                if !event.is_held {
+                    self.toggle_panel_tab(tab, cx);
+                }
+                cx.stop_propagation();
+                return;
+            }
         }
         // 统一绑定分发：命令（打开参数预览）→ 服务器（连接）→ 动态码（打开预览）
         if let Some(command) = self
@@ -2410,29 +2875,23 @@ impl WorkspaceView {
             return;
         }
         let key = event.keystroke.key.as_str();
-        if event.keystroke.modifiers.control
-            && !event.keystroke.modifiers.shift
-            && !event.keystroke.modifiers.alt
-            && key.eq_ignore_ascii_case("j")
-        {
+        if event.keystroke.modifiers.control && matches!(key, "left" | "right" | "up" | "down") {
+            // 方向键不是方向导航时应交还给终端（例如 Ctrl+Shift+Left）。
+            return;
+        }
+        if keystroke_matches_shortcut(event, "ctrl+j") {
             self.split_focused(SplitDirection::Horizontal, window, cx);
             cx.stop_propagation();
-        } else if event.keystroke.modifiers.control
-            && !event.keystroke.modifiers.shift
-            && !event.keystroke.modifiers.alt
-            && key.eq_ignore_ascii_case("k")
-        {
+        } else if keystroke_matches_shortcut(event, "ctrl+k") {
             self.split_focused(SplitDirection::Vertical, window, cx);
             cx.stop_propagation();
-        } else if event.keystroke.modifiers.control && event.keystroke.modifiers.shift && key == "["
-        {
+        } else if keystroke_matches_shortcut(event, "ctrl+shift+[") {
             self.cycle_focus(false, window, cx);
             cx.stop_propagation();
-        } else if event.keystroke.modifiers.control && event.keystroke.modifiers.shift && key == "]"
-        {
+        } else if keystroke_matches_shortcut(event, "ctrl+shift+]") {
             self.cycle_focus(true, window, cx);
             cx.stop_propagation();
-        } else if event.keystroke.modifiers.control && key.eq_ignore_ascii_case("t") {
+        } else if keystroke_matches_shortcut(event, "ctrl+t") {
             self.new_tab(
                 &MouseDownEvent {
                     position: gpui::point(px(0.0), px(0.0)),
@@ -2445,7 +2904,7 @@ impl WorkspaceView {
                 cx,
             );
             cx.stop_propagation();
-        } else if event.keystroke.modifiers.control && key == "w" {
+        } else if keystroke_matches_shortcut(event, "ctrl+w") {
             let id = self.focused_pane_id();
             self.close_pane(id, window, cx);
             cx.stop_propagation();
@@ -2504,6 +2963,10 @@ impl Render for WorkspaceView {
         let drag_listener_workspace = cx.weak_entity();
         let active_tab_id = self.active_tab;
         let active_layout = self.active_tab().layout.clone();
+        let pane_rects = Rc::new(RefCell::new(Vec::new()));
+        let geometry_cache = self.pane_geometry.clone();
+        let geometry_layout = active_layout.clone();
+        let geometry_rects = pane_rects.clone();
         let focused_pane = self.active_tab().focused_pane;
         // 每个标签的标题 = 其焦点窗格标题；多窗格时附带窗格数
         let tab_labels = self
@@ -2525,6 +2988,13 @@ impl Render for WorkspaceView {
             .flex_col()
             .bg(rgb(0x1A1B26))
             .capture_key_down(cx.listener(WorkspaceView::on_key_down))
+            .child({
+                let pane_rects = pane_rects.clone();
+                canvas(
+                    |_, _, _| (),
+                    move |_, _, _, _| pane_rects.borrow_mut().clear(),
+                )
+            })
             .child(
                 div()
                     .h(px(TITLEBAR_HEIGHT))
@@ -2537,9 +3007,12 @@ impl Render for WorkspaceView {
                             .h_full()
                             .flex()
                             .items_center()
+                            .flex_shrink_0()
                             .gap_1()
                             .px_2()
+                            .when(cfg!(target_os = "macos"), |brand| brand.pl(px(82.0)))
                             .child(button("☰", cx.listener(Self::toggle_left_panel)))
+                            .child(titlebar_logo())
                             .child(div().text_color(rgb(0xC0CAF5)).child("LaterTerm")),
                     )
                     .child(
@@ -2630,13 +3103,16 @@ impl Render for WorkspaceView {
                     ))
                     .child(button("▣", cx.listener(Self::toggle_right_panel)))
                     .child(button("⚙", cx.listener(Self::toggle_settings)))
-                    .child(button("—", cx.listener(Self::minimize)))
-                    .child(button("□", cx.listener(Self::zoom)))
-                    .child(button_with_color(
-                        "×",
-                        0xF7768E,
-                        cx.listener(Self::close_window),
-                    )),
+                    .when(!cfg!(target_os = "macos"), |titlebar| {
+                        titlebar
+                            .child(button("—", cx.listener(Self::minimize)))
+                            .child(button("□", cx.listener(Self::zoom)))
+                            .child(button_with_color(
+                                "×",
+                                0xF7768E,
+                                cx.listener(Self::close_window),
+                            ))
+                    }),
             )
             .child(
                 div()
@@ -2644,22 +3120,7 @@ impl Render for WorkspaceView {
                     .min_h(px(0.0))
                     .flex()
                     .child(if left_panel {
-                        div()
-                            .w(px(PANEL_WIDTH))
-                            .h_full()
-                            .bg(rgb(0x202132))
-                            .p_3()
-                            .child(div().text_color(rgb(0xC0CAF5)).child("标签"))
-                            .children(tab_labels.iter().map(|(id, title, _)| {
-                                div()
-                                    .py_1()
-                                    .text_color(if *id == active_tab_id {
-                                        rgb(0x7DCEFF)
-                                    } else {
-                                        rgb(0xA9B1D6)
-                                    })
-                                    .child(title.clone())
-                            }))
+                        left_sidebar(&tab_labels, active_tab_id, cx)
                     } else {
                         div()
                     })
@@ -2675,6 +3136,7 @@ impl Render for WorkspaceView {
                                 &self.panes,
                                 focused_pane,
                                 self.split_drag.map(|drag| drag.split_id),
+                                &pane_rects,
                                 cx,
                             )),
                     )
@@ -2696,6 +3158,19 @@ impl Render for WorkspaceView {
             .when_some(render_active_dialog(self, cx), |root, overlay| {
                 root.child(overlay)
             })
+            // 在全部窗格完成绘制后提交同一帧的几何快照。
+            .child(canvas(
+                |_, _, _| (),
+                move |_, _, window, _| {
+                    *geometry_cache.borrow_mut() = Some(PaneGeometry {
+                        tab_id: active_tab_id,
+                        viewport: window.viewport_size(),
+                        panels: (left_panel, right_panel),
+                        layout: geometry_layout.clone(),
+                        panes: geometry_rects.borrow().clone(),
+                    });
+                },
+            ))
             // 分割线拖拽：窗口级鼠标监听仅对下一帧有效，paint 期逐帧重挂
             // （canvas 的 paint 回调即 paint 期，模式同 CommandTextField 的 handle_input）
             .child(canvas(
@@ -2739,6 +3214,7 @@ fn render_layout(
     panes: &[Pane],
     focused: PaneId,
     dragging_split: Option<u64>,
+    pane_rects: &Rc<RefCell<Vec<PaneRect>>>,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
     match node {
@@ -2768,23 +3244,47 @@ fn render_layout(
                     }),
                 )
                 .capture_key_down(cx.listener(WorkspaceView::on_key_down))
-                .child(pane.terminal.clone());
+                .child(pane.terminal.clone())
+                .child({
+                    let pane_rects = pane_rects.clone();
+                    div().absolute().inset_0().child(
+                        canvas(
+                            |bounds, _, _| bounds,
+                            move |bounds, _, _, _| {
+                                pane_rects.borrow_mut().push(PaneRect {
+                                    id: close_id,
+                                    x: bounds.origin.x.into(),
+                                    y: bounds.origin.y.into(),
+                                    width: bounds.size.width.into(),
+                                    height: bounds.size.height.into(),
+                                });
+                            },
+                        )
+                        .size_full(),
+                    )
+                });
             // 悬浮滚动条：右侧细条平时半透明，悬停窗格加亮（无监听器，不拦截终端鼠标）
             if let Some((thumb, top)) = scroll.thumb() {
                 pane_div = pane_div.child(
-                    div().absolute().top_0().bottom_0().right_0().w(px(6.0)).child(
-                        div()
-                            .absolute()
-                            .top(relative(top))
-                            .right(px(2.0))
-                            .h(relative(thumb))
-                            .w(px(3.0))
-                            .rounded_full()
-                            .bg(gpui::Hsla::from(rgb(0x565A78)).opacity(0.6))
-                            .group_hover("pane", |style| {
-                                style.bg(gpui::Hsla::from(rgb(0x7AA2F7)).opacity(0.9))
-                            }),
-                    ),
+                    div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .right_0()
+                        .w(px(6.0))
+                        .child(
+                            div()
+                                .absolute()
+                                .top(relative(top))
+                                .right(px(2.0))
+                                .h(relative(thumb))
+                                .w(px(3.0))
+                                .rounded_full()
+                                .bg(gpui::Hsla::from(rgb(0x565A78)).opacity(0.6))
+                                .group_hover("pane", |style| {
+                                    style.bg(gpui::Hsla::from(rgb(0x7AA2F7)).opacity(0.9))
+                                }),
+                        ),
                 );
             }
             pane_div = pane_div.child(
@@ -2823,7 +3323,12 @@ fn render_layout(
             let split_id = *id;
             let direction = *direction;
             let dragging = dragging_split == Some(split_id);
-            let mut container = div().relative().flex().flex_1().min_w(px(0.0)).min_h(px(0.0));
+            let mut container = div()
+                .relative()
+                .flex()
+                .flex_1()
+                .min_w(px(0.0))
+                .min_h(px(0.0));
             if horizontal {
                 container = container.flex_row();
             } else {
@@ -2850,7 +3355,14 @@ fn render_layout(
                         .min_w(px(0.0))
                         .min_h(px(0.0))
                         .flex()
-                        .child(render_layout(first, panes, focused, dragging_split, cx)),
+                        .child(render_layout(
+                            first,
+                            panes,
+                            focused,
+                            dragging_split,
+                            pane_rects,
+                            cx,
+                        )),
                 )
                 .child(
                     divider
@@ -2868,7 +3380,14 @@ fn render_layout(
                             }),
                         ),
                 )
-                .child(render_layout(second, panes, focused, dragging_split, cx))
+                .child(render_layout(
+                    second,
+                    panes,
+                    focused,
+                    dragging_split,
+                    pane_rects,
+                    cx,
+                ))
                 // paint 期上报容器几何，mousedown 换算拖拽比例用
                 .child(div().absolute().inset_0().child(canvas(
                     move |bounds, _, _| bounds,
@@ -2882,97 +3401,253 @@ fn render_layout(
     }
 }
 
+/// 标签列表采用固定标题和独立滚动区域，长标题不挤占关闭按钮。
+fn left_sidebar(
+    tab_labels: &[(TabId, String, usize)],
+    active_tab_id: TabId,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    div()
+        .w(px(PANEL_WIDTH))
+        .h_full()
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .bg(rgb(0x202132))
+        .border_r_1()
+        .border_color(rgb(0x343750))
+        .child(sidebar_header("标签", tab_labels.len()))
+        .child(
+            div()
+                .id("sidebar-tabs")
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .px_2()
+                .pb_2()
+                .children(tab_labels.iter().map(|(id, title, count)| {
+                    let id = *id;
+                    let selected = id == active_tab_id;
+                    let label = if *count > 1 {
+                        format!("{title} · {count} 个窗格")
+                    } else {
+                        title.clone()
+                    };
+                    div()
+                        .h(px(32.0))
+                        .mb_1()
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .rounded_sm()
+                        .bg(if selected {
+                            rgb(0x2B3F5E)
+                        } else {
+                            rgb(0x202132)
+                        })
+                        .text_color(if selected {
+                            rgb(0xC0D6FF)
+                        } else {
+                            rgb(0xA9B1D6)
+                        })
+                        .hover(|style| {
+                            style.bg(if selected {
+                                rgb(0x2B3F5E)
+                            } else {
+                                rgb(0x292B3D)
+                            })
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event, window, cx| {
+                                this.activate_tab(id, event, window, cx)
+                            }),
+                        )
+                        .child(div().w(px(2.0)).h(px(16.0)).bg(if selected {
+                            rgb(0x7AA2F7)
+                        } else {
+                            rgb(0x202132)
+                        }))
+                        .child(div().flex_1().min_w(px(0.0)).truncate().child(label))
+                        .child(
+                            div()
+                                .px_1()
+                                .text_color(rgb(0x7D829F))
+                                .hover(|style| style.text_color(rgb(0xF7768E)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event, window, cx| {
+                                        this.close_tab(id, event, window, cx)
+                                    }),
+                                )
+                                .child("×"),
+                        )
+                })),
+        )
+}
+
 fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
     let commands = workspace.settings.commands.clone();
     let error = workspace.command_error.clone();
+    let delete_confirm = workspace.command_delete_confirm.clone();
     let active_tab = workspace.right_panel_tab;
+    let item_count = match active_tab {
+        RightPanelTab::Commands => commands.len(),
+        RightPanelTab::Totp => workspace.settings.totp.len(),
+        RightPanelTab::Servers => workspace.settings.servers.len(),
+    };
+    let scroll_id = match active_tab {
+        RightPanelTab::Commands => "sidebar-commands",
+        RightPanelTab::Totp => "sidebar-totp",
+        RightPanelTab::Servers => "sidebar-servers",
+    };
 
-    let mut panel = div()
-        .w(px(PANEL_WIDTH))
-        .h_full()
-        .overflow_hidden()
-        .bg(rgb(0x202132))
-        .p_3()
-        .text_color(rgb(0xC0CAF5))
-        // 分区切换：命令 / 动态码 / 服务器
-        .child(div().flex().gap_1().pb_2().children(
-            RightPanelTab::ALL.map(|tab| {
-                setting_button(
-                    tab.label(),
-                    tab == active_tab,
-                    cx.listener(move |this, _event, _window, cx| {
-                        this.right_panel_tab = tab;
-                        this.server_delete_confirm = None;
-                        cx.notify();
-                    }),
-                )
-            }),
-        ));
-
-    panel = match active_tab {
-        RightPanelTab::Commands => {
-            panel
-                .child(setting_button(
-                    "新建命令",
-                    true,
-                    cx.listener(|this, _event, window, cx| this.edit_command(None, window, cx)),
-                ))
-                .child(
-                    div()
-                        .pt_2()
-                        .text_color(rgb(0x7D829F))
-                        .child("模板和快捷键保存在 settings.toml"),
-                )
-                .when_some(error, |panel, error| {
-                    panel.child(div().text_color(rgb(0xF7768E)).child(error))
-                })
-                .children(commands.into_iter().map(|command| {
-                    let shortcut = command.shortcut.clone();
-                    let label = if command.template == command.name {
-                        command.name.clone()
-                    } else {
-                        format!("{}  ·  {}", command.name, command.template)
-                    };
-                    let open_command = command.clone();
-                    div()
-                        .py_2()
-                        .text_color(rgb(0xA9B1D6))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _event, window, cx| {
-                                this.open_command(&open_command, window, cx);
-                            }),
+    let panel = div().w_full().text_color(rgb(0xC0CAF5));
+    let panel = match active_tab {
+        RightPanelTab::Commands => panel
+            .child(setting_button(
+                "新建命令",
+                true,
+                cx.listener(|this, _event, window, cx| this.edit_command(None, window, cx)),
+            ))
+            .child(panel_caption("命令模板与快捷键"))
+            .when_some(error, |panel, error| {
+                panel.child(div().text_color(rgb(0xF7768E)).child(error))
+            })
+            .when(commands.is_empty(), |panel| {
+                panel.child(sidebar_empty("还没有命令", "点击上方按钮新建常用命令"))
+            })
+            .children(commands.into_iter().map(|command| {
+                let has_separate_template = command.template != command.name;
+                let pending_delete = delete_confirm.as_deref() == Some(command.name.as_str());
+                let open_command = command.clone();
+                entry_card()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_1()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _event, window, cx| {
+                                    this.open_command(&open_command, window, cx);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_color(rgb(0xC0CAF5))
+                                    .child(command.name.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .pt_1()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(value_chip(
+                                command.shortcut.as_deref().unwrap_or("未绑定 · 设置快捷键"),
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let command = command.clone();
+                                    move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.edit_command(Some(command.clone()), window, cx);
+                                        this.start_shortcut_recording(window, cx);
+                                    }
+                                }),
+                            ),
+                    )
+                    .when(has_separate_template, |card| {
+                        card.child(
+                            div()
+                                .pt_1()
+                                .truncate()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0x7D829F))
+                                .child(command.template.clone()),
                         )
-                        .child(label)
-                        .child(setting_button(
-                            "编辑",
-                            false,
-                            cx.listener({
-                                let command = command.clone();
-                                move |this, _event, window, cx| {
-                                    this.edit_command(Some(command.clone()), window, cx)
-                                }
-                            }),
-                        ))
-                        .child(setting_button(
-                            "删",
-                            false,
-                            cx.listener({
-                                let name = command.name.clone();
-                                move |this, _event, _window, cx| this.delete_command(&name, cx)
-                            }),
-                        ))
-                        .child(
-                            shortcut
-                                .map(|key| format!("  [{}]", key))
-                                .unwrap_or_default(),
-                        )
-                }))
-        }
+                    })
+                    .child(
+                        div()
+                            .pt_1()
+                            .flex()
+                            .gap_1()
+                            .child(setting_button(
+                                "编辑",
+                                false,
+                                cx.listener({
+                                    let command = command.clone();
+                                    move |this, _event, window, cx| {
+                                        this.edit_command(Some(command.clone()), window, cx)
+                                    }
+                                }),
+                            ))
+                            .child(setting_button(
+                                if pending_delete {
+                                    "确认删除"
+                                } else {
+                                    "删除"
+                                },
+                                pending_delete,
+                                cx.listener({
+                                    let name = command.name.clone();
+                                    move |this, _event, _window, cx| this.delete_command(&name, cx)
+                                }),
+                            )),
+                    )
+            })),
         RightPanelTab::Totp => render_totp_section(workspace, panel, cx),
         RightPanelTab::Servers => render_server_section(workspace, panel, cx),
     };
-    panel
+
+    div()
+        .w(px(PANEL_WIDTH))
+        .h_full()
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .bg(rgb(0x202132))
+        .border_l_1()
+        .border_color(rgb(0x343750))
+        .child(sidebar_header(active_tab.label(), item_count))
+        .child(
+            div()
+                .px_2()
+                .pb_2()
+                .flex()
+                .gap_1()
+                .children(RightPanelTab::ALL.map(|tab| {
+                    sidebar_tab_button(
+                        tab.label(),
+                        tab == active_tab,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.right_panel_tab = tab;
+                            this.command_delete_confirm = None;
+                            this.totp_delete_confirm = None;
+                            this.server_delete_confirm = None;
+                            cx.notify();
+                        }),
+                    )
+                })),
+        )
+        .child(
+            div()
+                .id(scroll_id)
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_y_scroll()
+                .px_2()
+                .pb_3()
+                .child(panel),
+        )
 }
 
 // ---------- 窗口级模态弹窗（命令/动态码/服务器共用） ----------
@@ -2983,6 +3658,33 @@ fn render_active_dialog(
     workspace: &mut WorkspaceView,
     cx: &mut Context<WorkspaceView>,
 ) -> Option<gpui::Div> {
+    if let Some(owner) = &workspace.panel_shortcut_dialog {
+        let body = div()
+            .p_4()
+            .when_some(workspace.shortcut_error.clone(), |body, error| {
+                body.child(dialog_error_line(error))
+            })
+            .when_some(workspace.shortcut_editor.as_ref(), |body, editor| {
+                body.child(shortcut_editor_row(editor.recorder.clone()))
+            })
+            .child(dialog_footer(vec![
+                setting_button(
+                    "保存",
+                    true,
+                    cx.listener(|this, _, window, cx| this.save_panel_shortcut(window, cx)),
+                ),
+                setting_button(
+                    "取消",
+                    false,
+                    dismiss_listener(cx, WorkspaceView::dismiss_panel_shortcut),
+                ),
+            ]));
+        return Some(modal_dialog(
+            owner.describe(),
+            body,
+            dismiss_listener(cx, WorkspaceView::dismiss_panel_shortcut),
+        ));
+    }
     if let Some(source) = workspace.server_import_dialog {
         return Some(server_import_modal(source, cx));
     }
@@ -3003,13 +3705,54 @@ fn render_active_dialog(
     }) = workspace.totp_dialog.clone()
     {
         return Some(totp_preview_modal(
-            workspace, name, code, generated_at, period, cx,
+            workspace,
+            name,
+            code,
+            generated_at,
+            period,
+            cx,
+        ));
+    }
+    if workspace.server_save.is_some() {
+        let body = div()
+            .p_4()
+            .child("正在保存服务器配置，请稍候…")
+            .child(
+                div()
+                    .pt_2()
+                    .text_color(rgb(0x7D829F))
+                    .child("可取消后续操作；已经进入系统密钥环的写入无法撤回。"),
+            )
+            .child(dialog_footer(vec![setting_button(
+                "取消",
+                false,
+                cx.listener(WorkspaceView::cancel_server),
+            )]));
+        return Some(modal_dialog(
+            "保存服务器",
+            body,
+            dismiss_listener(cx, WorkspaceView::dismiss_server),
         ));
     }
     if let Some(ServerDialog::Edit { original }) = workspace.server_dialog.clone() {
         return Some(server_edit_modal(workspace, original, cx));
     }
-    if let Some(ServerDialog::Connect { name, remember }) = workspace.server_dialog.clone() {
+    if let Some(ServerDialog::Connecting { name }) = workspace.server_dialog.clone() {
+        let body = div()
+            .p_4()
+            .child("正在准备连接（可取消）…")
+            .child(dialog_footer(vec![setting_button(
+                "取消连接",
+                false,
+                cx.listener(WorkspaceView::cancel_server),
+            )]));
+        return Some(modal_dialog(
+            format!("连接 {name}"),
+            body,
+            dismiss_listener(cx, WorkspaceView::dismiss_server),
+        ));
+    }
+    if let Some(ServerDialog::Connect { name, remember, .. }) = workspace.server_dialog.clone() {
         return Some(server_connect_modal(workspace, name, remember, cx));
     }
     None
@@ -3028,13 +3771,18 @@ fn modal_dialog(
         .items_center()
         .justify_center()
         .bg(gpui::black().opacity(0.55))
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
         .on_mouse_down(MouseButton::Left, cancel.clone())
         .child(
             div()
                 .w(px(480.0))
-                .max_h(px(640.0))
+                .debug_selector(|| "modal-card".into())
+                .max_w(relative(0.95))
+                .max_h(relative(0.90))
                 .flex()
                 .flex_col()
+                .overflow_hidden()
                 .bg(rgb(0x202132))
                 .border_1()
                 .border_color(rgb(0x3B3F5C))
@@ -3042,6 +3790,7 @@ fn modal_dialog(
                 .child(
                     div()
                         .h(px(44.0))
+                        .flex_shrink_0()
                         .w_full()
                         .flex()
                         .items_center()
@@ -3063,7 +3812,14 @@ fn modal_dialog(
                                 .child("×"),
                         ),
                 )
-                .child(body),
+                .child(
+                    div()
+                        .id("modal-body-scroll")
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_y_scroll()
+                        .child(body.flex_shrink_0()),
+                ),
         )
 }
 
@@ -3075,6 +3831,7 @@ fn dismiss_listener(
 ) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + Clone + 'static {
     let view = cx.weak_entity();
     move |_event, window, cx| {
+        cx.stop_propagation();
         view.update(cx, |view, cx| dismiss(view, window, cx)).ok();
     }
 }
@@ -3087,9 +3844,21 @@ fn dialog_field_row(label: &str, field: Entity<CommandTextField>) -> gpui::Div {
         .child(field)
 }
 
+fn shortcut_editor_row(recorder: Entity<ShortcutRecorder>) -> gpui::Div {
+    div()
+        .pt_2()
+        .child(div().text_color(rgb(0x7D829F)).child("快捷键（应用内）"))
+        .child(recorder)
+}
+
 /// 弹窗底部按钮排。
 fn dialog_footer(buttons: Vec<gpui::Div>) -> gpui::Div {
-    div().pt_4().flex().gap_2().children(buttons)
+    div()
+        .debug_selector(|| "modal-footer".into())
+        .pt_4()
+        .flex()
+        .gap_2()
+        .children(buttons)
 }
 
 /// 弹窗内错误提示行（保存/连接失败等需要就地可见的信息）。
@@ -3120,7 +3889,7 @@ fn command_edit_modal(
     } else {
         "新建命令"
     };
-    let body = div()
+    let mut body = div()
         .flex()
         .flex_col()
         .p_4()
@@ -3129,17 +3898,20 @@ fn command_edit_modal(
             fields
                 .into_iter()
                 .map(|(name, field)| dialog_field_row(&name, field)),
-        )
-        .child(dialog_footer(vec![
-            setting_button(
-                "保存",
-                true,
-                cx.listener(move |this, _event, window, cx| {
-                    this.save_edit_command(original_name.clone(), window, cx)
-                }),
-            ),
-            setting_button("取消", false, cx.listener(WorkspaceView::cancel_command)),
-        ]));
+        );
+    if let Some(editor) = &workspace.shortcut_editor {
+        body = body.child(shortcut_editor_row(editor.recorder.clone()));
+    }
+    let body = body.child(dialog_footer(vec![
+        setting_button(
+            "保存",
+            true,
+            cx.listener(move |this, _event, window, cx| {
+                this.save_edit_command(original_name.clone(), window, cx)
+            }),
+        ),
+        setting_button("取消", false, cx.listener(WorkspaceView::cancel_command)),
+    ]));
     modal_dialog(
         title,
         body,
@@ -3220,6 +3992,9 @@ fn totp_edit_modal(
                 .into_iter()
                 .map(|(name, field)| dialog_field_row(&name, field)),
         )
+        .when_some(workspace.shortcut_editor.as_ref(), |body, editor| {
+            body.child(shortcut_editor_row(editor.recorder.clone()))
+        })
         .child(
             div()
                 .pt_2()
@@ -3273,9 +4048,7 @@ fn totp_edit_modal(
             setting_button(
                 "保存",
                 true,
-                cx.listener(move |this, _event, _window, cx| {
-                    this.save_totp(original.clone(), cx)
-                }),
+                cx.listener(move |this, _event, _window, cx| this.save_totp(original.clone(), cx)),
             ),
             setting_button("取消", false, cx.listener(WorkspaceView::cancel_totp)),
         ]));
@@ -3353,6 +4126,7 @@ fn server_edit_modal(
                 .into_iter()
                 .map(|(name, field)| dialog_field_row(&name, field)),
         )
+        .when_some(workspace.shortcut_editor.as_ref(), |body, editor| body.child(shortcut_editor_row(editor.recorder.clone())))
         .child(
             div()
                 .pt_2()
@@ -3363,8 +4137,8 @@ fn server_edit_modal(
                 .children(
                     [
                         (ServerAuthKind::Password, "密码"),
-                        (ServerAuthKind::KeyboardInteractive, "交互"),
-                        (ServerAuthKind::PrivateKey, "密钥"),
+                        (ServerAuthKind::KeyboardInteractive, "交互口令"),
+                        (ServerAuthKind::PrivateKey, "私钥（免登录密码）"),
                     ]
                     .into_iter()
                     .map(|(kind, label)| {
@@ -3379,6 +4153,7 @@ fn server_edit_modal(
                     }),
                 ),
         )
+        .child(div().pt_2().text_size(px(11.0)).text_color(rgb(0x7D829F)).child("私钥模式凭据为本机私钥的解锁口令，可留空。客户端仍需与服务端公钥配对的私钥；暂不使用 ssh-agent。"))
         .child(dialog_footer(vec![
             setting_button(
                 "保存",
@@ -3404,6 +4179,14 @@ fn server_connect_modal(
 ) -> gpui::Div {
     let fields = workspace.server_fields.clone();
     let error = workspace.server_error.clone();
+    let is_private_key = matches!(
+        workspace.server_dialog,
+        Some(ServerDialog::Connect {
+            kind: CredentialKind::PrivateKey { .. },
+            ..
+        })
+    );
+    let busy = workspace.ssh_connecting.is_some();
     let body = div()
         .flex()
         .flex_col()
@@ -3412,7 +4195,7 @@ fn server_connect_modal(
         .child(
             div()
                 .text_color(rgb(0x7D829F))
-                .child("密钥环中没有该服务器的凭据，请补输一次"),
+                .child(if is_private_key { "本机私钥已加密，请输入私钥解锁口令（不是远端登录密码）" } else { "输入登录凭据；密码留空将使用本机对应私钥，不发送空密码。私钥路径留空时尝试 id_ed25519、id_rsa。" }),
         )
         .children(
             fields
@@ -3426,7 +4209,11 @@ fn server_connect_modal(
                 .items_center()
                 .gap_1()
                 .child(setting_button(
-                    if remember { "记住凭据 ✓" } else { "记住凭据" },
+                    if remember {
+                        "记住凭据 ✓"
+                    } else {
+                        "记住凭据"
+                    },
                     remember,
                     cx.listener(move |this, _event, _window, cx| {
                         if let Some(ServerDialog::Connect { remember, .. }) =
@@ -3437,12 +4224,13 @@ fn server_connect_modal(
                         cx.notify();
                     }),
                 ))
-                .child(div().text_color(rgb(0x565A78)).child("写入系统密钥环")),
+                .child(div().text_color(rgb(0x565A78)).child("连接成功后才保存；不勾选则仅本次使用")),
         )
+        .when(busy, |body| body.child(div().pt_2().child("正在连接，可取消…")))
         .child(dialog_footer(vec![
             setting_button(
-                "连接",
-                true,
+                if busy { "连接中…" } else { "连接" },
+                !busy,
                 cx.listener(|this, _event, _window, cx| this.submit_server_connect(cx)),
             ),
             setting_button("取消", false, cx.listener(WorkspaceView::cancel_server)),
@@ -3550,35 +4338,29 @@ fn render_totp_section(
     let error = workspace.totp_error.clone();
 
     panel
-        .child(div().pt_4().child("动态码 (TOTP)"))
         .child(setting_button(
             "新建动态码",
             true,
             cx.listener(|this, _event, window, cx| this.edit_totp(None, window, cx)),
         ))
-        .child(
-            div()
-                .pt_2()
-                .text_color(rgb(0x7D829F))
-                .child("密钥只存系统密钥环；支持粘贴 otpauth:// 链接"),
-        )
+        .child(panel_caption("密钥保存在系统密钥环中"))
         .when_some(error, |panel, error| {
             panel.child(div().text_color(rgb(0xF7768E)).child(error))
+        })
+        .when(entries.is_empty(), |panel| {
+            panel.child(sidebar_empty("还没有动态码", "支持粘贴密钥或 otpauth 链接"))
         })
         .children(entries.iter().map(|entry| {
             let name = entry.name.clone();
             let remaining = totp_window_remaining(entry.period);
             let pending_delete = delete_confirm.as_deref() == Some(entry.name.as_str());
-            div()
-                .pt_2()
-                .flex()
-                .items_center()
-                .gap_1()
+            entry_card()
                 .child(
                     div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .text_color(rgb(0xA9B1D6))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener({
@@ -3586,26 +4368,58 @@ fn render_totp_section(
                                 move |this, _event, _window, cx| this.open_totp(&entry, cx)
                             }),
                         )
-                        .child(match &entry.shortcut {
-                            Some(shortcut) => {
-                                format!("{}  [{}]", entry.name, shortcut)
-                            }
-                            None => format!("{} · {}s", entry.name, remaining),
-                        }),
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_color(rgb(0xC0CAF5))
+                                .child(entry.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0x7D829F))
+                                .child(format!("{remaining}s")),
+                        ),
                 )
-                .child(setting_button(
-                    "编辑",
-                    false,
-                    cx.listener({
-                        let entry = entry.clone();
-                        move |this, _event, window, cx| this.edit_totp(Some(&entry), window, cx)
-                    }),
-                ))
-                .child(setting_button(
-                    if pending_delete { "确认?" } else { "删" },
-                    pending_delete,
-                    cx.listener(move |this, _event, _window, cx| this.delete_totp(&name, cx)),
-                ))
+                .when_some(entry.shortcut.clone(), |card, shortcut| {
+                    card.child(
+                        div()
+                            .pt_1()
+                            .truncate()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0x7D829F))
+                            .child(shortcut),
+                    )
+                })
+                .child(
+                    div()
+                        .pt_1()
+                        .flex()
+                        .gap_1()
+                        .child(setting_button(
+                            "编辑",
+                            false,
+                            cx.listener({
+                                let entry = entry.clone();
+                                move |this, _event, window, cx| {
+                                    this.edit_totp(Some(&entry), window, cx)
+                                }
+                            }),
+                        ))
+                        .child(setting_button(
+                            if pending_delete {
+                                "确认删除"
+                            } else {
+                                "删除"
+                            },
+                            pending_delete,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.delete_totp(&name, cx)
+                            }),
+                        )),
+                )
         }))
 }
 
@@ -3643,19 +4457,15 @@ fn render_server_section(
                     cx.listener(|this, _event, _window, cx| this.export_servers(cx)),
                 )),
         )
-        .child(
-            div()
-                .pt_2()
-                .text_color(rgb(0x7D829F))
-                .child("凭据只存密钥环；连接在新标签打开"),
-        )
+        .child(panel_caption("凭据保存在系统密钥环中"))
+        .when(servers.is_empty(), |panel| {
+            panel.child(sidebar_empty(
+                "还没有服务器",
+                "新建连接，或导入已有的服务器列表",
+            ))
+        })
         .when_some(notice, |panel, notice| {
-            panel.child(
-                div()
-                    .pt_2()
-                    .text_color(rgb(0x9ECE6A))
-                    .child(notice),
-            )
+            panel.child(div().pt_2().text_color(rgb(0x9ECE6A)).child(notice))
         })
         .when_some(connecting, |panel, connecting| {
             panel.child(
@@ -3676,8 +4486,7 @@ fn render_server_section(
                 ServerAuthKind::PrivateKey => "密钥",
             };
             let pending_delete = delete_confirm.as_deref() == Some(entry.name.as_str());
-            div()
-                .pt_2()
+            entry_card()
                 // 第一行：名称 + 连接
                 .child(
                     div()
@@ -3690,10 +4499,7 @@ fn render_server_section(
                                 .min_w(px(0.0))
                                 .truncate()
                                 .text_color(rgb(0xC0CAF5))
-                                .child(match &entry.shortcut {
-                                    Some(shortcut) => format!("{}  [{}]", entry.name, shortcut),
-                                    None => entry.name.clone(),
-                                }),
+                                .child(entry.name.clone()),
                         )
                         .child(setting_button(
                             "连接",
@@ -3704,25 +4510,45 @@ fn render_server_section(
                             }),
                         )),
                 )
-                // 第二行：地址信息（小字）+ 编辑/删
                 .child(
                     div()
+                        .pt_1()
                         .flex()
                         .items_center()
                         .gap_1()
+                        .child(value_chip(
+                            entry.shortcut.as_deref().unwrap_or("未绑定 · 设置快捷键"),
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener({
+                                let entry = entry.clone();
+                                move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.edit_server(Some(&entry), window, cx);
+                                    this.start_shortcut_recording(window, cx);
+                                }
+                            }),
+                        ),
+                )
+                // 地址独占一行，按钮不再挤压主机信息。
+                .child(
+                    div()
+                        .w_full()
                         .pt_1()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .truncate()
-                                .text_size(px(12.0))
-                                .text_color(rgb(0x7D829F))
-                                .child(format!(
-                                    "{}@{}:{} [{}]",
-                                    entry.username, entry.host, entry.port, auth_label
-                                )),
-                        )
+                        .truncate()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xA9B1D6))
+                        .child(format!(
+                            "{}@{}:{} [{}]",
+                            entry.username, entry.host, entry.port, auth_label
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .pt_1()
                         .child(setting_button(
                             "编辑",
                             false,
@@ -3761,6 +4587,8 @@ fn settings_overlay(
         .items_center()
         .justify_center()
         .bg(gpui::black().opacity(0.6))
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
         .on_mouse_down(MouseButton::Left, scrim_listener)
         .child(
             div()
@@ -3875,7 +4703,7 @@ fn settings_content(
     };
     let body = match page {
         SettingsPage::Appearance => settings_panel(workspace, cx),
-        SettingsPage::Shortcuts => shortcuts_page(workspace),
+        SettingsPage::Shortcuts => shortcuts_page(workspace, cx),
         SettingsPage::Terminal => div()
             .pt_4()
             .flex()
@@ -3917,69 +4745,199 @@ fn settings_content(
 }
 
 /// 设置→快捷键：全量绑定总览（内置 + 命令 + 服务器 + 动态码），冲突标红。
-fn shortcuts_page(workspace: &WorkspaceView) -> gpui::Div {
+fn shortcuts_page(workspace: &WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
     let bindings = workspace.all_shortcut_bindings();
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for binding in &bindings {
         *counts.entry(binding.normalized.as_str()).or_default() += 1;
     }
     let row = |binding: &ShortcutBinding| {
-        let conflicted = counts.get(binding.normalized.as_str()).copied().unwrap_or(1) > 1;
-        setting_card()
-            .child(shortcut_row(
-                &binding.label,
-                &binding.normalized,
-                conflicted,
-            ))
+        let conflicted = counts
+            .get(binding.normalized.as_str())
+            .copied()
+            .unwrap_or(1)
+            > 1;
+        setting_card().child(shortcut_row(
+            &binding.label,
+            &binding.normalized,
+            conflicted,
+        ))
     };
     let mut page = div().pt_4().flex().flex_col().gap_3();
     page = page.child(section_title("内置"));
-    for binding in bindings.iter().filter(|b| matches!(b.owner, BindingOwner::Builtin)) {
+    for binding in bindings
+        .iter()
+        .filter(|b| matches!(b.owner, BindingOwner::Builtin))
+    {
         page = page.child(row(binding));
     }
-    let dynamic = [
-        ("命令（编辑弹窗里绑定）", BindingKind::Command),
-        ("服务器（编辑弹窗里绑定）", BindingKind::Server),
-        ("动态码（编辑弹窗里绑定）", BindingKind::Totp),
-    ];
-    // 下面用小枚举避免闭包里 match owner 的借用问题
-    #[derive(Clone, Copy)]
-    enum BindingKind {
-        Command,
-        Server,
-        Totp,
+    page = page.child(section_title("面板"));
+    for (label, shortcut, owner) in [
+        (
+            "命令面板",
+            workspace.settings.shortcuts.commands_panel.as_deref(),
+            BindingOwner::CommandsPanel,
+        ),
+        (
+            "服务器面板",
+            workspace.settings.shortcuts.servers_panel.as_deref(),
+            BindingOwner::ServersPanel,
+        ),
+    ] {
+        let invalid = shortcut.is_some_and(|key| normalize_shortcut(key).is_err());
+        let conflicted = shortcut
+            .and_then(|key| normalize_shortcut(key).ok())
+            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
+        page = page.child(
+            setting_card()
+                .child(shortcut_row(
+                    label,
+                    shortcut.unwrap_or("未设置"),
+                    invalid || conflicted,
+                ))
+                .child(setting_button(
+                    "编辑快捷键",
+                    false,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.edit_panel_shortcut(owner.clone(), window, cx);
+                    }),
+                )),
+        );
     }
-    for (title, kind) in dynamic {
-        let matched: Vec<&ShortcutBinding> = bindings
-            .iter()
-            .filter(|binding| {
-                matches!(
-                    (kind, &binding.owner),
-                    (BindingKind::Command, BindingOwner::Command(_))
-                        | (BindingKind::Server, BindingOwner::Server(_))
-                        | (BindingKind::Totp, BindingOwner::Totp(_))
-                )
-            })
-            .collect();
-        if matched.is_empty() {
-            continue;
-        }
-        page = page.child(section_title(title));
-        for binding in matched {
-            page = page.child(row(binding));
-        }
+    // 直接从配置渲染，保留未绑定和无效历史值的修复入口。
+    page = page.child(section_title("命令"));
+    for command in &workspace.settings.commands {
+        let command = command.clone();
+        let shortcut = command.shortcut.as_deref().unwrap_or("未绑定");
+        let invalid = command
+            .shortcut
+            .as_ref()
+            .is_some_and(|key| normalize_shortcut(key).is_err());
+        let conflicted = normalize_shortcut(shortcut)
+            .ok()
+            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
+        page = page.child(
+            setting_card()
+                .child(shortcut_row(&command.name, shortcut, invalid || conflicted))
+                .child(setting_button(
+                    "编辑快捷键",
+                    false,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.edit_command(Some(command.clone()), window, cx);
+                        this.start_shortcut_recording(window, cx);
+                    }),
+                )),
+        );
+    }
+    page = page.child(section_title("服务器"));
+    for entry in &workspace.settings.servers {
+        let entry = entry.clone();
+        let shortcut = entry.shortcut.as_deref().unwrap_or("未绑定");
+        let invalid = entry
+            .shortcut
+            .as_ref()
+            .is_some_and(|key| normalize_shortcut(key).is_err());
+        let conflicted = normalize_shortcut(shortcut)
+            .ok()
+            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
+        page = page.child(
+            setting_card()
+                .child(shortcut_row(&entry.name, shortcut, invalid || conflicted))
+                .child(setting_button(
+                    "编辑快捷键",
+                    false,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.edit_server(Some(&entry), window, cx);
+                        this.start_shortcut_recording(window, cx);
+                    }),
+                )),
+        );
+    }
+    page = page.child(section_title("动态码"));
+    for entry in &workspace.settings.totp {
+        let entry = entry.clone();
+        let shortcut = entry.shortcut.as_deref().unwrap_or("未绑定");
+        let invalid = entry
+            .shortcut
+            .as_ref()
+            .is_some_and(|key| normalize_shortcut(key).is_err());
+        let conflicted = normalize_shortcut(shortcut)
+            .ok()
+            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
+        page = page.child(
+            setting_card()
+                .child(shortcut_row(&entry.name, shortcut, invalid || conflicted))
+                .child(setting_button(
+                    "编辑快捷键",
+                    false,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.edit_totp(Some(&entry), window, cx);
+                        this.start_shortcut_recording(window, cx);
+                    }),
+                )),
+        );
     }
     let has_conflict = counts.values().any(|count| *count > 1);
+    let invalid = workspace
+        .settings
+        .commands
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .shortcut
+                .as_ref()
+                .map(|key| (format!("命令 {}", entry.name), key))
+        })
+        .chain(workspace.settings.servers.iter().filter_map(|entry| {
+            entry
+                .shortcut
+                .as_ref()
+                .map(|key| (format!("服务器 {}", entry.name), key))
+        }))
+        .chain(workspace.settings.totp.iter().filter_map(|entry| {
+            entry
+                .shortcut
+                .as_ref()
+                .map(|key| (format!("动态码 {}", entry.name), key))
+        }))
+        .chain(
+            workspace
+                .settings
+                .shortcuts
+                .commands_panel
+                .as_ref()
+                .map(|key| ("命令面板".to_string(), key)),
+        )
+        .chain(
+            workspace
+                .settings
+                .shortcuts
+                .servers_panel
+                .as_ref()
+                .map(|key| ("服务器面板".to_string(), key)),
+        )
+        .filter(|(_, key)| normalize_shortcut(key).is_err())
+        .collect::<Vec<_>>();
+    if !invalid.is_empty() {
+        page = page.child(section_title("无效快捷键"));
+        for (label, key) in &invalid {
+            page = page.child(setting_card().child(shortcut_row(label, key, true)));
+        }
+    }
     page.child(
         div()
             .pt_2()
-            .text_color(if has_conflict {
+            .text_color(if has_conflict || !invalid.is_empty() {
                 rgb(0xF7768E)
             } else {
                 rgb(0x565A78)
             })
-            .child(if has_conflict {
-                "存在冲突绑定：请在对应编辑弹窗里修改（保存时也会被拦截）"
+            .child(if has_conflict || !invalid.is_empty() {
+                "存在冲突或无效绑定：请在对应编辑弹窗里修改（方向切换优先）"
             } else {
                 "绑定在命令 / 服务器 / 动态码的编辑弹窗里设置，保存时自动查重"
             }),
@@ -4271,7 +5229,11 @@ fn shortcut_row(label: &str, keys: &str, conflicted: bool) -> gpui::Div {
         } else {
             rgb(0xA9B1D6)
         })
-        .child(format!("{}{}", label, if conflicted { " ⚠ 冲突" } else { "" }))
+        .child(format!(
+            "{}{}",
+            label,
+            if conflicted { " ⚠ 冲突" } else { "" }
+        ))
         .child(value_chip(keys))
 }
 
@@ -4336,6 +5298,92 @@ fn value_chip(text: &str) -> gpui::Div {
         .border_color(rgb(0x343750))
         .rounded_sm()
         .text_color(rgb(0xC0CAF5))
+        .child(text.to_string())
+}
+
+/// 侧栏列表项使用低对比度背景，强调色留给选中项和主要操作。
+fn entry_card() -> gpui::Div {
+    div()
+        .mt_2()
+        .p_2()
+        .rounded_sm()
+        .bg(rgb(0x242637))
+        .hover(|style| style.bg(rgb(0x292B3D)))
+}
+
+/// 侧栏的固定标题与条目数量。
+fn sidebar_header(title: &str, count: usize) -> gpui::Div {
+    div()
+        .h(px(42.0))
+        .px_3()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_between()
+        .text_color(rgb(0xC0CAF5))
+        .child(title.to_string())
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(0x9AA0A6))
+                .child(count.to_string()),
+        )
+}
+
+fn sidebar_tab_button(
+    label: &'static str,
+    selected: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Div {
+    div()
+        .flex_1()
+        .h(px(30.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .bg(if selected {
+            rgb(0x2B3F5E)
+        } else {
+            rgb(0x202132)
+        })
+        .text_color(if selected {
+            rgb(0xC0D6FF)
+        } else {
+            rgb(0xA9B1D6)
+        })
+        .hover(|style| {
+            style.bg(if selected {
+                rgb(0x2B3F5E)
+            } else {
+                rgb(0x292B3D)
+            })
+        })
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(label)
+}
+
+fn sidebar_empty(title: &str, description: &str) -> gpui::Div {
+    div()
+        .pt_4()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(div().text_color(rgb(0xA9B1D6)).child(title.to_string()))
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(0x9AA0A6))
+                .child(description.to_string()),
+        )
+}
+
+/// 侧栏操作下方的辅助说明。
+fn panel_caption(text: &str) -> gpui::Div {
+    div()
+        .pt_2()
+        .text_size(px(11.0))
+        .text_color(rgb(0x9AA0A6))
         .child(text.to_string())
 }
 
@@ -4408,7 +5456,7 @@ fn create_local_terminal(
     shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
 ) -> (Entity<TerminalView>, Arc<SessionControl>) {
     // 会话的开启/spawn/回收线程全部内聚在 LocalSession（laterterm-local）
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let shell = laterterm_local::default_shell();
     let session: Arc<dyn TerminalSession> = Arc::new(
         LocalSession::spawn(LocalOptions {
             shell,
@@ -4431,39 +5479,9 @@ fn create_local_terminal(
     (terminal, session_control)
 }
 
-/// 服务器条目 → SSH 会话。阻塞式（含连接超时），必须放在后台线程调用。
-/// 凭据由调用方从密钥环取出后传入，本函数不做任何持久化。
-fn connect_ssh_session(
-    entry: &ServerEntry,
-    secret: Option<&str>,
-) -> anyhow::Result<Arc<dyn TerminalSession>> {
-    let auth = match entry.auth {
-        ServerAuthKind::PrivateKey => AuthMethod::PrivateKey {
-            key_path: entry.key_path.clone().unwrap_or_default().into(),
-            passphrase: secret.filter(|value| !value.is_empty()).map(String::from),
-        },
-        // 密码/交互认证必须有凭据（连接入口已保证，此处兜底报错）
-        ServerAuthKind::Password => AuthMethod::Password {
-            password: secret
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("缺少密码，请在服务器条目中补填凭据"))?
-                .to_string(),
-        },
-        ServerAuthKind::KeyboardInteractive => AuthMethod::KeyboardInteractive {
-            secret: secret
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow::anyhow!("缺少口令，请在服务器条目中补填凭据"))?
-                .to_string(),
-        },
-    };
-    let options = SshOptions::new(entry.host.as_str(), entry.port, entry.username.as_str(), auth);
-    let session = SshSession::connect(options).map_err(|error| anyhow::anyhow!("{error}"))?;
-    Ok(Arc::new(session))
-}
-
 /// 密钥环操作包一层 5s 超时：Secret Service 偶发卡住（等解锁/授权确认而
 /// 弹窗不可见）时给出可行动的错误，而不是让连接流程永远停住。
-fn run_secret_op<T, F>(op: F) -> anyhow::Result<T>
+pub(crate) fn run_secret_op<T, F>(op: F) -> anyhow::Result<T>
 where
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
     T: Send + 'static,
@@ -4482,7 +5500,7 @@ where
 
 /// 开一个本地 shell 会话（attach_pane 之外仅差标题命名，故独立成函数）。
 fn spawn_local_session() -> Arc<dyn TerminalSession> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let shell = laterterm_local::default_shell();
     Arc::new(
         LocalSession::spawn(LocalOptions {
             shell,
@@ -4525,27 +5543,13 @@ fn create_terminal_view(
         let shortcut_tx = shortcut_tx.clone();
         TerminalView::new(session, config, cx)
             .with_key_handler(move |event| {
-                let shortcut = if event.keystroke.modifiers.control
-                    && !event.keystroke.modifiers.shift
-                    && !event.keystroke.modifiers.alt
-                    && event.keystroke.key.eq_ignore_ascii_case("j")
-                {
+                let shortcut = if keystroke_matches_shortcut(event, "ctrl+j") {
                     Some(WorkspaceShortcut::Split(SplitDirection::Horizontal))
-                } else if event.keystroke.modifiers.control
-                    && !event.keystroke.modifiers.shift
-                    && !event.keystroke.modifiers.alt
-                    && event.keystroke.key.eq_ignore_ascii_case("k")
-                {
+                } else if keystroke_matches_shortcut(event, "ctrl+k") {
                     Some(WorkspaceShortcut::Split(SplitDirection::Vertical))
-                } else if event.keystroke.modifiers.control
-                    && event.keystroke.modifiers.shift
-                    && event.keystroke.key == "["
-                {
+                } else if keystroke_matches_shortcut(event, "ctrl+shift+[") {
                     Some(WorkspaceShortcut::FocusPrevious)
-                } else if event.keystroke.modifiers.control
-                    && event.keystroke.modifiers.shift
-                    && event.keystroke.key == "]"
-                {
+                } else if keystroke_matches_shortcut(event, "ctrl+shift+]") {
                     Some(WorkspaceShortcut::FocusNext)
                 } else {
                     None
@@ -4591,24 +5595,27 @@ macro_rules! set_color {
     };
 }
 
+fn pane_direction_for_keystroke(key: &gpui::Keystroke) -> Option<PaneDirection> {
+    let modifiers = &key.modifiers;
+    if !modifiers.control
+        || modifiers.shift
+        || modifiers.alt
+        || modifiers.platform
+        || modifiers.function
+    {
+        return None;
+    }
+    match key.key.to_ascii_lowercase().as_str() {
+        "left" => Some(PaneDirection::Left),
+        "right" => Some(PaneDirection::Right),
+        "up" => Some(PaneDirection::Up),
+        "down" => Some(PaneDirection::Down),
+        _ => None,
+    }
+}
+
 fn keystroke_matches_shortcut(event: &KeyDownEvent, shortcut: &str) -> bool {
-    let parts = shortcut.to_ascii_lowercase();
-    let tokens = parts.split('+').collect::<Vec<_>>();
-    let key = tokens.last().copied().unwrap_or_default();
-    let modifiers = &event.keystroke.modifiers;
-    let wants_ctrl = tokens
-        .iter()
-        .any(|token| matches!(*token, "ctrl" | "control"));
-    let wants_alt = tokens.contains(&"alt");
-    let wants_shift = tokens.contains(&"shift");
-    let wants_cmd = tokens
-        .iter()
-        .any(|token| matches!(*token, "cmd" | "super" | "meta"));
-    modifiers.control == wants_ctrl
-        && modifiers.alt == wants_alt
-        && modifiers.shift == wants_shift
-        && modifiers.platform == wants_cmd
-        && event.keystroke.key.eq_ignore_ascii_case(key)
+    crate::shortcut_recorder::matches_shortcut(&event.keystroke, shortcut)
 }
 
 fn palette_for(theme: &Theme) -> ColorPalette {
@@ -4638,8 +5645,421 @@ fn palette_for(theme: &Theme) -> ColorPalette {
 
 #[cfg(test)]
 mod exit_regression_tests {
-    use super::{SplitDirection, WorkspaceView};
-    use gpui::{MouseDownEvent, TestAppContext};
+    use super::{
+        PaneDirection, SplitDirection, WorkspaceView, config_event_requires_reload,
+        keystroke_matches_shortcut, pane_direction_for_keystroke,
+    };
+    use gpui::{KeyDownEvent, Keystroke, MouseDownEvent, TestAppContext};
+
+    #[test]
+    fn config_watcher_ignores_read_access_but_keeps_mutations() {
+        use notify::EventKind;
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, ModifyKind, RemoveKind, RenameMode,
+        };
+        for kind in [
+            EventKind::Access(AccessKind::Open(AccessMode::Read)),
+            EventKind::Access(AccessKind::Read),
+            EventKind::Access(AccessKind::Close(AccessMode::Read)),
+            EventKind::Access(AccessKind::Open(AccessMode::Write)),
+        ] {
+            assert!(!config_event_requires_reload(&kind), "{kind:?}");
+        }
+        for kind in [
+            EventKind::Create(CreateKind::File),
+            EventKind::Modify(ModifyKind::Data(DataChange::Content)),
+            EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            EventKind::Remove(RemoveKind::File),
+            EventKind::Access(AccessKind::Close(AccessMode::Write)),
+            EventKind::Any,
+        ] {
+            assert!(config_event_requires_reload(&kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn directional_shortcuts_require_only_control() {
+        for (key, expected) in [
+            ("left", PaneDirection::Left),
+            ("right", PaneDirection::Right),
+            ("up", PaneDirection::Up),
+            ("down", PaneDirection::Down),
+        ] {
+            let event = Keystroke::parse(&format!("ctrl-{key}")).unwrap();
+            assert_eq!(pane_direction_for_keystroke(&event), Some(expected));
+            for prefix in ["", "ctrl-shift-", "ctrl-alt-", "ctrl-cmd-"] {
+                let event = Keystroke::parse(&format!("{prefix}{key}")).unwrap();
+                assert_eq!(pane_direction_for_keystroke(&event), None);
+            }
+        }
+    }
+
+    #[test]
+    fn shortcut_match_uses_canonical_modifiers() {
+        let event = KeyDownEvent {
+            keystroke: Keystroke::parse("ctrl-shift-up").unwrap(),
+            is_held: false,
+        };
+        assert!(keystroke_matches_shortcut(&event, " Shift + Control + Up "));
+        assert!(!keystroke_matches_shortcut(&event, "mystery+ctrl+shift+up"));
+        assert!(!keystroke_matches_shortcut(&event, "ctrl+up"));
+    }
+
+    #[gpui::test]
+    fn native_window_shutdown_cancels_pending_work(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update(cx, |view, _| {
+            let save = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let connect = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            view.server_save = Some(save.clone());
+            view.ssh_request = Some(super::SshRequest {
+                id: 1,
+                entry: laterterm_config::ServerEntry::default(),
+                active: connect.clone(),
+                running: true,
+            });
+            view.shutdown();
+            view.shutdown();
+            assert!(!save.load(std::sync::atomic::Ordering::Acquire));
+            assert!(!connect.load(std::sync::atomic::Ordering::Acquire));
+            assert!(view.panes.iter().all(|pane| {
+                pane.session
+                    .closing
+                    .load(std::sync::atomic::Ordering::Acquire)
+            }));
+        });
+    }
+
+    #[gpui::test]
+    fn titlebar_logo_keeps_square_bounds_in_narrow_window(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        cx.simulate_resize(gpui::size(gpui::px(600.0), gpui::px(460.0)));
+        cx.run_until_parked();
+        let logo = cx
+            .debug_bounds("brand-logo")
+            .expect("标题栏必须包含品牌图标");
+        assert_eq!(logo.size, gpui::size(gpui::px(20.0), gpui::px(20.0)));
+        assert!(logo.top() >= gpui::px(0.0));
+        assert!(logo.bottom() <= gpui::px(super::TITLEBAR_HEIGHT));
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn extra_modifiers_do_not_trigger_builtin_tabs(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            window.activate_window();
+            view.focus_active(window, cx);
+        });
+        cx.simulate_keystrokes("ctrl-alt-t");
+        cx.simulate_keystrokes("ctrl-cmd-j");
+        cx.simulate_keystrokes("ctrl-cmd-k");
+        cx.run_until_parked();
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(view.panes.len(), 1, "备用分屏处理也必须精确匹配");
+            assert_eq!(view.tabs.len(), 1, "额外修饰键不能被内置 Ctrl+T 抢走");
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn panel_shortcuts_toggle_tabs_without_creating_sessions(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            view.settings.shortcuts.commands_panel = Some("ctrl+alt+c".into());
+            view.settings.shortcuts.servers_panel = Some("ctrl+alt+s".into());
+            window.activate_window();
+            view.focus_active(window, cx);
+        });
+        cx.simulate_keystrokes("ctrl-alt-c");
+        workspace.read_with(cx, |view, _| {
+            assert!(view.right_panel);
+            assert_eq!(view.right_panel_tab, super::RightPanelTab::Commands);
+            assert!(
+                view.check_shortcut_conflict(Some("ctrl+alt+c"), None)
+                    .is_some()
+            );
+        });
+        cx.simulate_keystrokes("ctrl-alt-s");
+        workspace.read_with(cx, |view, _| {
+            assert!(view.right_panel);
+            assert_eq!(view.right_panel_tab, super::RightPanelTab::Servers);
+        });
+        cx.simulate_keystrokes("ctrl-alt-s");
+        workspace.read_with(cx, |view, _| {
+            assert!(!view.right_panel);
+            assert_eq!(view.tabs.len(), 1);
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn recorder_captures_reserved_keys_and_escape_cancels_only_recording(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            view.edit_command(None, window, cx);
+            let recorder = view.shortcut_editor.as_ref().unwrap().recorder.clone();
+            recorder.update(cx, |recorder, cx| recorder.start(window, cx));
+            window.activate_window();
+        });
+        cx.simulate_keystrokes("ctrl-j");
+        workspace.update_in(cx, |view, window, cx| {
+            assert_eq!(view.panes.len(), 1);
+            let recorder = view.shortcut_editor.as_ref().unwrap().recorder.clone();
+            assert_eq!(recorder.read(cx).value(), Some("ctrl+j"));
+            recorder.update(cx, |recorder, cx| recorder.start(window, cx));
+        });
+        cx.simulate_keystrokes("escape");
+        workspace.read_with(cx, |view, cx| {
+            assert!(view.command_dialog.is_some());
+            assert_eq!(view.shortcut_value(cx).as_deref(), Some("ctrl+j"));
+        });
+        cx.simulate_keystrokes("escape");
+        workspace.read_with(cx, |view, _| {
+            assert!(view.command_dialog.is_none());
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn cancelled_connection_drops_late_prompts(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            let entry = laterterm_config::ServerEntry {
+                name: "取消测试".into(),
+                host: "invalid.test".into(),
+                username: "test".into(),
+                ..Default::default()
+            };
+            view.settings.servers = vec![entry.clone()];
+            view.ssh_request = Some(super::SshRequest {
+                id: 9,
+                entry: entry.clone(),
+                active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                running: true,
+            });
+            view.ssh_connecting = Some(entry.name.clone());
+            view.dismiss_server(window, cx);
+            view.finish_ssh_connect(
+                9,
+                entry,
+                Ok(super::ConnectionOutcome::Prompt {
+                    kind: super::CredentialKind::Login,
+                    warning: None,
+                }),
+                window,
+                cx,
+            );
+            assert!(view.server_dialog.is_none(), "取消后不能弹回旧凭据框");
+            assert!(view.ssh_connecting.is_none());
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn server_modal_scroll_reaches_footer_in_short_window(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        cx.simulate_resize(gpui::size(gpui::px(800.0), gpui::px(460.0)));
+        workspace.update_in(cx, |view, window, cx| {
+            view.edit_server(None, window, cx);
+            window.activate_window();
+        });
+        cx.run_until_parked();
+        let card = cx.debug_bounds("modal-card").unwrap();
+        assert!(card.bottom() <= gpui::px(460.0));
+        let before = cx.debug_bounds("modal-footer").unwrap();
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: card.center(),
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(-1200.0))),
+            modifiers: Default::default(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.run_until_parked();
+        let after = cx.debug_bounds("modal-footer").unwrap();
+        assert!(after.top() < before.top(), "长表单必须能够滚动");
+        assert!(after.bottom() <= card.bottom(), "保存与取消按钮必须可达");
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn all_item_editors_record_without_dispatch_or_terminal_input(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        for kind in 0..3 {
+            workspace.update_in(cx, |view, window, cx| {
+                match kind {
+                    0 => view.edit_command(None, window, cx),
+                    1 => view.edit_server(None, window, cx),
+                    _ => view.edit_totp(None, window, cx),
+                }
+                view.start_shortcut_recording(window, cx);
+                window.activate_window();
+            });
+            cx.simulate_keystrokes("ctrl-down");
+            cx.simulate_keystrokes("ctrl-t");
+            cx.simulate_keystrokes("a");
+            workspace.update_in(cx, |view, window, cx| {
+                assert_eq!(view.shortcut_value(cx).as_deref(), Some("ctrl+down"));
+                assert_eq!(view.tabs.len(), 1, "录制控件保留焦点时不分发工作区动作");
+                assert_eq!(view.panes.len(), 1);
+                for (_, field) in view
+                    .command_fields
+                    .iter()
+                    .chain(view.server_fields.iter())
+                    .chain(view.totp_fields.iter())
+                {
+                    if field.read(cx).value().is_empty() {
+                        continue;
+                    }
+                    assert!(
+                        !field.read(cx).value().contains('a'),
+                        "录制后的字符不能进入表单"
+                    );
+                }
+                match kind {
+                    0 => view.dismiss_command(window, cx),
+                    1 => view.dismiss_server(window, cx),
+                    _ => view.dismiss_totp(window, cx),
+                }
+            });
+        }
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn stale_success_closes_session_without_attaching_tab(cx: &mut TestAppContext) {
+        struct StaleSession(std::sync::atomic::AtomicBool);
+        impl laterterm_core::TerminalSession for StaleSession {
+            fn backend(&self) -> laterterm_core::BackendKind {
+                laterterm_core::BackendKind::Ssh
+            }
+            fn title(&self) -> String {
+                "stale".into()
+            }
+            fn take_streams(&self) -> std::io::Result<laterterm_core::SessionStreams> {
+                panic!("过期会话不得进入视图")
+            }
+            fn resize(&self, _: u16, _: u16) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn kill(&self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let session = std::sync::Arc::new(StaleSession(std::sync::atomic::AtomicBool::new(false)));
+        workspace.update_in(cx, |view, window, cx| {
+            view.finish_ssh_connect(
+                99,
+                laterterm_config::ServerEntry::default(),
+                Ok(super::ConnectionOutcome::Connected {
+                    session: session.clone(),
+                    warning: None,
+                }),
+                window,
+                cx,
+            );
+            assert_eq!(view.tabs.len(), 1);
+            assert!(session.0.load(std::sync::atomic::Ordering::Acquire));
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn control_arrows_follow_visible_nested_panes(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let (left, top, bottom) = workspace.update_in(cx, |view, window, cx| {
+            let left = view.focused_pane_id();
+            view.split_focused(SplitDirection::Horizontal, window, cx);
+            let top = view.focused_pane_id();
+            view.split_focused(SplitDirection::Vertical, window, cx);
+            let bottom = view.focused_pane_id();
+            view.focus_pane(left, window, cx);
+            window.activate_window();
+            (left, top, bottom)
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-right");
+        workspace.read_with(cx, |view, _| assert_eq!(view.focused_pane_id(), top));
+        cx.simulate_keystrokes("ctrl-down");
+        workspace.read_with(cx, |view, _| assert_eq!(view.focused_pane_id(), bottom));
+        cx.simulate_keystrokes("ctrl-down");
+        workspace.read_with(cx, |view, _| assert_eq!(view.focused_pane_id(), bottom));
+        cx.simulate_keystrokes("ctrl-left");
+        workspace.read_with(cx, |view, _| assert_eq!(view.focused_pane_id(), left));
+        workspace.update_in(cx, |view, window, cx| {
+            view.settings_open = true;
+            view.focus_active(window, cx);
+            cx.notify();
+        });
+        cx.simulate_keystrokes("ctrl-right");
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(view.focused_pane_id(), left, "设置面板打开时不能切换窗格");
+        });
+        workspace.update_in(cx, |view, window, cx| {
+            view.settings_open = false;
+            view.focus_pane(bottom, window, cx);
+        });
+        cx.simulate_resize(gpui::size(gpui::px(1280.0), gpui::px(760.0)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("ctrl-up");
+        workspace.update_in(cx, |view, window, cx| {
+            assert_eq!(view.focused_pane_id(), top, "窗口缩放后应使用新几何");
+            view.edit_command(None, window, cx);
+        });
+        cx.simulate_keystrokes("ctrl-left");
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(
+                view.focused_pane_id(),
+                top,
+                "输入弹窗不能被方向快捷键抢焦点"
+            );
+            assert!(view.command_dialog.is_some());
+        });
+        workspace.update_in(cx, |view, window, cx| {
+            view.dismiss_command(window, cx);
+            let command = laterterm_config::CommandTemplate {
+                name: "确认".into(),
+                template: "pwd".into(),
+                confirm: true,
+                ..Default::default()
+            };
+            view.open_command(&command, window, cx);
+        });
+        cx.simulate_keystrokes("ctrl-left");
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(
+                view.focused_pane_id(),
+                top,
+                "无输入框的预览弹窗也不能切换窗格"
+            );
+            assert!(view.command_dialog.is_some());
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
 
     #[gpui::test]
     fn close_hidden_split_and_last_pane(cx: &mut TestAppContext) {

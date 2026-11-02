@@ -52,13 +52,40 @@ use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
 use alacritty_terminal::grid::Dimensions;
 use gpui::{Edges, ElementInputHandler, EntityInputHandler, UTF16Selection, *};
-use std::time::Duration;
 use laterterm_core::TerminalSession;
 use std::io::{Read, Write};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
+use std::time::{Duration, Instant};
+
+// 诊断只在进程启动时开启；不记录字体名或终端内容。
+fn font_trace_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+fn font_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| font_trace_requested(std::env::var_os("LATERTERM_FONT_TRACE").as_deref()))
+}
+
+fn font_trace_reason(
+    enabled: bool,
+    needs_measurement: bool,
+    font_changed: bool,
+) -> Option<&'static str> {
+    if enabled && needs_measurement {
+        Some(if font_changed {
+            "font_change"
+        } else {
+            "initial"
+        })
+    } else {
+        None
+    }
+}
 
 /// Configuration for terminal creation and runtime updates.
 ///
@@ -379,6 +406,9 @@ pub struct TerminalView {
     /// The renderer for drawing terminal content
     renderer: TerminalRenderer,
 
+    /// 标记下一次字体度量对应配置变更而非首次渲染。
+    font_trace_changed: bool,
+
     /// Focus handle for keyboard event handling
     focus_handle: FocusHandle,
 
@@ -585,6 +615,7 @@ impl TerminalView {
         Self {
             state,
             renderer,
+            font_trace_changed: false,
             focus_handle,
             stdin_writer,
             event_rx,
@@ -805,6 +836,9 @@ impl TerminalView {
         // Ctrl+Shift+F 打开回滚搜索
         if keystroke.modifiers.control
             && keystroke.modifiers.shift
+            && !keystroke.modifiers.alt
+            && !keystroke.modifiers.platform
+            && !keystroke.modifiers.function
             && keystroke.key.eq_ignore_ascii_case("f")
         {
             self.open_search(cx);
@@ -1206,6 +1240,7 @@ impl TerminalView {
         self.renderer.font_fallbacks = config.font_fallbacks.clone();
         if font_changed {
             self.renderer.invalidate_measurement();
+            self.font_trace_changed = true;
         }
 
         // Store the new config
@@ -1357,9 +1392,27 @@ impl Render for TerminalView {
 
         // Get terminal state and renderer for rendering
         let state_arc = self.state.term_arc();
-        if self.renderer.needs_measurement() {
+        let needs_measurement = self.renderer.needs_measurement();
+        let trace = font_trace_reason(
+            font_trace_enabled(),
+            needs_measurement,
+            self.font_trace_changed,
+        )
+        .map(|reason| {
+            (
+                reason,
+                Instant::now(),
+                cx.entity_id(),
+                window.scale_factor(),
+            )
+        });
+        if needs_measurement {
             self.renderer.measure_cell(window);
+            self.font_trace_changed = false;
         }
+        let trace = trace.map(|(reason, started, entity_id, scale)| {
+            (reason, started, entity_id, scale, started.elapsed())
+        });
         // metrics 已在实体 render 阶段测量完成；canvas 只捕获一次不可变快照，
         // 避免每个标签切换/每帧再 clone 后重复测量。
         let renderer = self.renderer.clone();
@@ -1471,25 +1524,51 @@ impl Render for TerminalView {
                         }
 
                         // Resize the grid first, then notify the PTY without holding its lock.
-                        let needs_resize = {
+                        let resize_lock_started = trace.map(|_| Instant::now());
+                        let (needs_resize, old_cols, old_rows, resize_lock_wait, resize_elapsed) = {
                             let mut term = state_arc.lock();
+                            let resize_lock_wait = resize_lock_started.map(|started| started.elapsed());
                             let current_cols = term.columns();
                             let current_rows = term.screen_lines();
                             if cols != current_cols || rows != current_rows {
+                                let resize_started = trace.map(|_| Instant::now());
                                 term.resize(TermSize { cols, rows });
-                                true
+                                (
+                                    true,
+                                    current_cols,
+                                    current_rows,
+                                    resize_lock_wait,
+                                    resize_started.map(|started| started.elapsed()),
+                                )
                             } else {
-                                false
+                                (false, current_cols, current_rows, resize_lock_wait, None)
                             }
                         };
-                        if needs_resize && let Some(ref callback) = resize_callback {
-                            callback(cols, rows);
-                        }
+                        let callback_elapsed = if needs_resize {
+                            if let Some(ref callback) = resize_callback {
+                                let callback_started = trace.map(|_| Instant::now());
+                                callback(cols, rows);
+                                callback_started.map(|started| started.elapsed())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
 
+                        let paint_lock_started = trace.map(|_| Instant::now());
                         let term = state_arc.lock();
+                        let paint_lock_wait = paint_lock_started.map(|started| started.elapsed());
+                        let history_lines = trace.map(|_| term.grid().total_lines() - term.screen_lines());
 
                         // Paint the terminal with measured dimensions
+                        let paint_started = trace.map(|_| Instant::now());
                         measured_renderer.paint(bounds, padding, &term, window, cx);
+                        let paint_elapsed = paint_started.map(|started| started.elapsed());
+
+                        let trace_report = trace.map(|(reason, started, entity_id, scale, measure_elapsed)| {
+                            (reason, entity_id, scale, measure_elapsed, started.elapsed())
+                        });
 
                         // 当前搜索命中的高亮覆盖层（网格坐标锚定，随滚动移动）
                         if search_open && let Some(match_) = current_match {
@@ -1533,6 +1612,26 @@ impl Render for TerminalView {
                                 &marked_text,
                             );
                         }
+                        // 持锁完成后再输出，避免诊断 I/O 阻塞 PTY 读线程。
+                        drop(term);
+                        if let Some((reason, entity_id, scale, measure_elapsed, total_elapsed)) = trace_report {
+                            let as_ms = |duration: Option<Duration>| {
+                                duration.map(|value| value.as_secs_f64() * 1000.0)
+                            };
+                            eprintln!(
+                                "[font-trace] phase=termview entity={entity_id} reason={reason} scale={scale:.2} old_grid={old_cols}x{old_rows} grid={cols}x{rows} history_lines={} cell_px={:.2}x{:.2} measure_ms={:.3} resize_lock_ms={:?} resize_ms={:?} callback_ms={:?} paint_lock_ms={:?} paint_ms={:?} render_to_paint_ms={:.3}",
+                                history_lines.unwrap_or_default(),
+                                cell_width_f32,
+                                cell_height_f32,
+                                measure_elapsed.as_secs_f64() * 1000.0,
+                                as_ms(resize_lock_wait),
+                                as_ms(resize_elapsed),
+                                as_ms(callback_elapsed),
+                                as_ms(paint_lock_wait),
+                                as_ms(paint_elapsed),
+                                total_elapsed.as_secs_f64() * 1000.0,
+                            );
+                        }
                     },
                 )
                 .size_full(),
@@ -1571,6 +1670,75 @@ mod tests {
             Ok(())
         }
         fn kill(&self) {}
+    }
+
+    #[test]
+    fn font_trace_is_opt_in_and_only_covers_remeasurement() {
+        use super::{font_trace_reason, font_trace_requested};
+        use std::ffi::OsStr;
+
+        assert!(!font_trace_requested(None));
+        assert!(!font_trace_requested(Some(OsStr::new("0"))));
+        assert!(!font_trace_requested(Some(OsStr::new("true"))));
+        assert!(font_trace_requested(Some(OsStr::new("1"))));
+        assert_eq!(font_trace_reason(false, true, true), None);
+        assert_eq!(font_trace_reason(true, false, false), None);
+        assert_eq!(font_trace_reason(true, false, true), None);
+        assert_eq!(font_trace_reason(true, true, false), Some("initial"));
+        assert_eq!(font_trace_reason(true, true, true), Some("font_change"));
+    }
+
+    #[gpui::test]
+    fn search_shortcut_rejects_extra_modifiers(cx: &mut TestAppContext) {
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.on_key_down(
+                &gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke::parse("ctrl-alt-shift-f").unwrap(),
+                    is_held: false,
+                },
+                window,
+                cx,
+            );
+            assert!(terminal.search.is_none(), "额外修饰键不能打开搜索");
+        });
+    }
+
+    #[gpui::test]
+    fn font_invalidation_is_consumed_by_next_render(cx: &mut TestAppContext) {
+        use gpui::px;
+
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        terminal.read_with(cx, |terminal, _| {
+            assert!(!terminal.renderer.needs_measurement());
+            assert!(!terminal.font_trace_changed);
+        });
+
+        terminal.update(cx, |terminal, cx| {
+            let mut config = terminal.config().clone();
+            config.font_size += px(1.0);
+            terminal.update_config(config, cx);
+            assert!(terminal.renderer.needs_measurement());
+            assert!(terminal.font_trace_changed);
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        terminal.read_with(cx, |terminal, _| {
+            assert!(!terminal.renderer.needs_measurement());
+            assert!(!terminal.font_trace_changed);
+        });
+
+        terminal.update(cx, |terminal, cx| {
+            let mut config = terminal.config().clone();
+            config.ligatures = !config.ligatures;
+            terminal.update_config(config, cx);
+            assert!(!terminal.renderer.needs_measurement());
+            assert!(!terminal.font_trace_changed);
+        });
     }
 
     #[gpui::test]

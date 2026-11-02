@@ -1,0 +1,83 @@
+name: Native platform builds
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          targets: x86_64-pc-windows-msvc
+      - name: Locate Windows SDK resource and shader tools
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rc.exe -ErrorAction SilentlyContinue)) { throw 'Windows SDK rc.exe unavailable' }
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe unavailable' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - uses: Swatinem/rust-cache@v2
+      - name: Build native Windows release
+        run: cargo build -p laterterm-app --release --target x86_64-pc-windows-msvc
+      - name: Check EXE icon resource ID 1
+        shell: pwsh
+        run: |
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class ResourceCheck {
+            [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern IntPtr LoadLibraryEx(string path, IntPtr reserved, uint flags);
+            [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+            public static extern IntPtr FindResource(IntPtr module, IntPtr name, IntPtr type);
+            [DllImport("kernel32.dll")]
+            public static extern bool FreeLibrary(IntPtr module);
+          }
+          '@
+          $exe = (Resolve-Path 'target/x86_64-pc-windows-msvc/release/laterterm.exe').Path
+          $module = [ResourceCheck]::LoadLibraryEx($exe, [IntPtr]::Zero, 2)
+          if ($module -eq [IntPtr]::Zero) { throw 'Unable to read executable resources' }
+          try {
+            if ([ResourceCheck]::FindResource($module, [IntPtr]1, [IntPtr]14) -eq [IntPtr]::Zero) {
+              throw 'RT_GROUP_ICON ID 1 is missing'
+            }
+          } finally { [void][ResourceCheck]::FreeLibrary($module) }
+      - name: Test native local PTY contract
+        run: cargo test -p laterterm-local --lib --target x86_64-pc-windows-msvc
+
+  macos-release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          targets: aarch64-apple-darwin
+      - name: Check Apple SDK and Metal tools
+        run: |
+          xcodebuild -version
+          xcrun --find metal
+          xcrun --find metallib
+      - uses: Swatinem/rust-cache@v2
+      - name: Build native macOS release
+        run: cargo build -p laterterm-app --release --target aarch64-apple-darwin
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Assemble unsigned application bundle
+        run: |
+          bash script/package-macos.sh --binary "$PWD/target/aarch64-apple-darwin/release/laterterm" --output "$RUNNER_TEMP/laterterm-bundle"
+          plutil -lint "$RUNNER_TEMP/laterterm-bundle/LaterTerm.app/Contents/Info.plist"
+          file "$RUNNER_TEMP/laterterm-bundle/LaterTerm.app/Contents/MacOS/laterterm"
+      - name: Test native local PTY contract
+        run: cargo test -p laterterm-local --lib --target aarch64-apple-darwin

@@ -179,6 +179,10 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// 归一化 `修饰键+主按键`，用于校验及冲突比较，不修改保存的原始文本。
+///
+/// `control` 等同于 `ctrl`，`super`、`meta` 等同于 `cmd`；修饰键按
+/// `ctrl`、`alt`、`shift`、`cmd` 的顺序输出，同一修饰键不能重复。
 pub fn normalize_shortcut(shortcut: &str) -> Result<String> {
     let normalized = shortcut
         .split('+')
@@ -192,17 +196,37 @@ pub fn normalize_shortcut(shortcut: &str) -> Result<String> {
         bail!("快捷键过长");
     }
     let modifiers = ["ctrl", "control", "alt", "shift", "cmd", "super", "meta"];
-    if !modifiers.contains(&key.as_str())
-        && key
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || "[]\\\\-_=;,./".contains(ch))
-    {
-        return Ok(normalized.join("+"));
-    }
     if modifiers.contains(&key.as_str()) {
         bail!("快捷键必须包含主按键");
     }
-    bail!("快捷键包含非法按键")
+    if !key
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || "[]\\\\-_=;,./".contains(ch))
+    {
+        bail!("快捷键包含非法按键");
+    }
+
+    let mut present = [false; 4];
+    for modifier in &normalized[..normalized.len() - 1] {
+        let index = match modifier.as_str() {
+            "ctrl" | "control" => 0,
+            "alt" => 1,
+            "shift" => 2,
+            "cmd" | "super" | "meta" => 3,
+            _ => bail!("未知快捷键修饰键: {modifier}"),
+        };
+        if present[index] {
+            bail!("快捷键修饰键重复: {modifier}");
+        }
+        present[index] = true;
+    }
+    let mut result = ["ctrl", "alt", "shift", "cmd"]
+        .into_iter()
+        .zip(present)
+        .filter_map(|(name, included)| included.then_some(name))
+        .collect::<Vec<_>>();
+    result.push(key);
+    Ok(result.join("+"))
 }
 
 fn validate_shortcut(shortcut: &str) -> Result<()> {
@@ -295,6 +319,360 @@ mod tests {
         assert!(normalize_shortcut("ctrl").is_err());
         let conflicts = shortcut_conflicts([("a", "ctrl+k"), ("b", " Ctrl+K ")]);
         assert_eq!(conflicts.len(), 1);
+    }
+
+    #[test]
+    fn normalizes_shortcut_modifier_aliases_and_order() {
+        for (input, expected) in [
+            (" Control + Left ", "ctrl+left"),
+            ("CONTROL+UP", "ctrl+up"),
+            ("Ctrl+Right", "ctrl+right"),
+            ("ctrl+down", "ctrl+down"),
+            ("shift+control+k", "ctrl+shift+k"),
+            ("SHIFT+ALT+CONTROL+K", "ctrl+alt+shift+k"),
+            ("meta+shift+superkey", "shift+cmd+superkey"),
+            ("Super+ALT+Control+Shift+K", "ctrl+alt+shift+cmd+k"),
+            ("cmd+alt+k", "alt+cmd+k"),
+            ("META+ALT+K", "alt+cmd+k"),
+        ] {
+            let normalized = normalize_shortcut(input).unwrap();
+            assert_eq!(normalized, expected, "{input}");
+            assert_eq!(
+                normalize_shortcut(&normalized).unwrap(),
+                normalized,
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn shortcut_conflicts_compare_aliases_and_modifier_order() {
+        let conflicts = shortcut_conflicts([
+            ("方向", "ctrl+left"),
+            ("方向别名", "Control+Left"),
+            ("另一个方向", "ctrl+right"),
+            ("多修饰键", "alt+ctrl+shift+k"),
+            ("重排", "shift+control+alt+k"),
+            ("平台", "meta+alt+1"),
+            ("平台别名", "alt+super+1"),
+            ("无效输入", "hyper+alt+1"),
+        ]);
+        assert_eq!(
+            conflicts,
+            [
+                "方向 与 方向别名 冲突: ctrl+left",
+                "多修饰键 与 重排 冲突: ctrl+alt+shift+k",
+                "平台 与 平台别名 冲突: alt+cmd+1",
+            ]
+        );
+    }
+
+    #[test]
+    fn shortcut_rejects_duplicate_and_unknown_modifiers() {
+        for input in [
+            "ctrl+ctrl+k",
+            "ctrl+control+left",
+            "alt+alt+k",
+            "shift+SHIFT+k",
+            "cmd+super+k",
+            "meta+cmd+k",
+        ] {
+            let error = normalize_shortcut(input).unwrap_err().to_string();
+            assert!(error.contains("重复"), "{input}: {error}");
+        }
+        for input in ["hyper+k", "ctrl+unknown+left", "k+ctrl+left"] {
+            let error = normalize_shortcut(input).unwrap_err().to_string();
+            assert!(error.contains("修饰键"), "{input}: {error}");
+        }
+    }
+
+    #[test]
+    fn shortcut_rejects_malformed_inputs() {
+        for input in [
+            "",
+            "ctrl",
+            "ctrl+",
+            "+ctrl+k",
+            "ctrl++k",
+            "ctrl+ +k",
+            "ctrl+shift",
+            "ctrl+\0",
+            "ctrl+!",
+            "ctrl+a b",
+            "ctrl+中文",
+            "ctrl+abcdefghijklmnopqrstu",
+            "control+alt+shift+super+abcdefghijklmnopq",
+        ] {
+            assert!(normalize_shortcut(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn existing_builtin_and_punctuation_shortcuts_remain_compatible() {
+        for shortcut in [
+            "ctrl+t",
+            "ctrl+w",
+            "ctrl+j",
+            "ctrl+k",
+            "ctrl+left",
+            "ctrl+right",
+            "ctrl+up",
+            "ctrl+down",
+            "ctrl+shift+[",
+            "ctrl+shift+]",
+            "ctrl+shift+f",
+            "ctrl+alt+1",
+            "ctrl+-",
+            "ctrl+_",
+            "ctrl+=",
+            "ctrl+;",
+            "ctrl+,",
+            "ctrl+.",
+            "ctrl+/",
+            "ctrl+\\",
+        ] {
+            assert_eq!(normalize_shortcut(shortcut).unwrap(), shortcut);
+        }
+        for (builtin, equivalent) in [
+            ("ctrl+t", "control+t"),
+            ("ctrl+left", "CONTROL+LEFT"),
+            ("ctrl+right", "Control+Right"),
+            ("ctrl+up", "control+up"),
+            ("ctrl+down", "Ctrl+Down"),
+            ("ctrl+shift+[", "shift+control+["),
+            ("ctrl+shift+]", "shift+ctrl+]"),
+            ("ctrl+shift+f", "shift+control+F"),
+        ] {
+            assert_eq!(
+                shortcut_conflicts([("内置", builtin), ("用户", equivalent)]).len(),
+                1,
+                "{builtin} 与 {equivalent} 应当冲突"
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_shortcuts_keep_original_spelling_and_detect_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[commands]]
+name = "one"
+template = "printf one"
+shortcut = " Shift + Control + K "
+
+[[commands]]
+name = "two"
+template = "printf two"
+shortcut = "ctrl+shift+k"
+"#,
+        )
+        .unwrap();
+        let mut settings = crate::Settings::load(&path).unwrap();
+        assert_eq!(
+            settings.commands[0].shortcut.as_deref(),
+            Some(" Shift + Control + K ")
+        );
+        assert_eq!(settings.command_shortcut_conflicts().len(), 1);
+        settings
+            .upsert_command(settings.commands[0].clone())
+            .unwrap();
+        settings.save_to(&path).unwrap();
+        let reloaded = crate::Settings::load(&path).unwrap();
+        assert_eq!(reloaded.commands, settings.commands);
+        assert_eq!(reloaded.command_shortcut_conflicts().len(), 1);
+    }
+
+    #[test]
+    fn server_and_totp_legacy_shortcuts_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[servers]]
+name = "server"
+host = "example.test"
+username = "ops"
+shortcut = "Shift+Control+Left"
+
+[[totp]]
+name = "otp"
+shortcut = "META+alt+1"
+"#,
+        )
+        .unwrap();
+        let mut settings = crate::Settings::load(&path).unwrap();
+        assert_eq!(settings.servers.len(), 1);
+        assert_eq!(settings.totp.len(), 1);
+        assert_eq!(
+            settings.servers[0].shortcut.as_deref(),
+            Some("Shift+Control+Left")
+        );
+        assert_eq!(settings.totp[0].shortcut.as_deref(), Some("META+alt+1"));
+        settings.upsert_server(settings.servers[0].clone()).unwrap();
+        settings.upsert_totp(settings.totp[0].clone()).unwrap();
+        assert_eq!(
+            shortcut_conflicts([
+                ("server", settings.servers[0].shortcut.as_deref().unwrap()),
+                ("server duplicate", "ctrl+shift+left"),
+                ("otp", settings.totp[0].shortcut.as_deref().unwrap()),
+                ("otp duplicate", "alt+cmd+1"),
+            ])
+            .len(),
+            2
+        );
+        settings.save_to(&path).unwrap();
+        let reloaded = crate::Settings::load(&path).unwrap();
+        assert_eq!(reloaded.servers, settings.servers);
+        assert_eq!(reloaded.totp, settings.totp);
+    }
+
+    #[test]
+    fn duplicate_and_unknown_modifiers_fail_save_validation() {
+        for shortcut in ["ctrl+control+left", "hyper+left"] {
+            let command = CommandTemplate {
+                name: "cmd".into(),
+                template: "true".into(),
+                shortcut: Some(shortcut.into()),
+                ..Default::default()
+            };
+            let server = crate::ServerEntry {
+                name: "server".into(),
+                host: "example.test".into(),
+                username: "ops".into(),
+                shortcut: Some(shortcut.into()),
+                ..Default::default()
+            };
+            let totp = crate::TotpEntry {
+                name: "otp".into(),
+                shortcut: Some(shortcut.into()),
+                ..Default::default()
+            };
+            let mut settings = crate::Settings::default();
+            assert!(settings.upsert_command(command).is_err(), "{shortcut}");
+            assert!(settings.upsert_server(server).is_err(), "{shortcut}");
+            assert!(settings.upsert_totp(totp).is_err(), "{shortcut}");
+        }
+    }
+
+    #[test]
+    fn legacy_invalid_shortcuts_keep_server_and_totp_values_after_load_and_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[commands]]
+name = "command"
+template = "true"
+shortcut = "ctrl+hyper+1"
+
+[[servers]]
+name = "duplicate"
+host = "example.test"
+username = "ops"
+shortcut = " Ctrl + Control + Left "
+
+[[servers]]
+name = "unknown"
+host = "example.test"
+username = "ops"
+shortcut = "hyper+left"
+
+[[servers]]
+name = "empty-shortcut"
+host = "example.test"
+username = "ops"
+shortcut = " "
+
+[[servers]]
+name = "bad-host"
+host = ""
+username = "ops"
+shortcut = "hyper+left"
+
+[[totp]]
+name = "otp"
+shortcut = "ctrl+ctrl+right"
+"#,
+        )
+        .unwrap();
+        let mut settings = crate::Settings::load(&path).unwrap();
+        assert_eq!(
+            settings.servers.len(),
+            3,
+            "合法连接信息不能被错误快捷键影响"
+        );
+        assert_eq!(
+            settings.commands[0].shortcut.as_deref(),
+            Some("ctrl+hyper+1")
+        );
+        assert_eq!(
+            settings.servers[0].shortcut.as_deref(),
+            Some(" Ctrl + Control + Left ")
+        );
+        assert_eq!(settings.servers[1].shortcut.as_deref(), Some("hyper+left"));
+        assert_eq!(settings.servers[2].shortcut.as_deref(), Some(" "));
+        assert_eq!(
+            settings.totp[0].shortcut.as_deref(),
+            Some("ctrl+ctrl+right")
+        );
+        assert!(settings.commands[0].validate().is_err());
+        assert!(settings.servers[0].validate().is_err());
+        assert!(settings.servers[1].validate().is_err());
+        assert!(settings.servers[2].validate().is_err());
+        assert!(settings.totp[0].validate().is_err());
+        assert!(
+            settings
+                .upsert_command(settings.commands[0].clone())
+                .is_err()
+        );
+        assert!(settings.upsert_server(settings.servers[0].clone()).is_err());
+        assert!(settings.upsert_totp(settings.totp[0].clone()).is_err());
+        settings.save_to(&path).unwrap();
+        let reloaded = crate::Settings::load(&path).unwrap();
+        assert_eq!(reloaded.commands, settings.commands);
+        assert_eq!(reloaded.servers, settings.servers);
+        assert_eq!(reloaded.totp, settings.totp);
+    }
+
+    #[test]
+    fn importing_servers_retains_invalid_shortcut_without_disabling_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("servers.toml");
+        let file = crate::ServersFile::new(vec![crate::ServerEntry {
+            name: " server ".into(),
+            host: " example.test ".into(),
+            username: " ops ".into(),
+            shortcut: Some(" Ctrl + Control + Left ".into()),
+            ..Default::default()
+        }]);
+        file.save_to(&path).unwrap();
+        let imported = crate::ServersFile::load_from(&path).unwrap();
+        let server = imported
+            .servers
+            .into_iter()
+            .next()
+            .unwrap()
+            .sanitized()
+            .unwrap();
+        assert_eq!(server.name, "server");
+        assert_eq!(server.host, "example.test");
+        assert_eq!(server.shortcut.as_deref(), Some(" Ctrl + Control + Left "));
+        assert!(server.validate().is_err());
+        let mut settings = crate::Settings::default();
+        assert!(settings.upsert_server(server.clone()).is_err());
+        // UI 的导入路径在检查重名后直接保存 sanitized 返回的条目。
+        settings.servers.push(server);
+        let settings_path = dir.path().join("settings.toml");
+        settings.save_to(&settings_path).unwrap();
+        assert_eq!(
+            crate::Settings::load(&settings_path).unwrap().servers,
+            settings.servers
+        );
     }
 
     #[test]

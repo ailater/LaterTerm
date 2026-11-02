@@ -11,6 +11,65 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// 返回当前平台的默认 shell 可执行文件。
+///
+/// 仅接受绝对路径且不含控制字符或引号，避免把环境变量误当作带参数的
+/// shell 命令拼接执行。路径中的空格是合法的，环境变量读取集中在这里，调用方无需修改进程环境。
+pub fn default_shell() -> String {
+    #[cfg(unix)]
+    {
+        default_shell_from_env(std::env::var("SHELL").ok().as_deref())
+    }
+    #[cfg(windows)]
+    {
+        default_shell_from_env(
+            std::env::var("COMSPEC").ok().as_deref(),
+            std::env::var("SystemRoot").ok().as_deref(),
+        )
+    }
+}
+
+#[cfg(unix)]
+fn default_shell_from_env(shell: Option<&str>) -> String {
+    shell
+        .filter(|value| is_valid_shell_path(value))
+        .unwrap_or("/bin/bash")
+        .to_owned()
+}
+
+#[cfg(unix)]
+fn is_valid_shell_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '\'' | '"'))
+        && Path::new(value).is_absolute()
+}
+
+#[cfg(windows)]
+fn default_shell_from_env(comspec: Option<&str>, system_root: Option<&str>) -> String {
+    if comspec.is_some_and(is_valid_shell_path) {
+        return comspec.unwrap().to_owned();
+    }
+    if let Some(root) = system_root.filter(|value| is_valid_shell_path(value)) {
+        return Path::new(root)
+            .join("System32")
+            .join("cmd.exe")
+            .to_string_lossy()
+            .into_owned();
+    }
+    "cmd.exe".to_owned()
+}
+
+#[cfg(windows)]
+fn is_valid_shell_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '\'' | '"'))
+        && Path::new(value).is_absolute()
+}
+
 /// 本地会话启动参数。
 pub struct LocalOptions {
     /// shell 可执行文件路径（如 $SHELL 解析结果）。
@@ -135,8 +194,81 @@ mod tests {
     use super::*;
     use std::io::Read;
 
+    #[cfg(unix)]
     fn shell_path() -> String {
-        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into())
+        "/bin/sh".into()
+    }
+
+    #[cfg(windows)]
+    fn shell_path() -> String {
+        default_shell()
+    }
+
+    fn shell_args(command: &str) -> Vec<String> {
+        #[cfg(unix)]
+        {
+            vec!["-c".into(), command.into()]
+        }
+        #[cfg(windows)]
+        {
+            vec!["/D".into(), "/S".into(), "/C".into(), command.into()]
+        }
+    }
+
+    #[cfg(unix)]
+    fn echo_command() -> &'static str {
+        "printf laterterm-ok"
+    }
+
+    #[cfg(windows)]
+    fn echo_command() -> &'static str {
+        "echo laterterm-ok"
+    }
+
+    #[cfg(unix)]
+    fn long_command() -> &'static str {
+        "sleep 30"
+    }
+
+    #[cfg(windows)]
+    fn long_command() -> &'static str {
+        "ping -n 30 127.0.0.1 >NUL"
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_shell_keeps_valid_absolute_shell() {
+        assert_eq!(default_shell_from_env(Some("/bin/sh")), "/bin/sh");
+        assert_eq!(
+            default_shell_from_env(Some("/opt/My Shell/bin/sh")),
+            "/opt/My Shell/bin/sh"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_shell_rejects_invalid_values() {
+        assert_eq!(default_shell_from_env(None), "/bin/bash");
+        assert_eq!(default_shell_from_env(Some("bash -l")), "/bin/bash");
+        assert_eq!(default_shell_from_env(Some("relative-shell")), "/bin/bash");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_shell_uses_comspec_then_system_root() {
+        assert_eq!(
+            default_shell_from_env(Some(r"C:\custom\cmd.exe"), Some(r"C:\Windows")),
+            r"C:\custom\cmd.exe"
+        );
+        assert_eq!(
+            default_shell_from_env(None, Some(r"C:\Windows")),
+            r"C:\Windows\System32\cmd.exe"
+        );
+        assert_eq!(default_shell_from_env(Some(""), None), "cmd.exe");
+        assert_eq!(
+            default_shell_from_env(Some(r"C:\Program Files\Shell\cmd.exe"), None),
+            r"C:\Program Files\Shell\cmd.exe"
+        );
     }
 
     /// 会话契约：echo 一次输出 → 读端拿到字节；二次 take_streams 报错。
@@ -144,7 +276,7 @@ mod tests {
     fn echo_output_reaches_reader_and_streams_are_take_once() {
         let session = LocalSession::spawn(LocalOptions {
             shell: shell_path(),
-            args: vec!["-c".into(), "printf laterterm-ok".into()],
+            args: shell_args(echo_command()),
             env: vec![],
             cols: 20,
             rows: 5,
@@ -167,7 +299,7 @@ mod tests {
     fn resize_applies_without_error() {
         let session = LocalSession::spawn(LocalOptions {
             shell: shell_path(),
-            args: vec!["-c".into(), "sleep 30".into()],
+            args: shell_args(long_command()),
             env: vec![],
             cols: 20,
             rows: 5,

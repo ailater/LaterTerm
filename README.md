@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/icons/png/laterterm-256.png" alt="LaterTerm Logo" width="112" height="112">
+
 # 🚧 LaterTerm
 
 [![Rust](https://img.shields.io/badge/Rust-1.85+-orange.svg)](https://www.rust-lang.org/)
@@ -60,6 +62,8 @@ git clone git@github.com:crazykun/LaterTerm.git
 cd LaterTerm
 cargo run --release
 ```
+
+> 图标资源、Linux 桌面集成和 Windows/macOS 原生构建边界见 [跨平台与品牌资源](docs/platforms.md)。Windows/macOS 资源已准备不等于原生运行已验收。
 
 > 架构决策与技术文档见 `docs/`（随 M0 落地）。
 

@@ -5,8 +5,8 @@
 //! 文件缺省视为「尚未见过该主机」，走首连记录路径。
 
 use russh::client;
-use russh::keys::{Error as KeysError, PublicKeyOrCertificate, check_known_hosts_path};
 use russh::keys::known_hosts::learn_known_hosts_path;
+use russh::keys::{Error as KeysError, PublicKeyOrCertificate, check_known_hosts_path};
 use std::fmt;
 use std::path::PathBuf;
 

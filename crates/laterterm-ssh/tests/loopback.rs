@@ -17,29 +17,43 @@ use tokio::net::TcpListener;
 /// 最小 mock 服务器：任意密码/公钥放行，PTY+shell 回 Success，
 /// 数据原样加前缀回显——足够驱动 SshSession 的完整数据路径。
 #[derive(Clone)]
-struct MockHandler;
+struct MockHandler {
+    accepted_key: Option<russh::keys::PublicKey>,
+}
 
 impl russh::server::Server for MockHandler {
     type Handler = Self;
 
     fn new_client(&mut self, _: Option<SocketAddr>) -> Self {
-        Self
+        self.clone()
     }
 }
 
 impl russh::server::Handler for MockHandler {
     type Error = russh::Error;
 
-    async fn auth_password(&mut self, _: &str, _: &str) -> Result<russh::server::Auth, Self::Error> {
+    async fn auth_password(
+        &mut self,
+        _: &str,
+        _: &str,
+    ) -> Result<russh::server::Auth, Self::Error> {
         Ok(russh::server::Auth::Accept)
     }
 
     async fn auth_publickey(
         &mut self,
         _: &str,
-        _: russh::server::VerifiedPublicKey<'_>,
+        key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<russh::server::Auth, Self::Error> {
-        Ok(russh::server::Auth::Accept)
+        if self
+            .accepted_key
+            .as_ref()
+            .is_none_or(|accepted| accepted == key.public_key)
+        {
+            Ok(russh::server::Auth::Accept)
+        } else {
+            Ok(russh::server::Auth::reject())
+        }
     }
 
     async fn channel_open_session(
@@ -119,12 +133,17 @@ impl MockServer {
     /// 在 `port` 上起服务器（0 = 临时端口）；端口被占用时短暂重试，
     /// 以支持「同端口换主机键」的用例。
     fn start(port: u16) -> Self {
+        Self::start_with_key(port, None)
+    }
+
+    fn start_with_key(port: u16, accepted_key: Option<russh::keys::PublicKey>) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .expect("mock runtime");
-        let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("生成主机键");
+        let host_key =
+            PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("生成主机键");
         let config = Arc::new(russh::server::Config {
             keys: vec![host_key],
             auth_rejection_time: Duration::ZERO,
@@ -150,7 +169,7 @@ impl MockServer {
             if port_tx.send(listener.local_addr().unwrap().port()).is_err() {
                 return; // 启动方已放弃等待
             }
-            let mut handler = MockHandler;
+            let mut handler = MockHandler { accepted_key };
             let running = handler.run_on_socket(Arc::clone(&config), &listener);
             let _ = running.await;
         });
@@ -270,9 +289,13 @@ fn publickey_auth_reaches_shell() {
         .tempdir()
         .expect("密钥临时目录");
     let key_path = key_dir.path().join("id_ed25519");
-    let client_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("生成客户端密钥");
-    std::fs::write(&key_path, client_key.to_openssh(LineEnding::LF).unwrap().as_bytes())
-        .expect("写密钥文件");
+    let client_key =
+        PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).expect("生成客户端密钥");
+    std::fs::write(
+        &key_path,
+        client_key.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+    )
+    .expect("写密钥文件");
 
     let session = SshSession::connect(options_for(
         server.port,
@@ -289,6 +312,60 @@ fn publickey_auth_reaches_shell() {
     read_until(&mut streams, "Got data: via-key");
     session.kill();
     wait_eof(&mut streams);
+}
+
+/// 已准备的密钥文件删除后仍可认证；第一把被拒必须继续第二把。
+#[test]
+fn prepared_keys_try_next_after_rejection_and_survive_file_removal() {
+    let dir = temp_known_hosts("prepared");
+    let rejected = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let accepted = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let path = dir.path().join("client-key");
+    std::fs::write(
+        &path,
+        accepted.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+    )
+    .unwrap();
+    let auth = laterterm_ssh::prepare_private_key(Some(&path), None).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let AuthMethod::PreparedPrivateKey { mut keys } = auth else {
+        panic!("应预加载")
+    };
+    keys.insert(0, Arc::new(rejected));
+    let server = MockServer::start_with_key(0, Some(accepted.public_key().clone()));
+    let session = SshSession::connect(options_for(
+        server.port,
+        AuthMethod::PreparedPrivateKey { keys },
+        dir.path(),
+    ))
+    .expect("第二把密钥应通过");
+    session.kill();
+}
+
+#[test]
+fn prepared_publickey_rejection_is_not_passphrase_error() {
+    let dir = temp_known_hosts("rejected");
+    let rejected = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let accepted = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let server = MockServer::start_with_key(0, Some(accepted.public_key().clone()));
+    let error = SshSession::connect(options_for(
+        server.port,
+        AuthMethod::PreparedPrivateKey {
+            keys: vec![Arc::new(rejected)],
+        },
+        dir.path(),
+    ))
+    .err()
+    .expect("必须拒绝");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(error.to_string().contains("公钥认证"));
+    assert!(
+        error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<laterterm_ssh::PrivateKeyPassphraseRequired>()
+            .is_none()
+    );
 }
 
 /// TOFU：首连记录主机键；同端口换键后被拒，错误文案可操作。
@@ -325,11 +402,20 @@ fn tofu_learns_first_key_and_rejects_changed_key() {
         Ok(_) => panic!("换键后必须拒绝连接"),
     };
     let message = error.to_string();
-    assert!(message.contains("主机键"), "错误应提示主机键问题: {message}");
-    assert!(message.contains("known_hosts"), "错误应指明处置路径: {message}");
+    assert!(
+        message.contains("主机键"),
+        "错误应提示主机键问题: {message}"
+    );
+    assert!(
+        message.contains("known_hosts"),
+        "错误应指明处置路径: {message}"
+    );
 
     // known_hosts 文件里应恰好记录了一行首连主机键（russh 追加时会先补一个换行）
     let recorded = std::fs::read_to_string(known_hosts.path().join("known_hosts")).expect("读记录");
-    let entries = recorded.lines().filter(|line| !line.trim().is_empty()).count();
+    let entries = recorded
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
     assert_eq!(entries, 1, "应只记录首连一次: {recorded:?}");
 }

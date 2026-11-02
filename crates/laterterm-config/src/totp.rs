@@ -7,8 +7,8 @@
 //!
 //! 密码学原语不自造：HMAC/SHA 走 RustCrypto（hmac、sha1、sha2）。
 
-use anyhow::{Result, bail, Context as _};
 use crate::commands::normalize_shortcut;
+use anyhow::{Context as _, Result, bail};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;

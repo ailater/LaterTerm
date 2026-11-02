@@ -76,10 +76,15 @@ pub fn totp_account(name: &str) -> Result<String> {
     namespaced_account("totp", name)
 }
 
-/// SSH 服务器凭据在密钥环中的账户名（密码 / keyboard-interactive 口令 /
-/// 私钥 passphrase 同用一个条目——一台服务器一个凭据位）。
+/// SSH 服务器密码 / keyboard-interactive 口令在密钥环中的账户名。
+/// 旧版本私钥 passphrase 同用此条目，仅为兼容保留；新口令使用 [`ssh_passphrase_account`]。
 pub fn ssh_account(name: &str) -> Result<String> {
     namespaced_account("ssh", name)
+}
+
+/// SSH 私钥口令的独立账户名，与同名服务器的密码条目隔离。
+pub fn ssh_passphrase_account(name: &str) -> Result<String> {
+    namespaced_account("ssh-passphrase", name)
 }
 
 fn namespaced_account(namespace: &str, name: &str) -> Result<String> {
@@ -169,6 +174,53 @@ mod tests {
         assert!(totp_account("").is_err());
         assert!(totp_account("a/b").is_err());
         assert!(totp_account("a\nb").is_err());
+    }
+
+    #[test]
+    fn ssh_passphrase_account_namespaces_and_validates_like_ssh() {
+        assert_eq!(
+            ssh_passphrase_account("跳板机").unwrap(),
+            "ssh-passphrase/跳板机"
+        );
+        assert_eq!(ssh_passphrase_account(" a ").unwrap(), "ssh-passphrase/a");
+        assert_eq!(
+            ssh_passphrase_account("  跳 板机  ").unwrap(),
+            "ssh-passphrase/跳 板机"
+        );
+        for name in ["", "   ", "a/b", "a\nb", "a\tb", "a\0b"] {
+            assert!(ssh_passphrase_account(name).is_err(), "{name:?}");
+            assert!(ssh_account(name).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn ssh_passphrase_namespace_does_not_overwrite_or_delete_password() {
+        let store = MemoryStore::new();
+        let password = ssh_account("跳板机").unwrap();
+        let passphrase = ssh_passphrase_account("跳板机").unwrap();
+        assert_ne!(password, passphrase);
+        assert_ne!(passphrase, totp_account("跳板机").unwrap());
+        store.set(&password, "登录密码").unwrap();
+        store.set(&passphrase, "私钥口令").unwrap();
+        assert_eq!(store.get(&password).unwrap().as_deref(), Some("登录密码"));
+        assert_eq!(store.get(&passphrase).unwrap().as_deref(), Some("私钥口令"));
+        store.delete(&passphrase).unwrap();
+        assert_eq!(store.get(&passphrase).unwrap(), None);
+        assert_eq!(store.get(&password).unwrap().as_deref(), Some("登录密码"));
+    }
+
+    #[test]
+    fn ssh_credentials_preserve_secret_whitespace() {
+        let store = MemoryStore::new();
+        for account in [
+            ssh_account("跳板机").unwrap(),
+            ssh_passphrase_account("跳板机").unwrap(),
+        ] {
+            for secret in ["  密码与口令  ", "   ", "\t口令\n"] {
+                store.set(&account, secret).unwrap();
+                assert_eq!(store.get(&account).unwrap().as_deref(), Some(secret));
+            }
+        }
     }
 
     #[test]
