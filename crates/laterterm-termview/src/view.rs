@@ -52,6 +52,7 @@ use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
 use alacritty_terminal::grid::Dimensions;
 use gpui::{Edges, ElementInputHandler, EntityInputHandler, UTF16Selection, *};
+use std::time::Duration;
 use laterterm_core::TerminalSession;
 use std::io::{Read, Write};
 use std::ops::Range;
@@ -412,6 +413,14 @@ pub struct TerminalView {
     /// Callback for terminal exit events
     exit_callback: Option<ExitCallback>,
 
+    /// 滚动位置变化回调（供外部绘制滚动条指示器等）。
+    scroll_callback: Option<ScrollCallback>,
+
+    /// 上次上报的滚动摘要；与当前值不同才触发回调，防止 notify 风暴。
+    last_scroll: Option<ScrollSummary>,
+    /// 防抖在途标记：输出洪峰时合并为每 150ms 至多一次宿主刷新。
+    scroll_report_scheduled: bool,
+
     /// Text currently being composed by the system input method.
     marked_text: String,
 
@@ -429,6 +438,42 @@ struct SearchState {
 
 /// 会话退出事件；不依赖终端是否可见。
 pub struct TerminalExited;
+
+/// 滚动位置变化回调：调用方按需读取 [`TerminalView::scroll_summary`]，
+/// 并用传入的上下文通知宿主刷新（如工作区的滚动条指示器）。
+pub type ScrollCallback = Box<dyn Fn(&mut Context<TerminalView>)>;
+
+/// 滚动状态摘要，用于外部绘制滚动条指示器。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScrollSummary {
+    /// 显示区相对底部向上偏移的行数（0 = 位于底部）。
+    pub display_offset: usize,
+    /// 屏幕可见行数。
+    pub screen_lines: usize,
+    /// 屏幕行数 + 回滚历史行数。
+    pub total_lines: usize,
+}
+
+impl ScrollSummary {
+    /// 是否有可滚动的历史（总行数超出屏幕行数）。
+    pub fn scrollable(&self) -> bool {
+        self.total_lines > self.screen_lines
+    }
+
+    /// 滑块长度占比与顶端位置占比（0.0–1.0，占满可用轨道）。
+    /// 无历史时返回 None。
+    pub fn thumb(&self) -> Option<(f32, f32)> {
+        if !self.scrollable() {
+            return None;
+        }
+        let scrollable = (self.total_lines - self.screen_lines) as f32;
+        let thumb = (self.screen_lines as f32 / self.total_lines as f32).clamp(0.08, 1.0);
+        // display_offset=0 表示在底部：滑块贴轨道底端
+        let traveled = self.display_offset as f32 / scrollable;
+        let top = traveled * (1.0 - thumb);
+        Some((thumb, top))
+    }
+}
 
 impl EventEmitter<TerminalExited> for TerminalView {}
 
@@ -559,6 +604,9 @@ impl TerminalView {
             title_callback: None,
             clipboard_store_callback: None,
             exit_callback: None,
+            scroll_callback: None,
+            last_scroll: None,
+            scroll_report_scheduled: false,
             marked_text: String::new(),
             search: None,
         }
@@ -950,6 +998,52 @@ impl TerminalView {
         (self.state.cols(), self.state.rows())
     }
 
+    /// 滚动状态摘要（display_offset / 可见行数 / 总行数），供外部画滚动条。
+    pub fn scroll_summary(&self) -> ScrollSummary {
+        self.state.with_term(|term| {
+            let grid = term.grid();
+            ScrollSummary {
+                display_offset: grid.display_offset(),
+                screen_lines: grid.screen_lines(),
+                total_lines: grid.total_lines(),
+            }
+        })
+    }
+
+    /// Set a callback to be invoked when the scroll position or history size changes.
+    pub fn with_scroll_callback(
+        mut self,
+        callback: impl Fn(&mut Context<TerminalView>) + 'static,
+    ) -> Self {
+        self.scroll_callback = Some(Box::new(callback));
+        self
+    }
+
+    /// 滚动摘要变化时触发一次 scroll 回调；150ms 防抖合并输出洪峰，
+    /// 避免高频输出把宿主（整个工作区）拖进逐批次重渲染。
+    fn schedule_scroll_report(&mut self, cx: &mut Context<Self>) {
+        if self.scroll_callback.is_none() || self.scroll_report_scheduled {
+            return;
+        }
+        self.scroll_report_scheduled = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.scroll_report_scheduled = false;
+                let summary = this.scroll_summary();
+                if this.last_scroll != Some(summary) {
+                    this.last_scroll = Some(summary);
+                    if let Some(callback) = &this.scroll_callback {
+                        callback(cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Resize the terminal to new dimensions.
     ///
     /// This method should be called when the terminal view size changes.
@@ -1266,6 +1360,8 @@ impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Process any pending events
         self.process_events(window, cx);
+        // 滚动位置/历史行数变化时通知宿主（防抖定时器，不在 render 期直接 notify）
+        self.schedule_scroll_report(cx);
 
         // Get terminal state and renderer for rendering
         let state_arc = self.state.term_arc();

@@ -11,11 +11,14 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub mod commands;
+pub mod importers;
 pub mod servers;
 pub mod theme;
 pub mod totp;
 
-pub use commands::CommandTemplate;
+pub use commands::{normalize_shortcut, shortcut_conflicts, CommandTemplate};
+pub use importers::{deepin_default_path, load_deepin_servers, load_xshell_sessions};
+pub use servers::{ServerAuthKind, ServerEntry, ServersFile};
 pub use theme::{DEFAULT_THEME, Theme, ThemeRegistry, themes_dir};
 pub use totp::{TotpAlgorithm, TotpConfig, TotpEntry, generate_code, parse_secret_input};
 
@@ -33,6 +36,9 @@ pub struct Settings {
     /// TOTP 动态码条目元数据；密钥本体在系统密钥环（laterterm-secrets），绝不落盘。
     #[serde(default)]
     pub totp: Vec<totp::TotpEntry>,
+    /// 服务器连接元数据；凭据同样只在密钥环。
+    #[serde(default)]
+    pub servers: Vec<servers::ServerEntry>,
 }
 
 /// 外观项。数值范围与设置面板的步进按钮一致。
@@ -51,8 +57,7 @@ pub struct Appearance {
     /// 备选字体链（主字体缺字时按序回退，如 CJK）；空表示用系统默认回退。
     #[serde(default)]
     pub font_fallbacks: Vec<String>,
-    /// ZMODEM/trzsz 接收文件落盘目录；空 = ~/Downloads。
-    #[serde(default)]
+    /// 接收目录；空 = ~/Downloads。
     pub downloads_dir: String,
 }
 
@@ -65,7 +70,8 @@ impl Default for Appearance {
         Self {
             font_family: "JetBrainsMono Nerd Font".into(),
             font_size: 13.0,
-            line_height: 1.0,
+            // 1.2 行距读长日志更舒适；纯网格对齐不受影响（TUI 按单元格定位）
+            line_height: 1.2,
             padding: 8.0,
             scrollback: 100_000,
             theme: DEFAULT_THEME.into(),
@@ -136,6 +142,38 @@ impl Settings {
         });
     }
 
+    /// 新增或按名称替换服务器条目。
+    pub fn upsert_server(&mut self, server: servers::ServerEntry) -> Result<()> {
+        server.validate()?;
+        if let Some(existing) = self.servers.iter_mut().find(|item| item.name == server.name) {
+            *existing = server;
+        } else {
+            self.servers.push(server);
+        }
+        Ok(())
+    }
+
+    pub fn remove_server(&mut self, name: &str) -> bool {
+        let before = self.servers.len();
+        self.servers.retain(|server| server.name != name);
+        before != self.servers.len()
+    }
+
+    /// 把加载中的服务器条目修正到合法范围；无法挽救的条目直接丢弃。
+    fn sanitize_servers(&mut self) {
+        self.servers.retain_mut(|server| {
+            server.name = server.name.trim().to_string();
+            server.host = server.host.trim().to_string();
+            server.username = server.username.trim().to_string();
+            server.note = server.note.trim().to_string();
+            if let Some(key_path) = &server.key_path {
+                let trimmed = key_path.trim().to_string();
+                server.key_path = (!trimmed.is_empty()).then_some(trimmed);
+            }
+            server.validate().is_ok()
+        });
+    }
+
     /// 用户配置目录下的设置文件路径。
     pub fn default_path() -> Option<PathBuf> {
         Some(config_dir()?.join(APP_DIR).join(SETTINGS_FILE))
@@ -154,6 +192,7 @@ impl Settings {
             toml::from_str(&raw).with_context(|| format!("解析设置失败: {}", path.display()))?;
         settings.appearance.sanitize();
         settings.sanitize_totp();
+        settings.sanitize_servers();
         Ok(settings)
     }
 
@@ -208,11 +247,6 @@ impl Settings {
             Some(path) if !path.exists() => self.save_to(&path).is_ok(),
             _ => false,
         }
-    }
-
-    /// 配置文件是否已存在（首启检测：不存在 = 第一次运行）。
-    pub fn settings_file_exists(&self) -> bool {
-        Self::default_path().is_some_and(|path| path.exists())
     }
 }
 

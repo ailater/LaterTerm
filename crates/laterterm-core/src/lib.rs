@@ -9,7 +9,7 @@
 
 use std::io::{self, Read, Write};
 
-/// 会话后端类型。M3 增加 `Ssh` 变体。
+/// 会话后端类型。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
     /// 本地 PTY（laterterm-local）。

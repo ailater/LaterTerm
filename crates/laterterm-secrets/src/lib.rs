@@ -73,6 +73,16 @@ impl SecretStore for KeyringStore {
 
 /// TOTP 条目在密钥环中的账户名。名称里不允许 '/'，避免与命名空间混淆。
 pub fn totp_account(name: &str) -> Result<String> {
+    namespaced_account("totp", name)
+}
+
+/// SSH 服务器凭据在密钥环中的账户名（密码 / keyboard-interactive 口令 /
+/// 私钥 passphrase 同用一个条目——一台服务器一个凭据位）。
+pub fn ssh_account(name: &str) -> Result<String> {
+    namespaced_account("ssh", name)
+}
+
+fn namespaced_account(namespace: &str, name: &str) -> Result<String> {
     let name = name.trim();
     if name.is_empty() {
         anyhow::bail!("名称不能为空");
@@ -80,7 +90,7 @@ pub fn totp_account(name: &str) -> Result<String> {
     if name.contains('/') || name.chars().any(char::is_control) {
         anyhow::bail!("名称不能包含 / 或控制字符");
     }
-    Ok(format!("totp/{name}"))
+    Ok(format!("{namespace}/{name}"))
 }
 
 /// 便捷构造：进程级共享的系统密钥环。
@@ -159,5 +169,14 @@ mod tests {
         assert!(totp_account("").is_err());
         assert!(totp_account("a/b").is_err());
         assert!(totp_account("a\nb").is_err());
+    }
+
+    #[test]
+    fn ssh_account_namespaces_and_validates_like_totp() {
+        assert_eq!(ssh_account("跳板机").unwrap(), "ssh/跳板机");
+        assert_eq!(ssh_account(" a ").unwrap(), "ssh/a");
+        assert!(ssh_account("").is_err());
+        assert!(ssh_account("a/b").is_err());
+        assert!(ssh_account("a\nb").is_err());
     }
 }

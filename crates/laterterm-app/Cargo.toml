@@ -17,11 +17,11 @@ laterterm-config = { path = "../laterterm-config" }
 laterterm-core.workspace = true
 laterterm-local.workspace = true
 laterterm-secrets.workspace = true
+laterterm-ssh = { path = "../laterterm-ssh" }
 anyhow.workspace = true
 parking_lot.workspace = true
 flume.workspace = true
 notify = "8"
-laterterm-ssh.workspace = true
 laterterm-xshell.workspace = true
 laterterm-deepin.workspace = true
 shellexpand = "3.1.2"

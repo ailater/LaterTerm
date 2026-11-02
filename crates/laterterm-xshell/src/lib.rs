@@ -147,6 +147,12 @@ pub fn parse_session(source: &str, text: &str) -> Result<XshellSession, ParseErr
 
 /// 遍历 Sessions 目录树（`.xsh` 全收、`folder.ini` 跳过、子目录 = 分组）。
 /// 文件编码按 BOM 识别：UTF-16LE 解码，其余按 UTF-8 容错读取。
+/// 读取单个会话，编码检测与目录导入一致。
+pub fn load_session(path: &Path) -> io::Result<XshellSession> {
+    let text = decode_xsh(&std::fs::read(path)?);
+    parse_session(&path.display().to_string(), &text).map_err(io::Error::other)
+}
+
 pub fn load_sessions_dir(root: &Path) -> io::Result<Vec<XshellSession>> {
     let mut sessions = Vec::new();
     walk_sessions(root, root, &mut sessions)?;

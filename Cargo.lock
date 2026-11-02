@@ -3779,6 +3779,7 @@ dependencies = [
  "serde",
  "sha1",
  "sha2 0.11.1",
+ "tempfile",
  "toml 0.8.23",
 ]
 
@@ -3811,7 +3812,11 @@ name = "laterterm-ssh"
 version = "0.1.0"
 dependencies = [
  "encoding_rs",
+ "env_logger",
+ "flume 0.12.0",
  "laterterm-core",
+ "log",
+ "rand 0.10.3",
  "russh",
  "russh-sftp",
  "tempfile",

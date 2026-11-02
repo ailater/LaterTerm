@@ -12,7 +12,7 @@
 #![allow(dead_code)]
 
 use laterterm_config::commands::CommandTemplate;
-use laterterm_config::servers::{ServerAuthKind, ServerEntry};
+use laterterm_config::servers::{StoredAuthKind as ServerAuthKind, StoredServerEntry as ServerEntry};
 use laterterm_deepin::{DeepinCommand, DeepinServer};
 use laterterm_xshell::XshellSession;
 

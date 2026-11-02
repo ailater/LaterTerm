@@ -43,6 +43,8 @@ pub enum HostKeyPolicy {
 pub enum SshAuth {
     /// 密码认证。
     Password(String),
+    /// 跳板机多轮口令认证（最多八轮）。
+    KeyboardInteractive(String),
     /// 私钥文件（OpenSSH 格式；`passphrase` 为私钥口令，未加密传 `None`）。
     KeyFile {
         path: PathBuf,
@@ -236,6 +238,7 @@ impl TerminalSession for SshSession {
     }
 
     fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+        if self.closing.load(Ordering::Acquire) { return Ok(()); }
         self.cmd_tx
             .send(SessionCmd::Resize {
                 cols: cols as u32,
@@ -253,6 +256,10 @@ impl TerminalSession for SshSession {
     }
 }
 
+impl Drop for SshSession {
+    fn drop(&mut self) { self.kill(); }
+}
+
 /// 读桥：tokio 侧推字节 → std 通道 → 阻塞 [`Read`]。
 ///
 /// `pending` 是上一批未读完的残余；发送端全部 drop 后 `recv` 返回
@@ -265,6 +272,7 @@ struct ChannelReader {
 
 impl io::Read for ChannelReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() { return Ok(0); }
         loop {
             if !self.pending.is_empty() {
                 let n = self.pending.len().min(buf.len());
@@ -373,12 +381,12 @@ async fn connect_and_auth(
         port: endpoint.port(),
     };
     let mut handle = russh::client::connect(
-        std::sync::Arc::new(russh::client::Config::default()),
+        std::sync::Arc::new(russh::client::Config { keepalive_interval: Some(std::time::Duration::from_secs(30)), keepalive_max: 3, nodelay: true, ..Default::default() }),
         (endpoint.host.as_str(), endpoint.port()),
         handler,
     )
     .await
-    .map_err(|error| io::Error::other(format!("SSH 连接 {} 失败: {error}", endpoint.title())))?;
+    .map_err(|error| io::Error::other(format!("SSH 连接 {} 失败: {error}（如为主机键变更，请核对 known_hosts）", endpoint.title())))?;
     authenticate(&mut handle, endpoint).await?;
     Ok(handle)
 }
@@ -408,6 +416,19 @@ async fn authenticate(
                 .await
                 .map_err(|error| io::Error::other(format!("SSH 认证通信失败: {error}")))?
                 .success()
+        }
+        SshAuth::KeyboardInteractive(secret) => {
+            use russh::client::KeyboardInteractiveAuthResponse;
+            let mut response = handle.authenticate_keyboard_interactive_start(&endpoint.username, None).await.map_err(io::Error::other)?;
+            let mut success = false;
+            for _ in 0..8 {
+                response = match response {
+                    KeyboardInteractiveAuthResponse::Success => { success = true; break; }
+                    KeyboardInteractiveAuthResponse::Failure { .. } => break,
+                    KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => handle.authenticate_keyboard_interactive_respond(vec![secret.clone(); prompts.len()]).await.map_err(io::Error::other)?,
+                };
+            }
+            success || matches!(response, KeyboardInteractiveAuthResponse::Success)
         }
         SshAuth::Agent => {
             // 连接 ssh-agent（SSH_AUTH_SOCK），逐身份尝试，成功即止
@@ -498,7 +519,7 @@ async fn network_main(options: SshOptions, ready_tx: std_mpsc::Sender<SessionHan
                     port: endpoint.port(),
                 };
                 let mut handle = russh::client::connect_stream(
-                    std::sync::Arc::new(russh::client::Config::default()),
+                    std::sync::Arc::new(russh::client::Config { keepalive_interval: Some(std::time::Duration::from_secs(30)), keepalive_max: 3, nodelay: true, ..Default::default() }),
                     stream,
                     handler,
                 )
@@ -533,6 +554,16 @@ async fn network_main(options: SshOptions, ready_tx: std_mpsc::Sender<SessionHan
             .await
             .map_err(|error| io::Error::other(format!("请求 shell 失败: {error}")))?;
 
+        let mut confirmed = 0;
+        while confirmed < 2 {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Success) => confirmed += 1,
+                Some(russh::ChannelMsg::Failure) => return Err(io::Error::other("远端拒绝 PTY 或 shell")),
+                None | Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close) => return Err(io::Error::other("shell 就绪前连接关闭")),
+                Some(_) => continue,
+            }
+        }
+
         // 三条桥：视图写 → 写任务；控制指令 → 收发任务；收发任务 → 视图读
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<SessionCmd>();
@@ -550,7 +581,11 @@ async fn network_main(options: SshOptions, ready_tx: std_mpsc::Sender<SessionHan
         });
 
         // spawn 侧就绪：取走三条桥的句柄
-        let _ = ready_tx.send(Ok((writer_tx, cmd_tx, data_rx)));
+        if ready_tx.send(Ok((writer_tx, cmd_tx, data_rx))).is_err() {
+            // 调用方已超时或取消，释放连接，不能留下无人持有的 shell。
+            let _ = handle.disconnect(russh::Disconnect::ByApplication, "connect cancelled", "en").await;
+            return Ok(());
+        }
 
         loop {
             tokio::select! {
@@ -566,6 +601,7 @@ async fn network_main(options: SshOptions, ready_tx: std_mpsc::Sender<SessionHan
                             break;
                         }
                     }
+                    Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close) => break,
                     Some(_) => continue,
                     None => break, // 通道关闭（远程退出/断连）
                 },

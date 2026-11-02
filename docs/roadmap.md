@@ -18,7 +18,7 @@
 ## 里程碑总览与当前状态
 
 ```
-M0 骨架 ✅ → M1 交互完善 🚧(本阶段) → M2 快捷命令 ⏳ → M3 远程 ⏳ → M4 发布 ⏳
+M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待实机走查) → M3 远程 🚧(SSH/服务器已落地) → M4 发布 ⏳
 ```
 
 ---
@@ -72,6 +72,11 @@ M0 骨架 ✅ → M1 交互完善 🚧(本阶段) → M2 快捷命令 ⏳ → M3
 > TOTP 已落地：RFC 6238（SHA1/256/512，RFC 附录 B 全向量测试）+ base32/otpauth 链接解析（laterterm-config）；密钥环封装 laterterm-secrets（keyring v4 → Linux Secret Service，本机 gnome-keyring 冒烟通过），密钥绝不落 TOML；右面板动态码 CRUD + 倒计时 + 确认发送到焦点窗格，DBus 存取全部走后台线程。
 > 剩余：侧面板服务器/SFTP/设置骨架按 M3 节奏演进；本阶段尚未完成 GUI 实机验收。
 > 验收期已修复：隐藏窗格/标签的终端退出泄漏（TerminalExited 事件化回收，2538ae5）；本机门禁需 `PATH="$HOME/.cargo/bin:$PATH"` 统一 rustup 1.94 工具链，否则 rustc/clippy 版本错位必报 E0514。
+> 体验打磨：命令/动态码/服务器的新建/编辑/补输对话框统一升级为窗口级模态弹窗（遮罩点击/Esc/×均可关闭，错误提示移入弹窗内），输入框获得焦点时显示闪烁光标与高亮边框，弹窗关闭后焦点自动归还终端窗格。
+> 快捷键体系统一：内置 + 命令 + 服务器 + 动态码四类绑定进统一注册表，保存时跨类别
+> 查重（编辑自身豁免），设置→快捷键页全量总览、冲突标红；Esc 关弹窗、动态码/服务器
+> 也可绑键一键直达。
+> UI 走查落地（外部评审建议筛选取舍）：分屏线 3px 可拖拽调比例（LayoutNode::Split 带 id+ratio，paint 期缓存容器几何 + 窗口级鼠标监听逐帧重挂）、焦点窗格描边 + 非活动窗格压暗（opacity 0.85）、面板右侧悬浮滚动条（termview 新增 ScrollSummary/scroll 回调，输出变化也会刷新）、标签激活态底部强调线 + 关闭按钮 hover 显形、默认行高 1.2。评审中已有/不做项：内边距与行高调节（设置面板已有）、连字/编程字体（默认 JetBrains Mono + calt）、ANSI 彩色（alacritty + TERM，单色是 shell 别名问题）、Ctrl+Shift+F 搜索（已有）、无边框标题栏（自绘）、提示符美化（属 shell 层 starship）。
 
 **目标**：Deepin 终端灵魂功能落地——运维的跳板机操作台。
 
@@ -80,25 +85,40 @@ M0 骨架 ✅ → M1 交互完善 🚧(本阶段) → M2 快捷命令 ⏳ → M3
 | 1 | 命令模板系统 | 参数化模板、安全展开、预览确认、focused pane 目标锁定、右侧面板 CRUD | ✅
 | 2 | 内建 TOTP | RFC 6238，密钥入系统密钥环；跳板机二次验证一键完成 | ✅
 | 3 | 每命令独立快捷键 | 应用内快捷键、capture 阶段拦截、冲突检测 | ✅
-| 4 | 侧面板 UI | 右侧命令面板 + 动态码已接入；服务器/SFTP/设置骨架随 M3 演进 | 🚧
+| 4 | 侧面板 UI | 右侧面板页签化（命令/动态码/服务器），三区均已接入；SFTP/设置骨架随 M3 演进 | 🚧
 
 **验收**：真实跳板机登录流程（密码 + 动态码）全程不碰键盘手输验证码（待实机走查）。
 
 ---
 
-## M3 · 远程与传输 ⏳
+## M3 · 远程与传输 🚧
+
+> 进度（2026-11-01）：laterterm-ssh 已落地——russh 0.65（密码 / keyboard-interactive /
+> 私钥三种认证，PTY+shell want_reply 确认，tokio 仅限网络层，数据/控制走异步泵 +
+> flume 桥接同步流），主机键 TOFU 校验（首连记入 `~/.config/laterterm/known_hosts`，
+> 换键拒绝并提示行号）；进程内 russh mock 服务器回环测试覆盖认证/回显/resize/kill EOF/
+> 换键拒绝。已知 russh 0.65 行为缺口：主动发起 CHANNEL_CLOSE 后会话表即时移除通道，
+> 远端回包被丢弃——输出泵以 select 监听本地 shutdown 信号终结（不依赖远端回包）。
+> 服务器管理已接入右面板「服务器」页签：TOML 元数据 + 密钥环凭据（ssh/<名称>）+ CRUD
+> + 缺凭据补输（可选记住）+ 连接在新标签打开（后台线程连接，结果 render 期消费）。
+> 导入/导出已就绪：ServersFile TOML 格式（带版本号，未来版本拒载），系统文件对话框
+> （xdg-desktop-portal）选择目标；凭据永不落盘，导入条目首次连接走既有补输流程，
+> 同名跳过、无效丢弃并回报计数。导入来源弹窗三选一：LaterTerm TOML / Deepin 终端
+> （一键读 ~/.config/deepin/deepin-terminal/server-config.conf，任务 7 服务器部分提前
+> 落地，本机 3 台真机验证）/ Xshell 会话（.xsh 多选，UTF-16 BOM 解码，密码绑定原机器
+> 加密不迁移）；三类解析器在 laterterm-config::importers，附真机自跳过冒烟测试。
 
 **目标**：远程不是"另一个功能"——同一个 termview，换 backend。
 
 | # | 任务 | 说明 |
 |---|------|------|
-| 1 | laterterm-ssh | russh + russh-sftp；tokio 仅限网络层，PTY 走线程泵（架构既定） |
-| 2 | 服务器管理 | 主机分组、连接配置、凭据入 keyring（laterterm-secrets） |
+| 1 | laterterm-ssh | russh + russh-sftp；tokio 仅限网络层，PTY 走线程泵（架构既定）；SSH 会话部分已落地，SFTP 随任务4 | 🚧
+| 2 | 服务器管理 | 主机分组、连接配置、凭据入 keyring（laterterm-secrets）；连接配置与凭据已接入右面板，主机分组待续 | 🚧
 | 3 | 跳板机链 | ProxyJump / keyboard-interrupt 认证链式穿透 |
 | 4 | SFTP 面板 | 双栏文件传输，进度与断点续传 |
 | 5 | 编码 | GBK 远程会话转码（中文老服务器刚需） |
 | 6 | trzsz | rz/sz 兼容协议，ZMODEM 类传输 |
-| 7 | Deepin 配置一键导入 | `command-config.conf` / `server-config.conf` 已逆向（见 architecture.md），M3 收官时做迁移工具 |
+| 7 | Deepin 配置一键导入 | `command-config.conf` / `server-config.conf` 已逆向（见 architecture.md）；server-config 导入已提前落地（含 Xshell .xsh 来源），命令模板迁移待续 | 🚧
 
 **验收**：从 LaterTerm 完成一次「跳板机 → 内网机 → GBK 环境 → rz 拉文件」全链路操作。
 
@@ -111,7 +131,7 @@ M0 骨架 ✅ → M1 交互完善 🚧(本阶段) → M2 快捷命令 ⏳ → M3
 | 1 | 三平台打包矩阵：Linux（AppImage + deb）、Windows（msi）、macOS（dmg），CI 发版链照抄 LaterMD 经验（auto-tag + 版本注入 Release 正文） |
 | 2 | Quake 下拉模式（全局快捷键顶部滑出） |
 | 3 | 广播输入（多会话同步键入） |
-| 4 | 动效与无障碍打磨；首启动引导（默认 shell/字体探测） |
+| 4 | 动效与无障碍打磨；首启动引导（默认 shell/字体探测）；终端光标样式可配置（方块/竖线/下划线 + 闪烁）；Quake 全局热键走 portal GlobalShortcuts（方案与 LaterScreen 四坑结论见 architecture.md） |
 
 **验收**：v0.1.0 发布，README 附真机截图（复用 LaterMD 的无头截图生成思路可选项）。
 
