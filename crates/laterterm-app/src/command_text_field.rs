@@ -9,6 +9,9 @@ use std::time::Duration;
 
 pub(crate) struct CommandTextChanged;
 
+/// 用户在输入框里按下 Enter（对话框用它触发主按钮动作）。
+pub(crate) struct FieldSubmit;
+
 /// 光标闪烁周期，与系统习惯（约 530ms）一致。
 const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
@@ -21,6 +24,8 @@ pub(crate) struct CommandTextField {
     reversed: bool,
     marked_text: String,
     placeholder: String,
+    /// 掩码模式（密码/密钥输入）：显示圆点，占位提示保持明文。
+    masked: bool,
     /// 焦点态缓存：render 时与 `focus_handle.is_focused(window)` 对账。
     focused: bool,
     /// 光标可见相位（闪烁用）；输入动作会重置为可见。
@@ -30,6 +35,7 @@ pub(crate) struct CommandTextField {
 }
 
 impl EventEmitter<CommandTextChanged> for CommandTextField {}
+impl EventEmitter<FieldSubmit> for CommandTextField {}
 
 impl CommandTextField {
     pub(crate) fn new(
@@ -46,6 +52,7 @@ impl CommandTextField {
             reversed: false,
             marked_text: String::new(),
             placeholder: placeholder.into(),
+            masked: false,
             focused: false,
             caret_on: true,
             blink_scheduled: false,
@@ -59,6 +66,12 @@ impl CommandTextField {
     /// 把焦点交给这个输入框（打开弹窗后调用，光标随即闪烁）。
     pub(crate) fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    /// 密码/密钥输入：内容以圆点显示。
+    pub(crate) fn masked(mut self) -> Self {
+        self.masked = true;
+        self
     }
 
     fn utf16_len(&self) -> usize {
@@ -119,6 +132,10 @@ impl CommandTextField {
             self.reversed = false;
             self.caret_on = true;
             cx.notify();
+            return;
+        }
+        if k == "enter" {
+            cx.emit(FieldSubmit);
             return;
         }
         match k {
@@ -232,9 +249,12 @@ impl Render for CommandTextField {
 
         if composing {
             // 输入法组词期间整体展示 原文+预编辑，不画光标（与终端 IME 行为一致）。
-            field = field
-                .text_color(rgb(0xC0CAF5))
-                .child(format!("{}{}", self.text, marked));
+            let shown = if self.masked {
+                "\u{2022}".repeat(self.text.chars().count() + marked.chars().count())
+            } else {
+                format!("{}{}", self.text, marked)
+            };
+            field = field.text_color(rgb(0xC0CAF5)).child(shown);
             return field;
         }
 
@@ -252,9 +272,22 @@ impl Render for CommandTextField {
         let collapsed = sel_start == sel_end;
         let start_byte = self.byte_offset(sel_start);
         let end_byte = self.byte_offset(sel_end);
-        let head = self.text[..start_byte].to_string();
-        let mid = self.text[start_byte..end_byte].to_string();
-        let tail = self.text[end_byte..].to_string();
+        let mask = |segment: &str| "\u{2022}".repeat(segment.chars().count());
+        let head = if self.masked {
+            mask(&self.text[..start_byte])
+        } else {
+            self.text[..start_byte].to_string()
+        };
+        let mid = if self.masked {
+            mask(&self.text[start_byte..end_byte])
+        } else {
+            self.text[start_byte..end_byte].to_string()
+        };
+        let tail = if self.masked {
+            mask(&self.text[end_byte..])
+        } else {
+            self.text[end_byte..].to_string()
+        };
         let caret_leading = self.reversed || collapsed;
         field = field.text_color(rgb(0xC0CAF5)).child(head);
         if show_caret && caret_leading {

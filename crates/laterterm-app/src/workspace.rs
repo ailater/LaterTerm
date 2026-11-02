@@ -1,4 +1,4 @@
-use crate::command_text_field::CommandTextField;
+use crate::command_text_field::{CommandTextChanged, CommandTextField, FieldSubmit};
 use gpui::{
     App, AppContext, AsyncApp, Bounds, Context, CursorStyle, DispatchPhase, Edges, Entity,
     PathPromptOptions,
@@ -398,6 +398,7 @@ pub struct WorkspaceView {
     right_panel_tab: RightPanelTab,
     server_dialog: Option<ServerDialog>,
     server_fields: Vec<(String, Entity<CommandTextField>)>,
+    server_field_subscriptions: Vec<gpui::Subscription>,
     server_meta_draft: ServerEntry,
     server_delete_confirm: Option<String>,
     server_error: Option<String>,
@@ -463,6 +464,7 @@ impl WorkspaceView {
             right_panel_tab: RightPanelTab::Commands,
             server_dialog: None,
             server_fields: Vec::new(),
+            server_field_subscriptions: Vec::new(),
             server_meta_draft: ServerEntry::default(),
             server_delete_confirm: None,
             server_error: None,
@@ -1162,7 +1164,7 @@ impl WorkspaceView {
                 let field = cx.new(|cx| CommandTextField::new(String::new(), variable.clone(), cx));
                 self.command_field_subscriptions.push(cx.subscribe(
                     &field,
-                    |workspace, _field, _event, cx| {
+                    |workspace, _field, _: &CommandTextChanged, cx| {
                         workspace.sync_command_values(cx);
                         cx.notify();
                     },
@@ -1357,18 +1359,25 @@ impl WorkspaceView {
                         meta.period = parsed.config.period;
                         // 落库前试算一次，把密钥/参数错误挡在保存之前。
                         generate_code(&parsed.secret, &parsed.config, SystemTime::now())?;
-                        store.set(&account, &parsed.secret)?;
+                        let store = store.clone();
+                        let secret_to_store = parsed.secret.clone();
+                        run_secret_op(move || store.set(&account, &secret_to_store))?;
                     } else if let Some(previous) = &original_bg {
                         let previous_account = totp_account(previous)?;
                         if previous_account != account {
                             // 改名不重录密钥：从旧账户迁移，失败则保持原状。
-                            match store.get(&previous_account)? {
-                                Some(secret) => {
-                                    store.set(&account, &secret)?;
-                                    store.delete(&previous_account)?;
+                            let store = store.clone();
+                            let previous_account = previous_account.clone();
+                            run_secret_op(move || -> anyhow::Result<()> {
+                                match store.get(&previous_account)? {
+                                    Some(secret) => {
+                                        store.set(&account, &secret)?;
+                                        store.delete(&previous_account)?;
+                                    }
+                                    None => store.delete(&previous_account)?,
                                 }
-                                None => store.delete(&previous_account)?,
-                            }
+                                Ok(())
+                            })?;
                         }
                     }
                     Ok::<_, anyhow::Error>(meta)
@@ -1426,8 +1435,8 @@ impl WorkspaceView {
                 .background_executor()
                 .spawn(async move {
                     let account = totp_account(&entry.name)?;
-                    let secret = store
-                        .get(&account)?
+                    let store = store.clone();
+                    let secret = run_secret_op(move || store.get(&account))?
                         .ok_or_else(|| anyhow::anyhow!("密钥环中没有该条目的密钥"))?;
                     let code = generate_code(
                         &secret,
@@ -1534,7 +1543,7 @@ impl WorkspaceView {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { store.delete(&account) })
+                .spawn(async move { run_secret_op(move || store.delete(&account)) })
                 .await;
             let _ = this.update(cx, |workspace, cx| match result {
                 Ok(()) => {
@@ -1568,6 +1577,7 @@ impl WorkspaceView {
     ) {
         self.server_meta_draft = entry.cloned().unwrap_or_default();
         self.server_fields.clear();
+        self.server_field_subscriptions.clear();
         let meta = self.server_meta_draft.clone();
         // 编辑时凭据框留空表示不改动；凭据本体只进密钥环
         let secret_placeholder = if entry.is_some() {
@@ -1669,18 +1679,25 @@ impl WorkspaceView {
                 .spawn(async move {
                     let account = ssh_account(&meta.name)?;
                     if !secret.is_empty() {
-                        store.set(&account, &secret)?;
+                        let store = store.clone();
+                        let secret = secret.clone();
+                        run_secret_op(move || store.set(&account, &secret))?;
                     } else if let Some(previous) = &original_bg {
                         // 改名不重录凭据：从旧账户迁移，失败则保持原状
                         let previous_account = ssh_account(previous)?;
                         if previous_account != account {
-                            match store.get(&previous_account)? {
-                                Some(existing) => {
-                                    store.set(&account, &existing)?;
-                                    store.delete(&previous_account)?;
+                            let store = store.clone();
+                            let previous_account = previous_account.clone();
+                            run_secret_op(move || -> anyhow::Result<()> {
+                                match store.get(&previous_account)? {
+                                    Some(existing) => {
+                                        store.set(&account, &existing)?;
+                                        store.delete(&previous_account)?;
+                                    }
+                                    None => store.delete(&previous_account)?,
                                 }
-                                None => store.delete(&previous_account)?,
-                            }
+                                Ok(())
+                            })?;
                         }
                     }
                     Ok::<_, anyhow::Error>(meta)
@@ -1736,6 +1753,7 @@ impl WorkspaceView {
         self.server_error = None;
         self.server_notice = None;
         self.server_fields.clear();
+        self.server_field_subscriptions.clear();
         self.server_delete_confirm = None;
         self.focus_active(window, cx);
         cx.notify();
@@ -1758,7 +1776,7 @@ impl WorkspaceView {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { store.delete(&account) })
+                .spawn(async move { run_secret_op(move || store.delete(&account)) })
                 .await;
             let _ = this.update(cx, |workspace, cx| match result {
                 Ok(()) => {
@@ -2049,7 +2067,8 @@ impl WorkspaceView {
                 .background_executor()
                 .spawn(async move {
                     let account = ssh_account(&entry_name)?;
-                    anyhow::Ok(store.get(&account)?)
+                    let store = store.clone();
+                    run_secret_op(move || store.get(&account))
                 })
                 .await;
             let _ = this.update(cx, |workspace, cx| {
@@ -2065,10 +2084,21 @@ impl WorkspaceView {
                                 ServerAuthKind::KeyboardInteractive => "口令 / 动态码",
                                 _ => "密码",
                             };
+                            // 只显示本条目自己的错误，不带上一台的失败残留
+                            workspace.server_error = None;
+                            workspace.server_notice = None;
                             workspace.server_fields.clear();
+                            workspace.server_field_subscriptions.clear();
                             let field = cx.new(|cx| {
-                                CommandTextField::new(String::new(), placeholder, cx)
+                                CommandTextField::new(String::new(), placeholder, cx).masked()
                             });
+                            // Enter 直接触发连接
+                            workspace.server_field_subscriptions.push(cx.subscribe(
+                                &field,
+                                |workspace, _field, _: &FieldSubmit, cx| {
+                                    workspace.submit_server_connect(cx);
+                                },
+                            ));
                             // 异步上下文拿不到 window，焦点请求入队 render 期生效
                             workspace.pending_focus =
                                 Some(field.read(cx).focus_handle().clone());
@@ -2127,8 +2157,9 @@ impl WorkspaceView {
                 .background_executor()
                 .spawn(async move {
                     let account = ssh_account(&entry_name)?;
-                    store.set(&account, secret_for_store.trim())?;
-                    anyhow::Ok(())
+                    let store = store.clone();
+                    let secret_for_store = secret_for_store.clone();
+                    run_secret_op(move || store.set(&account, secret_for_store.trim()))
                 })
                 .await;
             let _ = this.update(cx, |workspace, cx| {
@@ -4428,6 +4459,25 @@ fn connect_ssh_session(
     let options = SshOptions::new(entry.host.as_str(), entry.port, entry.username.as_str(), auth);
     let session = SshSession::connect(options).map_err(|error| anyhow::anyhow!("{error}"))?;
     Ok(Arc::new(session))
+}
+
+/// 密钥环操作包一层 5s 超时：Secret Service 偶发卡住（等解锁/授权确认而
+/// 弹窗不可见）时给出可行动的错误，而不是让连接流程永远停住。
+fn run_secret_op<T, F>(op: F) -> anyhow::Result<T>
+where
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = flume::bounded::<anyhow::Result<T>>(1);
+    std::thread::spawn(move || {
+        let _ = tx.send(op());
+    });
+    match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "密钥环 5 秒无响应（可能在等解锁/授权确认），请检查系统弹窗后重试"
+        )),
+    }
 }
 
 /// 开一个本地 shell 会话（attach_pane 之外仅差标题命名，故独立成函数）。
