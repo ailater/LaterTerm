@@ -1,13 +1,19 @@
 use gpui::{
     Bounds, Context, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Pixels, Render, Styled,
-    UTF16Selection, Window, canvas, div, px,
+    UTF16Selection, Window, canvas, div, px, rgb,
 };
+
 use std::ops::Range;
+use std::time::Duration;
 
 pub(crate) struct CommandTextChanged;
 
-/// 可复用的单行文本输入框。文本编辑使用 UTF-16 偏移，兼容 GPUI 输入法协议。
+/// 光标闪烁周期，与系统习惯（约 530ms）一致。
+const CARET_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+
+/// 可复用的单行文本输入框。文本编辑使用 UTF-16 偏移，兼容 GPUI 输入法协议；
+/// 获得焦点时显示闪烁光标与高亮边框。
 pub(crate) struct CommandTextField {
     focus_handle: FocusHandle,
     text: String,
@@ -15,6 +21,12 @@ pub(crate) struct CommandTextField {
     reversed: bool,
     marked_text: String,
     placeholder: String,
+    /// 焦点态缓存：render 时与 `focus_handle.is_focused(window)` 对账。
+    focused: bool,
+    /// 光标可见相位（闪烁用）；输入动作会重置为可见。
+    caret_on: bool,
+    /// 是否已有闪烁任务在跑，避免 render 反复 spawn。
+    blink_scheduled: bool,
 }
 
 impl EventEmitter<CommandTextChanged> for CommandTextField {}
@@ -34,12 +46,21 @@ impl CommandTextField {
             reversed: false,
             marked_text: String::new(),
             placeholder: placeholder.into(),
+            focused: false,
+            caret_on: true,
+            blink_scheduled: false,
         }
     }
 
     pub(crate) fn value(&self) -> &str {
         &self.text
     }
+
+    /// 把焦点交给这个输入框（打开弹窗后调用，光标随即闪烁）。
+    pub(crate) fn focus_handle(&self) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+
     fn utf16_len(&self) -> usize {
         self.text.encode_utf16().count()
     }
@@ -58,6 +79,7 @@ impl CommandTextField {
         let cursor = self.text[..start].encode_utf16().count() + text.encode_utf16().count();
         self.selection = cursor..cursor;
         self.reversed = false;
+        self.caret_on = true;
     }
     fn delete_backward(&mut self) {
         if self.selection.start != self.selection.end {
@@ -95,6 +117,7 @@ impl CommandTextField {
         if event.keystroke.modifiers.control && k.eq_ignore_ascii_case("a") {
             self.selection = 0..self.utf16_len();
             self.reversed = false;
+            self.caret_on = true;
             cx.notify();
             return;
         }
@@ -104,6 +127,7 @@ impl CommandTextField {
             "left" => {
                 let p = self.selection.start.min(self.selection.end);
                 self.selection = p.saturating_sub(1)..p.saturating_sub(1);
+                self.reversed = false;
             }
             "right" => {
                 let p = self
@@ -112,6 +136,7 @@ impl CommandTextField {
                     .max(self.selection.start)
                     .min(self.utf16_len());
                 self.selection = (p + 1).min(self.utf16_len())..(p + 1).min(self.utf16_len());
+                self.reversed = false;
             }
             "home" => self.selection = 0..0,
             "end" => {
@@ -120,35 +145,79 @@ impl CommandTextField {
             }
             _ => return,
         }
+        self.caret_on = true;
         cx.emit(CommandTextChanged);
         cx.notify();
+    }
+
+    /// 焦点期间每半个周期翻转一次光标相位；失焦后自动停。
+    fn schedule_caret_blink(&mut self, cx: &mut Context<Self>) {
+        if self.blink_scheduled {
+            return;
+        }
+        self.blink_scheduled = true;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(CARET_BLINK_INTERVAL)
+                .await;
+            let Ok(alive) = this.update(cx, |field, cx| {
+                if !field.focused {
+                    field.blink_scheduled = false;
+                    return false;
+                }
+                field.caret_on = !field.caret_on;
+                cx.notify();
+                true
+            }) else {
+                break;
+            };
+            if !alive {
+                break;
+            }
+        })
+        .detach();
     }
 }
 
 impl Render for CommandTextField {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity: Entity<Self> = cx.entity();
         let focus = self.focus_handle.clone();
-        let text = if self.text.is_empty() {
-            self.placeholder.clone()
-        } else {
-            self.text.clone()
-        };
+        let focused = focus.is_focused(window);
+        if focused != self.focused {
+            self.focused = focused;
+            // 重新获得焦点时光标立即可见，从头开始闪。
+            self.caret_on = true;
+        }
+        if focused {
+            self.schedule_caret_blink(cx);
+        }
+
         let marked = self.marked_text.clone();
-        div()
+        let composing = !marked.is_empty();
+        let show_caret = focused && self.caret_on && !composing;
+        let sel_start = self.selection.start.min(self.selection.end);
+        let sel_end = self.selection.start.max(self.selection.end);
+
+        let mut field = div()
             .track_focus(&focus)
             .h(px(30.0))
             .w_full()
             .px_2()
             .flex()
             .items_center()
-            .bg(gpui::rgb(0x292B3D))
-            .text_color(if self.text.is_empty() {
-                gpui::rgb(0x565A78)
+            .border_1()
+            .rounded_sm()
+            .bg(if focused {
+                rgb(0x2F3147)
             } else {
-                gpui::rgb(0xC0CAF5)
+                rgb(0x292B3D)
             })
-            .child(format!("{}{}", text, marked))
+            .border_color(if focused {
+                rgb(0x7AA2F7)
+            } else {
+                rgb(0x343750)
+            })
             .child(canvas(
                 move |bounds, _window, _cx| bounds,
                 move |bounds, _, window, cx| {
@@ -159,8 +228,57 @@ impl Render for CommandTextField {
                     );
                 },
             ))
-            .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_down(cx.listener(Self::on_key_down));
+
+        if composing {
+            // 输入法组词期间整体展示 原文+预编辑，不画光标（与终端 IME 行为一致）。
+            field = field
+                .text_color(rgb(0xC0CAF5))
+                .child(format!("{}{}", self.text, marked));
+            return field;
+        }
+
+        if self.text.is_empty() {
+            if show_caret {
+                field = field.child(caret_bar());
+            }
+            field = field
+                .text_color(rgb(0x565A78))
+                .child(self.placeholder.clone());
+            return field;
+        }
+
+        // 三段式：选区前 / 选区（高亮底色）/ 选区后；光标位置由选区方向决定。
+        let collapsed = sel_start == sel_end;
+        let start_byte = self.byte_offset(sel_start);
+        let end_byte = self.byte_offset(sel_end);
+        let head = self.text[..start_byte].to_string();
+        let mid = self.text[start_byte..end_byte].to_string();
+        let tail = self.text[end_byte..].to_string();
+        let caret_leading = self.reversed || collapsed;
+        field = field.text_color(rgb(0xC0CAF5)).child(head);
+        if show_caret && caret_leading {
+            field = field.child(caret_bar());
+        }
+        if !collapsed {
+            field = field.child(
+                div()
+                    .bg(rgb(0x3B4661))
+                    .text_color(rgb(0xE0E6F5))
+                    .child(mid),
+            );
+        }
+        if show_caret && !caret_leading {
+            field = field.child(caret_bar());
+        }
+        field = field.child(tail);
+        field
     }
+}
+
+/// 光标条：细竖线，闪烁由外层控制是否渲染。
+fn caret_bar() -> gpui::Div {
+    div().w(px(2.0)).h(px(16.0)).bg(rgb(0x7DCFFF))
 }
 
 impl EntityInputHandler for CommandTextField {

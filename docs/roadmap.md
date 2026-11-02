@@ -72,6 +72,7 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 > TOTP 已落地：RFC 6238（SHA1/256/512，RFC 附录 B 全向量测试）+ base32/otpauth 链接解析（laterterm-config）；密钥环封装 laterterm-secrets（keyring v4 → Linux Secret Service，本机 gnome-keyring 冒烟通过），密钥绝不落 TOML；右面板动态码 CRUD + 倒计时 + 确认发送到焦点窗格，DBus 存取全部走后台线程。
 > 剩余：侧面板服务器/SFTP/设置骨架按 M3 节奏演进；本阶段尚未完成 GUI 实机验收。
 > 验收期已修复：隐藏窗格/标签的终端退出泄漏（TerminalExited 事件化回收，2538ae5）；本机门禁需 `PATH="$HOME/.cargo/bin:$PATH"` 统一 rustup 1.94 工具链，否则 rustc/clippy 版本错位必报 E0514。
+> 体验打磨：命令/动态码/服务器的新建/编辑/补输对话框统一升级为窗口级模态弹窗（遮罩点击/Esc/×均可关闭，错误提示移入弹窗内），输入框获得焦点时显示闪烁光标与高亮边框，弹窗关闭后焦点自动归还终端窗格。
 
 **目标**：Deepin 终端灵魂功能落地——运维的跳板机操作台。
 

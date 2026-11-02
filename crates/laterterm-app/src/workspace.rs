@@ -1,8 +1,8 @@
 use crate::command_text_field::CommandTextField;
 use gpui::{
-    App, AppContext, AsyncApp, Context, Edges, Entity, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, StatefulInteractiveElement,
-    Styled, WeakEntity, Window, div, prelude::FluentBuilder, px, rgb,
+    App, AppContext, AsyncApp, Context, Edges, Entity, FocusHandle, InteractiveElement,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px, rgb,
 };
 use laterterm_config::{
     Appearance, CommandTemplate, ServerAuthKind, ServerEntry, Settings, Theme, ThemeRegistry,
@@ -297,6 +297,8 @@ pub struct WorkspaceView {
     ssh_connecting: Option<String>,
     /// SSH 连接结果暂存：后台线程产物在 render 期统一消费（需要 window 开新标签）。
     pending_ssh_results: Vec<(String, anyhow::Result<Arc<dyn TerminalSession>>)>,
+    /// 待生效的焦点请求：异步上下文拿不到 window，先记下 handle，render 期统一 focus。
+    pending_focus: Option<FocusHandle>,
     secret_store: Arc<dyn SecretStore>,
 }
 
@@ -354,6 +356,7 @@ impl WorkspaceView {
             server_error: None,
             ssh_connecting: None,
             pending_ssh_results: Vec::new(),
+            pending_focus: None,
             secret_store: default_store(),
             settings_page: SettingsPage::Appearance,
             panes: vec![Pane {
@@ -902,7 +905,12 @@ impl WorkspaceView {
         self.focus_pane(pane_id, window, cx);
     }
 
-    fn edit_command(&mut self, command: Option<CommandTemplate>, cx: &mut Context<Self>) {
+    fn edit_command(
+        &mut self,
+        command: Option<CommandTemplate>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let draft = command.clone().unwrap_or_default();
         self.command_fields.clear();
         self.command_field_subscriptions.clear();
@@ -918,10 +926,16 @@ impl WorkspaceView {
             original_name: command.map(|item| item.name),
         });
         self.command_error = None;
+        focus_first_field(&self.command_fields, window, cx);
         cx.notify();
     }
 
-    fn save_edit_command(&mut self, original_name: Option<String>, cx: &mut Context<Self>) {
+    fn save_edit_command(
+        &mut self,
+        original_name: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let values = self
             .command_fields
             .iter()
@@ -958,6 +972,7 @@ impl WorkspaceView {
         if self.command_error.is_none() {
             self.command_dialog = None;
             self.command_fields.clear();
+            self.focus_active(window, cx);
         }
     }
 
@@ -988,6 +1003,7 @@ impl WorkspaceView {
                 self.command_fields.push((variable, field));
             }
         }
+        focus_first_field(&self.command_fields, window, cx);
         if self.command_fields.is_empty() && !command.confirm {
             self.send_command_to_pane(
                 self.command_target.unwrap_or(self.focused_pane_id()),
@@ -1042,16 +1058,22 @@ impl WorkspaceView {
     fn cancel_command(
         &mut self,
         _event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
+        self.dismiss_command(window, cx);
+    }
+
+    /// 关闭命令对话框（取消/Esc 共用），焦点归还终端。
+    fn dismiss_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.command_dialog = None;
         self.command_error = None;
         self.command_target = None;
         self.command_fields.clear();
         self.command_field_subscriptions.clear();
         self.command_values.clear();
+        self.focus_active(window, cx);
         cx.notify();
     }
 
@@ -1075,7 +1097,12 @@ impl WorkspaceView {
         .detach();
     }
 
-    fn edit_totp(&mut self, entry: Option<&TotpEntry>, cx: &mut Context<Self>) {
+    fn edit_totp(
+        &mut self,
+        entry: Option<&TotpEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let draft = entry.cloned().unwrap_or_default();
         self.totp_meta_draft = TotpEntry {
             name: String::new(),
@@ -1099,6 +1126,7 @@ impl WorkspaceView {
             original: entry.map(|item| item.name.clone()),
         });
         self.totp_error = None;
+        focus_first_field(&self.totp_fields, window, cx);
         cx.notify();
     }
 
@@ -1181,6 +1209,8 @@ impl WorkspaceView {
                         workspace.totp_dialog = None;
                         workspace.totp_fields.clear();
                         workspace.totp_error = None;
+                        workspace.pending_focus =
+                            Some(workspace.focused_terminal().read(cx).focus_handle().clone());
                     }
                     cx.notify();
                 }
@@ -1285,15 +1315,21 @@ impl WorkspaceView {
     fn cancel_totp(
         &mut self,
         _event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
+        self.dismiss_totp(window, cx);
+    }
+
+    /// 关闭动态码对话框（取消/Esc 共用），焦点归还终端。
+    fn dismiss_totp(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.totp_dialog = None;
         self.totp_error = None;
         self.totp_target = None;
         self.totp_fields.clear();
         self.totp_delete_confirm = None;
+        self.focus_active(window, cx);
         cx.notify();
     }
 
@@ -1339,7 +1375,12 @@ impl WorkspaceView {
 
     // ---------- 服务器区（M3 服务器管理）----------
 
-    fn edit_server(&mut self, entry: Option<&ServerEntry>, cx: &mut Context<Self>) {
+    fn edit_server(
+        &mut self,
+        entry: Option<&ServerEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.server_meta_draft = entry.cloned().unwrap_or_default();
         self.server_fields.clear();
         let meta = self.server_meta_draft.clone();
@@ -1374,6 +1415,7 @@ impl WorkspaceView {
             original: entry.map(|item| item.name.clone()),
         });
         self.server_error = None;
+        focus_first_field(&self.server_fields, window, cx);
         cx.notify();
     }
 
@@ -1462,6 +1504,8 @@ impl WorkspaceView {
                         workspace.server_dialog = None;
                         workspace.server_fields.clear();
                         workspace.server_error = None;
+                        workspace.pending_focus =
+                            Some(workspace.focused_terminal().read(cx).focus_handle().clone());
                     }
                     cx.notify();
                 }
@@ -1477,14 +1521,20 @@ impl WorkspaceView {
     fn cancel_server(
         &mut self,
         _event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
+        self.dismiss_server(window, cx);
+    }
+
+    /// 关闭服务器对话框（取消/Esc 共用），焦点归还终端。
+    fn dismiss_server(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.server_dialog = None;
         self.server_error = None;
         self.server_fields.clear();
         self.server_delete_confirm = None;
+        self.focus_active(window, cx);
         cx.notify();
     }
 
@@ -1570,6 +1620,9 @@ impl WorkspaceView {
                             let field = cx.new(|cx| {
                                 CommandTextField::new(String::new(), placeholder, cx)
                             });
+                            // 异步上下文拿不到 window，焦点请求入队 render 期生效
+                            workspace.pending_focus =
+                                Some(field.read(cx).focus_handle().clone());
                             workspace.server_fields.push(("凭据".into(), field));
                             workspace.server_dialog = Some(ServerDialog::Connect {
                                 name: entry.name.clone(),
@@ -1635,6 +1688,8 @@ impl WorkspaceView {
                         workspace.server_dialog = None;
                         workspace.server_fields.clear();
                         workspace.server_error = None;
+                        workspace.pending_focus =
+                            Some(workspace.focused_terminal().read(cx).focus_handle().clone());
                         workspace.start_ssh_connect(entry, Some(secret), cx);
                     }
                     Err(error) => {
@@ -1741,6 +1796,17 @@ impl WorkspaceView {
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.command_dialog.is_some() || self.totp_dialog.is_some() || self.server_dialog.is_some()
         {
+            // Esc 关闭当前弹窗（焦点归还终端由各 dismiss 负责）
+            if event.keystroke.key.eq_ignore_ascii_case("escape") {
+                if self.command_dialog.is_some() {
+                    self.dismiss_command(window, cx);
+                } else if self.totp_dialog.is_some() {
+                    self.dismiss_totp(window, cx);
+                } else {
+                    self.dismiss_server(window, cx);
+                }
+                cx.stop_propagation();
+            }
             return;
         }
         if let Some(command) = self
@@ -1846,6 +1912,9 @@ impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_shortcuts(window, cx);
         self.process_ssh_results(window, cx);
+        if let Some(handle) = self.pending_focus.take() {
+            handle.focus(window);
+        }
         let active_tab_id = self.active_tab;
         let active_layout = self.active_tab().layout.clone();
         let focused_pane = self.active_tab().focused_pane;
@@ -2013,6 +2082,10 @@ impl Render for WorkspaceView {
                     settings_content(self.settings_page, self, cx),
                 ))
             })
+            // 命令/动态码/服务器对话框：窗口级模态弹窗（最上层）
+            .when_some(render_active_dialog(self, cx), |root, overlay| {
+                root.child(overlay)
+            })
     }
 }
 
@@ -2094,8 +2167,6 @@ fn render_layout(
 
 fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
     let commands = workspace.settings.commands.clone();
-    let dialog = workspace.command_dialog.clone();
-    let fields = workspace.command_fields.clone();
     let error = workspace.command_error.clone();
     let active_tab = workspace.right_panel_tab;
 
@@ -2126,7 +2197,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                 .child(setting_button(
                     "新建命令",
                     true,
-                    cx.listener(|this, _event, _window, cx| this.edit_command(None, cx)),
+                    cx.listener(|this, _event, window, cx| this.edit_command(None, window, cx)),
                 ))
                 .child(
                     div()
@@ -2160,8 +2231,8 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                             false,
                             cx.listener({
                                 let command = command.clone();
-                                move |this, _event, _window, cx| {
-                                    this.edit_command(Some(command.clone()), cx)
+                                move |this, _event, window, cx| {
+                                    this.edit_command(Some(command.clone()), window, cx)
                                 }
                             }),
                         ))
@@ -2183,92 +2254,484 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
         RightPanelTab::Totp => render_totp_section(workspace, panel, cx),
         RightPanelTab::Servers => render_server_section(workspace, panel, cx),
     };
-    if let Some(CommandDialog::Edit { original_name }) = dialog.clone() {
-        panel = panel.child(
-            div()
-                .absolute()
-                .top_0()
-                .right_0()
-                .bottom_0()
-                .left_0()
-                .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.98))
-                .p_3()
-                .child(div().text_color(rgb(0x7DCFFF)).child("编辑命令"))
-                .children(
-                    fields
-                        .clone()
-                        .into_iter()
-                        .map(|(name, field)| div().pt_2().child(name).child(field)),
-                )
-                .child(setting_button(
-                    "保存",
-                    true,
-                    cx.listener(move |this, _event, _window, cx| {
-                        this.save_edit_command(original_name.clone(), cx)
-                    }),
-                ))
-                .child(setting_button(
-                    "取消",
-                    false,
-                    cx.listener(WorkspaceView::cancel_command),
-                )),
-        );
-    }
-    if let Some(CommandDialog::Preview { template, preview }) = dialog {
-        let display_command = preview.unwrap_or_else(|| {
-            format!(
-                "参数错误：{}",
-                template.variables().unwrap_or_default().join(", ")
-            )
-        });
-        let display_confirm = template.confirm || !fields.is_empty();
-        panel = panel.child(
-            div()
-                .absolute()
-                .top_0()
-                .right_0()
-                .bottom_0()
-                .left_0()
-                .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.98))
-                .p_3()
-                .child(div().text_color(rgb(0x7DCFFF)).child("命令预览"))
-                .children(fields.clone().into_iter().map(|(name, field)| {
-                    div()
-                        .pt_2()
-                        .child(div().text_color(rgb(0x7D829F)).child(name))
-                        .child(field)
-                }))
-                .child(
-                    div()
-                        .pt_3()
-                        .text_color(rgb(0xC0CAF5))
-                        .child(display_command),
-                )
-                .child(if display_confirm {
-                    div()
-                        .pt_4()
-                        .flex()
-                        .gap_1()
-                        .child(setting_button(
-                            "发送",
-                            true,
-                            cx.listener(|this, _event, window, cx| {
-                                this.confirm_command(window, cx);
-                            }),
-                        ))
-                        .child(setting_button(
-                            "取消",
-                            false,
-                            cx.listener(WorkspaceView::cancel_command),
-                        ))
-                } else {
-                    div()
-                }),
-        );
-    }
     panel
 }
 
+// ---------- 窗口级模态弹窗（命令/动态码/服务器共用） ----------
+
+/// 按当前打开的对话框构建窗口级模态弹窗；无对话框时返回 None。
+/// （原为右面板内覆盖层，现统一为居中弹窗；错误提示随之移入弹窗内部。）
+fn render_active_dialog(
+    workspace: &mut WorkspaceView,
+    cx: &mut Context<WorkspaceView>,
+) -> Option<gpui::Div> {
+    if let Some(CommandDialog::Edit { original_name }) = workspace.command_dialog.clone() {
+        return Some(command_edit_modal(workspace, original_name, cx));
+    }
+    if let Some(CommandDialog::Preview { template, preview }) = workspace.command_dialog.clone() {
+        return Some(command_preview_modal(workspace, template, preview, cx));
+    }
+    if let Some(TotpDialog::Edit { original }) = workspace.totp_dialog.clone() {
+        return Some(totp_edit_modal(workspace, original, cx));
+    }
+    if let Some(TotpDialog::Preview {
+        name,
+        code,
+        generated_at,
+        period,
+    }) = workspace.totp_dialog.clone()
+    {
+        return Some(totp_preview_modal(
+            workspace, name, code, generated_at, period, cx,
+        ));
+    }
+    if let Some(ServerDialog::Edit { original }) = workspace.server_dialog.clone() {
+        return Some(server_edit_modal(workspace, original, cx));
+    }
+    if let Some(ServerDialog::Connect { name, remember }) = workspace.server_dialog.clone() {
+        return Some(server_connect_modal(workspace, name, remember, cx));
+    }
+    None
+}
+
+/// 弹窗骨架：暗色遮罩 + 居中卡片。点遮罩或标题栏 × 都走 cancel。
+fn modal_dialog(
+    title: impl Into<gpui::SharedString>,
+    body: gpui::Div,
+    cancel: impl Fn(&MouseDownEvent, &mut Window, &mut App) + Clone + 'static,
+) -> gpui::Div {
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::black().opacity(0.55))
+        .on_mouse_down(MouseButton::Left, cancel.clone())
+        .child(
+            div()
+                .w(px(480.0))
+                .max_h(px(640.0))
+                .flex()
+                .flex_col()
+                .bg(rgb(0x202132))
+                .border_1()
+                .border_color(rgb(0x3B3F5C))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .h(px(44.0))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_4()
+                        .border_b_1()
+                        .border_color(rgb(0x343750))
+                        .child(div().text_color(rgb(0xC0CAF5)).child(title.into()))
+                        .child(
+                            div()
+                                .h(px(26.0))
+                                .w(px(26.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(rgb(0x7D829F))
+                                .hover(|this| this.text_color(rgb(0xF7768E)))
+                                .on_mouse_down(MouseButton::Left, cancel)
+                                .child("×"),
+                        ),
+                )
+                .child(body),
+        )
+}
+
+/// `cx.listener` 的可克隆版本：listener 的返回类型不透出 `Clone`，
+/// 而弹窗遮罩与标题栏 × 需要把同一个 cancel 闭包用两次。
+fn dismiss_listener(
+    cx: &Context<WorkspaceView>,
+    dismiss: fn(&mut WorkspaceView, &mut Window, &mut Context<WorkspaceView>),
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + Clone + 'static {
+    let view = cx.weak_entity();
+    move |_event, window, cx| {
+        view.update(cx, |view, cx| dismiss(view, window, cx)).ok();
+    }
+}
+
+/// 弹窗内一行「标签 + 输入框」。
+fn dialog_field_row(label: &str, field: Entity<CommandTextField>) -> gpui::Div {
+    div()
+        .pt_2()
+        .child(div().text_color(rgb(0x7D829F)).child(label.to_string()))
+        .child(field)
+}
+
+/// 弹窗底部按钮排。
+fn dialog_footer(buttons: Vec<gpui::Div>) -> gpui::Div {
+    div().pt_4().flex().gap_2().children(buttons)
+}
+
+/// 弹窗内错误提示行（保存/连接失败等需要就地可见的信息）。
+fn dialog_error_line(error: String) -> gpui::Div {
+    div().pb_2().text_color(rgb(0xF7768E)).child(error)
+}
+
+/// 打开弹窗时把焦点交给第一个输入框（光标立即闪烁）。
+fn focus_first_field(
+    fields: &[(String, Entity<CommandTextField>)],
+    window: &mut Window,
+    cx: &Context<WorkspaceView>,
+) {
+    if let Some((_, first)) = fields.first() {
+        first.read(cx).focus_handle().focus(window);
+    }
+}
+
+fn command_edit_modal(
+    workspace: &WorkspaceView,
+    original_name: Option<String>,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let fields = workspace.command_fields.clone();
+    let error = workspace.command_error.clone();
+    let title = if original_name.is_some() {
+        "编辑命令"
+    } else {
+        "新建命令"
+    };
+    let body = div()
+        .flex()
+        .flex_col()
+        .p_4()
+        .when_some(error, |body, error| body.child(dialog_error_line(error)))
+        .children(
+            fields
+                .into_iter()
+                .map(|(name, field)| dialog_field_row(&name, field)),
+        )
+        .child(dialog_footer(vec![
+            setting_button(
+                "保存",
+                true,
+                cx.listener(move |this, _event, window, cx| {
+                    this.save_edit_command(original_name.clone(), window, cx)
+                }),
+            ),
+            setting_button("取消", false, cx.listener(WorkspaceView::cancel_command)),
+        ]));
+    modal_dialog(
+        title,
+        body,
+        dismiss_listener(cx, WorkspaceView::dismiss_command),
+    )
+}
+
+fn command_preview_modal(
+    workspace: &WorkspaceView,
+    template: CommandTemplate,
+    preview: Option<String>,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let fields = workspace.command_fields.clone();
+    let error = workspace.command_error.clone();
+    let display_command = preview.unwrap_or_else(|| {
+        format!(
+            "参数错误：{}",
+            template.variables().unwrap_or_default().join(", ")
+        )
+    });
+    let display_confirm = template.confirm || !fields.is_empty();
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .p_4()
+        .when_some(error, |body, error| body.child(dialog_error_line(error)))
+        .children(
+            fields
+                .into_iter()
+                .map(|(name, field)| dialog_field_row(&name, field)),
+        )
+        .child(
+            div()
+                .pt_3()
+                .text_color(rgb(0xC0CAF5))
+                .child(display_command),
+        );
+    if display_confirm {
+        body = body.child(dialog_footer(vec![
+            setting_button(
+                "发送",
+                true,
+                cx.listener(|this, _event, window, cx| {
+                    this.confirm_command(window, cx);
+                }),
+            ),
+            setting_button("取消", false, cx.listener(WorkspaceView::cancel_command)),
+        ]));
+    }
+    modal_dialog(
+        "命令预览",
+        body,
+        dismiss_listener(cx, WorkspaceView::dismiss_command),
+    )
+}
+
+fn totp_edit_modal(
+    workspace: &WorkspaceView,
+    original: Option<String>,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let fields = workspace.totp_fields.clone();
+    let meta = workspace.totp_meta_draft.clone();
+    let error = workspace.totp_error.clone();
+    let title = if original.is_some() {
+        "编辑动态码"
+    } else {
+        "新建动态码"
+    };
+    let body = div()
+        .flex()
+        .flex_col()
+        .p_4()
+        .when_some(error, |body, error| body.child(dialog_error_line(error)))
+        .children(
+            fields
+                .into_iter()
+                .map(|(name, field)| dialog_field_row(&name, field)),
+        )
+        .child(
+            div()
+                .pt_2()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(div().text_color(rgb(0x7D829F)).child("算法"))
+                .children(
+                    [
+                        TotpAlgorithm::Sha1,
+                        TotpAlgorithm::Sha256,
+                        TotpAlgorithm::Sha512,
+                    ]
+                    .into_iter()
+                    .map(|algo| {
+                        setting_button(
+                            algo.label(),
+                            meta.algorithm == algo,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.totp_meta_draft.algorithm = algo;
+                                cx.notify();
+                            }),
+                        )
+                    }),
+                ),
+        )
+        .child(
+            div()
+                .pt_2()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(div().text_color(rgb(0x7D829F)).child("位数"))
+                .children([6u32, 8].into_iter().map(|digits| {
+                    setting_button(
+                        digits.to_string(),
+                        meta.digits == digits,
+                        cx.listener(move |this, _event, _window, cx| {
+                            this.totp_meta_draft.digits = digits;
+                            cx.notify();
+                        }),
+                    )
+                }))
+                .child(
+                    div()
+                        .text_color(rgb(0x565A78))
+                        .child(format!("周期 {} 秒", meta.period)),
+                ),
+        )
+        .child(dialog_footer(vec![
+            setting_button(
+                "保存",
+                true,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.save_totp(original.clone(), cx)
+                }),
+            ),
+            setting_button("取消", false, cx.listener(WorkspaceView::cancel_totp)),
+        ]));
+    modal_dialog(
+        title,
+        body,
+        dismiss_listener(cx, WorkspaceView::dismiss_totp),
+    )
+}
+
+fn totp_preview_modal(
+    workspace: &WorkspaceView,
+    name: String,
+    code: Option<String>,
+    generated_at: SystemTime,
+    period: u64,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let error = workspace.totp_error.clone();
+    let remaining = totp_preview_remaining(generated_at, period);
+    let expired = code.is_some() && remaining == 0;
+    let ready = code.is_some() && !expired;
+    let body_line = match (code, expired) {
+        (None, _) => div().text_color(rgb(0x7D829F)).child("正在从密钥环读取…"),
+        (Some(code), false) => div()
+            .text_color(rgb(0xC0CAF5))
+            .child(format!("{code}   {remaining}s 后轮换")),
+        (Some(_), true) => div()
+            .text_color(rgb(0xF7768E))
+            .child("已过期，重新点击条目生成"),
+    };
+    let body = div()
+        .flex()
+        .flex_col()
+        .p_4()
+        .when_some(error, |body, error| body.child(dialog_error_line(error)))
+        .child(body_line)
+        .child(dialog_footer(vec![
+            setting_button(
+                "发送",
+                ready,
+                cx.listener(|this, _event, window, cx| {
+                    this.confirm_totp(window, cx);
+                }),
+            ),
+            setting_button("取消", false, cx.listener(WorkspaceView::cancel_totp)),
+        ]));
+    modal_dialog(
+        format!("动态码 · {name}"),
+        body,
+        dismiss_listener(cx, WorkspaceView::dismiss_totp),
+    )
+}
+
+fn server_edit_modal(
+    workspace: &WorkspaceView,
+    original: Option<String>,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let fields = workspace.server_fields.clone();
+    let meta = workspace.server_meta_draft.clone();
+    let error = workspace.server_error.clone();
+    let title = if original.is_some() {
+        "编辑服务器"
+    } else {
+        "新建服务器"
+    };
+    let body = div()
+        .flex()
+        .flex_col()
+        .p_4()
+        .when_some(error, |body, error| body.child(dialog_error_line(error)))
+        .children(
+            fields
+                .into_iter()
+                .map(|(name, field)| dialog_field_row(&name, field)),
+        )
+        .child(
+            div()
+                .pt_2()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(div().text_color(rgb(0x7D829F)).child("认证"))
+                .children(
+                    [
+                        (ServerAuthKind::Password, "密码"),
+                        (ServerAuthKind::KeyboardInteractive, "交互"),
+                        (ServerAuthKind::PrivateKey, "密钥"),
+                    ]
+                    .into_iter()
+                    .map(|(kind, label)| {
+                        setting_button(
+                            label,
+                            meta.auth == kind,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.server_meta_draft.auth = kind;
+                                cx.notify();
+                            }),
+                        )
+                    }),
+                ),
+        )
+        .child(dialog_footer(vec![
+            setting_button(
+                "保存",
+                true,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.save_server(original.clone(), cx)
+                }),
+            ),
+            setting_button("取消", false, cx.listener(WorkspaceView::cancel_server)),
+        ]));
+    modal_dialog(
+        title,
+        body,
+        dismiss_listener(cx, WorkspaceView::dismiss_server),
+    )
+}
+
+fn server_connect_modal(
+    workspace: &WorkspaceView,
+    name: String,
+    remember: bool,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let fields = workspace.server_fields.clone();
+    let error = workspace.server_error.clone();
+    let body = div()
+        .flex()
+        .flex_col()
+        .p_4()
+        .when_some(error, |body, error| body.child(dialog_error_line(error)))
+        .child(
+            div()
+                .text_color(rgb(0x7D829F))
+                .child("密钥环中没有该服务器的凭据，请补输一次"),
+        )
+        .children(
+            fields
+                .into_iter()
+                .map(|(name, field)| dialog_field_row(&name, field)),
+        )
+        .child(
+            div()
+                .pt_2()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(setting_button(
+                    if remember { "记住凭据 ✓" } else { "记住凭据" },
+                    remember,
+                    cx.listener(move |this, _event, _window, cx| {
+                        if let Some(ServerDialog::Connect { remember, .. }) =
+                            &mut this.server_dialog
+                        {
+                            *remember = !*remember;
+                        }
+                        cx.notify();
+                    }),
+                ))
+                .child(div().text_color(rgb(0x565A78)).child("写入系统密钥环")),
+        )
+        .child(dialog_footer(vec![
+            setting_button(
+                "连接",
+                true,
+                cx.listener(|this, _event, _window, cx| this.submit_server_connect(cx)),
+            ),
+            setting_button("取消", false, cx.listener(WorkspaceView::cancel_server)),
+        ]));
+    modal_dialog(
+        format!("连接 {name}"),
+        body,
+        dismiss_listener(cx, WorkspaceView::dismiss_server),
+    )
+}
 /// 当前时间窗口的剩余秒数（条目行内的轮换提示，随 ticker 每秒刷新）。
 fn totp_window_remaining(period: u64) -> u64 {
     let now = SystemTime::now()
@@ -2286,25 +2749,22 @@ fn totp_preview_remaining(generated_at: SystemTime, period: u64) -> u64 {
         .unwrap_or(0)
 }
 
-/// 右面板「动态码」区：条目列表 + 编辑/预览覆盖层。
+/// 右面板「动态码」区：条目列表（编辑/预览走窗口级模态弹窗）。
 fn render_totp_section(
     workspace: &mut WorkspaceView,
     panel: gpui::Div,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
     let entries = workspace.settings.totp.clone();
-    let dialog = workspace.totp_dialog.clone();
-    let fields = workspace.totp_fields.clone();
-    let meta_draft = workspace.totp_meta_draft.clone();
     let delete_confirm = workspace.totp_delete_confirm.clone();
     let error = workspace.totp_error.clone();
 
-    let mut panel = panel
+    panel
         .child(div().pt_4().child("动态码 (TOTP)"))
         .child(setting_button(
             "新建动态码",
             true,
-            cx.listener(|this, _event, _window, cx| this.edit_totp(None, cx)),
+            cx.listener(|this, _event, window, cx| this.edit_totp(None, window, cx)),
         ))
         .child(
             div()
@@ -2343,7 +2803,7 @@ fn render_totp_section(
                     false,
                     cx.listener({
                         let entry = entry.clone();
-                        move |this, _event, _window, cx| this.edit_totp(Some(&entry), cx)
+                        move |this, _event, window, cx| this.edit_totp(Some(&entry), window, cx)
                     }),
                 ))
                 .child(setting_button(
@@ -2351,184 +2811,25 @@ fn render_totp_section(
                     pending_delete,
                     cx.listener(move |this, _event, _window, cx| this.delete_totp(&name, cx)),
                 ))
-        }));
-
-    if let Some(TotpDialog::Edit { original }) = dialog.clone() {
-        let meta = meta_draft;
-        panel = panel.child(
-            div()
-                .absolute()
-                .top_0()
-                .right_0()
-                .bottom_0()
-                .left_0()
-                .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.98))
-                .p_3()
-                .child(
-                    div()
-                        .text_color(rgb(0x7DCFFF))
-                        .child(if original.is_some() {
-                            "编辑动态码"
-                        } else {
-                            "新建动态码"
-                        }),
-                )
-                .children(fields.clone().into_iter().map(|(name, field)| {
-                    div()
-                        .pt_2()
-                        .child(div().text_color(rgb(0x7D829F)).child(name))
-                        .child(field)
-                }))
-                .child(
-                    div()
-                        .pt_2()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(div().text_color(rgb(0x7D829F)).child("算法"))
-                        .children(
-                            [
-                                TotpAlgorithm::Sha1,
-                                TotpAlgorithm::Sha256,
-                                TotpAlgorithm::Sha512,
-                            ]
-                            .into_iter()
-                            .map(|algo| {
-                                setting_button(
-                                    algo.label(),
-                                    meta.algorithm == algo,
-                                    cx.listener({
-                                        move |this, _event, _window, cx| {
-                                            this.totp_meta_draft.algorithm = algo;
-                                            cx.notify();
-                                        }
-                                    }),
-                                )
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .pt_2()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(div().text_color(rgb(0x7D829F)).child("位数"))
-                        .children([6u32, 8].into_iter().map(|digits| {
-                            setting_button(
-                                digits.to_string(),
-                                meta.digits == digits,
-                                cx.listener({
-                                    move |this, _event, _window, cx| {
-                                        this.totp_meta_draft.digits = digits;
-                                        cx.notify();
-                                    }
-                                }),
-                            )
-                        }))
-                        .child(
-                            div()
-                                .text_color(rgb(0x565A78))
-                                .child(format!("周期 {} 秒", meta.period)),
-                        ),
-                )
-                .child(
-                    div()
-                        .pt_3()
-                        .flex()
-                        .gap_1()
-                        .child(setting_button(
-                            "保存",
-                            true,
-                            cx.listener(move |this, _event, _window, cx| {
-                                this.save_totp(original.clone(), cx)
-                            }),
-                        ))
-                        .child(setting_button(
-                            "取消",
-                            false,
-                            cx.listener(WorkspaceView::cancel_totp),
-                        )),
-                ),
-        );
-    }
-
-    if let Some(TotpDialog::Preview {
-        name,
-        code,
-        generated_at,
-        period,
-    }) = dialog
-    {
-        let remaining = totp_preview_remaining(generated_at, period);
-        let expired = code.is_some() && remaining == 0;
-        let ready = code.is_some() && !expired;
-        let body = match (code, expired) {
-            (None, _) => div().text_color(rgb(0x7D829F)).child("正在从密钥环读取…"),
-            (Some(code), false) => div()
-                .text_color(rgb(0xC0CAF5))
-                .child(format!("{code}   {remaining}s 后轮换")),
-            (Some(_), true) => div()
-                .text_color(rgb(0xF7768E))
-                .child("已过期，重新点击条目生成"),
-        };
-        panel = panel.child(
-            div()
-                .absolute()
-                .top_0()
-                .right_0()
-                .bottom_0()
-                .left_0()
-                .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.98))
-                .p_3()
-                .child(
-                    div()
-                        .text_color(rgb(0x7DCFFF))
-                        .child(format!("动态码 · {name}")),
-                )
-                .child(div().pt_2().child(body))
-                .child(
-                    div()
-                        .pt_3()
-                        .flex()
-                        .gap_1()
-                        .child(setting_button(
-                            "发送",
-                            ready,
-                            cx.listener(|this, _event, window, cx| {
-                                this.confirm_totp(window, cx);
-                            }),
-                        ))
-                        .child(setting_button(
-                            "取消",
-                            false,
-                            cx.listener(WorkspaceView::cancel_totp),
-                        )),
-                ),
-        );
-    }
-    panel
+        }))
 }
 
-/// 右面板「服务器」区：条目列表 + 编辑/连接覆盖层。
+/// 右面板「服务器」区：条目列表（编辑/连接凭据走窗口级模态弹窗）。
 fn render_server_section(
     workspace: &mut WorkspaceView,
     panel: gpui::Div,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
     let servers = workspace.settings.servers.clone();
-    let dialog = workspace.server_dialog.clone();
-    let fields = workspace.server_fields.clone();
-    let meta_draft = workspace.server_meta_draft.clone();
     let delete_confirm = workspace.server_delete_confirm.clone();
     let error = workspace.server_error.clone();
     let connecting = workspace.ssh_connecting.clone();
 
-    let mut panel = panel
+    panel
         .child(setting_button(
             "新建服务器",
             true,
-            cx.listener(|this, _event, _window, cx| this.edit_server(None, cx)),
+            cx.listener(|this, _event, window, cx| this.edit_server(None, window, cx)),
         ))
         .child(
             div()
@@ -2582,7 +2883,7 @@ fn render_server_section(
                     false,
                     cx.listener({
                         let entry = entry.clone();
-                        move |this, _event, _window, cx| this.edit_server(Some(&entry), cx)
+                        move |this, _event, window, cx| this.edit_server(Some(&entry), window, cx)
                     }),
                 ))
                 .child(setting_button(
@@ -2593,152 +2894,7 @@ fn render_server_section(
                         move |this, _event, _window, cx| this.delete_server(&name, cx)
                     }),
                 ))
-        }));
-
-    if let Some(ServerDialog::Edit { original }) = dialog.clone() {
-        panel = panel.child(
-            div()
-                .absolute()
-                .top_0()
-                .right_0()
-                .bottom_0()
-                .left_0()
-                .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.98))
-                .p_3()
-                .child(
-                    div()
-                        .text_color(rgb(0x7DCFFF))
-                        .child(if original.is_some() {
-                            "编辑服务器"
-                        } else {
-                            "新建服务器"
-                        }),
-                )
-                .children(fields.clone().into_iter().map(|(name, field)| {
-                    div()
-                        .pt_2()
-                        .child(div().text_color(rgb(0x7D829F)).child(name))
-                        .child(field)
-                }))
-                .child(
-                    div()
-                        .pt_2()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(div().text_color(rgb(0x7D829F)).child("认证"))
-                        .children(
-                            [
-                                (ServerAuthKind::Password, "密码"),
-                                (ServerAuthKind::KeyboardInteractive, "交互"),
-                                (ServerAuthKind::PrivateKey, "密钥"),
-                            ]
-                            .into_iter()
-                            .map(|(kind, label)| {
-                                setting_button(
-                                    label,
-                                    meta_draft.auth == kind,
-                                    cx.listener(move |this, _event, _window, cx| {
-                                        this.server_meta_draft.auth = kind;
-                                        cx.notify();
-                                    }),
-                                )
-                            }),
-                        ),
-                )
-                .child(
-                    div()
-                        .pt_3()
-                        .flex()
-                        .gap_1()
-                        .child(setting_button(
-                            "保存",
-                            true,
-                            cx.listener(move |this, _event, _window, cx| {
-                                this.save_server(original.clone(), cx)
-                            }),
-                        ))
-                        .child(setting_button(
-                            "取消",
-                            false,
-                            cx.listener(WorkspaceView::cancel_server),
-                        )),
-                ),
-        );
-    }
-
-    if let Some(ServerDialog::Connect { name, remember }) = dialog {
-        panel = panel.child(
-            div()
-                .absolute()
-                .top_0()
-                .right_0()
-                .bottom_0()
-                .left_0()
-                .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.98))
-                .p_3()
-                .child(
-                    div()
-                        .text_color(rgb(0x7DCFFF))
-                        .child(format!("连接 {name}")),
-                )
-                .child(
-                    div()
-                        .pt_2()
-                        .text_color(rgb(0x7D829F))
-                        .child("密钥环中没有该服务器的凭据，请补输一次"),
-                )
-                .children(fields.clone().into_iter().map(|(name, field)| {
-                    div()
-                        .pt_2()
-                        .child(div().text_color(rgb(0x7D829F)).child(name))
-                        .child(field)
-                }))
-                .child(
-                    div()
-                        .pt_2()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(setting_button(
-                            if remember { "记住凭据 ✓" } else { "记住凭据" },
-                            remember,
-                            cx.listener(move |this, _event, _window, cx| {
-                                if let Some(ServerDialog::Connect { remember, .. }) =
-                                    &mut this.server_dialog
-                                {
-                                    *remember = !*remember;
-                                }
-                                cx.notify();
-                            }),
-                        ))
-                        .child(
-                            div()
-                                .text_color(rgb(0x565A78))
-                                .child("写入系统密钥环"),
-                        ),
-                )
-                .child(
-                    div()
-                        .pt_3()
-                        .flex()
-                        .gap_1()
-                        .child(setting_button(
-                            "连接",
-                            true,
-                            cx.listener(|this, _event, _window, cx| {
-                                this.submit_server_connect(cx)
-                            }),
-                        ))
-                        .child(setting_button(
-                            "取消",
-                            false,
-                            cx.listener(WorkspaceView::cancel_server),
-                        )),
-                ),
-        );
-    }
-    panel
+        }))
 }
 
 fn settings_overlay(
