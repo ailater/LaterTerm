@@ -1,9 +1,11 @@
 use crate::command_text_field::CommandTextField;
 use gpui::{
-    App, AppContext, AsyncApp, Context, Edges, Entity, FocusHandle, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render,
-    StatefulInteractiveElement, Styled, WeakEntity, Window, div, prelude::FluentBuilder, px, rgb,
+    App, AppContext, AsyncApp, Bounds, Context, CursorStyle, DispatchPhase, Edges, Entity,
+    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, Render, StatefulInteractiveElement, Styled,
+    WeakEntity, Window, canvas, div, prelude::FluentBuilder, px, relative, rgb,
 };
+use laterterm_termview::view::ScrollSummary;
 use laterterm_config::{
     Appearance, CommandTemplate, ServerAuthKind, ServerEntry, Settings, Theme, ThemeRegistry,
     TotpAlgorithm, TotpConfig, TotpEntry, app_config_dir, generate_code, parse_secret_input,
@@ -52,14 +54,45 @@ enum WorkspaceShortcut {
 }
 
 /// 标签内的分屏布局树，叶子是 PaneId。
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Split 带 id（拖拽定位）与 ratio（首个子树占比，0.0–1.0）。
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum LayoutNode {
     Leaf(PaneId),
     Split {
+        id: u64,
         direction: SplitDirection,
         first: Box<LayoutNode>,
         second: Box<LayoutNode>,
+        ratio: f32,
     },
+}
+
+/// 递归更新指定分割节点的比例；找不到时静默跳过（节点可能已被修剪）。
+pub(crate) fn apply_split_ratio(node: &mut LayoutNode, split_id: u64, ratio: f32) {
+    match node {
+        LayoutNode::Split {
+            id, ratio: node_ratio, ..
+        } if *id == split_id => *node_ratio = ratio,
+        LayoutNode::Split { first, second, .. } => {
+            apply_split_ratio(first, split_id, ratio);
+            apply_split_ratio(second, split_id, ratio);
+        }
+        LayoutNode::Leaf(_) => {}
+    }
+}
+
+/// 分割线拖拽中：目标分割节点 + 容器几何（mousedown 时从 paint 缓存取）。
+#[derive(Clone, Copy, Debug)]
+struct SplitDrag {
+    split_id: u64,
+    direction: SplitDirection,
+    geometry: Bounds<gpui::Pixels>,
+}
+
+thread_local! {
+    /// 分割容器几何缓存：paint 期由 canvas 写入，mousedown 换算拖拽比例时读取。
+    static SPLIT_GEOMETRY: std::cell::RefCell<std::collections::HashMap<u64, Bounds<gpui::Pixels>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 impl LayoutNode {
@@ -264,6 +297,9 @@ pub struct WorkspaceView {
     active_tab: TabId,
     next_pane_id: u64,
     next_tab_id: u64,
+    next_split_id: u64,
+    /// 进行中的分割线拖拽（None = 空闲）。
+    split_drag: Option<SplitDrag>,
     left_panel: bool,
     right_panel: bool,
     settings_open: bool,
@@ -357,6 +393,8 @@ impl WorkspaceView {
             ssh_connecting: None,
             pending_ssh_results: Vec::new(),
             pending_focus: None,
+            next_split_id: 1,
+            split_drag: None,
             secret_store: default_store(),
             settings_page: SettingsPage::Appearance,
             panes: vec![Pane {
@@ -551,8 +589,12 @@ impl WorkspaceView {
         let session = spawn_local_session();
         let pane_id = self.attach_pane(title, session, window, cx);
         let tab_index = self.active_tab_index();
+        let split_id = self.next_split_id;
+        self.next_split_id += 1;
         let replacement = LayoutNode::Split {
+            id: split_id,
             direction,
+            ratio: 0.5,
             first: Box::new(LayoutNode::Leaf(old)),
             second: Box::new(LayoutNode::Leaf(pane_id)),
         };
@@ -564,6 +606,50 @@ impl WorkspaceView {
             return;
         }
         self.focus_pane(pane_id, window, cx);
+    }
+
+    /// 按下分割线：记录目标节点与容器几何，进入拖拽。
+    /// 移动/松开由 render 期注册的窗口级鼠标监听处理（on_mouse_event 仅下一帧有效，
+    /// canvas paint 回调逐帧重挂，见 render）。
+    fn start_split_drag(&mut self, split_id: u64, direction: SplitDirection, cx: &mut Context<Self>) {
+        let geometry = SPLIT_GEOMETRY.with_borrow(|map| map.get(&split_id).copied());
+        let Some(geometry) = geometry else {
+            return;
+        };
+        self.split_drag = Some(SplitDrag {
+            split_id,
+            direction,
+            geometry,
+        });
+        cx.notify();
+    }
+
+    /// 拖拽中按鼠标位置换算分割比例（0.1–0.9，给两侧留最小窗格空间）。
+    /// 返回布局是否变化。
+    fn update_split_drag(&mut self, position: gpui::Point<gpui::Pixels>) -> bool {
+        let Some(drag) = self.split_drag else {
+            return false;
+        };
+        let raw = match drag.direction {
+            SplitDirection::Horizontal => {
+                (position.x - drag.geometry.origin.x) / drag.geometry.size.width
+            }
+            SplitDirection::Vertical => {
+                (position.y - drag.geometry.origin.y) / drag.geometry.size.height
+            }
+        };
+        let index = self.active_tab_index();
+        apply_split_ratio(
+            &mut self.tabs[index].layout,
+            drag.split_id,
+            raw.clamp(0.1, 0.9),
+        );
+        true
+    }
+
+    /// 松开鼠标结束拖拽；返回此前是否有拖拽在进行。
+    fn end_split_drag(&mut self) -> bool {
+        self.split_drag.take().is_some()
     }
 
     fn activate_tab(
@@ -1915,6 +2001,7 @@ impl Render for WorkspaceView {
         if let Some(handle) = self.pending_focus.take() {
             handle.focus(window);
         }
+        let drag_listener_workspace = cx.weak_entity();
         let active_tab_id = self.active_tab;
         let active_layout = self.active_tab().layout.clone();
         let focused_pane = self.active_tab().focused_pane;
@@ -1973,6 +2060,8 @@ impl Render for WorkspaceView {
                                 };
                                 div()
                                     .h_full()
+                                    .relative()
+                                    .group("tab")
                                     .flex()
                                     .items_center()
                                     .gap_1()
@@ -1994,10 +2083,25 @@ impl Render for WorkspaceView {
                                         }),
                                     )
                                     .child(label)
+                                    // 激活标签底部强调线
+                                    .when(is_active, |tab| {
+                                        tab.child(
+                                            div()
+                                                .absolute()
+                                                .bottom_0()
+                                                .left_0()
+                                                .right_0()
+                                                .h(px(2.0))
+                                                .bg(rgb(0x7AA2F7)),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .px_1()
                                             .text_color(rgb(0x7D829F))
+                                            .opacity(0.55)
+                                            .group_hover("tab", |style| style.opacity(1.0))
+                                            .hover(|style| style.text_color(rgb(0xF7768E)))
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |this, event, window, cx| {
@@ -2066,7 +2170,13 @@ impl Render for WorkspaceView {
                             .flex_1()
                             .min_w(px(0.0))
                             .min_h(px(0.0))
-                            .child(render_layout(&active_layout, &self.panes, focused_pane, cx)),
+                            .child(render_layout(
+                                &active_layout,
+                                &self.panes,
+                                focused_pane,
+                                self.split_drag.map(|drag| drag.split_id),
+                                cx,
+                            )),
                     )
                     .child(if right_panel {
                         quick_panel(self, cx)
@@ -2086,6 +2196,41 @@ impl Render for WorkspaceView {
             .when_some(render_active_dialog(self, cx), |root, overlay| {
                 root.child(overlay)
             })
+            // 分割线拖拽：窗口级鼠标监听仅对下一帧有效，paint 期逐帧重挂
+            // （canvas 的 paint 回调即 paint 期，模式同 CommandTextField 的 handle_input）
+            .child(canvas(
+                move |_, _, _| {},
+                move |_, _, window, _cx| {
+                    let weak = drag_listener_workspace.clone();
+                    window.on_mouse_event(
+                        move |event: &MouseMoveEvent, phase: DispatchPhase, _window, cx| {
+                            if phase != DispatchPhase::Capture {
+                                return;
+                            }
+                            let _ = weak.update(cx, |workspace, cx| {
+                                if workspace.split_drag.is_some()
+                                    && workspace.update_split_drag(event.position)
+                                {
+                                    cx.notify();
+                                }
+                            });
+                        },
+                    );
+                    let weak = drag_listener_workspace.clone();
+                    window.on_mouse_event(
+                        move |_event: &MouseUpEvent, phase: DispatchPhase, _window, cx| {
+                            if phase != DispatchPhase::Capture {
+                                return;
+                            }
+                            let _ = weak.update(cx, |workspace, cx| {
+                                if workspace.end_split_drag() {
+                                    cx.notify();
+                                }
+                            });
+                        },
+                    );
+                },
+            ))
     }
 }
 
@@ -2093,6 +2238,7 @@ fn render_layout(
     node: &LayoutNode,
     panes: &[Pane],
     focused: PaneId,
+    dragging_split: Option<u64>,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
     match node {
@@ -2101,8 +2247,11 @@ fn render_layout(
                 return div();
             };
             let close_id = *id;
+            // 滚动摘要：有历史时画悬浮滚动条（随滚动回调刷新）
+            let scroll: ScrollSummary = pane.terminal.read(cx).scroll_summary();
             let mut pane_div = div()
                 .relative()
+                .group("pane")
                 .flex_1()
                 .min_w(px(0.0))
                 .min_h(px(0.0))
@@ -2119,48 +2268,116 @@ fn render_layout(
                     }),
                 )
                 .capture_key_down(cx.listener(WorkspaceView::on_key_down))
-                .child(pane.terminal.clone())
-                .child(
-                    div()
-                        .absolute()
-                        .top_1()
-                        .right_1()
-                        .px_1()
-                        .text_color(rgb(0x7D829F))
-                        .bg(gpui::Hsla::from(rgb(0x202132)).opacity(0.85))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _event, window, cx| {
-                                this.close_pane(close_id, window, cx)
+                .child(pane.terminal.clone());
+            // 悬浮滚动条：右侧细条平时半透明，悬停窗格加亮（无监听器，不拦截终端鼠标）
+            if let Some((thumb, top)) = scroll.thumb() {
+                pane_div = pane_div.child(
+                    div().absolute().top_0().bottom_0().right_0().w(px(6.0)).child(
+                        div()
+                            .absolute()
+                            .top(relative(top))
+                            .right(px(2.0))
+                            .h(relative(thumb))
+                            .w(px(3.0))
+                            .rounded_full()
+                            .bg(gpui::Hsla::from(rgb(0x565A78)).opacity(0.6))
+                            .group_hover("pane", |style| {
+                                style.bg(gpui::Hsla::from(rgb(0x7AA2F7)).opacity(0.9))
                             }),
-                        )
-                        .child("×"),
+                    ),
                 );
+            }
+            pane_div = pane_div.child(
+                div()
+                    .absolute()
+                    .top_1()
+                    .right_1()
+                    .px_1()
+                    .text_color(rgb(0x7D829F))
+                    .bg(gpui::Hsla::from(rgb(0x202132)).opacity(0.85))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event, window, cx| {
+                            this.close_pane(close_id, window, cx)
+                        }),
+                    )
+                    .child("×"),
+            );
             if *id == focused {
+                // 焦点窗格：强调色边框
                 pane_div = pane_div.border_1().border_color(rgb(0x7AA2F7));
+            } else {
+                // 非活动窗格整体压暗，配合边框一眼分清操作区域
+                pane_div = pane_div.opacity(0.85);
             }
             pane_div
         }
         LayoutNode::Split {
+            id,
             direction,
             first,
             second,
+            ratio,
         } => {
             let horizontal = matches!(direction, SplitDirection::Horizontal);
-            let mut container = div().flex().flex_1().min_w(px(0.0)).min_h(px(0.0));
+            let split_id = *id;
+            let direction = *direction;
+            let dragging = dragging_split == Some(split_id);
+            let mut container = div().relative().flex().flex_1().min_w(px(0.0)).min_h(px(0.0));
             if horizontal {
                 container = container.flex_row();
             } else {
                 container = container.flex_col();
             }
+            // 首个子树占 ratio 比例（百分比定位），余量由第二个子树 flex_1 吃掉
+            let (first_wrapper, divider) = if horizontal {
+                (
+                    div().w(relative(*ratio)),
+                    div()
+                        .w(px(3.0))
+                        .h_full()
+                        .cursor(CursorStyle::ResizeLeftRight),
+                )
+            } else {
+                (
+                    div().h(relative(*ratio)),
+                    div().h(px(3.0)).w_full().cursor(CursorStyle::ResizeRow),
+                )
+            };
             container
-                .child(render_layout(first, panes, focused, cx))
-                .child(if horizontal {
-                    div().w(px(1.0)).h_full().bg(rgb(0x343750))
-                } else {
-                    div().h(px(1.0)).w_full().bg(rgb(0x343750))
-                })
-                .child(render_layout(second, panes, focused, cx))
+                .child(
+                    first_wrapper
+                        .min_w(px(0.0))
+                        .min_h(px(0.0))
+                        .flex()
+                        .child(render_layout(first, panes, focused, dragging_split, cx)),
+                )
+                .child(
+                    divider
+                        .flex_shrink_0()
+                        .bg(if dragging {
+                            rgb(0x7AA2F7)
+                        } else {
+                            rgb(0x3A3E5C)
+                        })
+                        .hover(|style| style.bg(gpui::Hsla::from(rgb(0x7AA2F7)).opacity(0.7)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.start_split_drag(split_id, direction, cx)
+                            }),
+                        ),
+                )
+                .child(render_layout(second, panes, focused, dragging_split, cx))
+                // paint 期上报容器几何，mousedown 换算拖拽比例用
+                .child(div().absolute().inset_0().child(canvas(
+                    move |bounds, _, _| bounds,
+                    move |bounds, _, _, _| {
+                        SPLIT_GEOMETRY.with_borrow_mut(|map| {
+                            map.insert(split_id, bounds);
+                        });
+                    },
+                )))
         }
     }
 }
@@ -3639,6 +3856,13 @@ fn create_terminal_view(
                     if active {
                         window.set_window_title(if title.is_empty() { "LaterTerm" } else { title });
                     }
+                }
+            })
+            // 滚动/输出变化时唤醒工作区，让滚动条指示器跟手
+            .with_scroll_callback({
+                let workspace = workspace.clone();
+                move |cx| {
+                    let _ = workspace.update(cx, |_, cx| cx.notify());
                 }
             })
     })

@@ -66,7 +66,8 @@ impl Default for Appearance {
         Self {
             font_family: "JetBrainsMono Nerd Font".into(),
             font_size: 13.0,
-            line_height: 1.0,
+            // 1.2 行距读长日志更舒适；纯网格对齐不受影响（TUI 按单元格定位）
+            line_height: 1.2,
             padding: 8.0,
             scrollback: 100_000,
             theme: DEFAULT_THEME.into(),
