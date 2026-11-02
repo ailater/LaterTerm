@@ -274,8 +274,8 @@ enum ServerDialog {
 const BUILTIN_SHORTCUTS: &[(&str, &str)] = &[
     ("ctrl+t", "新建标签"),
     ("ctrl+w", "关闭窗格 / 标签"),
-    ("ctrl+shift+e", "左右分屏"),
-    ("ctrl+shift+o", "上下分屏"),
+    ("ctrl+j", "左右分屏"),
+    ("ctrl+k", "上下分屏"),
     ("ctrl+shift+[", "上一个窗格"),
     ("ctrl+shift+]", "下一个窗格"),
     ("ctrl+shift+f", "回滚搜索"),
@@ -2380,14 +2380,16 @@ impl WorkspaceView {
         }
         let key = event.keystroke.key.as_str();
         if event.keystroke.modifiers.control
-            && event.keystroke.modifiers.shift
-            && key.eq_ignore_ascii_case("e")
+            && !event.keystroke.modifiers.shift
+            && !event.keystroke.modifiers.alt
+            && key.eq_ignore_ascii_case("j")
         {
             self.split_focused(SplitDirection::Horizontal, window, cx);
             cx.stop_propagation();
         } else if event.keystroke.modifiers.control
-            && event.keystroke.modifiers.shift
-            && key.eq_ignore_ascii_case("o")
+            && !event.keystroke.modifiers.shift
+            && !event.keystroke.modifiers.alt
+            && key.eq_ignore_ascii_case("k")
         {
             self.split_focused(SplitDirection::Vertical, window, cx);
             cx.stop_propagation();
@@ -4474,13 +4476,15 @@ fn create_terminal_view(
         TerminalView::new(session, config, cx)
             .with_key_handler(move |event| {
                 let shortcut = if event.keystroke.modifiers.control
-                    && event.keystroke.modifiers.shift
-                    && event.keystroke.key.eq_ignore_ascii_case("e")
+                    && !event.keystroke.modifiers.shift
+                    && !event.keystroke.modifiers.alt
+                    && event.keystroke.key.eq_ignore_ascii_case("j")
                 {
                     Some(WorkspaceShortcut::Split(SplitDirection::Horizontal))
                 } else if event.keystroke.modifiers.control
-                    && event.keystroke.modifiers.shift
-                    && event.keystroke.key.eq_ignore_ascii_case("o")
+                    && !event.keystroke.modifiers.shift
+                    && !event.keystroke.modifiers.alt
+                    && event.keystroke.key.eq_ignore_ascii_case("k")
                 {
                     Some(WorkspaceShortcut::Split(SplitDirection::Vertical))
                 } else if event.keystroke.modifiers.control
