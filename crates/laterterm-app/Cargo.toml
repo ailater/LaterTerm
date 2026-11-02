@@ -22,6 +22,10 @@ anyhow.workspace = true
 parking_lot.workspace = true
 flume.workspace = true
 notify = "8"
+laterterm-xshell.workspace = true
+laterterm-deepin.workspace = true
+shellexpand = "3.1.2"
+laterterm-transfer.workspace = true
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

@@ -57,6 +57,8 @@ pub struct Appearance {
     /// 备选字体链（主字体缺字时按序回退，如 CJK）；空表示用系统默认回退。
     #[serde(default)]
     pub font_fallbacks: Vec<String>,
+    /// 接收目录；空 = ~/Downloads。
+    pub downloads_dir: String,
 }
 
 fn default_true() -> bool {
@@ -75,6 +77,7 @@ impl Default for Appearance {
             theme: DEFAULT_THEME.into(),
             ligatures: true,
             font_fallbacks: Vec::new(),
+            downloads_dir: String::new(),
         }
     }
 }

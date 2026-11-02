@@ -5,7 +5,7 @@
 //! 不依赖外部 sshd。
 
 use laterterm_core::{BackendKind, TerminalSession};
-use laterterm_ssh::{AuthMethod, SshOptions, SshSession};
+use laterterm_ssh::{HostKeyPolicy, SessionEncoding, SshAuth, SshEndpoint, SshOptions, SshSession};
 use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
 use russh::server::Server as _;
 use std::io::{Read, Write};
@@ -175,10 +175,10 @@ impl Drop for MockServer {
 }
 
 /// 连接参数（known_hosts 落在独立临时目录下的文件）。
-fn options_for(port: u16, auth: AuthMethod, dir: &std::path::Path) -> SshOptions {
-    let mut options = SshOptions::new("127.0.0.1", port, "tester", auth);
-    options.known_hosts = dir.join("known_hosts");
-    options
+fn options_for(port: u16, auth: SshAuth, dir: &std::path::Path) -> SshOptions {
+    SshOptions { endpoint: SshEndpoint { host: "127.0.0.1".into(), port: Some(port), username: "tester".into(), auth,
+        host_key_policy: HostKeyPolicy::KnownHosts { path: Some(dir.join("known_hosts")) }, encoding: SessionEncoding::Utf8 },
+        jump: None, cols: 110, rows: 30 }
 }
 
 fn temp_known_hosts(tag: &str) -> tempfile::TempDir {
@@ -230,17 +230,15 @@ fn password_auth_echo_resize_and_kill_eof() {
     let server = MockServer::start(0);
     let known_hosts = temp_known_hosts("echo");
 
-    let session = SshSession::connect(options_for(
+    let session = SshSession::spawn(options_for(
         server.port,
-        AuthMethod::Password {
-            password: "secret".into(),
-        },
+        SshAuth::Password("secret".into()),
         known_hosts.path(),
     ))
     .expect("连接 mock 服务器");
 
     assert_eq!(session.backend(), BackendKind::Ssh);
-    assert_eq!(session.title(), "tester@127.0.0.1");
+    assert_eq!(session.title(), format!("tester@127.0.0.1:{}", server.port));
 
     let mut streams = session.take_streams().expect("首次 take_streams");
     assert!(session.take_streams().is_err(), "二次 take_streams 应报错");
@@ -274,10 +272,10 @@ fn publickey_auth_reaches_shell() {
     std::fs::write(&key_path, client_key.to_openssh(LineEnding::LF).unwrap().as_bytes())
         .expect("写密钥文件");
 
-    let session = SshSession::connect(options_for(
+    let session = SshSession::spawn(options_for(
         server.port,
-        AuthMethod::PrivateKey {
-            key_path,
+        SshAuth::KeyFile {
+            path: key_path,
             passphrase: None,
         },
         known_hosts.path(),
@@ -298,11 +296,9 @@ fn tofu_learns_first_key_and_rejects_changed_key() {
     let port = server.port;
     let known_hosts = temp_known_hosts("tofu");
 
-    let first = SshSession::connect(options_for(
+    let first = SshSession::spawn(options_for(
         port,
-        AuthMethod::Password {
-            password: "secret".into(),
-        },
+        SshAuth::Password("secret".into()),
         known_hosts.path(),
     ))
     .expect("首连应通过 TOFU");
@@ -314,11 +310,9 @@ fn tofu_learns_first_key_and_rejects_changed_key() {
     let impostor = MockServer::start(port);
     assert_eq!(impostor.port, port, "换键用例要求复用同一端口");
 
-    let error = match SshSession::connect(options_for(
+    let error = match SshSession::spawn(options_for(
         port,
-        AuthMethod::Password {
-            password: "secret".into(),
-        },
+        SshAuth::Password("secret".into()),
         known_hosts.path(),
     )) {
         Err(error) => error,

@@ -17,6 +17,8 @@ pub enum ServerAuthKind {
     KeyboardInteractive,
     /// 私钥文件认证（passphrase 可选，在密钥环）。
     PrivateKey,
+    /// SSH agent 认证。
+    Agent,
 }
 
 /// 一台可连接的服务器。
@@ -36,6 +38,8 @@ pub struct ServerEntry {
     /// 应用内快捷键（ctrl+alt+k 一类），可选；统一注册表查重。
     #[serde(default)]
     pub shortcut: Option<String>,
+    /// 会话编码；缺省 UTF-8。
+    pub encoding: Option<String>,
 }
 
 impl Default for ServerEntry {
@@ -49,6 +53,7 @@ impl Default for ServerEntry {
             key_path: None,
             note: String::new(),
             shortcut: None,
+            encoding: None,
         }
     }
 }
@@ -161,6 +166,102 @@ impl ServersFile {
         Ok(file)
     }
 }
+
+use std::path::PathBuf;
+
+/// 认证方式（持久化形态；连接时映射为 laterterm_ssh::SshAuth）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StoredAuthKind {
+    /// ssh-agent（SSH_AUTH_SOCK）。
+    Agent,
+    /// 私钥文件路径。
+    KeyFile(String),
+    /// 系统密钥环存密码（account = [`password_account`]）。
+    Keyring,
+}
+
+/// 一台远程服务器。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredServerEntry {
+    /// 显示名（唯一标识，重名保存时后者覆盖前者）。
+    pub name: String,
+    pub host: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    pub username: String,
+    pub auth: StoredAuthKind,
+    /// 终端编码（`"UTF-8"` / `"GBK"` / `"GB18030"`；缺省 UTF-8）。
+    #[serde(default)]
+    pub encoding: Option<String>,
+}
+
+fn default_port() -> u16 {
+    22
+}
+
+/// 密码在系统密钥环里的 account 命名（与 TOTP 的命名同风格）。
+pub fn password_account(name: &str) -> String {
+    format!("laterterm-server-{name}")
+}
+
+/// 服务器列表（servers.toml 的读写单元）。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerStore {
+    pub servers: Vec<StoredServerEntry>,
+}
+
+impl ServerStore {
+    /// 从配置目录读（文件缺失/损坏回落空表，损坏不致命——面板可重建）。
+    pub fn load() -> Self {
+        let Some(path) = servers_path() else {
+            return Self::default();
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Self::default();
+        };
+        toml::from_str(&text).unwrap_or_default()
+    }
+
+    /// 落盘（同名校验由调用方做，这里保序全量写）。
+    pub fn save(&self) -> Result<(), String> {
+        let Some(path) = servers_path() else {
+            return Err("无法定位配置目录（缺 HOME）".into());
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let text = toml::to_string_pretty(self).map_err(|e| e.to_string())?;
+        std::fs::write(&path, text).map_err(|e| e.to_string())
+    }
+
+    /// 按名取条目。
+    pub fn get(&self, name: &str) -> Option<&StoredServerEntry> {
+        self.servers.iter().find(|server| server.name == name)
+    }
+
+    /// 插入或按名覆盖（重命名语义 = 先 remove 再 upsert）。
+    pub fn upsert(&mut self, entry: StoredServerEntry) {
+        match self
+            .servers
+            .iter()
+            .position(|server| server.name == entry.name)
+        {
+            Some(index) => self.servers[index] = entry,
+            None => self.servers.push(entry),
+        }
+    }
+
+    pub fn remove(&mut self, name: &str) -> bool {
+        let before = self.servers.len();
+        self.servers.retain(|server| server.name != name);
+        before != self.servers.len()
+    }
+}
+
+fn servers_path() -> Option<PathBuf> {
+    crate::app_config_dir().map(|dir| dir.join("servers.toml"))
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -278,6 +379,7 @@ username = "u"
             key_path: None,
             note: "导出测试".into(),
             shortcut: Some("ctrl+alt+1".into()),
+            encoding: None,
         }]);
         file.save_to(&path).unwrap();
         let loaded = ServersFile::load_from(&path).unwrap();
@@ -311,5 +413,36 @@ username = "u"
         assert_eq!(ok.host, "h");
         assert_eq!(ok.username, "ops");
         assert!(ServerEntry::default().sanitized().is_none(), "空条目丢弃");
+    }
+}
+
+impl From<StoredServerEntry> for ServerEntry {
+    fn from(entry: StoredServerEntry) -> Self {
+        let (auth, key_path) = match entry.auth {
+            StoredAuthKind::Agent => (ServerAuthKind::Agent, None),
+            StoredAuthKind::KeyFile(path) => (ServerAuthKind::PrivateKey, Some(path)),
+            StoredAuthKind::Keyring => (ServerAuthKind::Password, None),
+        };
+        Self { name: entry.name, host: entry.host, port: entry.port, username: entry.username,
+            auth, key_path, encoding: entry.encoding, ..Self::default() }
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn main_servers_convert_without_losing_key_or_encoding() {
+        let stored = StoredServerEntry { name: "旧服务器".into(), host: "host".into(), port: 2222,
+            username: "ops".into(), auth: StoredAuthKind::KeyFile("/tmp/id".into()), encoding: Some("GBK".into()) };
+        let entry = ServerEntry::from(stored);
+        assert_eq!(entry.auth, ServerAuthKind::PrivateKey);
+        assert_eq!(entry.key_path.as_deref(), Some("/tmp/id"));
+        assert_eq!(entry.encoding.as_deref(), Some("GBK"));
+        assert!(entry.validate().is_ok());
+        let file = ServersFile::new(vec![entry]);
+        let text = toml::to_string(&file).unwrap();
+        assert_eq!(toml::from_str::<ServersFile>(&text).unwrap(), file);
     }
 }

@@ -1,47 +1,71 @@
 <div align="center">
 
-# 🚧 LaterTerm
+# LaterTerm
 
-[![Rust](https://img.shields.io/badge/Rust-1.85+-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-1.94+-orange.svg)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey)]()
+[![CI](https://github.com/ailater/LaterTerm/actions/workflows/ci.yml/badge.svg)](https://github.com/ailater/LaterTerm/actions/workflows/ci.yml)
 
-**跨平台 GPU 终端 · Rust + GPUI · 快捷命令面板 · 远程服务器管理**
+**跨平台 GPU 终端 · Rust + GPUI · 远程服务器管理 · 终端内文件传输**
 
 为中文开发者打造的原生终端：Deepin 终端的功能 × Tabby 的颜值 × 原生的性能。
 
-[特性](#特性) · [路线图](#路线图) · [技术栈](#技术栈) · [开发](#开发)
+[特性](#特性) · [安装](#安装) · [技术栈](#技术栈) · [开发](#开发)
 
 </div>
 
-> 🚧 **项目处于早期开发阶段（M1）**，首个可用版本将在 M1 里程碑后发布。
-
-## 特性（规划）
+## 特性
 
 ### 终端本体
 
 - ⚡ **GPU 渲染** — GPUI 文本管线，连字 / CJK / emoji / HiDPI 原生支持
-- 🧩 **会话抽象** — 本地 PTY 与 SSH 远程会话共用一套交互，远程不是"另一个功能"
-- 🔍 **深度回滚** — 10 万行滚动缓冲 + 全文搜索
+- 🧩 **多标签 + 嵌套分屏** — H/V 任意分屏（Ctrl+Shift+E/O），焦点循环，标签栏 × / 窗格角标双级关闭
+- ⌨️ **中文 IME** — 预编辑下划线浮层 + 候选框光标跟随
+- 🔍 **回滚搜索** — 10 万行缓冲 + Ctrl+Shift+F 全文搜索（含 CJK 宽字符）
+- 🎨 **主题热加载** — TOML 配置即时生效，Tokyo Night 起步
+- 📢 **广播输入** — Ctrl+Shift+B 多窗格同步键入，多台服务器跑同一命令
 
-### Deepin 功能对齐
+### 远程会话
 
-- ⌨️ **快捷命令面板** — 参数化命令模板、内建 TOTP（跳板机二次验证一键完成）、每命令独立快捷键
-- 🌐 **远程服务器管理** — 主机分组、凭据入系统密钥环、SFTP 文件面板、跳板机链式跳转
-- 📦 **rz/sz 传输** — 兼容 trzsz 协议
-- 🪟 分屏 / 广播输入 / Quake 下拉模式 / 主题热加载
+- 🌐 **SSH 连接** — 密码 / 私钥文件 / ssh-agent 三种认证
+- 🔗 **跳板机链** — ProxyJump 语义，端到端加密穿透
+- 🔐 **主机密钥 TOFU** — OpenSSH known_hosts 兼容，变更硬拒绝
+- 📦 **GBK/GB18030 转码** — 遗留中文服务器直连即读
+- 📁 **SFTP 文件通道** — 列目录 / 上传 / 下载 / 进度回调
 
-## 路线图
+### 终端内文件传输
 
-| 里程碑 | 内容 | 状态 |
-|--------|------|------|
-| M0 | 窗口 + 本地会话 + 网格渲染，vim / htop / tmux 无残影 | ✅ 完成 |
-| M1 | 多标签 ✅ · 主题热加载 ✅ · 设置面板 ✅ · 分屏 / 搜索回滚 / 中文 IME 🚧 | 🚧 进行中 |
-| M2 | 快捷命令面板 + OTP + 每命令快捷键 | ⏳ |
-| M3 | SSH 远程管理 + 跳板机链 + SFTP + GBK 转码 | ⏳ |
-| M4 | 三平台打包、设置界面、动效打磨 | ⏳ |
+- **ZMODEM**（rz/sz 兼容）— lrzsz 检测串自动触发
+- **trzsz 接收**（trz/tsz 推文件）— MD5 全文校验
+- **trzsz 上传**（R 触发，本端推文件到远端）
 
-> 任务清单、验收标准与风险台账见 [docs/roadmap.md](docs/roadmap.md)。
+### 快捷命令操作台
+
+- **参数化命令模板** — 安全 shell 转义 + 预览确认 + focused pane 下发
+- **每命令独立快捷键** — 应用内绑定 + 冲突检测
+- **内建 TOTP** — RFC 6238，密钥入系统密钥环，跳板机二次验证一键完成
+
+### 服务器管理与导入
+
+- **服务器列表** — 添加 / 编辑 / 连接 / 删除，密码存密钥环不落盘
+- **XShell 会话导入** — Sessions 目录树 → 分组服务器列表
+- **deepin-terminal 配置导入** — 命令模板 + 服务器一键迁移
+
+## 安装
+
+从 [Releases](https://github.com/ailater/LaterTerm/releases/latest) 下载：
+
+| 平台 | 文件 |
+|------|------|
+| Linux x64 | `laterterm-*-x86_64-unknown-linux-gnu.tar.xz` |
+| macOS（Intel + Apple Silicon） | `laterterm-*-universal2-apple-darwin.dmg` |
+| Windows x64 | `laterterm-*-x86_64-pc-windows-msvc.zip`（🧪 实验性） |
+
+```bash
+tar -xJf laterterm-*-linux-gnu.tar.xz
+./laterterm-*/laterterm
+```
 
 ## 技术栈
 
@@ -50,26 +74,43 @@
 | UI 框架 | [GPUI](https://github.com/zed-industries/zed)（Zed 同款渲染） |
 | VT 仿真 | [alacritty_terminal](https://github.com/alacritty/alacritty) |
 | PTY | portable-pty |
-| SSH / SFTP | russh / russh-sftp |
+| SSH / SFTP | russh + russh-sftp |
+| ZMODEM | [rzsz](https://github.com/kookob/rzsz)（lrzsz 现代 Rust 重写） |
+| 编码转换 | encoding_rs（GBK / GB18030） |
 | 凭据 | 系统密钥环（keyring） |
 
-## 开发
+## 从源码构建
 
 ```bash
-git clone git@github.com:crazykun/LaterTerm.git
+git clone https://github.com/ailater/LaterTerm.git
 cd LaterTerm
 cargo run --release
 ```
 
-> 架构决策与技术文档见 `docs/`（随 M0 落地）。
+Linux 需要系统库：
 
-## 相关项目
+```bash
+sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev \
+  libwayland-dev libx11-dev libasound2-dev libudev-dev libfontconfig1-dev
+```
 
-| 项目 | 说明 |
-|------|------|
-| [LaterScreen](https://github.com/crazykun/LaterScreen) | 跨平台截图标注工具（OCR / 录屏 / 贴图） |
-| [LaterMd](https://github.com/ailater/LaterMd) | Markdown 知识工作台 |
+Rust 工具链钉 1.94（`rust-toolchain.toml` 自动切换）。
+
+## 架构
+
+```
+laterterm-app        主程序：工作台（标签/分屏/面板/设置/导入/广播）
+laterterm-termview   GPUI 终端网格（内化自 zortax/gpui-terminal）
+laterterm-config     设置/主题/命令模板/服务器列表/TOTP（TOML）
+laterterm-core       TerminalSession 契约（纯 std）
+laterterm-local      本地 PTY 会话
+laterterm-ssh        SSH 远程会话（认证/跳板链/TOFU/GBK/SFTP）
+laterterm-transfer   ZMODEM + trzsz 终端内文件传输
+laterterm-secrets    系统密钥环封装
+laterterm-xshell     XShell .xsh 会话文件解析
+laterterm-deepin     deepin-terminal 配置解析
+```
 
 ## License
 
-[MIT](LICENSE) © 2026 crazykun
+[MIT](LICENSE)

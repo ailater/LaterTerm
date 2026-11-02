@@ -49,3 +49,22 @@ jobs:
 
       - name: test
         run: cargo test --workspace --lib --bins
+
+  windows-check:
+    name: Windows 编译检查
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-windows
+
+      # Windows 编译面：transfer（UnixStream/rzsz）与 ssh（UnixStream）
+      # 尚未跨平台，先检查其余核心 crate；全量 Windows 支持是 M4 后续
+      - name: 编译检查（跨平台核心 crate）
+        run: cargo check -p laterterm-core -p laterterm-config -p laterterm-local -p laterterm-secrets
