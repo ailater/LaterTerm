@@ -4,7 +4,7 @@
 
 ## 资源与身份
 
-- 原图：`assets/logo.png`，用户提供的 1254×1254 RGB PNG。保留全部颜色、背景和比例，不自动抠图或裁剪。
+- 原图：`assets/logo.png`，用户提供的 500×500 RGBA PNG（透明背景版）。保留全部颜色与透明轮廓，不自动抠图或裁剪；图标在小尺寸下按 alpha 边缘缩放。
 - Linux：`assets/icons/png/laterterm-<尺寸>.png`，16/24/32/48/64/128/256/512/1024 像素。
 - Windows：`assets/icons/laterterm.ico`，16 至 256 像素的多尺寸容器；应用 `build.rs` 为目标 EXE 嵌入 ID 1，与 GPUI 的加载约定一致。
 - macOS：`assets/icons/laterterm.icns`，标准尺寸及 Retina 槽位。

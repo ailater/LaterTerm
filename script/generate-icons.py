@@ -43,8 +43,8 @@ def container_bytes(image: Image.Image, fmt: str, sizes: tuple[int, ...]) -> byt
 
 def expected_outputs(source: Path, output_dir: Path) -> dict[Path, bytes]:
     with Image.open(source) as image:
-        if image.format != "PNG" or image.size != (1254, 1254) or image.mode != "RGB":
-            raise ValueError("source must be a 1254x1254 RGB PNG")
+        if image.format != "PNG" or image.size != (500, 500) or image.mode != "RGBA":
+            raise ValueError("source must be a 500x500 RGBA PNG")
         image.load()
         outputs = {
             output_dir / "png" / f"laterterm-{s}.png": png_bytes(image, s)

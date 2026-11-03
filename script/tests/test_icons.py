@@ -11,7 +11,7 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "script" / "generate-icons.py"
 SOURCE = ROOT / "assets" / "logo.png"
-SOURCE_SHA256 = "b2fd91dcae0d8ada3d3e4a981d86a17b2c708f2c46a3193a50a9bf0c5a594324"
+SOURCE_SHA256 = "53fc30e3f1ffdcb4dfa666e9fda4c2c9bda16445f504928586a7f383482250c8"
 PNG_SIZES = (16, 24, 32, 48, 64, 128, 256, 512, 1024)
 ICO_SIZES = (16, 24, 32, 48, 64, 128, 256)
 ICNS_CHUNKS = ((b"icp4", 16), (b"icp5", 32), (b"icp6", 48), (b"ic07", 128), (b"ic08", 256), (b"ic09", 512), (b"ic10", 1024), (b"ic11", 32), (b"ic12", 64), (b"ic13", 256), (b"ic14", 512))
@@ -38,7 +38,7 @@ class IconGenerationTests(unittest.TestCase):
         self.assertEqual(hashlib.sha256(self.source.read_bytes()).hexdigest(), SOURCE_SHA256)
         with Image.open(self.source) as image:
             self.assertEqual(image.format, "PNG")
-            self.assertEqual((image.size, image.mode), ((1254, 1254), "RGB"))
+            self.assertEqual((image.size, image.mode), ((500, 500), "RGBA"))
 
     def test_outputs_are_isolated_and_pixels_match_full_resize(self):
         self.run_generator()

@@ -552,6 +552,63 @@ mod tests {
     }
 
     #[test]
+    fn test_grid_line_semantics_for_cursor_rendering() {
+        // 锚定 grid Line 坐标语义: Line 自顶向下为正, Line(0) = 屏幕顶行。
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+
+        // 全新终端(未输出内容)的光标在顶行行首 —— 与真实终端一致。
+        terminal.with_term(|term| {
+            let grid = term.grid();
+            let cursor = grid.cursor.point;
+            assert_eq!(cursor.line.0, 0, "初始光标应在顶行 Line(0)");
+            assert_eq!(cursor.column.0, 0);
+            assert_eq!(cursor.line.0 + grid.display_offset() as i32, 0);
+        });
+
+        // 输出两行,光标应紧跟最后写入的内容行。
+        terminal.process_bytes(b"one\r\ntwo\r\n");
+
+        terminal.with_term(|term| {
+            let grid = term.grid();
+            let cursor = grid.cursor.point;
+            let display_offset = grid.display_offset() as i32;
+            let cursor_line = cursor.line.0 + display_offset;
+            assert!(
+                (0..grid.screen_lines() as i32).contains(&cursor_line),
+                "光标行 {cursor_line} 应在可见区: cursor.line={} display_offset={display_offset}",
+                cursor.line.0
+            );
+            assert_eq!(cursor_line, 2, "两行输出后光标应在屏幕第 2 行");
+            assert_eq!(cursor.column.0, 0);
+            // 光标紧跟在最后写入行("two" 在第 1 行)之后的空行首
+            let prev: String = (0..3)
+                .map(|c| grid[AlacPoint::new(Line(cursor_line - 1), Column(c))].c)
+                .collect();
+            assert_eq!(prev, "two", "光标必须紧跟最后写入的内容行(其上一行)");
+        });
+
+        // 首帧 grow resize(4→8 行): 光标行号与内容行都必须保持不变
+        // (alacritty 的 grow_lines 在 history 为空时内容留在原行),
+        // 否则光标与内容分离 —— 即「打开时光标画在屏幕最前面」缺陷。
+        terminal.resize(20, 8);
+        terminal.with_term(|term| {
+            let grid = term.grid();
+            let display_offset = grid.display_offset() as i32;
+            let cursor_line = grid.cursor.point.line.0 + display_offset;
+            assert_eq!(cursor_line, 2, "grow resize 后光标行号必须保持不变");
+            let prev: String = (0..3)
+                .map(|c| grid[AlacPoint::new(Line(cursor_line - 1), Column(c))].c)
+                .collect();
+            assert_eq!(
+                prev, "two",
+                "resize 后内容与光标必须保持相对位置(光标上一行仍是最后写入行)"
+            );
+        });
+    }
+
+    #[test]
     fn test_scrollback_and_display_offset() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);

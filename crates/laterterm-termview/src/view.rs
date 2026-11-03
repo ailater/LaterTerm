@@ -594,6 +594,11 @@ impl TerminalView {
                 // Wait for bytes from the background reader (blocks until data arrives)
                 match bytes_rx.recv_async().await {
                     Ok(bytes) => {
+                        if std::env::var_os("LATERTERM_PTY_TRACE").as_deref()
+                            == Some(std::ffi::OsStr::new("1"))
+                        {
+                            eprintln!("[pty-trace] recv {} bytes", bytes.len());
+                        }
                         // Process bytes and notify the view
                         let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
                             view.state.process_bytes(&bytes);
