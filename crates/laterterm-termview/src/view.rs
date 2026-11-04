@@ -440,6 +440,9 @@ pub struct TerminalView {
     /// Callback for terminal bell events
     bell_callback: Option<BellCallback>,
 
+    /// 最近一次绘制的内容原点（padding 内侧）；URL 点击检测用
+    pub(crate) last_content_origin: Option<Point<Pixels>>,
+
     /// Callback for terminal title changes
     title_callback: Option<TitleCallback>,
 
@@ -644,6 +647,7 @@ impl TerminalView {
             key_handler: None,
             input_callback: None,
             bell_callback: None,
+            last_content_origin: None,
             title_callback: None,
             clipboard_store_callback: None,
             exit_callback: None,
@@ -929,7 +933,7 @@ impl TerminalView {
     /// Currently a placeholder for future mouse selection and interaction support.
     fn on_mouse_down(
         &mut self,
-        _event: &MouseDownEvent,
+        event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -937,10 +941,20 @@ impl TerminalView {
         window.focus(&self.focus_handle);
         cx.notify();
 
-        // TODO: Implement mouse selection
-        // - Convert pixel coordinates to cell coordinates
-        // - Start selection at clicked cell
-        // - Send mouse reports if mouse tracking is enabled
+        // URL 点击：把像素坐标换算为网格单元，提取 URL 并用系统浏览器打开
+        if let Some(origin) = self.last_content_origin {
+            let cell = crate::mouse::pixel_to_cell(
+                event.position,
+                origin,
+                self.renderer.cell_width,
+                self.renderer.cell_height,
+            );
+            let row = cell.line.0.max(0) as usize;
+            let col = cell.column.0;
+            if let Some(url) = self.state.extract_url_at(row, col) {
+                open_url(&url);
+            }
+        }
     }
 
     /// Handle mouse up events.
@@ -1597,6 +1611,13 @@ impl Render for TerminalView {
 
                         // Paint the terminal with measured dimensions
                         let paint_started = trace.map(|_| Instant::now());
+                        // 记录内容原点（URL 点击检测用：padding 内侧的字符区起点）
+                        entity.update(cx, |view: &mut Self, _| {
+                            view.last_content_origin = Some(Point {
+                                x: bounds.origin.x + padding.left,
+                                y: bounds.origin.y + padding.top,
+                            });
+                        });
                         measured_renderer.paint(bounds, padding, &term, window, cx);
                         let paint_elapsed = paint_started.map(|started| started.elapsed());
 
@@ -1676,6 +1697,18 @@ impl Render for TerminalView {
             root
         }
     }
+}
+
+/// 用系统默认浏览器打开 URL。
+fn open_url(url: &str) {
+    let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
+        ("open", vec![url])
+    } else if cfg!(target_os = "windows") {
+        ("cmd", vec!["/c", "start", url])
+    } else {
+        ("xdg-open", vec![url])
+    };
+    let _ = std::process::Command::new(program).args(args).spawn();
 }
 
 #[cfg(test)]

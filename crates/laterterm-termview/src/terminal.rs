@@ -66,6 +66,58 @@ pub struct SearchMatch {
 }
 
 /// 大小写不敏感的逐字符子串搜索（避免 UTF-8 字节索引在中文场景错位）。
+/// URL 前缀（小写匹配，大小写不敏感）。
+const URL_SCHEMES: [&str; 4] = ["http://", "https://", "ftp://", "www."];
+
+/// URL 结束字符：空白 + 常见的包裹/终止符。
+fn is_url_end_char(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | '"' | '\'' | '|' | '`'
+        )
+}
+
+/// 从行文本中提取包含指定列的 URL。
+/// `cells` 是 (列号, 字符) 的映射，用于把字符串索引换算回网格列。
+fn extract_url_containing(text: &str, cells: &[(usize, char)], click_col: usize) -> Option<String> {
+    let lower: Vec<char> = text.to_lowercase().chars().collect();
+    let raw: Vec<char> = text.chars().collect();
+
+    for scheme in URL_SCHEMES {
+        let sc: Vec<char> = scheme.chars().collect();
+        let mut i = 0;
+        while i + sc.len() <= lower.len() {
+            if lower[i..i + sc.len()] == sc[..] {
+                let start = i;
+                let mut end = i + sc.len();
+                while end < raw.len() && !is_url_end_char(raw[end]) {
+                    end += 1;
+                }
+                while end > start && matches!(raw[end - 1], '.' | ',' | ';' | ':' | '!' | '?') {
+                    end -= 1;
+                }
+                let start_col = cells.get(start).map(|(c, _)| *c).unwrap_or(usize::MAX);
+                let end_col = cells
+                    .get(end.saturating_sub(1))
+                    .map(|(c, _)| c + 1)
+                    .unwrap_or(0);
+                if click_col >= start_col && click_col < end_col {
+                    let url: String = raw[start..end].iter().collect();
+                    if scheme == "www." {
+                        return Some(format!("https://{url}"));
+                    }
+                    return Some(url);
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
 fn search_grid(grid: &Grid<Cell>, needle: &[char]) -> Vec<SearchMatch> {
     let total_lines = grid.total_lines();
     let history = total_lines - grid.screen_lines();
@@ -397,6 +449,33 @@ impl TerminalState {
         self.with_term(|term| search_grid(term.grid(), &needle))
     }
 
+    /// 从网格中提取点击位置处的 URL。
+    ///
+    /// `row` 是屏幕行（0 = 视口顶行），`col` 是网格列。
+    /// 检测整个行文本中的 http/https/ftp/www 前缀，返回包含点击列的完整 URL。
+    pub fn extract_url_at(&self, row: usize, col: usize) -> Option<String> {
+        self.with_term(|term| {
+            let grid = term.grid();
+            let history = (grid.total_lines() - grid.screen_lines()) as i32;
+            let display_offset = grid.display_offset() as i32;
+            // 屏幕行 → grid 行：与 search_grid 同口径
+            let absolute = history + row as i32 + display_offset;
+            let line = Line(absolute - history);
+
+            let columns = grid.columns();
+            let mut cells: Vec<(usize, char)> = Vec::with_capacity(columns);
+            for c in 0..columns {
+                let cell = &grid[AlacPoint::new(line, Column(c))];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                cells.push((c, cell.c));
+            }
+            let text: String = cells.iter().map(|(_, ch)| *ch).collect();
+            extract_url_containing(&text, &cells, col)
+        })
+    }
+
     /// Execute a function with read access to the terminal.
     ///
     /// This method provides safe read access to the underlying `Term` structure.
@@ -658,6 +737,62 @@ mod tests {
         });
         let (row, _) = terminal.ime_anchor();
         assert!(row < 4, "滚动后锚点仍应钳在视口内: {row}");
+    }
+
+    #[test]
+    fn test_extract_url_from_grid() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(60, 4, 32, event_proxy);
+        terminal.process_bytes(b"See https://example.com/page\r\n");
+
+        // 先验证 search 能找到 URL（确保文本在网格里）
+        let matches = terminal.search("https");
+        assert!(!matches.is_empty(), "search 应找到 https");
+
+        // 再测 URL 提取——用 search 返回的列作为点击列
+        let m = &matches[0];
+        let url = terminal.extract_url_at(0, m.column + 2);
+        assert_eq!(
+            url.as_deref(),
+            Some("https://example.com/page"),
+            "点击列={}→",
+            m.column + 2
+        );
+    }
+
+    #[test]
+    fn test_extract_url_trailing_punctuation() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(60, 4, 32, event_proxy);
+        terminal.process_bytes(b"Link: https://example.com.,\r\n");
+        let matches = terminal.search("https");
+        assert!(!matches.is_empty());
+        let url = terminal.extract_url_at(0, matches[0].column + 2);
+        assert_eq!(url.as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn test_extract_url_www_prefix() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(60, 4, 32, event_proxy);
+        terminal.process_bytes(b"Visit www.example.com today\r\n");
+        let matches = terminal.search("www");
+        assert!(!matches.is_empty());
+        let url = terminal.extract_url_at(0, matches[0].column + 2);
+        assert_eq!(url.as_deref(), Some("https://www.example.com"));
+    }
+
+    #[test]
+    fn test_extract_url_none_in_plain_text() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        terminal.process_bytes("中文内容没有链接\r\nplain text line\r\n".as_bytes());
+        assert!(terminal.extract_url_at(0, 2).is_none());
+        assert!(terminal.extract_url_at(1, 5).is_none());
     }
 
     #[test]
