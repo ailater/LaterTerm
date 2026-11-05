@@ -38,6 +38,8 @@ laterterm-deepin = { path = "crates/laterterm-deepin" }
 [patch.crates-io]
 # xattr 0.2.3 引用了新版 libc 已移除的 Linux ENOATTR；Linux 语义等价于 ENODATA。
 xattr = { path = "vendor/xattr" }
+# gpui 0.2.2 本地副本：携带 Linux 后台任务/帧调度诊断与修复（见 vendor/gpui 内注释）。
+gpui = { path = "vendor/gpui" }
 
 [profile.release]
 lto = "thin"
