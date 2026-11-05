@@ -532,8 +532,8 @@ impl ScrollSummary {
         }
         let scrollable = (self.total_lines - self.screen_lines) as f32;
         let thumb = (self.screen_lines as f32 / self.total_lines as f32).clamp(0.08, 1.0);
-        // display_offset=0 表示在底部：滑块贴轨道底端
-        let traveled = self.display_offset as f32 / scrollable;
+        // display_offset=0 表示在底部，历史顶部对应最大 offset。
+        let traveled = 1.0 - (self.display_offset as f32 / scrollable).clamp(0.0, 1.0);
         let top = traveled * (1.0 - thumb);
         Some((thumb, top))
     }
@@ -1048,6 +1048,8 @@ impl TerminalView {
     ) {
         // Request focus when clicking the terminal
         window.focus(&self.focus_handle);
+        // 点击后光标立即回到可见相位，避免刚点完就停在熄灭态。
+        self.blink_on.store(true, std::sync::atomic::Ordering::Relaxed);
         cx.notify();
 
         // URL 点击：把像素坐标换算为网格单元，提取 URL 并用系统浏览器打开
@@ -1122,6 +1124,7 @@ impl TerminalView {
             self.scroll_residual = total - whole;
             whole as i32
         } else {
+            self.scroll_residual = 0.0;
             delta_y.round() as i32
         };
         if lines == 0 {
@@ -1197,22 +1200,35 @@ impl TerminalView {
         (self.state.cols(), self.state.rows())
     }
 
-    /// 按比例设置滚动位置：0.0 = 滚到最老历史，1.0 = 滚回底部。
-    /// 供滚动条拖拽/点击导航使用；与 scroll_summary 构成双向联动。
-    pub fn set_scroll_fraction(&self, fraction: f32) {
-        let fraction = fraction.clamp(0.0, 1.0);
-        self.state.with_term_mut(|term| {
-            let scrollable = (term.grid().total_lines() - term.grid().screen_lines()) as i32;
-            if scrollable <= 0 {
-                return;
+    /// 按比例设置滚动位置：0.0 = 最老历史，1.0 = 底部。
+    /// 用于宿主滚动条点击/拖拽；变化会立即请求终端重绘。
+    pub fn set_scroll_fraction(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        let fraction = if fraction.is_finite() {
+            fraction.clamp(0.0, 1.0)
+        } else if fraction.is_sign_negative() {
+            0.0
+        } else {
+            1.0
+        };
+        let changed = self.state.with_term_mut(|term| {
+            let grid = term.grid();
+            let scrollable = grid.total_lines().saturating_sub(grid.screen_lines());
+            if scrollable == 0 {
+                return false;
             }
-            let offset = ((1.0 - fraction) * scrollable as f32).round() as i32;
-            let current = term.grid().display_offset() as i32;
-            let delta = offset - current;
-            if delta != 0 {
-                term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
+            let target = ((1.0 - fraction) * scrollable as f32).round() as i32;
+            let current = grid.display_offset() as i32;
+            if target == current {
+                return false;
             }
+            term.scroll_display(alacritty_terminal::grid::Scroll::Delta(target - current));
+            true
         });
+        self.scroll_residual = 0.0;
+        if changed {
+            cx.notify();
+            self.schedule_scroll_report(cx);
+        }
     }
 
     /// 滚动状态摘要（display_offset / 可见行数 / 总行数），供外部画滚动条。
@@ -1423,7 +1439,9 @@ impl TerminalView {
             cx.notify();
         }
 
-        // Update renderer with new font settings and palette
+        if !config.smooth_scrolling {
+            self.scroll_residual = 0.0;
+        }
         let font_changed = self.renderer.font_family != config.font_family
             || self.renderer.font_size != config.font_size
             || self.renderer.line_height_multiplier != config.line_height_multiplier
@@ -1621,6 +1639,11 @@ impl Render for TerminalView {
             !self.config.cursor_blink
                 || self.blink_on.load(std::sync::atomic::Ordering::Relaxed);
         let entity = cx.entity();
+        let scroll_offset = if self.config.smooth_scrolling {
+            self.scroll_residual
+        } else {
+            0.0
+        };
         let padding = self.config.padding;
         // 搜索快照：canvas 闭包在绘制阶段执行，不能借用 self
         let search_open = self.search.is_some();
@@ -1780,6 +1803,7 @@ impl Render for TerminalView {
                             window,
                             cx,
                             cursor_visible,
+                            scroll_offset,
                         );
                         let paint_elapsed = paint_started.map(|started| started.elapsed());
 
@@ -1827,6 +1851,7 @@ impl Render for TerminalView {
                                 window,
                                 cx,
                                 &marked_text,
+                                scroll_offset,
                             );
                         }
                         // 持锁完成后再输出，避免诊断 I/O 阻塞 PTY 读线程。

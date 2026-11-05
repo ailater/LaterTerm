@@ -568,6 +568,23 @@ shortcut = "  legacy shortcut  "
     }
 
     #[test]
+    fn cursor_and_smooth_scrolling_defaults_and_false_roundtrip() {
+        let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert!(legacy.appearance.cursor_blink);
+        assert!(legacy.appearance.smooth_scrolling);
+
+        let path = temp_settings_path("scroll-options");
+        let mut settings = Settings::default();
+        settings.appearance.cursor_blink = false;
+        settings.appearance.smooth_scrolling = false;
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert!(!loaded.appearance.cursor_blink);
+        assert!(!loaded.appearance.smooth_scrolling);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn parse_error_is_reported_not_swallowed() {
         let path = temp_settings_path("broken");
         std::fs::write(&path, "not a toml file [[").unwrap();

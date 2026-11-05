@@ -131,48 +131,79 @@ impl Read for TransferReader {
         if buf.is_empty() {
             return Ok(0);
         }
-        match &mut self.state {
-            ReaderState::Active { pump, done } => {
-                if done.load(Ordering::Acquire) {
-                    self.state = ReaderState::Scanning;
-                    self.carry.clear();
-                    return self.scan_chunk(&[], buf);
-                }
-                let n = self.inner.read(buf)?;
-                if n == 0 {
-                    // 会话 EOF：断管让工作线程的接收循环收场
-                    self.state = ReaderState::Scanning;
-                    return Ok(0);
-                }
-                if pump.write_all(&buf[..n]).is_err() {
-                    // 工作线程已退出（读端 drop）：当前块回到扫描态处理
-                    self.state = ReaderState::Scanning;
-                    let chunk: Vec<u8> = buf[..n].to_vec();
-                    return self.scan_chunk(&chunk, buf);
-                }
-                // 协议字节已转喂状态机，不进视图；报告消费以驱动读泵
-                Ok(n)
-            }
-            ReaderState::Scanning => loop {
-                let n = self.inner.read(buf)?;
-                if n == 0 {
-                    // EOF：carry 里的候选前缀已无成触发可能，冲给视图
-                    if self.carry.is_empty() {
-                        return Ok(0);
-                    }
+        loop {
+            if matches!(self.state, ReaderState::Active { .. }) {
+                // 触发前已经确定是普通输出的前缀，优先交给终端；协议数据
+                // 从未进入这个 carry。
+                if !self.carry.is_empty() {
                     let take = self.carry.len().min(buf.len());
                     buf[..take].copy_from_slice(&self.carry[..take]);
                     self.carry.drain(..take);
                     return Ok(take);
                 }
-                let chunk: Vec<u8> = buf[..n].to_vec();
-                let produced = self.scan_chunk(&chunk, buf)?;
-                // 无产出 = 整块进了 carry（触发尾巴/未齐行）：
-                // 必须继续拉内层，返回 0 会被调用方当 EOF
-                if produced > 0 || matches!(self.state, ReaderState::Active { .. }) {
-                    return Ok(produced);
+
+                let done = match &self.state {
+                    ReaderState::Active { done, .. } => done.load(Ordering::Acquire),
+                    ReaderState::Scanning => false,
+                };
+                if done {
+                    // 协议线程已结束：恢复扫描并继续读取底层会话，不能用 0
+                    // 把“协议完成”伪装成会话 EOF。
+                    self.state = ReaderState::Scanning;
+                    continue;
                 }
-            },
+
+                // 协议字节必须完全留在传输管道，不能借用调用方的 buf 返回；
+                // 否则上层会把它再次送入 VT 解析器。
+                let mut protocol_buf = [0u8; 8192];
+                let n = self.inner.read(&mut protocol_buf)?;
+                if n == 0 {
+                    self.state = ReaderState::Scanning;
+                    return Ok(0);
+                }
+                let pump_result = match &mut self.state {
+                    ReaderState::Active { pump, .. } => pump.write_all(&protocol_buf[..n]),
+                    ReaderState::Scanning => continue,
+                };
+                if pump_result.is_err() {
+                    // 工作线程已退出：当前块回到扫描态，避免丢掉可能的普通输出。
+                    self.state = ReaderState::Scanning;
+                    return self.scan_chunk(&protocol_buf[..n], buf);
+                }
+                // 继续泵送，直到协议完成或底层会话结束。
+                continue;
+            }
+
+            // 小目标缓冲区可能让 scan_chunk 暂存一段已经安全的普通输出；
+            // 先把它排空，不能等底层再来一个字节，否则会在长连接上丢尾字节。
+            if !self.carry.is_empty() {
+                let keep = longest_trigger_prefix_suffix(&self.carry);
+                let safe_len = self.carry.len().saturating_sub(keep);
+                if safe_len > 0 {
+                    let take = safe_len.min(buf.len());
+                    buf[..take].copy_from_slice(&self.carry[..take]);
+                    self.carry.drain(..take);
+                    return Ok(take);
+                }
+            }
+
+            let n = self.inner.read(buf)?;
+            if n == 0 {
+                // EOF：carry 里的候选前缀已无成触发可能，冲给视图。
+                if self.carry.is_empty() {
+                    return Ok(0);
+                }
+                let take = self.carry.len().min(buf.len());
+                buf[..take].copy_from_slice(&self.carry[..take]);
+                self.carry.drain(..take);
+                return Ok(take);
+            }
+            let chunk: Vec<u8> = buf[..n].to_vec();
+            let produced = self.scan_chunk(&chunk, buf)?;
+            if produced > 0 {
+                return Ok(produced);
+            }
+            // 无产出表示整块只是触发候选尾巴；继续拉取，不能伪造 EOF。
         }
     }
 }
@@ -228,10 +259,11 @@ impl TransferReader {
                             Route::Zmodem => unreachable!(),
                         },
                         None => {
-                            // 触发行未到齐：前缀放行，触发行整体扣进 carry 等下轮
+                            // 触发行未到齐：只把当前 buffer 能容纳的普通前缀
+                            // 交给视图，前缀剩余部分与候选触发串一起保留。
                             let out_len = pos.min(buf.len());
                             buf[..out_len].copy_from_slice(&window[..out_len]);
-                            self.carry = window[pos..].to_vec();
+                            self.carry = window[out_len..].to_vec();
                             return Ok(out_len);
                         }
                     }
@@ -240,8 +272,9 @@ impl TransferReader {
             match divert {
                 Some((pump, done)) => {
                     self.state = ReaderState::Active { pump, done };
-                    // 触发帧在内全部转喂：本块不给视图
-                    return Ok(chunk.len().max(1));
+                    // 触发帧在内全部转喂；外层 read 会继续泵送，不能伪造
+                    // 一个正长度让 VT 解析器读取未初始化的调用方缓冲区。
+                    return Ok(0);
                 }
                 None => {
                     let _ = self
@@ -252,20 +285,37 @@ impl TransferReader {
             }
         }
 
-        // 未触发：放行「确定不可能是触发前缀」的部分，尾巴留待下轮
-        let keep = [ZMODEM_TRIGGER, trzsz::TRZSZ_TRIGGER, trzsz::TRZSZ_R_TRIGGER]
-            .iter()
-            .flat_map(|trigger| (1..trigger.len()).map(move |len| &trigger[..len]))
-            .filter(|prefix| window.ends_with(prefix))
-            .map(|prefix| prefix.len())
-            .max()
-            .unwrap_or(0);
-        let safe_len = window.len() - keep;
+        // 未触发：只保留确实可能成为触发串开头的尾部字节。
+        // 普通提示符、ANSI 控制序列和 UTF-8 文本不能因为协议扫描而延迟。
+        let keep = longest_trigger_prefix_suffix(&window);
+        let safe_len = window.len().saturating_sub(keep);
         let out_len = safe_len.min(buf.len());
         buf[..out_len].copy_from_slice(&window[..out_len]);
         self.carry = window[out_len..].to_vec();
         Ok(out_len)
     }
+}
+
+/// 返回 `window` 尾部同时匹配某个触发串前缀的最长长度。
+///
+/// 完整触发串会在 [`TransferReader::scan_chunk`] 的前置扫描中处理，
+/// 因而这里最多保留 `trigger.len() - 1` 字节。
+#[cfg(unix)]
+fn longest_trigger_prefix_suffix(window: &[u8]) -> usize {
+    [
+        ZMODEM_TRIGGER,
+        trzsz::TRZSZ_TRIGGER,
+        trzsz::TRZSZ_R_TRIGGER,
+    ]
+    .into_iter()
+    .map(|trigger| {
+        (1..trigger.len().min(window.len() + 1))
+            .rev()
+            .find(|&len| window.ends_with(&trigger[..len]))
+            .unwrap_or(0)
+    })
+    .max()
+    .unwrap_or(0)
 }
 
 /// 在 haystack 中找 needle 的首位置。
@@ -395,6 +445,123 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    /// 模拟仍连接但暂无新输出的交互会话；不能用 EOF 掩盖尾部滞留。
+    struct IdleReader(std::io::Cursor<Vec<u8>>);
+
+    impl Read for IdleReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.0.read(buf)?;
+            if n == 0 && !buf.is_empty() {
+                Err(io::ErrorKind::WouldBlock.into())
+            } else {
+                Ok(n)
+            }
+        }
+    }
+
+    fn scanner(inner: impl Read + Send + 'static) -> TransferReader {
+        let (events, _) = std_mpsc::channel();
+        TransferReader {
+            inner: Box::new(inner),
+            state: ReaderState::Scanning,
+            carry: Vec::new(),
+            reply: SharedWriter {
+                inner: Arc::new(Mutex::new(Box::new(io::sink()))),
+            },
+            options: TransferOptions {
+                download_dir: PathBuf::new(),
+                events,
+                upload_files: None,
+            },
+        }
+    }
+
+    #[test]
+    fn prompt_is_visible_before_next_output_or_eof() {
+        let prompt = b"user@host:~$ ";
+        let mut reader = scanner(IdleReader(io::Cursor::new(prompt.to_vec())));
+        let mut buf = [0; 128];
+        let n = reader.read(&mut buf).expect("静默长连接不能扣住提示符");
+        assert_eq!(&buf[..n], prompt);
+        assert_eq!(reader.read(&mut buf).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn ordinary_output_never_waits_for_eighteen_more_bytes() {
+        for bytes in [
+            b"x".as_slice(),
+            b"user@host:~$ ",
+            b"\x1b[32muser@host\x1b[0m:~$ ",
+            "中文终端提示符 $ ".as_bytes(),
+            b"a longer ordinary output that has no transfer prefix",
+        ] {
+            for buffer_size in 1..=bytes.len() + 2 {
+                let mut reader = scanner(IdleReader(io::Cursor::new(bytes.to_vec())));
+                let mut output = Vec::new();
+                let mut buf = vec![0; buffer_size];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => panic!("长连接不能伪造 EOF"),
+                        Ok(n) => output.extend_from_slice(&buf[..n]),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("读取失败: {error}"),
+                    }
+                }
+                assert_eq!(output, bytes, "目标缓冲区大小 {buffer_size}");
+            }
+        }
+    }
+
+    #[test]
+    fn scanner_keeps_only_actual_trigger_prefixes() {
+        for trigger in [ZMODEM_TRIGGER, trzsz::TRZSZ_TRIGGER, trzsz::TRZSZ_R_TRIGGER] {
+            for split in 1..trigger.len() {
+                let mut reader = scanner(io::empty());
+                let mut buf = [0; 128];
+                let mut first = b"visible ".to_vec();
+                first.extend_from_slice(&trigger[..split]);
+                let n = reader.scan_chunk(&first, &mut buf).unwrap();
+                assert_eq!(&buf[..n], b"visible ");
+                assert_eq!(reader.carry, trigger[..split]);
+                // 候选失配后，旧尾巴必须在这一块立即释放。
+                let n = reader.scan_chunk(b"!", &mut buf).unwrap();
+                let mut expected = trigger[..split].to_vec();
+                expected.push(b'!');
+                assert_eq!(&buf[..n], expected);
+                assert!(reader.carry.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn completed_transfer_resumes_scanning_without_false_eof() {
+        let mut reader = scanner(IdleReader(io::Cursor::new(b"user@host:~$ ".to_vec())));
+        let (pump, _feed) = UnixStream::pair().unwrap();
+        reader.state = ReaderState::Active {
+            pump,
+            done: Arc::new(AtomicBool::new(true)),
+        };
+        let mut buf = [0; 128];
+        let n = reader.read(&mut buf).expect("完成后继续读取会话");
+        assert_eq!(&buf[..n], b"user@host:~$ ");
+    }
+
+    #[test]
+    fn active_protocol_bytes_are_not_terminal_output() {
+        let mut reader = scanner(IdleReader(io::Cursor::new(b"protocol frame".to_vec())));
+        let (pump, mut feed) = UnixStream::pair().unwrap();
+        feed.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        reader.state = ReaderState::Active {
+            pump,
+            done: Arc::new(AtomicBool::new(false)),
+        };
+        let mut buf = [0; 128];
+        assert_eq!(reader.read(&mut buf).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        let mut frame = [0; 14];
+        feed.read_exact(&mut frame).unwrap();
+        assert_eq!(&frame, b"protocol frame");
+    }
+
     #[test]
     fn subslice_finder_basics() {
         assert_eq!(find_subslice(b"abc**\x18B0def", ZMODEM_TRIGGER), Some(3));
@@ -403,41 +570,6 @@ mod tests {
         assert_eq!(find_subslice(b"nothing here", trzsz::TRZSZ_TRIGGER), None);
         assert_eq!(find_subslice(b"xy**", ZMODEM_TRIGGER), None);
         assert_eq!(find_subslice(b"", ZMODEM_TRIGGER), None);
-    }
-
-    #[test]
-    fn prompt_is_delivered_without_waiting_for_more_output() {
-        let (events, _) = std_mpsc::channel();
-        let mut reader = TransferReader {
-            inner: Box::new(io::empty()),
-            reply: SharedWriter { inner: Arc::new(std::sync::Mutex::new(Box::new(io::sink()))) },
-            state: ReaderState::Scanning,
-            carry: Vec::new(),
-            options: TransferOptions { download_dir: PathBuf::from("/tmp"), events, upload_files: None },
-        };
-        let prompt = b"[jii@ubuntu ~]$ ";
-        let mut output = [0; 128];
-        let n = reader.scan_chunk(prompt, &mut output).unwrap();
-        assert_eq!(&output[..n], prompt);
-        assert!(reader.carry.is_empty());
-    }
-
-    #[test]
-    fn partial_trigger_is_preserved_across_chunks() {
-        let (events, _) = std_mpsc::channel();
-        let mut reader = TransferReader {
-            inner: Box::new(io::empty()),
-            reply: SharedWriter { inner: Arc::new(std::sync::Mutex::new(Box::new(io::sink()))) },
-            state: ReaderState::Scanning,
-            carry: Vec::new(),
-            options: TransferOptions { download_dir: PathBuf::from("/tmp"), events, upload_files: None },
-        };
-        let mut output = [0; 128];
-        let n = reader.scan_chunk(b"hello::TRZSZ:TR", &mut output).unwrap();
-        assert_eq!(&output[..n], b"hello");
-        assert_eq!(reader.carry, b"::TRZSZ:TR");
-        let n = reader.scan_chunk(b"not-a-trigger", &mut output).unwrap();
-        assert_eq!(&output[..n], b"::TRZSZ:TRnot-a-trigger");
     }
 
     /// 真协议回环：sz（rzsz sender）发文件 → 本装饰器检测/分流/落盘，
