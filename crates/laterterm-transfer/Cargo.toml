@@ -13,11 +13,9 @@ laterterm-core.workspace = true
 md5 = "0.8.1"
 serde = { workspace = true, features = ["derive"] }
 serde_json = "1.0.154"
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 # rzsz 依赖 Unix AsFd/nix；Windows 只穿透会话流，不启用自动传输。
 # 现代 lrzsz 重写的库形态；ZMODEM 状态机不自造（AGENTS「禁自造轮子」同纪律）
 rzsz = "0.1"
-
-[dev-dependencies]
-tempfile = "3"

@@ -253,12 +253,14 @@ impl TransferReader {
         }
 
         // 未触发：放行「确定不可能是触发前缀」的部分，尾巴留待下轮
-        let keep = ZMODEM_TRIGGER
-            .len()
-            .max(trzsz::TRZSZ_TRIGGER.len())
-            .max(trzsz::TRZSZ_R_TRIGGER.len())
-            - 1;
-        let safe_len = window.len().saturating_sub(keep);
+        let keep = [ZMODEM_TRIGGER, trzsz::TRZSZ_TRIGGER, trzsz::TRZSZ_R_TRIGGER]
+            .iter()
+            .flat_map(|trigger| (1..trigger.len()).map(move |len| &trigger[..len]))
+            .filter(|prefix| window.ends_with(prefix))
+            .map(|prefix| prefix.len())
+            .max()
+            .unwrap_or(0);
+        let safe_len = window.len() - keep;
         let out_len = safe_len.min(buf.len());
         buf[..out_len].copy_from_slice(&window[..out_len]);
         self.carry = window[out_len..].to_vec();
@@ -401,6 +403,41 @@ mod tests {
         assert_eq!(find_subslice(b"nothing here", trzsz::TRZSZ_TRIGGER), None);
         assert_eq!(find_subslice(b"xy**", ZMODEM_TRIGGER), None);
         assert_eq!(find_subslice(b"", ZMODEM_TRIGGER), None);
+    }
+
+    #[test]
+    fn prompt_is_delivered_without_waiting_for_more_output() {
+        let (events, _) = std_mpsc::channel();
+        let mut reader = TransferReader {
+            inner: Box::new(io::empty()),
+            reply: SharedWriter { inner: Arc::new(std::sync::Mutex::new(Box::new(io::sink()))) },
+            state: ReaderState::Scanning,
+            carry: Vec::new(),
+            options: TransferOptions { download_dir: PathBuf::from("/tmp"), events, upload_files: None },
+        };
+        let prompt = b"[jii@ubuntu ~]$ ";
+        let mut output = [0; 128];
+        let n = reader.scan_chunk(prompt, &mut output).unwrap();
+        assert_eq!(&output[..n], prompt);
+        assert!(reader.carry.is_empty());
+    }
+
+    #[test]
+    fn partial_trigger_is_preserved_across_chunks() {
+        let (events, _) = std_mpsc::channel();
+        let mut reader = TransferReader {
+            inner: Box::new(io::empty()),
+            reply: SharedWriter { inner: Arc::new(std::sync::Mutex::new(Box::new(io::sink()))) },
+            state: ReaderState::Scanning,
+            carry: Vec::new(),
+            options: TransferOptions { download_dir: PathBuf::from("/tmp"), events, upload_files: None },
+        };
+        let mut output = [0; 128];
+        let n = reader.scan_chunk(b"hello::TRZSZ:TR", &mut output).unwrap();
+        assert_eq!(&output[..n], b"hello");
+        assert_eq!(reader.carry, b"::TRZSZ:TR");
+        let n = reader.scan_chunk(b"not-a-trigger", &mut output).unwrap();
+        assert_eq!(&output[..n], b"::TRZSZ:TRnot-a-trigger");
     }
 
     /// 真协议回环：sz（rzsz sender）发文件 → 本装饰器检测/分流/落盘，

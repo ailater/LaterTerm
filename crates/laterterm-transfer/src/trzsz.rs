@@ -119,7 +119,7 @@ fn trzsz_receive_loop(
         "lang": "rs",
         "confirm": true,
         "version": env!("CARGO_PKG_VERSION"),
-        "support_dir": true,
+        "support_dir": false,
         "protocol": 1,
     });
     send_line(&reply, "ACT", &action.to_string())?;
@@ -129,13 +129,13 @@ fn trzsz_receive_loop(
     if frame.typ != "CFG" {
         return Err(io::Error::other(format!("期望 CFG，收到 {}", frame.typ)));
     }
-    // ③ 回客户端 CFG（目录传输开——NAME 可能是 json 对象）
+    // ③ 暂不支持安全目录传输，明确关闭目录能力。
     let config = serde_json::json!({
         "lang": "rs",
         "quiet": true,
         "binary": true,
         "escape_chars": false,
-        "directory": true,
+        "directory": false,
         "bufsize": 131_072,
         "timeout": 60,
         "overwrite": false,
@@ -183,24 +183,10 @@ fn recv_one_file(
     // NAME 载荷：base64(zlib(utf8 名字)) 或 json 对象（目录模式）
     let decoded = decode_payload(&frame.payload)?;
     let text = String::from_utf8_lossy(&decoded).into_owned();
-    let (name, is_dir) = if text.trim_start().starts_with('{') {
-        let object: serde_json::Value = serde_json::from_str(&text)
-            .map_err(|e| io::Error::other(format!("NAME json 解析失败: {e}")))?;
-        let name = object
-            .get("path_name")
-            .and_then(|list| list.as_array())
-            .and_then(|parts| parts.last())
-            .and_then(|part| part.as_str())
-            .ok_or_else(|| io::Error::other("NAME json 缺 path_name"))?
-            .to_string();
-        let is_dir = object
-            .get("is_dir")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        (name, is_dir)
-    } else {
-        (text, false)
-    };
+    if text.trim_start().starts_with('{') {
+        return Err(io::Error::other("暂不支持 trzsz 目录传输"));
+    }
+    let name = text;
     // 路径剥离：只按文件名落盘（与 ZMODEM junk_path 同安全口径）
     let safe_name = std::path::Path::new(&name)
         .file_name()
@@ -210,11 +196,6 @@ fn recv_one_file(
         return Err(io::Error::other(format!("非法文件名: {name}")));
     }
     let target = options.download_dir.join(&safe_name);
-
-    if is_dir {
-        std::fs::create_dir_all(&target)?;
-        return Ok(None);
-    }
 
     // SIZE
     let frame = recv_frame(feed)?;
@@ -226,7 +207,7 @@ fn recv_one_file(
     send_line(reply, "SUCC", frame.payload.trim())?;
 
     // DATA × n（每块回解码长度）+ 全文 MD5
-    let mut file = std::fs::File::create(&target)?;
+    let mut file = tempfile::NamedTempFile::new_in(&options.download_dir)?;
     let mut hasher = md5::Context::new();
     let mut received: u64 = 0;
     while received < size {
@@ -247,9 +228,9 @@ fn recv_one_file(
     let expect = decode_payload(&frame.payload)?;
     let digest = hasher.finalize().0;
     if expect.as_slice() != digest {
-        let _ = std::fs::remove_file(&target);
         return Err(io::Error::other("MD5 校验失败，文件已丢弃"));
     }
+    file.persist_noclobber(&target).map_err(|error| error.error)?;
     send_line(reply, "SUCC", &frame.payload)?;
 
     Ok(Some(target))
@@ -416,6 +397,53 @@ mod tests {
         let encoded = encode_payload(data);
         assert!(!encoded.contains('\n'), "行帧载荷不得含换行");
         assert_eq!(decode_payload(&encoded).unwrap(), data.to_vec());
+    }
+
+    #[test]
+    fn receive_rejects_existing_file_without_changing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("existing.txt");
+        std::fs::write(&target, "原始内容".as_bytes()).unwrap();
+        let (events, _) = std::sync::mpsc::channel();
+        let options = TransferOptions {
+            download_dir: dir.path().to_path_buf(),
+            events,
+            upload_files: None,
+        };
+        let reply = SharedWriter {
+            inner: Arc::new(std::sync::Mutex::new(Box::new(io::sink()) as Box<dyn Write + Send>)),
+        };
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        write!(sender, "#NAME:{}\n#SIZE:3\n#DATA:{}\n#MD5:{}\n", encode_payload(b"existing.txt"), encode_payload(b"new"), encode_payload(&md5::compute(b"new").0)).unwrap();
+        assert!(recv_one_file(&options, &reply, &mut receiver).is_err());
+        assert_eq!(std::fs::read(target).unwrap(), "原始内容".as_bytes());
+    }
+
+    #[test]
+    fn interrupted_receive_leaves_no_partial_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _) = std::sync::mpsc::channel();
+        let options = TransferOptions { download_dir: dir.path().to_path_buf(), events, upload_files: None };
+        let reply = SharedWriter { inner: Arc::new(std::sync::Mutex::new(Box::new(io::sink()) as Box<dyn Write + Send>)) };
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        write!(sender, "#NAME:{}\n#SIZE:5\n#DATA:{}\n", encode_payload(b"partial.txt"), encode_payload(b"abc")).unwrap();
+        drop(sender);
+        assert!(recv_one_file(&options, &reply, &mut receiver).is_err());
+        assert!(!dir.path().join("partial.txt").exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn directory_entries_are_rejected_instead_of_flattened() {
+        let dir = tempfile::tempdir().unwrap();
+        let (events, _) = std::sync::mpsc::channel();
+        let options = TransferOptions { download_dir: dir.path().to_path_buf(), events, upload_files: None };
+        let reply = SharedWriter { inner: Arc::new(std::sync::Mutex::new(Box::new(io::sink()) as Box<dyn Write + Send>)) };
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        let name = serde_json::json!({"path_name": ["parent", "child"], "is_dir": true}).to_string();
+        writeln!(sender, "#NAME:{}", encode_payload(name.as_bytes())).unwrap();
+        assert!(recv_one_file(&options, &reply, &mut receiver).is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     /// 协议回放：伪造远端 trz（ACT→CFG→NUM→单文件→EXIT）逐帧喂入，
