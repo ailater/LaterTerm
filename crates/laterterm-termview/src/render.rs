@@ -566,6 +566,8 @@ impl TerminalRenderer {
         term: &Term<GpuiEventProxy>,
         window: &mut Window,
         _cx: &mut App,
+        cursor_visible: bool,
+        scroll_offset: f32,
     ) {
         // Get terminal dimensions
         let grid = term.grid();
@@ -622,7 +624,7 @@ impl TerminalRenderer {
                 }
 
                 let x = origin.x + self.cell_width * (bg_rect.start_col as f32);
-                let y = origin.y + self.cell_height * (bg_rect.row as f32);
+                let y = origin.y + self.cell_height * (bg_rect.row as f32 + scroll_offset);
                 let width = self.cell_width * ((bg_rect.end_col - bg_rect.start_col) as f32);
                 let height = self.cell_height;
 
@@ -646,7 +648,7 @@ impl TerminalRenderer {
             let base_height = self.cell_height / self.line_height_multiplier;
             let vertical_offset = (self.cell_height - base_height) / 2.0;
 
-            let y_base = origin.y + self.cell_height * (line_idx as f32);
+            let y_base = origin.y + self.cell_height * (line_idx as f32 + scroll_offset);
             let cy = y_base + self.cell_height / 2.0;
 
             // Use cells vec for multiple passes (already collected above)
@@ -788,10 +790,10 @@ impl TerminalRenderer {
             }
         }
 
-        // Paint cursor only when the terminal has not hidden it with DECSET ?25l.
         if !term
             .mode()
             .contains(alacritty_terminal::term::TermMode::SHOW_CURSOR)
+            || !cursor_visible
         {
             return;
         }
@@ -802,7 +804,7 @@ impl TerminalRenderer {
             return;
         }
         let cursor_x = origin.x + self.cell_width * (cursor_point.column.0 as f32);
-        let cursor_y = origin.y + self.cell_height * (cursor_line as f32);
+        let cursor_y = origin.y + self.cell_height * (cursor_line as f32 + scroll_offset);
 
         let cursor_color = self.palette.resolve(
             Color::Named(alacritty_terminal::vte::ansi::NamedColor::Cursor),
@@ -842,6 +844,7 @@ impl TerminalRenderer {
         window: &mut Window,
         cx: &mut App,
         text: &str,
+        scroll_offset: f32,
     ) {
         if text.is_empty() {
             return;
@@ -860,7 +863,7 @@ impl TerminalRenderer {
         // 与网格文字相同的垂直居中口径
         let base_height = self.cell_height / self.line_height_multiplier;
         let vertical_offset = (self.cell_height - base_height) / 2.0;
-        let y = origin.y + self.cell_height * (row as f32) + vertical_offset;
+        let y = origin.y + self.cell_height * (row as f32 + scroll_offset) + vertical_offset;
 
         for (col, ch, _) in preedit_layout(text, cursor.column.0, grid.columns()) {
             let char_str = ch.to_string();

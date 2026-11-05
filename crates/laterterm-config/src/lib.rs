@@ -86,6 +86,14 @@ pub struct Appearance {
     /// 备选字体链（主字体缺字时按序回退，如 CJK）；空表示用系统默认回退。
     #[serde(default)]
     pub font_fallbacks: Vec<String>,
+
+    /// 光标闪烁。默认开启；关闭后光标常显。
+    #[serde(default = "default_true")]
+    pub cursor_blink: bool,
+
+    /// 平滑滚动：滚轮/触控板按像素累积连续滚动。默认开启。
+    #[serde(default = "default_true")]
+    pub smooth_scrolling: bool,
     /// 接收目录；空 = ~/Downloads。
     pub downloads_dir: String,
 }
@@ -105,6 +113,8 @@ impl Default for Appearance {
             scrollback: 100_000,
             theme: DEFAULT_THEME.into(),
             ligatures: true,
+            cursor_blink: true,
+            smooth_scrolling: true,
             font_fallbacks: Vec::new(),
             downloads_dir: String::new(),
         }
@@ -554,6 +564,23 @@ shortcut = "  legacy shortcut  "
             loaded.appearance.font_fallbacks,
             vec!["Sarasa Mono SC", "Noto Sans Mono CJK SC"]
         );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn cursor_and_smooth_scrolling_defaults_and_false_roundtrip() {
+        let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert!(legacy.appearance.cursor_blink);
+        assert!(legacy.appearance.smooth_scrolling);
+
+        let path = temp_settings_path("scroll-options");
+        let mut settings = Settings::default();
+        settings.appearance.cursor_blink = false;
+        settings.appearance.smooth_scrolling = false;
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert!(!loaded.appearance.cursor_blink);
+        assert!(!loaded.appearance.smooth_scrolling);
         std::fs::remove_file(&path).unwrap();
     }
 

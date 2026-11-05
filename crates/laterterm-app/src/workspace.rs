@@ -5260,6 +5260,28 @@ fn settings_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>
                         |s: &mut Appearance, value| s.ligatures = value,
                     ),
                 ))
+                .child(setting_row(
+                    "光标闪烁",
+                    div(),
+                    toggle_controls(
+                        cx,
+                        ("开", true),
+                        ("关", false),
+                        settings.cursor_blink,
+                        |s: &mut Appearance, value| s.cursor_blink = value,
+                    ),
+                ))
+                .child(setting_row(
+                    "平滑滚动",
+                    div(),
+                    toggle_controls(
+                        cx,
+                        ("开", true),
+                        ("关", false),
+                        settings.smooth_scrolling,
+                        |s: &mut Appearance, value| s.smooth_scrolling = value,
+                    ),
+                ))
                 .child(
                     div()
                         .flex()
@@ -5744,6 +5766,7 @@ fn wrap_transfer(
         download_dir,
     })
 }
+#[allow(clippy::too_many_arguments)] // 装配函数：显式传参比打包结构更直观
 fn create_local_terminal(
     id: PaneId,
     workspace: gpui::WeakEntity<WorkspaceView>,
@@ -5753,7 +5776,8 @@ fn create_local_terminal(
     shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
     broadcast_tx: flume::Sender<(PaneId, Vec<u8>)>,
 ) -> (Entity<TerminalView>, Arc<SessionControl>) {
-    // 会话的开启/spawn/回收线程全部内聚在 LocalSession（laterterm-local）
+    // 会话的开启/spawn/回收线程全部内聚在 LocalSession（laterterm-local）。
+    // 初始 PTY 与视图保持固定 110×30；真实 resize 由 termview 按首帧测量处理。
     let shell = laterterm_local::default_shell();
     let session: Arc<dyn TerminalSession> = Arc::new(
         LocalSession::spawn(LocalOptions {
@@ -5820,6 +5844,8 @@ fn terminal_config_for(settings: &Appearance, theme: &Theme) -> TerminalConfig {
         font_size: px(settings.font_size),
         cols: 110,
         rows: 30,
+        cursor_blink: settings.cursor_blink,
+        smooth_scrolling: settings.smooth_scrolling,
         scrollback: settings.scrollback,
         line_height_multiplier: settings.line_height,
         padding: Edges::all(px(settings.padding)),
