@@ -205,6 +205,10 @@ pub struct TerminalState {
 
     /// Number of rows (lines) in the terminal.
     rows: usize,
+
+    /// 数据版本号：每次 process_bytes 自增。渲染侧用它判断「有新数据未上屏」，
+    /// 作为 flume 异步唤醒丢失时的兜底刷新依据。
+    data_epoch: std::sync::atomic::AtomicU64,
 }
 
 impl TerminalState {
@@ -252,7 +256,13 @@ impl TerminalState {
             parser,
             cols,
             rows,
+            data_epoch: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// 数据版本号：渲染侧用它检测「有新字节尚未上屏」。
+    pub fn data_epoch(&self) -> u64 {
+        self.data_epoch.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Process incoming bytes from the PTY.
@@ -281,6 +291,8 @@ impl TerminalState {
         // The parser.advance method calls handler methods on the Term
         // The Term implements the Handler trait from the VTE crate
         self.parser.advance(&mut *term, bytes);
+        self.data_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Resize the terminal to new dimensions.
@@ -605,6 +617,18 @@ mod tests {
                 prev, "two",
                 "resize 后内容与光标必须保持相对位置(光标上一行仍是最后写入行)"
             );
+        });
+    }
+
+    #[test]
+    fn shell_prompt_cursor_stays_after_prompt_when_rows_shrink() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(80, 30, 100, GpuiEventProxy::new(tx));
+        terminal.process_bytes(b"user@host:~$ ");
+        terminal.resize(80, 20);
+        terminal.with_term(|term| {
+            assert_eq!(term.grid().cursor.point.column.0, 13, "光标应位于提示符之后");
+            assert_eq!(term.grid().cursor.point.line.0, 0, "首行提示符不应因缩小高度而移出可见区域");
         });
     }
 

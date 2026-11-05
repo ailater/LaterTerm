@@ -113,6 +113,12 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 > 落地，本机 3 台真机验证）/ Xshell 会话（.xsh 多选，UTF-16 BOM 解码，密码绑定原机器
 > 加密不迁移）；三类解析器在 laterterm-config::importers，附真机自跳过冒烟测试。
 
+> 启动光标错位修复（2026-11-04）：PTY/网格初始尺寸改为按窗口内容区估算（cell 7.83×19.2 @13px 实测系数），
+> 消除「启动后 resize → bash readline 发 \r 把光标拉回提示符行首」的错位；隔离实测估算 193×42 与
+> 首帧实测一致（零 resize）。reader 数据链增加 GPUI 定时器保活轮询（100ms，独立于 flume 唤醒通道），
+> 并将字节处理/重绘通知移入窗口上下文（update_window + window.refresh），避免后台任务通知不触发重绘。
+> 诊断开关：LATERTERM_PTY_TRACE（数据批次）、LATERTERM_GPUI_TRACE 需 vendor 分支（已移除每帧读取）。
+> 注意：cargo run 为 debug 构建，GPUI 渲染在 debug 下明显偏慢，性能验证请用 cargo run --release。
 > 主线整合（2026-11-02）：保留 SSH Agent、ProxyJump 后端（面板跳板配置待接线）、GBK/GB18030、SFTP、ZMODEM/trzsz、广播与首启引导；服务器旧文件一次性迁移到 settings.toml，保留当前同名条目，删除后不再复活。主机键按应用目录→旧应用路径→OpenSSH 路径逐主机兼容，已有记录不匹配或读取失败立即拒绝；连接建立/认证设置超时为 15s，不给长会话设置 15s 截止。广播复用真实控制键/文本/IME 提交回调，目标写入不回调以防环；Windows 自动传输暂为透明旁路，不吞数据，不宣称协议支持。
 
 **目标**：远程不是"另一个功能"——同一个 termview，换 backend。

@@ -5,7 +5,7 @@ use crate::server_connection::{self, ConnectionOutcome, CredentialKind};
 use crate::shortcut_recorder::{ShortcutChanged, ShortcutRecorder};
 use gpui::{
     App, AppContext, AsyncApp, Bounds, Context, CursorStyle, DispatchPhase, Edges, Entity,
-    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ScrollHandle,
     MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Render,
     StatefulInteractiveElement, Styled, WeakEntity, Window, canvas, div, prelude::FluentBuilder,
     px, relative, rgb,
@@ -434,6 +434,7 @@ pub struct WorkspaceView {
     /// 进行中的分割线拖拽（None = 空闲）。
     split_drag: Option<SplitDrag>,
     left_panel: bool,
+    tab_scroll: ScrollHandle,
     right_panel: bool,
     settings_open: bool,
     broadcast: bool,
@@ -503,6 +504,14 @@ impl WorkspaceView {
         let first_pane = PaneId(1);
         let first_tab = TabId(1);
         let theme = themes.resolve(&settings.appearance.theme).clone();
+        // 初始网格尺寸按当前窗口内容区估算：PTY 一启动就是正确尺寸，
+        // 避免「首帧 resize → bash readline 把光标拉回提示符行首」的错位。
+        let viewport = window.viewport_size();
+        let terminal_area = gpui::Size {
+            width: (viewport.width - px(PANEL_WIDTH)).max(px(1.0)),
+            height: viewport.height - px(TITLEBAR_HEIGHT),
+        };
+        let (initial_cols, initial_rows) = estimate_grid_size(&settings.appearance, terminal_area);
         let (terminal, session) = create_local_terminal(
             first_pane,
             weak_workspace,
@@ -511,6 +520,8 @@ impl WorkspaceView {
             &theme,
             shortcut_tx.clone(),
             broadcast_tx.clone(),
+            initial_cols,
+            initial_rows,
         );
         cx.subscribe_in(
             &terminal,
@@ -578,7 +589,8 @@ impl WorkspaceView {
             active_tab: first_tab,
             next_pane_id: 2,
             next_tab_id: 2,
-            left_panel: false,
+            left_panel: true,
+            tab_scroll: ScrollHandle::new(),
             right_panel: false,
             settings_open: false,
             broadcast: false,
@@ -615,6 +627,9 @@ impl WorkspaceView {
                 .iter()
                 .position(|tab| tab.layout.contains(pane_id))
             {
+                if self.active_tab != self.tabs[tab_index].id {
+                    self.tab_scroll.scroll_to_item(tab_index);
+                }
                 self.active_tab = self.tabs[tab_index].id;
                 self.tabs[tab_index].focused_pane = pane_id;
                 self.handle_shortcut(shortcut, window, cx);
@@ -710,6 +725,9 @@ impl WorkspaceView {
 
     fn focus_pane(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(tab_index) = self.tabs.iter().position(|tab| tab.layout.contains(id)) {
+            if self.active_tab != self.tabs[tab_index].id {
+                self.tab_scroll.scroll_to_item(tab_index);
+            }
             self.active_tab = self.tabs[tab_index].id;
             self.tabs[tab_index].focused_pane = id;
             if let Some(pane) = self.pane(id) {
@@ -783,10 +801,17 @@ impl WorkspaceView {
         let theme = self.themes.resolve(&self.settings.appearance.theme).clone();
         let session = wrap_transfer(session, &self.settings.appearance);
         let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
+        // 新窗格继承当前窗口的估算网格尺寸（与首窗格同一口径）。
+        let viewport = window.viewport_size();
+        let terminal_area = gpui::Size {
+            width: viewport.width,
+            height: viewport.height - px(TITLEBAR_HEIGHT),
+        };
+        let (cols, rows) = estimate_grid_size(&self.settings.appearance, terminal_area);
         let terminal = create_terminal_view(
             pane_id,
             session,
-            terminal_config_for(&self.settings.appearance, &theme),
+            terminal_config_for(&self.settings.appearance, &theme, cols, rows),
             cx.weak_entity(),
             self.shortcut_tx.clone(),
             self.broadcast_tx.clone(),
@@ -996,6 +1021,7 @@ impl WorkspaceView {
             && let Some(last) = self.tabs.last()
         {
             self.active_tab = last.id;
+            self.tab_scroll.scroll_to_item(self.tabs.len() - 1);
         }
         // 焦点窗格失效时回退到活动标签的首个窗格
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == self.active_tab)
@@ -1023,6 +1049,9 @@ impl WorkspaceView {
     ) {
         cx.stop_propagation();
         self.left_panel = !self.left_panel;
+        if self.left_panel {
+            self.tab_scroll.scroll_to_item(self.active_tab_index());
+        }
         cx.notify();
     }
 
@@ -1092,6 +1121,7 @@ impl WorkspaceView {
                 config.scrollback = appearance.scrollback;
                 config.colors = palette.clone();
                 config.ligatures = appearance.ligatures;
+                config.cursor_blink = appearance.cursor_blink;
                 config.font_fallbacks = appearance.font_fallbacks.clone();
                 terminal.update_config(config, cx);
             });
@@ -3158,67 +3188,69 @@ impl Render for WorkspaceView {
                             .flex()
                             .items_center()
                             .overflow_x_hidden()
-                            .children(tab_labels.iter().map(|(id, title, count)| {
-                                let id = *id;
-                                let is_active = id == active_tab_id;
-                                let label = if *count > 1 {
-                                    format!("{title} ⊞{count}")
-                                } else {
-                                    title.clone()
-                                };
-                                div()
-                                    .h_full()
-                                    .relative()
-                                    .group("tab")
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .px_3()
-                                    .bg(if is_active {
-                                        rgb(0x292B3D)
+                            .when(!left_panel, |bar| {
+                                bar.children(tab_labels.iter().map(|(id, title, count)| {
+                                    let id = *id;
+                                    let is_active = id == active_tab_id;
+                                    let label = if *count > 1 {
+                                        format!("{title} ⊞{count}")
                                     } else {
-                                        rgb(0x161722)
-                                    })
-                                    .text_color(if is_active {
-                                        rgb(0xC0CAF5)
-                                    } else {
-                                        rgb(0xA9B1D6)
-                                    })
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(move |this, event, window, cx| {
-                                            this.activate_tab(id, event, window, cx)
-                                        }),
-                                    )
-                                    .child(label)
-                                    // 激活标签底部强调线
-                                    .when(is_active, |tab| {
-                                        tab.child(
-                                            div()
-                                                .absolute()
-                                                .bottom_0()
-                                                .left_0()
-                                                .right_0()
-                                                .h(px(2.0))
-                                                .bg(rgb(0x7AA2F7)),
+                                        title.clone()
+                                    };
+                                    div()
+                                        .h_full()
+                                        .relative()
+                                        .group("tab")
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .px_3()
+                                        .bg(if is_active {
+                                            rgb(0x292B3D)
+                                        } else {
+                                            rgb(0x161722)
+                                        })
+                                        .text_color(if is_active {
+                                            rgb(0xC0CAF5)
+                                        } else {
+                                            rgb(0xA9B1D6)
+                                        })
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, event, window, cx| {
+                                                this.activate_tab(id, event, window, cx)
+                                            }),
                                         )
-                                    })
-                                    .child(
-                                        div()
-                                            .px_1()
-                                            .text_color(rgb(0x7D829F))
-                                            .opacity(0.55)
-                                            .group_hover("tab", |style| style.opacity(1.0))
-                                            .hover(|style| style.text_color(rgb(0xF7768E)))
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |this, event, window, cx| {
-                                                    this.close_tab(id, event, window, cx)
-                                                }),
+                                        .child(label)
+                                        // 激活标签底部强调线
+                                        .when(is_active, |tab| {
+                                            tab.child(
+                                                div()
+                                                    .absolute()
+                                                    .bottom_0()
+                                                    .left_0()
+                                                    .right_0()
+                                                    .h(px(2.0))
+                                                    .bg(rgb(0x7AA2F7)),
                                             )
-                                            .child("×"),
-                                    )
-                            }))
+                                        })
+                                        .child(
+                                            div()
+                                                .px_1()
+                                                .text_color(rgb(0x7D829F))
+                                                .opacity(0.55)
+                                                .group_hover("tab", |style| style.opacity(1.0))
+                                                .hover(|style| style.text_color(rgb(0xF7768E)))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, event, window, cx| {
+                                                        this.close_tab(id, event, window, cx)
+                                                    }),
+                                                )
+                                                .child("×"),
+                                        )
+                                }))
+                            })
                             .child(button("+", cx.listener(Self::new_tab)))
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::start_move)),
                     )
@@ -3255,7 +3287,7 @@ impl Render for WorkspaceView {
                     .min_h(px(0.0))
                     .flex()
                     .child(if left_panel {
-                        left_sidebar(&tab_labels, active_tab_id, cx)
+                        left_sidebar(&tab_labels, active_tab_id, &self.tab_scroll, cx)
                     } else {
                         div()
                     })
@@ -3270,6 +3302,7 @@ impl Render for WorkspaceView {
                                 &active_layout,
                                 &self.panes,
                                 focused_pane,
+                                show_pane_close(active_layout.leaf_count()),
                                 self.split_drag.map(|drag| drag.split_id),
                                 &pane_rects,
                                 cx,
@@ -3450,10 +3483,15 @@ fn welcome_shortcut(label: &str, keys: &str) -> gpui::Div {
         )
 }
 
+fn show_pane_close(pane_count: usize) -> bool {
+    pane_count > 1
+}
+
 fn render_layout(
     node: &LayoutNode,
     panes: &[Pane],
     focused: PaneId,
+    show_close: bool,
     dragging_split: Option<u64>,
     pane_rects: &Rc<RefCell<Vec<PaneRect>>>,
     cx: &mut Context<WorkspaceView>,
@@ -3528,28 +3566,37 @@ fn render_layout(
                         ),
                 );
             }
-            pane_div = pane_div.child(
-                div()
-                    .absolute()
-                    .top_1()
-                    .right_1()
-                    .px_1()
-                    .text_color(rgb(0x7D829F))
-                    .bg(gpui::Hsla::from(rgb(0x202132)).opacity(0.85))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _event, window, cx| {
-                            this.close_pane(close_id, window, cx)
-                        }),
-                    )
-                    .child("×"),
-            );
-            if *id == focused {
-                // 焦点窗格：强调色边框
-                pane_div = pane_div.border_1().border_color(rgb(0x7AA2F7));
-            } else {
-                // 非活动窗格整体压暗，配合边框一眼分清操作区域
-                pane_div = pane_div.opacity(0.85);
+            if show_close {
+                pane_div = pane_div.child(
+                    div()
+                        .absolute()
+                        .top_1()
+                        .right_1()
+                        .w(px(22.0))
+                        .h(px(22.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_sm()
+                        .opacity(0.0)
+                        .group_hover("pane", |style| style.opacity(1.0))
+                        .text_color(rgb(0xA9B1D6))
+                        .bg(gpui::Hsla::from(rgb(0x24283B)).opacity(0.95))
+                        .hover(|style| style.bg(rgb(0x3B4261)).text_color(rgb(0xF7768E)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event, window, cx| {
+                                this.close_pane(close_id, window, cx)
+                            }),
+                        )
+                        .child("×"),
+                );
+                if *id == focused {
+                    pane_div = pane_div.child(
+                        div().absolute().top_0().left_0().right_0().h(px(2.0))
+                            .bg(gpui::Hsla::from(rgb(0x7AA2F7)).opacity(0.7)),
+                    );
+                }
             }
             pane_div
         }
@@ -3600,6 +3647,7 @@ fn render_layout(
                             first,
                             panes,
                             focused,
+                            show_close,
                             dragging_split,
                             pane_rects,
                             cx,
@@ -3625,6 +3673,7 @@ fn render_layout(
                     second,
                     panes,
                     focused,
+                    show_close,
                     dragging_split,
                     pane_rects,
                     cx,
@@ -3646,6 +3695,7 @@ fn render_layout(
 fn left_sidebar(
     tab_labels: &[(TabId, String, usize)],
     active_tab_id: TabId,
+    scroll: &ScrollHandle,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
     div()
@@ -3654,38 +3704,53 @@ fn left_sidebar(
         .flex_shrink_0()
         .flex()
         .flex_col()
-        .bg(rgb(0x202132))
+        .bg(rgb(0x1C1E2C))
         .border_r_1()
-        .border_color(rgb(0x343750))
-        .child(sidebar_header("标签", tab_labels.len()))
+        .border_color(rgb(0x292D40))
         .child(
             div()
+                .h(px(52.0))
+                .px_3()
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_between()
+                .text_size(px(12.0))
+                .text_color(rgb(0xA9B1D6))
+                .child(div().flex().items_center().gap_2()
+                    .child("会话")
+                    .child(div().px_1().rounded_sm().bg(rgb(0x303548)).text_color(rgb(0xC0CAF5)).child(tab_labels.len().to_string())))
+                .child(button("+", cx.listener(WorkspaceView::new_tab))),
+        )
+        .child(
+            div()
+                .debug_selector(|| "sidebar-tabs".into())
                 .id("sidebar-tabs")
                 .flex_1()
                 .min_h(px(0.0))
                 .overflow_y_scroll()
+                .track_scroll(scroll)
                 .px_2()
                 .pb_2()
                 .children(tab_labels.iter().map(|(id, title, count)| {
                     let id = *id;
                     let selected = id == active_tab_id;
-                    let label = if *count > 1 {
-                        format!("{title} · {count} 个窗格")
-                    } else {
-                        title.clone()
-                    };
+                    let label = title.clone();
+                    let count = *count;
                     div()
-                        .h(px(32.0))
+                        .debug_selector(move || if selected { "sidebar-active-tab".into() } else { "sidebar-other-tab".into() })
+                        .group("session-row")
+                        .h(px(38.0))
                         .mb_1()
                         .px_2()
                         .flex()
                         .items_center()
-                        .gap_1()
-                        .rounded_sm()
+                        .gap_2()
+                        .rounded_md()
                         .bg(if selected {
-                            rgb(0x2B3F5E)
+                            rgb(0x303A52)
                         } else {
-                            rgb(0x202132)
+                            rgb(0x1C1E2C)
                         })
                         .text_color(if selected {
                             rgb(0xC0D6FF)
@@ -3694,9 +3759,9 @@ fn left_sidebar(
                         })
                         .hover(|style| {
                             style.bg(if selected {
-                                rgb(0x2B3F5E)
+                                rgb(0x35415B)
                             } else {
-                                rgb(0x292B3D)
+                                rgb(0x292D40)
                             })
                         })
                         .on_mouse_down(
@@ -3705,16 +3770,20 @@ fn left_sidebar(
                                 this.activate_tab(id, event, window, cx)
                             }),
                         )
-                        .child(div().w(px(2.0)).h(px(16.0)).bg(if selected {
+                        .child(div().w(px(2.0)).h(px(18.0)).rounded_full().bg(if selected {
                             rgb(0x7AA2F7)
                         } else {
-                            rgb(0x202132)
+                            rgb(0x1C1E2C)
                         }))
-                        .child(div().flex_1().min_w(px(0.0)).truncate().child(label))
+                        .child(div().text_size(px(13.0)).text_color(rgb(0x7AA2F7)).child("›_"))
+                        .child(div().flex_1().min_w(px(0.0)).truncate().text_size(px(13.0)).child(label))
+                        .when(count > 1, |row| row.child(div().text_size(px(11.0)).text_color(rgb(0xA9B1D6)).child(count.to_string())))
                         .child(
                             div()
                                 .px_1()
-                                .text_color(rgb(0x7D829F))
+                                .opacity(0.0)
+                                .group_hover("session-row", |style| style.opacity(1.0))
+                                .text_color(rgb(0xA9B1D6))
                                 .hover(|style| style.text_color(rgb(0xF7768E)))
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -3726,6 +3795,10 @@ fn left_sidebar(
                         )
                 })),
         )
+}
+
+fn sidebar_shortcut_label(shortcut: Option<&str>) -> &str {
+    shortcut.unwrap_or("设置快捷键")
 }
 
 fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
@@ -3785,15 +3858,23 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                                     .child(command.name.clone()),
                             ),
                     )
+                    .when(has_separate_template, |card| {
+                        card.child(
+                            div()
+                                .pt_1()
+                                .truncate()
+                                .text_size(px(12.0))
+                                .text_color(rgb(0xA9B1D6))
+                                .child(command.template.clone()),
+                        )
+                    })
                     .child(
                         div()
-                            .pt_1()
+                            .pt_2()
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(value_chip(
-                                command.shortcut.as_deref().unwrap_or("未绑定 · 设置快捷键"),
-                            ))
+                            .child(sidebar_shortcut_chip(sidebar_shortcut_label(command.shortcut.as_deref())))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener({
@@ -3806,16 +3887,6 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                                 }),
                             ),
                     )
-                    .when(has_separate_template, |card| {
-                        card.child(
-                            div()
-                                .pt_1()
-                                .truncate()
-                                .text_size(px(11.0))
-                                .text_color(rgb(0x7D829F))
-                                .child(command.template.clone()),
-                        )
-                    })
                     .child(
                         div()
                             .pt_1()
@@ -3855,14 +3926,17 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
         .flex_shrink_0()
         .flex()
         .flex_col()
-        .bg(rgb(0x202132))
+        .bg(rgb(0x1C1E2C))
         .border_l_1()
-        .border_color(rgb(0x343750))
-        .child(sidebar_header(active_tab.label(), item_count))
+        .border_color(rgb(0x292D40))
+        .child(sidebar_header("工具", item_count))
         .child(
             div()
-                .px_2()
-                .pb_2()
+                .mx_2()
+                .mb_2()
+                .p_1()
+                .rounded_md()
+                .bg(rgb(0x161824))
                 .flex()
                 .gap_1()
                 .children(RightPanelTab::ALL.map(|tab| {
@@ -4678,26 +4752,26 @@ fn render_server_section(
     let connecting = workspace.ssh_connecting.clone();
 
     panel
-        .child(setting_button(
-            "新建服务器",
-            true,
-            cx.listener(|this, _event, window, cx| this.edit_server(None, window, cx)),
-        ))
         .child(
             div()
-                .pt_2()
                 .flex()
+                .items_center()
                 .gap_1()
+                .child(div().debug_selector(|| "server-new-button".into()).flex_1().min_w(px(0.0)).child(setting_button(
+                    "+ 新建",
+                    true,
+                    cx.listener(|this, _event, window, cx| this.edit_server(None, window, cx)),
+                )))
                 .child(setting_button(
                     "导入",
                     false,
                     cx.listener(|this, _event, _window, cx| this.open_server_import(cx)),
                 ))
-                .child(setting_button(
+                .child(div().debug_selector(|| "server-export-button".into()).child(setting_button(
                     "导出",
                     false,
                     cx.listener(|this, _event, _window, cx| this.export_servers(cx)),
-                )),
+                ))),
         )
         .child(panel_caption("凭据保存在系统密钥环中"))
         .when(servers.is_empty(), |panel| {
@@ -4729,7 +4803,7 @@ fn render_server_section(
                 ServerAuthKind::Agent => "Agent",
             };
             let pending_delete = delete_confirm.as_deref() == Some(entry.name.as_str());
-            entry_card()
+            server_list_item()
                 // 第一行：名称 + 连接
                 .child(
                     div()
@@ -4744,72 +4818,85 @@ fn render_server_section(
                                 .text_color(rgb(0xC0CAF5))
                                 .child(entry.name.clone()),
                         )
-                        .child(setting_button(
-                            "连接",
-                            false,
-                            cx.listener({
-                                let name = entry.name.clone();
-                                move |this, _event, _window, cx| this.connect_server(&name, cx)
-                            }),
-                        )),
-                )
-                .child(
-                    div()
-                        .pt_1()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(value_chip(
-                            entry.shortcut.as_deref().unwrap_or("未绑定 · 设置快捷键"),
-                        ))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener({
-                                let entry = entry.clone();
-                                move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.edit_server(Some(&entry), window, cx);
-                                    this.start_shortcut_recording(window, cx);
-                                }
-                            }),
+                        .child(
+                            div()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .text_size(px(12.0))
+                                .text_color(rgb(0xB7CEFF))
+                                .bg(rgb(0x303E58))
+                                .hover(|style| style.bg(rgb(0x405578)))
+                                .on_mouse_down(MouseButton::Left, cx.listener({
+                                    let name = entry.name.clone();
+                                    move |this, _event, _window, cx| this.connect_server(&name, cx)
+                                }))
+                                .child("连接"),
                         ),
                 )
-                // 地址独占一行，按钮不再挤压主机信息。
+                // 优先展示连接目标；快捷键属于次要操作。
                 .child(
                     div()
+                        .debug_selector(|| "server-address".into())
                         .w_full()
                         .pt_1()
                         .truncate()
                         .text_size(px(12.0))
                         .text_color(rgb(0xA9B1D6))
                         .child(format!(
-                            "{}@{}:{} [{}]",
+                            "{}@{}:{} · {}",
                             entry.username, entry.host, entry.port, auth_label
                         )),
                 )
                 .child(
                     div()
+                        .pt_2()
                         .flex()
-                        .gap_1()
-                        .pt_1()
-                        .child(setting_button(
-                            "编辑",
-                            false,
-                            cx.listener({
-                                let entry = entry.clone();
-                                move |this, _event, window, cx| {
-                                    this.edit_server(Some(&entry), window, cx)
-                                }
-                            }),
-                        ))
-                        .child(setting_button(
-                            if pending_delete { "确认?" } else { "删" },
-                            pending_delete,
-                            cx.listener({
-                                let name = entry.name.clone();
-                                move |this, _event, _window, cx| this.delete_server(&name, cx)
-                            }),
-                        )),
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .debug_selector(|| "server-shortcut".into())
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(11.0))
+                                .text_color(rgb(0xA9B1D6))
+                                .hover(|style| style.text_color(rgb(0xC0D6FF)))
+                                .on_mouse_down(MouseButton::Left, cx.listener({
+                                    let entry = entry.clone();
+                                    move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.edit_server(Some(&entry), window, cx);
+                                        this.start_shortcut_recording(window, cx);
+                                    }
+                                }))
+                                .child(sidebar_shortcut_label(entry.shortcut.as_deref()).to_string()),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "server-edit".into())
+                                .text_size(px(11.0))
+                                .text_color(rgb(0xA9B1D6))
+                                .hover(|style| style.text_color(rgb(0xC0D6FF)))
+                                .on_mouse_down(MouseButton::Left, cx.listener({
+                                    let entry = entry.clone();
+                                    move |this, _event, window, cx| this.edit_server(Some(&entry), window, cx)
+                                }))
+                                .child("编辑"),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "server-delete".into())
+                                .text_size(px(11.0))
+                                .text_color(rgb(if pending_delete { 0xF7768E } else { 0xA9B1D6 }))
+                                .hover(|style| style.text_color(rgb(0xF7768E)))
+                                .on_mouse_down(MouseButton::Left, cx.listener({
+                                    let name = entry.name.clone();
+                                    move |this, _event, _window, cx| this.delete_server(&name, cx)
+                                }))
+                                .child(if pending_delete { "确认删除" } else { "删除" }),
+                        ),
                 )
         }))
 }
@@ -4840,9 +4927,10 @@ fn settings_overlay(
                 .flex()
                 .flex_col()
                 .overflow_hidden()
-                .bg(rgb(0x202132))
+                .rounded_md()
+                .bg(rgb(0x1C1E2C))
                 .border_1()
-                .border_color(rgb(0x3B3F5C))
+                .border_color(rgb(0x343A50))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(
                     div()
@@ -4913,16 +5001,18 @@ fn settings_navigation(page: SettingsPage, cx: &mut Context<WorkspaceView>) -> g
                 .w_full()
                 .px_3()
                 .py_2()
+                .rounded_md()
                 .bg(if selected {
-                    rgb(0x303550)
+                    rgb(0x35415B)
                 } else {
                     rgb(0x1B1C2A)
                 })
                 .text_color(if selected {
-                    rgb(0x7DCEFF)
+                    rgb(0xD6E3FF)
                 } else {
                     rgb(0xA9B1D6)
                 })
+                .hover(|style| style.bg(if selected { rgb(0x35415B) } else { rgb(0x292D40) }))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event, window, cx| {
@@ -5260,6 +5350,28 @@ fn settings_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>
                         |s: &mut Appearance, value| s.ligatures = value,
                     ),
                 ))
+                .child(setting_row(
+                    "光标闪烁",
+                    div(),
+                    toggle_controls(
+                        cx,
+                        ("开", true),
+                        ("关", false),
+                        settings.cursor_blink,
+                        |s: &mut Appearance, value| s.cursor_blink = value,
+                    ),
+                ))
+                .child(setting_row(
+                    "平滑滚动",
+                    div(),
+                    toggle_controls(
+                        cx,
+                        ("开", true),
+                        ("关", false),
+                        settings.smooth_scrolling,
+                        |s: &mut Appearance, value| s.smooth_scrolling = value,
+                    ),
+                ))
                 .child(
                     div()
                         .flex()
@@ -5506,9 +5618,9 @@ fn setting_card() -> gpui::Div {
         .flex_col()
         .p_3()
         .gap_1()
-        .bg(rgb(0x252637))
+        .bg(rgb(0x252939))
         .border_1()
-        .border_color(rgb(0x343750))
+        .border_color(rgb(0x303548))
         .rounded_md()
 }
 
@@ -5544,31 +5656,65 @@ fn value_chip(text: &str) -> gpui::Div {
         .child(text.to_string())
 }
 
+/// 侧栏快捷键入口：保留点击设置，同时降低对主要内容的视觉干扰。
+fn sidebar_shortcut_chip(text: &str) -> gpui::Div {
+    div()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .text_size(px(11.0))
+        .text_color(rgb(0xA9B1D6))
+        .bg(rgb(0x30364A))
+        .hover(|style| style.bg(rgb(0x3B4561)).text_color(rgb(0xD6DFF8)))
+        .child(text.to_string())
+}
+
+/// 服务器采用列表而非重卡片，减少视觉噪声和垂直占用。
+fn server_list_item() -> gpui::Div {
+    div()
+        .pt_3()
+        .pb_3()
+        .px_1()
+        .flex()
+        .flex_col()
+        .border_b_1()
+        .border_color(rgb(0x303548))
+        .hover(|style| style.bg(rgb(0x242838)))
+}
+
 /// 侧栏列表项使用低对比度背景，强调色留给选中项和主要操作。
 fn entry_card() -> gpui::Div {
     div()
         .mt_2()
-        .p_2()
-        .rounded_sm()
-        .bg(rgb(0x242637))
-        .hover(|style| style.bg(rgb(0x292B3D)))
+        .p_3()
+        .flex()
+        .flex_col()
+        .rounded_md()
+        .bg(rgb(0x252939))
+        .border_1()
+        .border_color(rgb(0x303548))
+        .hover(|style| style.bg(rgb(0x2B3042)))
 }
 
 /// 侧栏的固定标题与条目数量。
 fn sidebar_header(title: &str, count: usize) -> gpui::Div {
     div()
-        .h(px(42.0))
+        .h(px(52.0))
         .px_3()
         .flex_shrink_0()
         .flex()
         .items_center()
-        .justify_between()
-        .text_color(rgb(0xC0CAF5))
+        .gap_2()
+        .text_size(px(12.0))
+        .text_color(rgb(0xA9B1D6))
         .child(title.to_string())
         .child(
             div()
+                .px_1()
+                .rounded_sm()
+                .bg(rgb(0x303548))
                 .text_size(px(11.0))
-                .text_color(rgb(0x9AA0A6))
+                .text_color(rgb(0xC0CAF5))
                 .child(count.to_string()),
         )
 }
@@ -5585,21 +5731,22 @@ fn sidebar_tab_button(
         .items_center()
         .justify_center()
         .rounded_sm()
+        .text_size(px(12.0))
         .bg(if selected {
-            rgb(0x2B3F5E)
+            rgb(0x35415B)
         } else {
-            rgb(0x202132)
+            rgb(0x161824)
         })
         .text_color(if selected {
-            rgb(0xC0D6FF)
+            rgb(0xD6E3FF)
         } else {
             rgb(0xA9B1D6)
         })
         .hover(|style| {
             style.bg(if selected {
-                rgb(0x2B3F5E)
+                rgb(0x35415B)
             } else {
-                rgb(0x292B3D)
+                rgb(0x292D40)
             })
         })
         .on_mouse_down(MouseButton::Left, listener)
@@ -5685,7 +5832,9 @@ fn button_with_color(
         .items_center()
         .justify_center()
         .px_2()
+        .rounded_sm()
         .text_color(rgb(color))
+        .hover(|style| style.bg(rgb(0x292D40)).text_color(rgb(0xD7DEF7)))
         .on_mouse_down(MouseButton::Left, listener)
         .child(label)
 }
@@ -5744,6 +5893,7 @@ fn wrap_transfer(
         download_dir,
     })
 }
+#[allow(clippy::too_many_arguments)] // 装配函数：显式传参比打包结构更直观
 fn create_local_terminal(
     id: PaneId,
     workspace: gpui::WeakEntity<WorkspaceView>,
@@ -5752,16 +5902,20 @@ fn create_local_terminal(
     theme: &Theme,
     shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
     broadcast_tx: flume::Sender<(PaneId, Vec<u8>)>,
+    cols: usize,
+    rows: usize,
 ) -> (Entity<TerminalView>, Arc<SessionControl>) {
-    // 会话的开启/spawn/回收线程全部内聚在 LocalSession（laterterm-local）
+    // 会话的开启/spawn/回收线程全部内聚在 LocalSession（laterterm-local）。
+    // PTY 初始尺寸直接用窗口实际尺寸：避免启动后 resize 触发 bash readline
+    // 的 \r 重画，把光标拉回提示符行首。
     let shell = laterterm_local::default_shell();
     let session: Arc<dyn TerminalSession> = Arc::new(
         LocalSession::spawn(LocalOptions {
             shell,
             args: vec![],
             env: vec![],
-            cols: 110,
-            rows: 30,
+            cols: cols as u16,
+            rows: rows as u16,
         })
         .expect("启动本地会话失败"),
     );
@@ -5770,7 +5924,7 @@ fn create_local_terminal(
     let terminal = create_terminal_view(
         id,
         session,
-        terminal_config_for(settings, theme),
+        terminal_config_for(settings, theme, cols, rows),
         workspace,
         shortcut_tx,
         broadcast_tx,
@@ -5814,12 +5968,35 @@ fn spawn_local_session() -> Arc<dyn TerminalSession> {
 }
 
 /// 外观设置 → 终端视图配置（本地与 SSH 会话共用）。
-fn terminal_config_for(settings: &Appearance, theme: &Theme) -> TerminalConfig {
+/// 首帧前的网格/PTY 初始尺寸估算：用字体度量近似值把窗口内容区换算成行列。
+/// 与真实测量的偏差极小，避免「启动后 resize → bash readline 重画 → 光标被
+/// \r 拉回行首」的提示符错位。
+fn estimate_grid_size(settings: &Appearance, viewport: gpui::Size<gpui::Pixels>) -> (usize, usize) {
+    // 系数为 JetBrains Mono 实测值(cell 7.83x19.2 @13px)：估算与首帧实测的偏差
+    // 应尽量小，否则启动后的 PTY resize 会触发 bash readline 的 \r 重画，
+    // 把光标拉回提示符行首。
+    let cell_width = settings.font_size * 0.6058;
+    let cell_height = settings.font_size * 1.2308 * settings.line_height;
+    let usable_width = (viewport.width - px(settings.padding * 2.0)).max(px(1.0));
+    let usable_height = (viewport.height - px(settings.padding * 2.0)).max(px(1.0));
+    let cols = ((usable_width / px(cell_width)) as usize).clamp(2, 500);
+    let rows = ((usable_height / px(cell_height)) as usize).clamp(2, 200);
+    (cols, rows)
+}
+
+fn terminal_config_for(
+    settings: &Appearance,
+    theme: &Theme,
+    cols: usize,
+    rows: usize,
+) -> TerminalConfig {
     TerminalConfig {
         font_family: settings.font_family.clone(),
         font_size: px(settings.font_size),
-        cols: 110,
-        rows: 30,
+        cols,
+        rows,
+        cursor_blink: settings.cursor_blink,
+        smooth_scrolling: settings.smooth_scrolling,
         scrollback: settings.scrollback,
         line_height_multiplier: settings.line_height,
         padding: Edges::all(px(settings.padding)),
@@ -6009,6 +6186,115 @@ mod exit_regression_tests {
         assert!(keystroke_matches_shortcut(&event, " Shift + Control + Up "));
         assert!(!keystroke_matches_shortcut(&event, "mystery+ctrl+shift+up"));
         assert!(!keystroke_matches_shortcut(&event, "ctrl+up"));
+    }
+
+    #[gpui::test]
+    fn workspace_opens_with_vertical_tabs_and_right_panel_closed(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.read_with(cx, |view, _| {
+            assert!(view.left_panel, "启动时应显示左侧标签栏");
+            assert!(!view.right_panel, "右侧功能面板默认保持关闭");
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn new_active_tab_is_visible_in_scrolling_sidebar(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        cx.simulate_resize(gpui::size(gpui::px(900.0), gpui::px(400.0)));
+        workspace.update_in(cx, |view, window, cx| {
+            view.welcome_visible = false;
+            for _ in 0..12 {
+                view.spawn_tab(window, cx);
+            }
+        });
+        cx.run_until_parked();
+        let list = cx.debug_bounds("sidebar-tabs").expect("侧栏列表必须存在");
+        let active = cx.debug_bounds("sidebar-active-tab").expect("活动标签必须存在");
+        assert!(active.top() >= list.top() && active.bottom() <= list.bottom(), "新建的活动标签应滚入可视区域");
+        workspace.update_in(cx, |view, window, cx| {
+            let first = view.tabs[0].focused_pane;
+            view.focus_pane(first, window, cx);
+        });
+        cx.run_until_parked();
+        let list = cx.debug_bounds("sidebar-tabs").unwrap();
+        let active = cx.debug_bounds("sidebar-active-tab").unwrap();
+        assert!(active.top() >= list.top() && active.bottom() <= list.bottom(), "切换至顶部标签时应滚入可视区域");
+        workspace.update_in(cx, |view, window, cx| {
+            view.tab_scroll.set_offset(gpui::point(gpui::px(0.0), -view.tab_scroll.max_offset().height));
+            view.toggle_left_panel(&MouseDownEvent::default(), window, cx);
+            view.toggle_left_panel(&MouseDownEvent::default(), window, cx);
+        });
+        cx.run_until_parked();
+        let list = cx.debug_bounds("sidebar-tabs").unwrap();
+        let active = cx.debug_bounds("sidebar-active-tab").unwrap();
+        assert!(active.top() >= list.top() && active.bottom() <= list.bottom(), "重新打开侧栏应显示活动标签");
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn cursor_blink_setting_updates_existing_panes(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            view.spawn_tab(window, cx);
+            let enabled = !view.panes[0].terminal.read(cx).config().cursor_blink;
+            view.settings.appearance.cursor_blink = enabled;
+            view.apply_appearance(cx);
+            for pane in &view.panes {
+                assert_eq!(pane.terminal.read(cx).config().cursor_blink, enabled);
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn server_card_places_address_above_shortcut(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, _, cx| {
+            view.welcome_visible = false;
+            view.right_panel = true;
+            view.right_panel_tab = super::RightPanelTab::Servers;
+            view.settings.servers = vec![laterterm_config::ServerEntry {
+                name: "测试服务器".into(),
+                host: "example.com".into(),
+                username: "user".into(),
+                ..Default::default()
+            }];
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let new_button = cx.debug_bounds("server-new-button").expect("新建按钮应可见");
+        let export = cx.debug_bounds("server-export-button").expect("导出按钮应可见");
+        assert!(new_button.right() <= export.left(), "服务器工具栏按钮不可重叠");
+        let address = cx.debug_bounds("server-address").expect("服务器地址应可见");
+        let shortcut = cx.debug_bounds("server-shortcut").expect("快捷键入口应可见");
+        assert!(address.bottom() <= shortcut.top(), "服务器地址应排在快捷键之前");
+        let edit = cx.debug_bounds("server-edit").expect("编辑按钮应可见");
+        let delete = cx.debug_bounds("server-delete").expect("删除按钮应可见");
+        assert_eq!(shortcut.top(), edit.top(), "次要操作应在同一行");
+        assert_eq!(edit.top(), delete.top(), "编辑和删除应在同一行");
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes { pane.session.close(); }
+        });
+    }
+
+    #[test]
+    fn sidebar_shortcut_label_remains_concise_and_identifiable() {
+        assert_eq!(super::sidebar_shortcut_label(None), "设置快捷键");
+        assert_eq!(super::sidebar_shortcut_label(Some("ctrl+shift+k")), "ctrl+shift+k");
+    }
+
+    #[test]
+    fn pane_close_button_is_only_shown_for_split_sessions() {
+        assert!(!super::show_pane_close(1));
+        assert!(super::show_pane_close(2));
+        assert!(super::show_pane_close(3));
     }
 
     #[gpui::test]

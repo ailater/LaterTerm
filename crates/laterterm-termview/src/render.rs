@@ -566,6 +566,7 @@ impl TerminalRenderer {
         term: &Term<GpuiEventProxy>,
         window: &mut Window,
         _cx: &mut App,
+        cursor_visible: bool,
     ) {
         // Get terminal dimensions
         let grid = term.grid();
@@ -788,10 +789,12 @@ impl TerminalRenderer {
             }
         }
 
-        // Paint cursor only when the terminal has not hidden it with DECSET ?25l.
+        // Paint cursor only when the terminal has not hidden it with DECSET ?25l
+        // and (when blink is enabled) the blink phase is "on".
         if !term
             .mode()
             .contains(alacritty_terminal::term::TermMode::SHOW_CURSOR)
+            || !cursor_visible
         {
             return;
         }

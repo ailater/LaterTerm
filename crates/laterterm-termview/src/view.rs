@@ -172,6 +172,13 @@ pub struct TerminalConfig {
 
     /// 备选字体链：主字体缺字时按序回退（如 CJK 字体）；空表示系统默认回退。
     pub font_fallbacks: Vec<String>,
+
+    /// 光标闪烁。默认开启；关闭后光标常显。
+    pub cursor_blink: bool,
+
+    /// 平滑滚动：滚轮/触控板按像素累积连续滚动，而不是一次跳一整行。
+    /// 默认开启。
+    pub smooth_scrolling: bool,
 }
 
 impl Default for TerminalConfig {
@@ -187,6 +194,8 @@ impl Default for TerminalConfig {
             colors: ColorPalette::default(),
             ligatures: true,
             font_fallbacks: Vec::new(),
+            cursor_blink: true,
+            smooth_scrolling: true,
         }
     }
 }
@@ -427,9 +436,21 @@ pub struct TerminalView {
     /// Async task that reads bytes and notifies the view (push-based)
     #[allow(dead_code)]
     _reader_task: Task<()>,
+    /// 光标闪烁任务（可配置开关；关闭时不产生重绘）
+    _blink_task: Task<()>,
+    /// 数据保活任务：兜底唤醒丢失时强制刷新（每 200ms 检查一次数据版本）
+    _sync_task: Task<()>,
+    /// 已渲染的数据版本号（主线程侧），与 state.data_epoch() 对账。
+    rendered_epoch: u64,
+    /// 光标闪烁当前相位（true=可见）。
+    blink_on: Arc<std::sync::atomic::AtomicBool>,
+    /// 平滑滚动残差：不足一行的像素滚动累积于此（单位：行，可为小数）。
+    scroll_residual: f32,
 
     /// Callback to notify the PTY about size changes
     resize_callback: Option<Arc<ResizeCallback>>,
+    /// 已同步到会话的首帧尺寸；会话初始尺寸不一定等于网格配置。
+    session_size: Arc<parking_lot::Mutex<Option<(usize, usize)>>>,
 
     /// Optional callback to intercept key events before terminal processing
     key_handler: Option<Arc<KeyHandler>>,
@@ -462,6 +483,10 @@ pub struct TerminalView {
 
     /// 回滚搜索状态；打开时终端按键被拦截为搜索输入，不再写入 PTY。
     search: Option<SearchState>,
+
+    /// 所属窗口句柄；首帧 render 时记录，PTY 数据路径用它把 notify
+    /// 绑定到窗口上下文，避免后台任务通知不触发窗口重绘。
+    window_handle: Option<AnyWindowHandle>,
 }
 
 /// 搜索栏状态。
@@ -591,34 +616,111 @@ impl TerminalView {
         // This is push-based: the task blocks until bytes arrive, then immediately notifies
         let reader_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
-                // Wait for bytes from the background reader (blocks until data arrives)
-                match bytes_rx.recv_async().await {
-                    Ok(bytes) => {
-                        if std::env::var_os("LATERTERM_PTY_TRACE").as_deref()
-                            == Some(std::ffi::OsStr::new("1"))
-                        {
-                            eprintln!("[pty-trace] recv {} bytes", bytes.len());
+                // 等待字节；用 GPUI 定时器与 flume 唤醒竞争——GPUI Linux 后台任务的
+                // 唤醒在部分场景下会丢失(实测 reader_task 曾永久饿死, 网格停在空首帧)，
+                // 定时器走独立的 dispatch_after 通道，保证数据最多延迟 100ms 必被处理。
+                let wakeup = futures::future::select(
+                    bytes_rx.recv_async(),
+                    cx.background_executor().timer(Duration::from_millis(100)),
+                )
+                .await;
+                match wakeup {
+                    futures::future::Either::Left((result, _timer)) => match result {
+                        Ok(bytes) => {
+                            // Process bytes and notify the view.
+                            // 优先走窗口上下文: 后台任务的 cx.notify() 只标记实体 dirty,
+                            // 不保证平台请求新帧(X11 由 60Hz 定时器检查 is_dirty, Wayland 靠
+                            // 合成器帧回调); 必须在窗口上下文里显式 window.refresh() 才能让
+                            // 终端输出及时上屏 —— 否则出现「打开后只有左上角光标, 提示符
+                            // 停留在网格里不上屏」的现象。
+                            let window_handle =
+                                this.update(cx, |view, _| view.window_handle).ok().flatten();
+                            let result = match window_handle {
+                                Some(handle) => cx.update_window(handle, |_root, window, app| {
+                                    this.update(app, |view, cx| {
+                                        view.state.process_bytes(&bytes);
+                                        cx.notify();
+                                        window.refresh();
+                                    })
+                                }),
+                                None => Ok(this.update(
+                                    cx,
+                                    |view: &mut Self, cx: &mut Context<Self>| {
+                                        view.state.process_bytes(&bytes);
+                                        cx.notify();
+                                    },
+                                )),
+                            };
+                            if result.is_err() {
+                                // View was dropped, exit
+                                break;
+                            }
                         }
-                        // Process bytes and notify the view
-                        let result = this.update(cx, |view: &mut Self, cx: &mut Context<Self>| {
-                            view.state.process_bytes(&bytes);
-                            cx.notify();
-                        });
-                        if result.is_err() {
-                            // View was dropped, exit
+                        Err(_) => {
+                            // Channel closed - PTY has finished, send Exit event
+                            let _ = exit_event_tx.send(TerminalEvent::Exit);
+                            // 生命周期事件必须在绘制之外派发，隐藏终端也能被父视图回收。
+                            let _ = this.update(cx, |_view, cx: &mut Context<Self>| {
+                                cx.emit(TerminalExited);
+                                cx.notify();
+                            });
                             break;
                         }
+                    },
+                    futures::future::Either::Right(_) => {
+                        // 保活定时器到期：无数据则继续等待。
                     }
-                    Err(_) => {
-                        // Channel closed - PTY has finished, send Exit event
-                        let _ = exit_event_tx.send(TerminalEvent::Exit);
-                        // 生命周期事件必须在绘制之外派发，隐藏终端也能被父视图回收。
-                        let _ = this.update(cx, |_view, cx: &mut Context<Self>| {
-                            cx.emit(TerminalExited);
+                }
+            }
+        });
+
+        // 光标闪烁：每 530ms 翻转相位；关闭闪烁时不产生多余重绘。
+        let blink_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(530))
+                    .await;
+                let changed = this
+                    .update(cx, |view, cx| {
+                        let enabled = view.config.cursor_blink;
+                        let next = if enabled {
+                            !view.blink_on.load(std::sync::atomic::Ordering::Relaxed)
+                        } else {
+                            true
+                        };
+                        let changed = view.blink_on.swap(next, std::sync::atomic::Ordering::Relaxed)
+                            != next;
+                        if changed {
                             cx.notify();
-                        });
-                        break;
-                    }
+                        }
+                        changed
+                    })
+                    .unwrap_or(false);
+                let _ = changed;
+            }
+        });
+
+        // 数据保活：每 200ms 对账数据版本与已渲染版本，不一致则强制刷新。
+        // 兜底 GPUI Linux 后台任务唤醒丢失的场景（实测会导致启动提示符不上屏）。
+        let sync_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(200))
+                    .await;
+                if this
+                    .update(cx, |view, cx| {
+                        let data = view.state.data_epoch();
+                        let stale = data != view.rendered_epoch;
+                        if stale {
+                            view.rendered_epoch = data;
+                            cx.notify();
+                        }
+                        stale
+                    })
+                    .unwrap_or(false)
+                {
+                    // 实体已释放
+                    break;
                 }
             }
         });
@@ -632,6 +734,11 @@ impl TerminalView {
             event_rx,
             config,
             _reader_task: reader_task,
+            _blink_task: blink_task,
+            _sync_task: sync_task,
+            scroll_residual: 0.0,
+            rendered_epoch: 0,
+            blink_on: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             // 默认 resize 回调转发给会话；with_resize_callback 可整体覆盖
             resize_callback: {
                 let session_for_resize = Arc::clone(&session);
@@ -641,6 +748,7 @@ impl TerminalView {
                     }
                 })))
             },
+            session_size: Arc::new(parking_lot::Mutex::new(None)),
             key_handler: None,
             input_callback: None,
             bell_callback: None,
@@ -652,6 +760,7 @@ impl TerminalView {
             scroll_report_scheduled: false,
             marked_text: String::new(),
             search: None,
+            window_handle: None,
         }
     }
 
@@ -991,8 +1100,18 @@ impl TerminalView {
             }
         };
         // 当前桌面使用自然滚动：保持滚轮方向与内容移动方向一致。
-        let lines = delta_y.round() as i32;
+        // 平滑滚动：小数行残差累积到累计器，够一整行才滚动——触控板/高分辨率
+        // 滚轮的微小位移也能连续生效，不丢行也不跳行。
+        let lines = if self.config.smooth_scrolling {
+            let total = self.scroll_residual + delta_y;
+            let whole = total.trunc();
+            self.scroll_residual = total - whole;
+            whole as i32
+        } else {
+            delta_y.round() as i32
+        };
         if lines == 0 {
+            cx.notify();
             return;
         }
 
@@ -1064,6 +1183,24 @@ impl TerminalView {
         (self.state.cols(), self.state.rows())
     }
 
+    /// 按比例设置滚动位置：0.0 = 滚到最老历史，1.0 = 滚回底部。
+    /// 供滚动条拖拽/点击导航使用；与 scroll_summary 构成双向联动。
+    pub fn set_scroll_fraction(&self, fraction: f32) {
+        let fraction = fraction.clamp(0.0, 1.0);
+        self.state.with_term_mut(|term| {
+            let scrollable = (term.grid().total_lines() - term.grid().screen_lines()) as i32;
+            if scrollable <= 0 {
+                return;
+            }
+            let offset = ((1.0 - fraction) * scrollable as f32).round() as i32;
+            let current = term.grid().display_offset() as i32;
+            let delta = offset - current;
+            if delta != 0 {
+                term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
+            }
+        });
+    }
+
     /// 滚动状态摘要（display_offset / 可见行数 / 总行数），供外部画滚动条。
     pub fn scroll_summary(&self) -> ScrollSummary {
         self.state.with_term(|term| {
@@ -1125,6 +1262,7 @@ impl TerminalView {
         self.state.resize(cols, rows);
         if let Some(callback) = &self.resize_callback {
             callback(cols, rows);
+            *self.session_size.lock() = Some((cols, rows));
         }
     }
 
@@ -1264,6 +1402,11 @@ impl TerminalView {
         }
         if config.scrollback != self.config.scrollback {
             self.state.set_scrollback(config.scrollback);
+        }
+        // 光标闪烁开关变化时立即恢复常显，避免停留在熄灭相位。
+        if config.cursor_blink != self.config.cursor_blink && config.cursor_blink {
+            self.blink_on.store(true, std::sync::atomic::Ordering::Relaxed);
+            cx.notify();
         }
 
         // Update renderer with new font settings and palette
@@ -1419,6 +1562,12 @@ impl EntityInputHandler for TerminalView {
 
 impl Render for TerminalView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 记录所属窗口句柄: PTY 数据任务依赖它把重绘绑定到本窗口。
+        if self.window_handle.is_none() {
+            self.window_handle = Some(window.window_handle());
+        }
+        // 本帧已渲染到当前数据版本
+        self.rendered_epoch = self.state.data_epoch();
         // Process any pending events
         self.process_events(window, cx);
         // 滚动位置/历史行数变化时通知宿主（防抖定时器，不在 render 期直接 notify）
@@ -1451,7 +1600,12 @@ impl Render for TerminalView {
         // 避免每个标签切换/每帧再 clone 后重复测量。
         let renderer = self.renderer.clone();
         let resize_callback = self.resize_callback.clone();
+        let session_size = self.session_size.clone();
         let focus_handle = self.focus_handle.clone();
+        // 光标可见性快照：canvas 闭包在绘制阶段读取（闪烁相位由 blink 任务驱动）
+        let cursor_visible =
+            !self.config.cursor_blink
+                || self.blink_on.load(std::sync::atomic::Ordering::Relaxed);
         let entity = cx.entity();
         let padding = self.config.padding;
         // 搜索快照：canvas 闭包在绘制阶段执行，不能借用 self
@@ -1578,10 +1732,11 @@ impl Render for TerminalView {
                                 (false, current_cols, current_rows, resize_lock_wait, None)
                             }
                         };
-                        let callback_elapsed = if needs_resize {
+                        let callback_elapsed = if needs_resize || *session_size.lock() != Some((cols, rows)) {
                             if let Some(ref callback) = resize_callback {
                                 let callback_started = trace.map(|_| Instant::now());
                                 callback(cols, rows);
+                                *session_size.lock() = Some((cols, rows));
                                 callback_started.map(|started| started.elapsed())
                             } else {
                                 None
@@ -1597,7 +1752,14 @@ impl Render for TerminalView {
 
                         // Paint the terminal with measured dimensions
                         let paint_started = trace.map(|_| Instant::now());
-                        measured_renderer.paint(bounds, padding, &term, window, cx);
+                        measured_renderer.paint(
+                            bounds,
+                            padding,
+                            &term,
+                            window,
+                            cx,
+                            cursor_visible,
+                        );
                         let paint_elapsed = paint_started.map(|started| started.elapsed());
 
                         let trace_report = trace.map(|(reason, started, entity_id, scale, measure_elapsed)| {
@@ -1720,6 +1882,40 @@ mod tests {
         assert_eq!(font_trace_reason(true, false, true), None);
         assert_eq!(font_trace_reason(true, true, false), Some("initial"));
         assert_eq!(font_trace_reason(true, true, true), Some("font_change"));
+    }
+
+    #[gpui::test]
+    fn first_layout_synchronizes_session_even_if_grid_size_matches(cx: &mut TestAppContext) {
+        use std::sync::Mutex;
+        struct RecordingSession(Arc<Mutex<Vec<(u16, u16)>>>);
+        impl TerminalSession for RecordingSession {
+            fn backend(&self) -> BackendKind { BackendKind::Local }
+            fn title(&self) -> String { String::new() }
+            fn take_streams(&self) -> std::io::Result<SessionStreams> {
+                Ok(SessionStreams { reader: Box::new(std::io::empty()), writer: Box::new(std::io::sink()) })
+            }
+            fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+                self.0.lock().unwrap().push((cols, rows));
+                Ok(())
+            }
+            fn kill(&self) {}
+        }
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        let captured = sizes.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| TerminalView::new(Arc::new(RecordingSession(captured)), TerminalConfig::default(), cx));
+        cx.run_until_parked();
+        let grid = terminal.read_with(cx, |view, _| view.state.with_term(|term| {
+            use alacritty_terminal::grid::Dimensions;
+            (term.columns() as u16, term.screen_lines() as u16)
+        }));
+        sizes.lock().unwrap().clear();
+        let captured = sizes.clone();
+        let (_second, cx) = cx.add_window_view(|_, cx| {
+            let config = TerminalConfig { cols: grid.0 as usize, rows: grid.1 as usize, ..TerminalConfig::default() };
+            TerminalView::new(Arc::new(RecordingSession(captured)), config, cx)
+        });
+        cx.run_until_parked();
+        assert_eq!(sizes.lock().unwrap().last().copied(), Some(grid), "首次布局必须同步会话网格");
     }
 
     #[gpui::test]
