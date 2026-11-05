@@ -201,7 +201,7 @@ pub fn normalize_shortcut(shortcut: &str) -> Result<String> {
     }
     if !key
         .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || "[]\\\\-_=;,./".contains(ch))
+        .all(|ch| ch.is_ascii_alphanumeric() || "[]\\\\-_=;,./`~".contains(ch))
     {
         bail!("快捷键包含非法按键");
     }
@@ -308,6 +308,13 @@ mod tests {
         };
         let values = BTreeMap::from([("user".into(), "x\ny".into())]);
         assert!(command.expand(&values).is_err());
+    }
+
+    #[test]
+    fn normalizes_grave_and_tilde_shortcuts() {
+        assert_eq!(normalize_shortcut("ctrl+`").unwrap(), "ctrl+`");
+        assert_eq!(normalize_shortcut("ctrl+~").unwrap(), "ctrl+~");
+        assert_eq!(normalize_shortcut("ctrl+shift+~").unwrap(), "ctrl+shift+~");
     }
 
     #[test]

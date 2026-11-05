@@ -279,6 +279,24 @@ mod tests {
     use gpui::Keystroke;
 
     #[test]
+    fn records_and_matches_grave_and_tilde() {
+        for (name, shift, expected) in [
+            ("`", false, "ctrl+`"),
+            ("~", false, "ctrl+~"),
+            ("~", true, "ctrl+shift+~"),
+        ] {
+            let key = Keystroke {
+                modifiers: gpui::Modifiers { control: true, shift, ..Default::default() },
+                key: name.into(),
+                key_char: None,
+            };
+            let recorded = shortcut_for_keystroke(&key).unwrap();
+            assert_eq!(recorded, expected);
+            assert!(super::matches_shortcut(&key, &recorded));
+        }
+    }
+
+    #[test]
     fn formats_supported_modifiers_in_config_order() {
         let key = Keystroke::parse("shift-ctrl-k").expect("keystroke");
         assert_eq!(shortcut_for_keystroke(&key).unwrap(), "ctrl+shift+k");
