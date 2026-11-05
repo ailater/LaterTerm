@@ -4,11 +4,11 @@ use crate::pane_navigation::{Direction as PaneDirection, PaneRect, neighbor};
 use crate::server_connection::{self, ConnectionOutcome, CredentialKind};
 use crate::shortcut_recorder::{ShortcutChanged, ShortcutRecorder};
 use gpui::{
-    App, AppContext, AsyncApp, Bounds, Context, CursorStyle, DispatchPhase, Edges, Entity,
-    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ScrollHandle,
-    MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Render,
-    StatefulInteractiveElement, Styled, WeakEntity, Window, canvas, div, prelude::FluentBuilder,
-    px, relative, rgb,
+    App, AppContext, AsyncApp, Bounds, Context, CursorStyle, DispatchPhase, Div, Edges, Entity,
+    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
+    Point, ScrollHandle, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Render,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, anchored, canvas, deferred, div,
+    prelude::FluentBuilder, px, relative, rgb,
 };
 use laterterm_config::{
     Appearance, CommandTemplate, ServerAuthKind, ServerEntry, ServersFile, Settings, Theme,
@@ -405,6 +405,19 @@ struct Pane {
     status: TabStatus,
 }
 
+/// 终端右键菜单的打开状态与来源窗格。
+#[derive(Clone)]
+struct TerminalMenuState {
+    pane_id: PaneId,
+    /// 菜单锚点（窗口坐标）。
+    position: Point<Pixels>,
+    /// 右键处的 URL（若有），供「在浏览器打开」使用。
+    url: Option<String>,
+}
+
+/// 右键菜单动作：拿到工作区、窗口与上下文执行具体操作。
+type TerminalMenuAction = Box<dyn Fn(&mut WorkspaceView, &mut Window, &mut Context<WorkspaceView>)>;
+
 /// 标签：持有自己的分屏树与窗格焦点。
 struct WorkspaceTab {
     id: TabId,
@@ -433,6 +446,8 @@ pub struct WorkspaceView {
     pane_geometry: Rc<RefCell<Option<PaneGeometry>>>,
     /// 进行中的分割线拖拽（None = 空闲）。
     split_drag: Option<SplitDrag>,
+    /// 终端右键菜单状态（None = 关闭）。
+    terminal_menu: Option<TerminalMenuState>,
     left_panel: bool,
     tab_scroll: ScrollHandle,
     right_panel: bool,
@@ -531,6 +546,7 @@ impl WorkspaceView {
             },
         )
         .detach();
+        subscribe_terminal_menu(&terminal, first_pane, window, cx).detach();
         let view = Self {
             settings,
             themes,
@@ -569,6 +585,7 @@ impl WorkspaceView {
             next_split_id: 1,
             pane_geometry: Rc::new(RefCell::new(None)),
             split_drag: None,
+            terminal_menu: None,
             secret_store: default_store(),
             settings_page: SettingsPage::Appearance,
             shortcut_editor: None,
@@ -825,6 +842,7 @@ impl WorkspaceView {
             },
         )
         .detach();
+        subscribe_terminal_menu(&terminal, pane_id, window, cx).detach();
         self.panes.push(Pane {
             id: pane_id,
             title,
@@ -964,13 +982,7 @@ impl WorkspaceView {
 
     /// 关闭整个标签（标签栏 ×）：向该标签所有窗格会话发关闭请求（幂等），
     /// 窗格实体随 TerminalExited 事件逐个清理（隐藏标签同样生效）；标签立即从标签栏消失。
-    fn close_tab(
-        &mut self,
-        id: TabId,
-        _event: &MouseDownEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn close_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         cx.stop_propagation();
         let Some(tab_index) = self.tabs.iter().position(|tab| tab.id == id) else {
             return;
@@ -1066,12 +1078,157 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    fn toggle_settings(
-        &mut self,
-        _event: &MouseDownEvent,
-        _window: &mut Window,
+    /// 终端右键菜单浮层：anchored 定位 + snap_to_window 防贴边溢出。
+    /// 样式与命令输入框右键菜单同一套（Tokyo Night 深色）。
+    fn terminal_context_menu(
+        &self,
+        menu: TerminalMenuState,
         cx: &mut Context<Self>,
-    ) {
+    ) -> impl IntoElement {
+        let pane = self.pane(menu.pane_id);
+        let has_selection = pane.is_some_and(|pane| pane.terminal.read(cx).has_selection());
+        let single_pane = self.tabs[self.active_tab_index()].layout.leaf_count() <= 1;
+        let menu_pane = menu.pane_id;
+
+        // 菜单项工厂：禁用项置灰且不挂动作；动作执行后统一收起菜单。
+        // 嵌套 fn 里不能用 Self，需写全类型名；listener 要求 'static，label 用字面量。
+        fn item(
+            cx: &mut Context<WorkspaceView>,
+            label: &'static str,
+            enabled: bool,
+            action: TerminalMenuAction,
+        ) -> Div {
+            let base = div()
+                .h(px(26.0))
+                .px_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_size(px(12.0));
+            if enabled {
+                base.text_color(rgb(0xC0CAF5))
+                    .hover(|style| style.bg(rgb(0x2F3147)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            action(this, window, cx);
+                            this.terminal_menu = None;
+                            cx.notify();
+                        }),
+                    )
+            } else {
+                base.text_color(rgb(0x565B79))
+            }
+            .child(label)
+        }
+        let separator = || div().mx_2().my_1().h(px(1.0)).bg(rgb(0x343750));
+
+        // 终端级动作统一按菜单来源窗格定位；窗格可能已被回收，找不到则静默跳过。
+        let mut items: Vec<Div> = Vec::new();
+        let broadcast_label: &'static str =
+            if self.broadcast { "关闭广播输入" } else { "开启广播输入" };
+        if let Some(url) = &menu.url {
+            let url = url.clone();
+            items.push(item(cx, "在浏览器打开", true, Box::new(move |_, _, _| {
+                laterterm_termview::open_url(&url);
+            })));
+        }
+        items.push(item(cx, "复制", has_selection, Box::new(move |this, _, cx| {
+            if let Some(pane) = this.pane(menu_pane) {
+                let terminal = pane.terminal.clone();
+                terminal.update(cx, |view, cx| view.copy_selection(cx));
+            }
+        })));
+        items.push(item(cx, "粘贴", true, Box::new(move |this, _, cx| {
+            if let Some(pane) = this.pane(menu_pane) {
+                let terminal = pane.terminal.clone();
+                terminal.update(cx, |view, cx| view.paste_from_clipboard(cx));
+            }
+        })));
+        items.push(item(cx, "全选", true, Box::new(move |this, _, cx| {
+            if let Some(pane) = this.pane(menu_pane) {
+                let terminal = pane.terminal.clone();
+                terminal.update(cx, |view, cx| view.select_all(cx));
+            }
+        })));
+        items.push(separator());
+        items.push(item(cx, "搜索回滚内容", true, Box::new(move |this, _, cx| {
+            if let Some(pane) = this.pane(menu_pane) {
+                let terminal = pane.terminal.clone();
+                terminal.update(cx, |view, cx| view.open_search(cx));
+            }
+        })));
+        items.push(item(cx, "清屏", true, Box::new(move |this, _, cx| {
+            if let Some(pane) = this.pane(menu_pane) {
+                let terminal = pane.terminal.clone();
+                terminal.update(cx, |view, cx| view.clear_screen(cx));
+            }
+        })));
+        items.push(item(cx, "重置终端", true, Box::new(move |this, _, cx| {
+            if let Some(pane) = this.pane(menu_pane) {
+                let terminal = pane.terminal.clone();
+                terminal.update(cx, |view, cx| view.reset_terminal(cx));
+            }
+        })));
+        items.push(separator());
+        items.push(item(cx, "向左分屏", true, Box::new(|this, window, cx| {
+            this.split_focused(SplitDirection::Horizontal, window, cx);
+        })));
+        items.push(item(cx, "向下分屏", true, Box::new(|this, window, cx| {
+            this.split_focused(SplitDirection::Vertical, window, cx);
+        })));
+        if !single_pane {
+            items.push(item(cx, "关闭窗格", true, Box::new(move |this, window, cx| {
+                this.close_pane(menu_pane, window, cx);
+            })));
+        }
+        items.push(item(cx, "新标签", true, Box::new(|this, window, cx| {
+            this.spawn_tab(window, cx);
+        })));
+        items.push(item(cx, "关闭标签", true, Box::new(move |this, window, cx| {
+            if let Some(tab) = this.tabs.iter().find(|tab| tab.layout.contains(menu_pane)) {
+                let tab_id = tab.id;
+                this.close_tab(tab_id, window, cx);
+            }
+        })));
+        items.push(separator());
+        items.push(item(cx, broadcast_label, true, Box::new(|this, _, cx| {
+            this.toggle_broadcast(cx);
+        })));
+        items.push(item(cx, "设置", true, Box::new(|this, _, cx| {
+            this.toggle_settings(cx);
+        })));
+
+        deferred(
+            anchored()
+                .position(menu.position)
+                .snap_to_window()
+                .child(
+                    div()
+                        .w(px(176.0))
+                        .flex()
+                        .flex_col()
+                        .py_1()
+                        .bg(rgb(0x252837))
+                        .border_1()
+                        .border_color(rgb(0x3B3F5C))
+                        .rounded_md()
+                        // 点击菜单外任意处（含终端区）关闭
+                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                            this.terminal_menu = None;
+                            cx.notify();
+                        }))
+                        // 菜单内的点击不穿透，避免误触终端或触发选区
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                        .children(items),
+                ),
+        )
+        .with_priority(1)
+    }
+
+    fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         cx.stop_propagation();
         self.settings_open = !self.settings_open;
         cx.notify();
@@ -2900,6 +3057,15 @@ impl WorkspaceView {
             cx.stop_propagation();
             return;
         }
+        // 终端右键菜单：Esc 直接关闭；其他按键先关菜单再正常分发。
+        if self.terminal_menu.is_some() {
+            self.terminal_menu = None;
+            cx.notify();
+            if plain_escape {
+                cx.stop_propagation();
+                return;
+            }
+        }
         if self.command_dialog.is_some()
             || self.totp_dialog.is_some()
             || self.server_dialog.is_some()
@@ -3243,8 +3409,8 @@ impl Render for WorkspaceView {
                                                 .hover(|style| style.text_color(rgb(0xF7768E)))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
-                                                    cx.listener(move |this, event, window, cx| {
-                                                        this.close_tab(id, event, window, cx)
+                                                    cx.listener(move |this, _, window, cx| {
+                                                        this.close_tab(id, window, cx)
                                                     }),
                                                 )
                                                 .child("×"),
@@ -3269,7 +3435,7 @@ impl Render for WorkspaceView {
                         }),
                     ))
                     .child(button("▣", cx.listener(Self::toggle_right_panel)))
-                    .child(button("⚙", cx.listener(Self::toggle_settings)))
+                    .child(button("⚙", cx.listener(|this, _, _, cx| this.toggle_settings(cx))))
                     .when(!cfg!(target_os = "macos"), |titlebar| {
                         titlebar
                             .child(button("—", cx.listener(Self::minimize)))
@@ -3332,6 +3498,13 @@ impl Render for WorkspaceView {
             .when_some(render_active_dialog(self, cx), |root, overlay| {
                 root.child(overlay)
             })
+            // 终端右键菜单：anchored 浮层，最顶层
+            .when_some(
+                self.terminal_menu
+                    .clone()
+                    .map(|menu| self.terminal_context_menu(menu, cx)),
+                |root, menu_overlay| root.child(menu_overlay),
+            )
             // 在全部窗格完成绘制后提交同一帧的几何快照。
             .child(canvas(
                 |_, _, _| (),
@@ -3787,8 +3960,8 @@ fn left_sidebar(
                                 .hover(|style| style.text_color(rgb(0xF7768E)))
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(move |this, event, window, cx| {
-                                        this.close_tab(id, event, window, cx)
+                                    cx.listener(move |this, _, window, cx| {
+                                        this.close_tab(id, window, cx)
                                     }),
                                 )
                                 .child("×"),
@@ -6078,6 +6251,28 @@ macro_rules! set_color {
     };
 }
 
+/// 订阅终端右键菜单请求：把事件转成工作区的菜单状态。
+/// 首窗格（内联创建）与后续窗格（attach_pane）共用。
+fn subscribe_terminal_menu(
+    terminal: &Entity<TerminalView>,
+    pane_id: PaneId,
+    window: &mut Window,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Subscription {
+    cx.subscribe_in(
+        terminal,
+        window,
+        move |this, _, event: &laterterm_termview::TerminalMenuRequested, _window, cx| {
+            this.terminal_menu = Some(TerminalMenuState {
+                pane_id,
+                position: event.position,
+                url: event.url.clone(),
+            });
+            cx.notify();
+        },
+    )
+}
+
 fn pane_direction_for_keystroke(key: &gpui::Keystroke) -> Option<PaneDirection> {
     let modifiers = &key.modifiers;
     if !modifiers.control
@@ -6250,6 +6445,30 @@ mod exit_regression_tests {
                 assert_eq!(pane.terminal.read(cx).config().cursor_blink, enabled);
                 pane.session.close();
             }
+        });
+    }
+
+    #[gpui::test]
+    fn terminal_right_click_event_records_menu_state(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let pane_id = workspace.update_in(cx, |view, _window, cx| {
+            let pane_id = view.panes[0].id;
+            let terminal = view.panes[0].terminal.clone();
+            // 模拟 termview 右键：直接发射菜单请求事件（真实链路由 on_right_click 触发）。
+            // subscribe_in 是窗口级订阅，须在窗口上下文里发射才会派发。
+            terminal.update(cx, |_, cx| {
+                cx.emit(laterterm_termview::TerminalMenuRequested {
+                    position: gpui::point(gpui::px(40.0), gpui::px(60.0)),
+                    url: Some("https://example.com".into()),
+                });
+            });
+            pane_id
+        });
+        cx.run_until_parked();
+        workspace.update(cx, |view, _| {
+            let menu = view.terminal_menu.clone().expect("右键事件应记录菜单状态");
+            assert_eq!(menu.pane_id, pane_id);
+            assert_eq!(menu.url.as_deref(), Some("https://example.com"));
         });
     }
 
@@ -6691,7 +6910,7 @@ mod exit_regression_tests {
             view.split_focused(SplitDirection::Horizontal, window, cx);
             let split = view.focused_pane_id();
             let tab = view.tabs[0].id;
-            view.close_tab(tab, &MouseDownEvent::default(), window, cx);
+            view.close_tab(tab, window, cx);
             view.close_pane(split, window, cx);
             (hidden, split)
         });

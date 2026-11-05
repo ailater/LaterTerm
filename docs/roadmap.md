@@ -113,6 +113,12 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 > 落地，本机 3 台真机验证）/ Xshell 会话（.xsh 多选，UTF-16 BOM 解码，密码绑定原机器
 > 加密不迁移）；三类解析器在 laterterm-config::importers，附真机自跳过冒烟测试。
 
+> 右键菜单与文本选区（2026-11-05）：终端左键支持拖拽选区（单击字符/双击词/三击行，alacritty
+> Selection 存于 Term.selection，渲染侧逐行画高亮段），右键经 TerminalMenuRequested 事件交工作区
+> 渲染 anchored 浮层菜单（复制/粘贴/全选/URL 打开/搜索/清屏/重置/分屏/标签/广播/设置，Esc 与
+> 点击外部关闭）。注：应用开启鼠标协议上报（vim/tmux mouse mode）时右键仍弹菜单不上报给应用——
+> 鼠标协议上报（mouse_button_report 已在 mouse.rs 备好）为独立后续项。
+
 > 启动光标错位修复（2026-11-04）：PTY/网格初始尺寸改为按窗口内容区估算（cell 7.83×19.2 @13px 实测系数），
 > 消除「启动后 resize → bash readline 发 \r 把光标拉回提示符行首」的错位；隔离实测估算 193×42 与
 > 首帧实测一致（零 resize）。reader 数据链增加 GPUI 定时器保活轮询（100ms，独立于 flume 唤醒通道），

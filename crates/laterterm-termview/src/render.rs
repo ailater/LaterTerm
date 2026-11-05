@@ -559,6 +559,7 @@ impl TerminalRenderer {
     /// * `term` - The terminal state
     /// * `window` - The GPUI window
     /// * `cx` - The application context
+    #[allow(clippy::too_many_arguments)] // 绘制入口：逐项传参比打包结构更直观
     pub fn paint(
         &self,
         bounds: Bounds<Pixels>,

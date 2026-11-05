@@ -712,6 +712,50 @@ mod tests {
     }
 
     #[test]
+    fn clear_screen_empties_visible_area() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(80, 24, 100, GpuiEventProxy::new(tx));
+        terminal.process_bytes(b"stale output before clear");
+        use alacritty_terminal::vte::ansi::Handler as _;
+        terminal.with_term_mut(|term| {
+            term.clear_screen(alacritty_terminal::vte::ansi::ClearMode::All);
+        });
+        terminal.with_term(|term| {
+            use alacritty_terminal::grid::Dimensions;
+            let grid = term.grid();
+            for row in 0..grid.screen_lines() {
+                for column in 0..grid.columns() {
+                    let cell = grid[alacritty_terminal::index::Line(row as i32)]
+                        [alacritty_terminal::index::Column(column)]
+                    .c;
+                    assert_eq!(cell, ' ', "清屏后可见区应全空");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn selection_stored_on_term_roundtrips_text() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(80, 24, 100, GpuiEventProxy::new(tx));
+        terminal.process_bytes(b"hello selection\r\n$ ");
+        terminal.with_term_mut(|term| {
+            use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
+            use alacritty_terminal::selection::{
+                Selection as AlacSelection, SelectionType as AlacSelectionType,
+            };
+            let mut selection = AlacSelection::new(
+                AlacSelectionType::Simple,
+                AlacPoint::new(Line(0), Column(0)),
+                Side::Left,
+            );
+            selection.update(AlacPoint::new(Line(0), Column(4)), Side::Right);
+            term.selection = Some(selection);
+            assert_eq!(term.selection_to_string().as_deref(), Some("hello"));
+        });
+    }
+
+    #[test]
     fn test_scrollback_and_display_offset() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);

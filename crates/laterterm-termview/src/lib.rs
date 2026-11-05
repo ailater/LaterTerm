@@ -330,6 +330,6 @@ pub use event::{GpuiEventProxy, TerminalEvent};
 pub use render::TerminalRenderer;
 pub use terminal::TerminalState;
 pub use view::{
-    BellCallback, ClipboardStoreCallback, ExitCallback, KeyHandler, ResizeCallback, TerminalConfig,
-    TerminalView, TitleCallback,
+    BellCallback, ClipboardStoreCallback, ExitCallback, KeyHandler, ResizeCallback,
+    TerminalConfig, TerminalMenuRequested, TerminalView, TitleCallback, open_url,
 };

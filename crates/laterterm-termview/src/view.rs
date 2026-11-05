@@ -51,6 +51,11 @@ use crate::input::keystroke_to_bytes;
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
+use alacritty_terminal::selection::{
+    Selection as AlacSelection, SelectionType as AlacSelectionType,
+};
+use alacritty_terminal::vte::ansi::{ClearMode, Handler as AnsiHandler};
 use gpui::{Edges, ElementInputHandler, EntityInputHandler, UTF16Selection, *};
 use laterterm_core::TerminalSession;
 use std::io::{Read, Write};
@@ -503,6 +508,15 @@ struct SearchState {
 /// 会话退出事件；不依赖终端是否可见。
 pub struct TerminalExited;
 
+/// 右键菜单请求：宿主（工作区）据此在窗口坐标处渲染上下文菜单。
+#[derive(Clone, Debug)]
+pub struct TerminalMenuRequested {
+    /// 右键发生时的窗口坐标，作为菜单锚点。
+    pub position: Point<Pixels>,
+    /// 右键处的 URL（若命中），供「在浏览器打开」使用。
+    pub url: Option<String>,
+}
+
 /// 滚动位置变化回调：调用方按需读取 [`TerminalView::scroll_summary`]，
 /// 并用传入的上下文通知宿主刷新（如工作区的滚动条指示器）。
 pub type ScrollCallback = Box<dyn Fn(&mut Context<TerminalView>)>;
@@ -540,6 +554,8 @@ impl ScrollSummary {
 }
 
 impl EventEmitter<TerminalExited> for TerminalView {}
+
+impl EventEmitter<TerminalMenuRequested> for TerminalView {}
 
 impl TerminalView {
     /// Create a new terminal bound to a [`TerminalSession`].
@@ -1037,9 +1053,34 @@ impl TerminalView {
         }
     }
 
+    /// 把窗口像素坐标换算为终端网格坐标。
+    ///
+    /// 返回的 `Line` 是 alacritty 网格坐标：可见行数减去 display_offset，
+    /// 回滚历史为负行；越界钳制到网格内。
+    fn grid_point_at(&self, position: Point<Pixels>) -> Option<AlacPoint> {
+        let origin = self.last_content_origin?;
+        let (columns, screen_lines, display_offset) = self.state.with_term(|term| {
+            let grid = term.grid();
+            (grid.columns(), grid.screen_lines(), grid.display_offset() as i32)
+        });
+        let cell = crate::mouse::pixel_to_cell(
+            position,
+            origin,
+            self.renderer.cell_width,
+            self.renderer.cell_height,
+        );
+        let row = (cell.line.0 as usize).min(screen_lines.saturating_sub(1));
+        let column = cell.column.0.min(columns.saturating_sub(1));
+        Some(AlacPoint::new(
+            Line(row as i32 - display_offset),
+            Column(column),
+        ))
+    }
+
     /// Handle mouse down events.
     ///
-    /// Currently a placeholder for future mouse selection and interaction support.
+    /// 左键负责 URL 打开与文本选区（单击字符 / 双击词 / 三击行），
+    /// 右键交给 [`Self::on_right_click`]。
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -1066,34 +1107,83 @@ impl TerminalView {
                 open_url(&url);
             }
         }
+
+        // 文本选区：单击字符、双击词（semantic）、三击整行。
+        // `Term.selection` 存 Selection 构造器本体，渲染/复制时按需换算。
+        let Some(point) = self.grid_point_at(event.position) else {
+            return;
+        };
+        let selection_type = match event.click_count {
+            0 | 1 => AlacSelectionType::Simple,
+            2 => AlacSelectionType::Semantic,
+            _ => AlacSelectionType::Lines,
+        };
+        let selection = AlacSelection::new(selection_type, point, Side::Left);
+        self.state.with_term_mut(|term| term.selection = Some(selection));
+        cx.notify();
     }
 
-    /// Handle mouse up events.
-    ///
-    /// Currently a placeholder for future mouse selection support.
+    /// Handle mouse up events: 结束拖拽；未成形的单击选区直接清除。
     fn on_mouse_up(
         &mut self,
         _event: &MouseUpEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        // TODO: Implement mouse selection
-        // - End selection at released cell
-        // - Copy selection to clipboard if configured
+        let had_selection = self.state.with_term(|term| term.selection.is_some());
+        if !had_selection {
+            return;
+        }
+        self.state.with_term_mut(|term| {
+            // to_range 对空选区返回 None（单击未拖拽），据此保留或清除。
+            let finalized =
+                term.selection.take().filter(|selection| selection.to_range(term).is_some());
+            term.selection = finalized;
+        });
+        cx.notify();
     }
 
-    /// Handle mouse move events.
-    ///
-    /// Currently a placeholder for future mouse selection support.
+    /// Handle mouse move events: 按住左键拖拽时更新选区终点。
     fn on_mouse_move(
         &mut self,
-        _event: &MouseMoveEvent,
+        event: &MouseMoveEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        // TODO: Implement mouse selection
-        // - Update selection range while dragging
-        // - Send mouse motion reports if mouse tracking is enabled
+        if event.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        let Some(point) = self.grid_point_at(event.position) else {
+            return;
+        };
+        self.state.with_term_mut(|term| {
+            if let Some(selection) = term.selection.as_mut() {
+                selection.update(point, Side::Right);
+            }
+        });
+        cx.notify();
+    }
+
+    /// 右键：向宿主发菜单请求（锚点 + 命中的 URL），菜单由工作区渲染。
+    fn on_right_click(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        window.focus(&self.focus_handle);
+        let url = self.last_content_origin.and_then(|origin| {
+            let cell = crate::mouse::pixel_to_cell(
+                event.position,
+                origin,
+                self.renderer.cell_width,
+                self.renderer.cell_height,
+            );
+            let row = cell.line.0.max(0) as usize;
+            self.state.extract_url_at(row, cell.column.0)
+        });
+        cx.emit(TerminalMenuRequested { position: event.position, url });
     }
 
     /// Handle scroll events.
@@ -1325,6 +1415,63 @@ impl TerminalView {
             self.marked_text.clear();
             cx.notify();
         }
+    }
+
+    /// 是否存在文本选区。
+    pub fn has_selection(&self) -> bool {
+        self.state.with_term(|term| term.selection.is_some())
+    }
+
+    /// 复制选中文本到剪贴板；无选区时不动作。
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
+        let text = self.state.with_term(|term| term.selection_to_string());
+        if let Some(text) = text
+            && !text.is_empty()
+        {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        }
+    }
+
+    /// 粘贴剪贴板文本到终端（原样写入 PTY，换行由应用自行处理）。
+    pub fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text())
+            && !text.is_empty()
+        {
+            self.write_input(text.as_bytes());
+        }
+    }
+
+    /// 全选：覆盖可见区与全部回滚历史。
+    pub fn select_all(&mut self, cx: &mut Context<Self>) {
+        self.state.with_term_mut(|term| {
+            let grid = term.grid();
+            let mut selection = AlacSelection::new(
+                AlacSelectionType::Lines,
+                AlacPoint::new(term.topmost_line(), Column(0)),
+                Side::Left,
+            );
+            selection.update(
+                AlacPoint::new(
+                    Line(grid.screen_lines() as i32 - 1),
+                    Column(grid.columns().saturating_sub(1)),
+                ),
+                Side::Right,
+            );
+            term.selection = Some(selection);
+        });
+        cx.notify();
+    }
+
+    /// 清屏（等价 shell `clear`：清除可见区，回滚历史保留）。
+    pub fn clear_screen(&mut self, cx: &mut Context<Self>) {
+        self.state.with_term_mut(|term| term.clear_screen(ClearMode::All));
+        cx.notify();
+    }
+
+    /// 重置终端状态（颜色、样式、终端模式全部恢复默认）。
+    pub fn reset_terminal(&mut self, cx: &mut Context<Self>) {
+        self.state.with_term_mut(|term| term.reset_state());
+        cx.notify();
     }
 
     /// 搜索查询追加分本（来自 InputHandler 提交或按键）。
@@ -1691,6 +1838,7 @@ impl Render for TerminalView {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_right_click))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_scroll_wheel(cx.listener(Self::on_scroll))
             .child(
@@ -1839,6 +1987,54 @@ impl Render for TerminalView {
                                 ));
                             }
                         }
+                        // 文本选区高亮：逐行画选区段覆盖（网格坐标锚定，随滚动移动）
+                        if let Some(selection) =
+                            term.selection.as_ref().and_then(|sel| sel.to_range(&term))
+                        {
+                            let grid = term.grid();
+                            let display_offset = grid.display_offset() as i64;
+                            let columns = grid.columns();
+                            let origin_x = bounds.origin.x + padding.left;
+                            let origin_y = bounds.origin.y + padding.top;
+                            for screen_row in 0..grid.screen_lines() as i64 {
+                                let line = screen_row - display_offset;
+                                if line < selection.start.line.0 as i64
+                                    || line > selection.end.line.0 as i64
+                                {
+                                    continue;
+                                }
+                                let start_col = if line == selection.start.line.0 as i64 {
+                                    selection.start.column.0
+                                } else {
+                                    0
+                                };
+                                let end_col = if line == selection.end.line.0 as i64 {
+                                    (selection.end.column.0 + 1).min(columns)
+                                } else {
+                                    columns
+                                };
+                                if end_col <= start_col {
+                                    continue;
+                                }
+                                let x = origin_x + measured_renderer.cell_width * start_col as f32;
+                                let y = origin_y + measured_renderer.cell_height * screen_row as f32;
+                                window.paint_quad(gpui::quad(
+                                    Bounds {
+                                        origin: Point { x, y },
+                                        size: Size {
+                                            width: measured_renderer.cell_width
+                                                * (end_col - start_col) as f32,
+                                            height: measured_renderer.cell_height,
+                                        },
+                                    },
+                                    px(0.0),
+                                    gpui::Hsla::from(gpui::rgb(0x7AA2F7)).opacity(0.30),
+                                    Edges::<Pixels>::default(),
+                                    gpui::transparent_black(),
+                                    gpui::BorderStyle::default(),
+                                ));
+                            }
+                        }
                         // IME 预编辑浮层：光标处起排、带下划线，画在网格与搜索层之上
                         if !marked_text.is_empty() {
                             let origin = Point {
@@ -1887,7 +2083,8 @@ impl Render for TerminalView {
 }
 
 /// 用系统默认浏览器打开 URL。
-fn open_url(url: &str) {
+/// 用系统默认浏览器打开 URL（跨平台：open / cmd start / xdg-open）。
+pub fn open_url(url: &str) {
     let (program, args): (&str, Vec<&str>) = if cfg!(target_os = "macos") {
         ("open", vec![url])
     } else if cfg!(target_os = "windows") {
@@ -1901,7 +2098,7 @@ fn open_url(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::{TerminalConfig, TerminalExited, TerminalSession, TerminalView};
-    use gpui::{AppContext, TestAppContext};
+    use gpui::{AppContext, MouseDownEvent, MouseButton, TestAppContext};
     use laterterm_core::{BackendKind, SessionStreams};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1974,6 +2171,87 @@ mod tests {
         });
         cx.run_until_parked();
         assert_eq!(sizes.lock().unwrap().last().copied(), Some(grid), "首次布局必须同步会话网格");
+    }
+
+    #[gpui::test]
+    fn grid_point_at_maps_visible_row_through_display_offset(cx: &mut TestAppContext) {
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update(cx, |view, _| {
+            // 显式固定小网格，避免依赖测试窗口首帧测量出的尺寸
+            view.resize(10, 5);
+            // 先灌出回滚历史，否则空网格无法滚动
+            for i in 0..20 {
+                view.state.process_bytes(format!("line {i}\r\n").as_bytes());
+            }
+            view.last_content_origin = Some(gpui::Point { x: gpui::px(0.0), y: gpui::px(0.0) });
+            view.renderer.cell_width = gpui::px(10.0);
+            view.renderer.cell_height = gpui::px(20.0);
+            // 向上滚 2 行后，可见首行对应网格 Line(-2)
+            view.state.with_term_mut(|term| {
+                term.scroll_display(alacritty_terminal::grid::Scroll::Delta(2));
+            });
+            let point = view
+                .grid_point_at(gpui::point(gpui::px(5.0), gpui::px(10.0)))
+                .expect("网格点");
+            assert_eq!(point.line.0, -2, "可见首行在 display_offset=2 时应映射为 Line(-2)");
+            assert_eq!(point.column.0, 0);
+        });
+    }
+
+    #[gpui::test]
+    fn mouse_selection_roundtrips_text_and_clears_on_plain_click(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseMoveEvent, MouseUpEvent};
+
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            view.state.process_bytes(b"hello selection\r\n$ ");
+            view.last_content_origin = Some(gpui::Point { x: gpui::px(0.0), y: gpui::px(0.0) });
+            view.renderer.cell_width = gpui::px(10.0);
+            view.renderer.cell_height = gpui::px(20.0);
+
+            let down = |position, click_count| MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count,
+                first_mouse: false,
+            };
+            let move_to = |position| MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            };
+            let up = |position| MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+
+            // 拖拽：down(0,0) → move(0,4) → up，应选中 "hello"
+            view.on_mouse_down(&down(gpui::point(gpui::px(5.0), gpui::px(10.0)), 1), window, cx);
+            view.on_mouse_move(
+                &move_to(gpui::point(gpui::px(45.0), gpui::px(10.0))),
+                window,
+                cx,
+            );
+            view.on_mouse_up(&up(gpui::point(gpui::px(45.0), gpui::px(10.0))), window, cx);
+            assert!(view.has_selection(), "拖拽后应有选区");
+            let text = view.state.with_term(|term| term.selection_to_string());
+            assert_eq!(text.as_deref(), Some("hello"));
+
+            // 复制公开 API 不 panic（剪贴板写入走 gpui）
+            view.copy_selection(cx);
+
+            // 单击（未拖拽）→ up 后选区清空
+            view.on_mouse_down(&down(gpui::point(gpui::px(5.0), gpui::px(10.0)), 1), window, cx);
+            view.on_mouse_up(&up(gpui::point(gpui::px(5.0), gpui::px(10.0))), window, cx);
+            assert!(!view.has_selection(), "单击未拖拽不应留下选区");
+        });
     }
 
     #[gpui::test]
