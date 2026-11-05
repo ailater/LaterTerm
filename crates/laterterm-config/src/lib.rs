@@ -17,8 +17,14 @@ pub mod theme;
 pub mod totp;
 
 pub use commands::{CommandTemplate, normalize_shortcut, shortcut_conflicts};
-pub use importers::{deepin_default_path, load_deepin_servers, load_xshell_sessions};
-pub use servers::{ServerAuthKind, ServerEntry, ServersFile};
+pub use importers::{
+    deepin_commands_default_path, deepin_default_path, load_deepin_commands, load_deepin_servers,
+    load_xshell_sessions,
+};
+pub use servers::{
+    ServerAuthKind, ServerEntry, ServersFile, clear_broken_jump_refs, normalize_group,
+    resolve_jump_chain, servers_referencing_jump,
+};
 pub use theme::{DEFAULT_THEME, Theme, ThemeRegistry, themes_dir};
 pub use totp::{TotpAlgorithm, TotpConfig, TotpEntry, generate_code, parse_secret_input};
 
@@ -223,12 +229,17 @@ impl Settings {
     }
 
     /// 修正加载中的连接信息；错误快捷键保留原值供用户修正。
+    ///
+    /// 跳板引用（jump）单独走全表清理：格式非法、悬空、成环、超深一律断链
+    /// 保条目——这是载入期兜底，坏引用不会一直存活到连接期才暴露。
     fn sanitize_servers(&mut self) {
         self.servers.retain_mut(|server| {
             server.name = server.name.trim().to_string();
             server.host = server.host.trim().to_string();
             server.username = server.username.trim().to_string();
             server.note = server.note.trim().to_string();
+            // 分组宽容归一化：坏分组降级 None，绝不因分组丢条目
+            server.group = servers::normalize_group(server.group.as_deref());
             if let Some(key_path) = &server.key_path {
                 let trimmed = key_path.trim().to_string();
                 server.key_path = (!trimmed.is_empty()).then_some(trimmed);
@@ -239,6 +250,17 @@ impl Settings {
             server.warn_invalid_shortcut();
             true
         });
+        servers::clear_broken_jump_refs(&mut self.servers);
+    }
+
+    /// 重命名服务器后改写所有指向旧名的跳板引用（按名引用随改名同步，
+    /// 跨机器改名断链由导入侧悬空清理兜底）。
+    pub fn retarget_jump_refs(&mut self, old: &str, new: &str) {
+        for server in &mut self.servers {
+            if server.jump.as_deref() == Some(old) {
+                server.jump = Some(new.to_string());
+            }
+        }
     }
 
     /// 用户配置目录下的设置文件路径。

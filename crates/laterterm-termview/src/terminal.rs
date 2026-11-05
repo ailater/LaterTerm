@@ -706,8 +706,16 @@ mod tests {
         terminal.process_bytes(b"user@host:~$ ");
         terminal.resize(80, 20);
         terminal.with_term(|term| {
-            assert_eq!(term.grid().cursor.point.column.0, 13, "光标应位于提示符之后");
-            assert_eq!(term.grid().cursor.point.line.0, 0, "首行提示符不应因缩小高度而移出可见区域");
+            assert_eq!(
+                term.grid().cursor.point.column.0,
+                13,
+                "光标应位于提示符之后"
+            );
+            assert_eq!(
+                term.grid().cursor.point.line.0,
+                0,
+                "首行提示符不应因缩小高度而移出可见区域"
+            );
         });
     }
 

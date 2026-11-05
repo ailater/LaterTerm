@@ -230,7 +230,8 @@ fn recv_one_file(
     if expect.as_slice() != digest {
         return Err(io::Error::other("MD5 校验失败，文件已丢弃"));
     }
-    file.persist_noclobber(&target).map_err(|error| error.error)?;
+    file.persist_noclobber(&target)
+        .map_err(|error| error.error)?;
     send_line(reply, "SUCC", &frame.payload)?;
 
     Ok(Some(target))
@@ -411,10 +412,19 @@ mod tests {
             upload_files: None,
         };
         let reply = SharedWriter {
-            inner: Arc::new(std::sync::Mutex::new(Box::new(io::sink()) as Box<dyn Write + Send>)),
+            inner: Arc::new(std::sync::Mutex::new(
+                Box::new(io::sink()) as Box<dyn Write + Send>
+            )),
         };
         let (mut sender, mut receiver) = UnixStream::pair().unwrap();
-        write!(sender, "#NAME:{}\n#SIZE:3\n#DATA:{}\n#MD5:{}\n", encode_payload(b"existing.txt"), encode_payload(b"new"), encode_payload(&md5::compute(b"new").0)).unwrap();
+        write!(
+            sender,
+            "#NAME:{}\n#SIZE:3\n#DATA:{}\n#MD5:{}\n",
+            encode_payload(b"existing.txt"),
+            encode_payload(b"new"),
+            encode_payload(&md5::compute(b"new").0)
+        )
+        .unwrap();
         assert!(recv_one_file(&options, &reply, &mut receiver).is_err());
         assert_eq!(std::fs::read(target).unwrap(), "原始内容".as_bytes());
     }
@@ -423,10 +433,24 @@ mod tests {
     fn interrupted_receive_leaves_no_partial_target() {
         let dir = tempfile::tempdir().unwrap();
         let (events, _) = std::sync::mpsc::channel();
-        let options = TransferOptions { download_dir: dir.path().to_path_buf(), events, upload_files: None };
-        let reply = SharedWriter { inner: Arc::new(std::sync::Mutex::new(Box::new(io::sink()) as Box<dyn Write + Send>)) };
+        let options = TransferOptions {
+            download_dir: dir.path().to_path_buf(),
+            events,
+            upload_files: None,
+        };
+        let reply = SharedWriter {
+            inner: Arc::new(std::sync::Mutex::new(
+                Box::new(io::sink()) as Box<dyn Write + Send>
+            )),
+        };
         let (mut sender, mut receiver) = UnixStream::pair().unwrap();
-        write!(sender, "#NAME:{}\n#SIZE:5\n#DATA:{}\n", encode_payload(b"partial.txt"), encode_payload(b"abc")).unwrap();
+        write!(
+            sender,
+            "#NAME:{}\n#SIZE:5\n#DATA:{}\n",
+            encode_payload(b"partial.txt"),
+            encode_payload(b"abc")
+        )
+        .unwrap();
         drop(sender);
         assert!(recv_one_file(&options, &reply, &mut receiver).is_err());
         assert!(!dir.path().join("partial.txt").exists());
@@ -437,10 +461,19 @@ mod tests {
     fn directory_entries_are_rejected_instead_of_flattened() {
         let dir = tempfile::tempdir().unwrap();
         let (events, _) = std::sync::mpsc::channel();
-        let options = TransferOptions { download_dir: dir.path().to_path_buf(), events, upload_files: None };
-        let reply = SharedWriter { inner: Arc::new(std::sync::Mutex::new(Box::new(io::sink()) as Box<dyn Write + Send>)) };
+        let options = TransferOptions {
+            download_dir: dir.path().to_path_buf(),
+            events,
+            upload_files: None,
+        };
+        let reply = SharedWriter {
+            inner: Arc::new(std::sync::Mutex::new(
+                Box::new(io::sink()) as Box<dyn Write + Send>
+            )),
+        };
         let (mut sender, mut receiver) = UnixStream::pair().unwrap();
-        let name = serde_json::json!({"path_name": ["parent", "child"], "is_dir": true}).to_string();
+        let name =
+            serde_json::json!({"path_name": ["parent", "child"], "is_dir": true}).to_string();
         writeln!(sender, "#NAME:{}", encode_payload(name.as_bytes())).unwrap();
         assert!(recv_one_file(&options, &reply, &mut receiver).is_err());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);

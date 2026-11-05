@@ -302,20 +302,16 @@ impl TransferReader {
 /// 因而这里最多保留 `trigger.len() - 1` 字节。
 #[cfg(unix)]
 fn longest_trigger_prefix_suffix(window: &[u8]) -> usize {
-    [
-        ZMODEM_TRIGGER,
-        trzsz::TRZSZ_TRIGGER,
-        trzsz::TRZSZ_R_TRIGGER,
-    ]
-    .into_iter()
-    .map(|trigger| {
-        (1..trigger.len().min(window.len() + 1))
-            .rev()
-            .find(|&len| window.ends_with(&trigger[..len]))
-            .unwrap_or(0)
-    })
-    .max()
-    .unwrap_or(0)
+    [ZMODEM_TRIGGER, trzsz::TRZSZ_TRIGGER, trzsz::TRZSZ_R_TRIGGER]
+        .into_iter()
+        .map(|trigger| {
+            (1..trigger.len().min(window.len() + 1))
+                .rev()
+                .find(|&len| window.ends_with(&trigger[..len]))
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// 在 haystack 中找 needle 的首位置。
@@ -483,7 +479,10 @@ mod tests {
         let mut buf = [0; 128];
         let n = reader.read(&mut buf).expect("静默长连接不能扣住提示符");
         assert_eq!(&buf[..n], prompt);
-        assert_eq!(reader.read(&mut buf).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            reader.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]
@@ -556,7 +555,10 @@ mod tests {
             done: Arc::new(AtomicBool::new(false)),
         };
         let mut buf = [0; 128];
-        assert_eq!(reader.read(&mut buf).unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(
+            reader.read(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
         let mut frame = [0; 14];
         feed.read_exact(&mut frame).unwrap();
         assert_eq!(&frame, b"protocol frame");

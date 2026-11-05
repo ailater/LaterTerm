@@ -36,11 +36,19 @@ pub struct ServerEntry {
     pub key_path: Option<String>,
     /// 备注（纯展示）。
     pub note: String,
+    /// 所属分组（扁平单层 TOML 元数据；`None` = 未分组）。
+    /// 无父子指针：类型层面无法成环；允许 `/`（Xshell 目录树「生产/入口层」整串展示）。
+    #[serde(default)]
+    pub group: Option<String>,
     /// 应用内快捷键（ctrl+alt+k 一类），可选；统一注册表查重。
     #[serde(default)]
     pub shortcut: Option<String>,
     /// 会话编码；缺省 UTF-8。
     pub encoding: Option<String>,
+    /// 跳板机：另一条条目的展示名（ProxyJump 按名引用）；`None` = 直连。
+    /// 多跳链由 [`resolve_jump_chain`] 沿引用逐跳展开。
+    #[serde(default)]
+    pub jump: Option<String>,
 }
 
 impl Default for ServerEntry {
@@ -53,8 +61,10 @@ impl Default for ServerEntry {
             auth: ServerAuthKind::Password,
             key_path: None,
             note: String::new(),
+            group: None,
             shortcut: None,
             encoding: None,
+            jump: None,
         }
     }
 }
@@ -65,6 +75,19 @@ impl ServerEntry {
         self.validate_connection()?;
         if let Some(shortcut) = &self.shortcut {
             normalize_shortcut(shortcut).context("快捷键格式不合法")?;
+        }
+        // 跳板引用只做格式校验；存在性/环由调用方结合全表用 resolve_jump_chain 查
+        // （validate_connection 不查 jump：它被载入/导入的「宁断链不丢条目」路径复用）。
+        if let Some(jump) = &self.jump {
+            let jump = jump.trim();
+            if jump.is_empty() {
+                bail!("跳板机名称不能为空（留空表示直连）");
+            }
+            validate_ref_name(jump).context("跳板机名称不合法")?;
+        }
+        // 分组走严格校验（与宽容归一化 normalize_group 成对，见其文档）
+        if let Some(group) = &self.group {
+            validate_group(group).context("分组不合法")?;
         }
         Ok(())
     }
@@ -117,12 +140,22 @@ impl ServerEntry {
     }
 
     /// 导入前整理连接信息；保留历史快捷键原值，编辑时仍需通过 `validate`。
+    ///
+    /// 跳板引用格式非法（含 `/`、控制字符、超长）时置 `None` 而不是丢弃条目——
+    /// 与载入期「宁断链不丢条目」同一口径；悬空/成环的全表检查由
+    /// [`clear_broken_jump_refs`] 在合并完成后做。
     pub fn sanitized(mut self) -> Option<Self> {
         self.name = self.name.trim().to_string();
         self.host = self.host.trim().to_string();
         self.username = self.username.trim().to_string();
         self.note = self.note.trim().to_string();
         self.key_path = self.key_path.take().map(|p| p.trim().to_string());
+        self.jump = self
+            .jump
+            .take()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty() && validate_ref_name(name).is_ok());
+        self.group = normalize_group(self.group.as_deref());
         if self.validate_connection().is_ok() {
             self.warn_invalid_shortcut();
             Some(self)
@@ -142,6 +175,188 @@ impl ServerEntry {
             );
         }
     }
+}
+
+/// 跳板链最大跳数；防手改配置成环把连接器拖死。
+pub const MAX_JUMP_DEPTH: usize = 8;
+
+/// 引用名（跳板机名）的格式校验，规则与服务器名一致：≤80 字、无 `/`、无控制字符。
+fn validate_ref_name(name: &str) -> Result<()> {
+    if name.chars().count() > 80 {
+        bail!("引用名过长");
+    }
+    if name.contains('/') || name.chars().any(char::is_control) {
+        bail!("引用名不能包含 / 或控制字符");
+    }
+    Ok(())
+}
+
+/// 分组的严格校验（UI 保存路径）：trim 后非空、≤80 字、无控制字符。
+/// 与名称不同，分组允许 `/`（Xshell 目录树「生产/入口层」整串展示）。
+fn validate_group(group: &str) -> Result<()> {
+    let name = group.trim();
+    if name.is_empty() {
+        bail!("分组名不能为空");
+    }
+    if name.chars().count() > 80 {
+        bail!("分组名过长（最多 80 字）");
+    }
+    if name.chars().any(char::is_control) {
+        bail!("分组名不能包含控制字符");
+    }
+    Ok(())
+}
+
+/// 分组的宽容归一化（载入/导入路径，与 `validate_group` 严格报错成对）：
+/// trim；trim 后为空、含控制字符或超长的分组整体降级 `None`——
+/// 宁丢分组不丢条目，分组绝不进 `validate_connection` 的丢弃路径。
+pub fn normalize_group(raw: Option<&str>) -> Option<String> {
+    let name = raw?.trim();
+    if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// 跳板链缺陷（内部结构化形态，供错误文案与清理共用）。
+enum JumpDefect {
+    /// 环（含自引）：成员按环序排列（如 `["A", "B"]` 表示 A→B→A）。
+    Cycle(Vec<String>),
+    /// 引用了不存在的跳板名。
+    Missing(String),
+    /// 超过 [`MAX_JUMP_DEPTH`] 跳。
+    TooDeep,
+}
+
+/// 检查 `name` 的跳板链是否存在缺陷；无缺陷返回 `None`。
+fn jump_defect(servers: &[ServerEntry], name: &str) -> Option<JumpDefect> {
+    let find = |target: &str| servers.iter().find(|server| server.name == target);
+    let target = find(name)?;
+    let mut path = vec![target.name.clone()];
+    let mut current = target;
+    while let Some(jump_name) = current.jump.as_deref() {
+        if let Some(start) = path.iter().position(|visited| visited == jump_name) {
+            let mut cycle = path[start..].to_vec();
+            cycle.push(jump_name.to_string());
+            return Some(JumpDefect::Cycle(cycle));
+        }
+        let next = match find(jump_name) {
+            Some(next) => next,
+            // `?` 会把「名字不存在」误判为「无缺陷」，必须显式报 Missing
+            None => return Some(JumpDefect::Missing(jump_name.to_string())),
+        };
+        path.push(next.name.clone());
+        if path.len() > MAX_JUMP_DEPTH + 1 {
+            return Some(JumpDefect::TooDeep);
+        }
+        current = next;
+    }
+    None
+}
+
+/// 从目标条目沿 `jump` 引用逐跳回溯，返回有序跳板链（由外到内，第 0 项最先连接，
+/// `ssh -J` 语义）。
+///
+/// 自引、环、引用不存在的名字、超过 [`MAX_JUMP_DEPTH`] 跳都报错；
+/// 环错误携带完整链路（如 `A→B→A`），便于用户定位手改坏的配置。
+pub fn resolve_jump_chain<'a>(
+    servers: &'a [ServerEntry],
+    name: &str,
+) -> Result<Vec<&'a ServerEntry>> {
+    if !servers.iter().any(|server| server.name == name) {
+        bail!("服务器「{name}」不存在");
+    }
+    let find = |target: &str| servers.iter().find(|server| server.name == target);
+    match jump_defect(servers, name) {
+        Some(JumpDefect::Cycle(cycle)) => bail!("跳板链形成环: {}", cycle.join("→")),
+        Some(JumpDefect::Missing(jump_name)) => {
+            bail!("跳板机「{jump_name}」不存在");
+        }
+        Some(JumpDefect::TooDeep) => {
+            bail!("跳板链过长（最多 {MAX_JUMP_DEPTH} 跳）");
+        }
+        None => {}
+    }
+    // 缺陷检查已通过，重新走一遍收集链路；引用方向是「到 X 要经谁」，
+    // 回溯得到内→外，连接顺序是外→内，反转一次。
+    let target = find(name).expect("上方已确认存在");
+    let mut chain: Vec<&ServerEntry> = Vec::new();
+    let mut current = target;
+    while let Some(next) = current.jump.as_deref().and_then(find) {
+        chain.push(next);
+        current = next;
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
+/// 引用 `name` 作为跳板的条目名列表（删除阻断用）。
+pub fn servers_referencing_jump<'a>(servers: &'a [ServerEntry], name: &str) -> Vec<&'a str> {
+    servers
+        .iter()
+        .filter(|server| server.jump.as_deref() == Some(name))
+        .map(|server| server.name.as_str())
+        .collect()
+}
+
+/// 清理全表跳板引用：格式非法、悬空、成环、超深的引用一律置 `None`——
+/// 宁断链不丢条目。返回被清理引用的条目名（供导入回报计数）。
+///
+/// 载入（`Settings::load`→`sanitize_servers`）与导入合并两条路径都要调用，
+/// 否则手改 TOML 的坏引用会一直存活到连接期才报错。
+/// 环只断环上成员：路过环的条目在下一轮复检后保留有效链路。
+pub fn clear_broken_jump_refs(servers: &mut [ServerEntry]) -> Vec<String> {
+    // 格式层：先记录格式非法条目，再统一 trim / 置 None
+    let format_broken: Vec<String> = servers
+        .iter()
+        .filter(|server| {
+            server.jump.as_deref().is_some_and(|name| {
+                name.trim().is_empty() || validate_ref_name(name.trim()).is_err()
+            })
+        })
+        .map(|server| server.name.clone())
+        .collect();
+    for server in servers.iter_mut() {
+        server.jump = server
+            .jump
+            .take()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty() && validate_ref_name(name).is_ok());
+    }
+    // 链路层：循环到不动点。环清成员，悬空/超深清自身；
+    // 路过环的条目在环成员断链后复检通过，不会被误伤。
+    let mut cleared = format_broken;
+    loop {
+        let defects: Vec<(String, JumpDefect)> = servers
+            .iter()
+            .filter_map(|server| {
+                jump_defect(servers, &server.name).map(|defect| (server.name.clone(), defect))
+            })
+            .collect();
+        if defects.is_empty() {
+            break;
+        }
+        let mut touched = false;
+        for (name, defect) in defects {
+            let victims = match defect {
+                JumpDefect::Cycle(members) => members,
+                JumpDefect::Missing(_) | JumpDefect::TooDeep => vec![name],
+            };
+            for victim in victims {
+                if let Some(server) = servers.iter_mut().find(|server| server.name == victim)
+                    && server.jump.take().is_some()
+                    && !cleared.contains(&server.name)
+                {
+                    cleared.push(server.name.clone());
+                    touched = true;
+                }
+            }
+        }
+        if !touched {
+            break;
+        }
+    }
+    cleared
 }
 
 /// 服务器导入/导出文件格式。只含连接元数据——凭据在系统密钥环里，永不落盘；
@@ -423,6 +638,7 @@ port = 2222
 username = "ops"
 auth = "keyboard-interactive"
 note = "老机房"
+group = "生产/入口层"
 
 [[servers]]
 name = "跳板"
@@ -442,11 +658,15 @@ key_path = "/home/me/.ssh/id_ed25519"
             settings.servers[1].key_path.as_deref(),
             Some("/home/me/.ssh/id_ed25519")
         );
-        // 缺省 port/auth 走默认值
+        // 分组字段往返保留
+        assert_eq!(settings.servers[0].group.as_deref(), Some("生产/入口层"));
+        assert_eq!(settings.servers[1].group, None);
+        // 缺省 port/auth 走默认值；旧文件缺 group/group/jump 字段解析为 None
         let legacy: Settings =
             toml::from_str("[[servers]]\nname = 'x'\nhost = 'h'\nusername = 'u'\n").unwrap();
         assert_eq!(legacy.servers[0].port, 22);
         assert_eq!(legacy.servers[0].auth, ServerAuthKind::Password);
+        assert_eq!(legacy.servers[0].group, None);
         assert!(settings.servers[0].validate().is_ok());
     }
 
@@ -458,18 +678,29 @@ name = "  跳板  "
 host = " jump.example.com "
 username = " root "
 note = "ok"
+group = " 生产 "
 
 [[servers]]
 name = "  "
 host = "h"
 username = "u"
+
+[[servers]]
+name = "分组坏了"
+host = "h3"
+username = "u3"
+group = "坏\n组"
 "#;
         let mut settings: Settings = toml::from_str(raw).unwrap();
         settings.sanitize_servers();
-        assert_eq!(settings.servers.len(), 1);
+        assert_eq!(settings.servers.len(), 2);
         assert_eq!(settings.servers[0].name, "跳板");
         assert_eq!(settings.servers[0].host, "jump.example.com");
         assert_eq!(settings.servers[0].username, "root");
+        assert_eq!(settings.servers[0].group.as_deref(), Some("生产"));
+        // 手改坏的分组降级 None，条目本身保留
+        assert_eq!(settings.servers[1].name, "分组坏了");
+        assert_eq!(settings.servers[1].group, None);
     }
 
     #[test]
@@ -484,13 +715,16 @@ username = "u"
             auth: ServerAuthKind::KeyboardInteractive,
             key_path: None,
             note: "导出测试".into(),
+            group: Some("生产".into()),
             shortcut: Some("ctrl+alt+1".into()),
             encoding: None,
+            jump: None,
         }]);
         file.save_to(&path).unwrap();
         let loaded = ServersFile::load_from(&path).unwrap();
         assert_eq!(loaded.version, ServersFile::CURRENT_VERSION);
         assert_eq!(loaded.servers, file.servers);
+        assert_eq!(loaded.servers[0].group.as_deref(), Some("生产"));
         assert!(loaded.servers[0].validate().is_ok());
 
         // 缺 version 的旧文件按当前版本解析
@@ -519,6 +753,272 @@ username = "u"
         assert_eq!(ok.host, "h");
         assert_eq!(ok.username, "ops");
         assert!(ServerEntry::default().sanitized().is_none(), "空条目丢弃");
+    }
+
+    // ---------- 分组（扁平单层）严格/宽容成对口径 ----------
+
+    #[test]
+    fn group_validate_strict_and_normalize_forgiving_pair_up() {
+        let mut server = entry("跳板", "10.0.0.1");
+        // 允许 `/` 与首尾空白（保存路径会先 trim 再进 validate）
+        server.group = Some(" 生产/入口层 ".into());
+        assert!(server.validate().is_ok());
+        for bad in ["   ".to_string(), "坏\n组".to_string(), "长".repeat(81)] {
+            server.group = Some(bad.clone());
+            assert!(server.validate().is_err(), "{bad:?} 分组应严格报错");
+        }
+        // sanitized（宽容路径）：trim 保留合法分组；坏分组降级 None，条目保留
+        server.group = Some("  生产  ".into());
+        assert_eq!(
+            server.clone().sanitized().unwrap().group.as_deref(),
+            Some("生产")
+        );
+        for raw in [
+            Some("   ".to_string()),
+            Some("坏\u{0}组".to_string()),
+            Some("长".repeat(81)),
+            None,
+        ] {
+            server.group = raw.clone();
+            let sanitized = server.clone().sanitized().unwrap();
+            assert_eq!(sanitized.group, None, "{raw:?} 应归一化为 None");
+            assert!(
+                sanitized.validate_connection().is_ok(),
+                "分组问题绝不丢条目"
+            );
+        }
+        // normalize_group 直查：None 入 None 出
+        assert_eq!(normalize_group(None), None);
+        assert_eq!(normalize_group(Some("  A  ")), Some("A".into()));
+    }
+
+    // ---------- 跳板链（ProxyJump）纯逻辑 ----------
+
+    fn jump_entry(name: &str, jump: Option<&str>) -> ServerEntry {
+        ServerEntry {
+            name: name.into(),
+            host: "10.0.0.1".into(),
+            username: "ops".into(),
+            jump: jump.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_jump_chain_orders_hops_outer_to_inner() {
+        // 目标 T → 跳板 inner → 跳板 outer；连接顺序应为 outer 最先
+        let servers = vec![
+            jump_entry("T", Some("inner")),
+            jump_entry("inner", Some("outer")),
+            jump_entry("outer", None),
+        ];
+        let chain = resolve_jump_chain(&servers, "T").unwrap();
+        let names: Vec<&str> = chain.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["outer", "inner"]);
+        // 单跳与直连
+        assert_eq!(
+            resolve_jump_chain(&servers, "inner")
+                .unwrap()
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["outer"]
+        );
+        assert!(resolve_jump_chain(&servers, "outer").unwrap().is_empty());
+    }
+
+    #[test]
+    fn resolve_jump_chain_rejects_self_loop_missing_and_depth() {
+        let servers = vec![
+            jump_entry("自引", Some("自引")),
+            jump_entry("A", Some("B")),
+            jump_entry("B", Some("A")),
+            jump_entry("悬空", Some("不存在")),
+            jump_entry("T", Some("A")),
+        ];
+        // 自引：环链路 A→A
+        let error = resolve_jump_chain(&servers, "自引")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("环"), "{error}");
+        assert!(error.contains("自引→自引"), "{error}");
+        // 双节点环：A→B→A
+        let error = resolve_jump_chain(&servers, "A").unwrap_err().to_string();
+        assert!(error.contains("A→B→A"), "{error}");
+        // 缺失引用
+        let error = resolve_jump_chain(&servers, "悬空")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("不存在"), "{error}");
+        assert!(error.contains("「不存在」"), "{error}");
+        // 目标本身不存在
+        assert!(resolve_jump_chain(&servers, "幽灵").is_err());
+        // 深度超限（9 跳 > 8）
+        let mut deep = vec![jump_entry("d0", Some("d1"))];
+        for hop in 1..=9 {
+            deep.push(jump_entry(
+                &format!("d{hop}"),
+                Some(&format!("d{}", hop + 1)),
+            ));
+        }
+        let error = resolve_jump_chain(&deep, "d0").unwrap_err().to_string();
+        assert!(error.contains("跳板链过长"), "{error}");
+    }
+
+    #[test]
+    fn servers_referencing_jump_lists_referrers_only() {
+        let servers = vec![
+            jump_entry("a", Some("jump")),
+            jump_entry("b", Some("jump")),
+            jump_entry("c", Some("其他")),
+            jump_entry("jump", None),
+        ];
+        assert_eq!(servers_referencing_jump(&servers, "jump"), vec!["a", "b"]);
+        assert!(servers_referencing_jump(&servers, "无").is_empty());
+    }
+
+    #[test]
+    fn clear_broken_jump_refs_keeps_entries_breaks_links() {
+        let mut servers = vec![
+            jump_entry("好的", Some("跳板")),
+            jump_entry("跳板", None),
+            // 悬空引用
+            jump_entry("悬空", Some("幽灵")),
+            // 自引成环
+            jump_entry("自引", Some("自引")),
+            // 格式非法（含 /）
+            jump_entry("脏名", Some("pro d/uct")),
+        ];
+        let cleared = clear_broken_jump_refs(&mut servers);
+        assert_eq!(cleared.len(), 3);
+        for name in ["悬空", "自引", "脏名"] {
+            assert!(
+                cleared.iter().any(|item| item == name),
+                "{cleared:?} 应含 {name}"
+            );
+        }
+        assert_eq!(servers.len(), 5, "宁断链不丢条目");
+        assert_eq!(servers[0].jump.as_deref(), Some("跳板"));
+        assert_eq!(servers[1].jump, None);
+        for broken in ["悬空", "自引", "脏名"] {
+            let entry = servers.iter().find(|entry| entry.name == broken).unwrap();
+            assert_eq!(entry.jump, None, "{broken} 的引用应被清空");
+        }
+    }
+
+    #[test]
+    fn clear_broken_jump_refs_breaks_cycle_between_two_entries() {
+        let mut servers = vec![
+            jump_entry("A", Some("B")),
+            jump_entry("B", Some("A")),
+            jump_entry("旁观", Some("A")),
+        ];
+        let cleared = clear_broken_jump_refs(&mut servers);
+        // A、B 成环都被断链；旁观→A 在 A 断链后是否悬空不影响本函数判定
+        // （顺序敏感：断的是环上条目，旁观条目保持原引用，其链路下一轮载入会再查）
+        assert_eq!(cleared.len(), 2);
+        assert_eq!(servers[2].jump.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn validate_rejects_bad_jump_format_but_validate_connection_ignores_jump() {
+        let mut server = jump_entry("自身", Some("自身名"));
+        server.name = "自身名".into();
+        // validate（UI 严格路径）管格式；自引的存在性错误由 resolve_jump_chain 报
+        assert!(server.validate().is_ok());
+        for bad in ["a/b".to_string(), "坏\n名".to_string(), "长".repeat(81)] {
+            server.jump = Some(bad);
+            assert!(server.validate().is_err(), "{:?} 应格式非法", server.jump);
+        }
+        // validate_connection（载入/导入宽松路径）不查 jump：脏引用不丢条目
+        server.jump = Some("a/b".into());
+        assert!(server.validate_connection().is_ok());
+        // sanitized 清格式非法引用、trim 合法引用
+        server.jump = Some("  好/坏  ".into());
+        assert_eq!(server.clone().sanitized().unwrap().jump, None);
+        server.jump = Some("  跳板  ".into());
+        assert_eq!(
+            server.clone().sanitized().unwrap().jump.as_deref(),
+            Some("跳板")
+        );
+    }
+
+    #[test]
+    fn toml_roundtrip_keeps_jump_and_legacy_files_still_load() {
+        let raw = r#"
+[[servers]]
+name = "内网机"
+host = "192.168.1.10"
+username = "ops"
+jump = "跳板"
+
+[[servers]]
+name = "跳板"
+host = "jump.example.com"
+username = "root"
+"#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert_eq!(settings.servers[0].jump.as_deref(), Some("跳板"));
+        assert_eq!(settings.servers[1].jump, None);
+        let chain = resolve_jump_chain(&settings.servers, "内网机").unwrap();
+        assert_eq!(chain[0].name, "跳板");
+
+        // 旧文件无 jump 字段照常解析（serde 缺省 None）
+        let legacy: Settings =
+            toml::from_str("[[servers]]\nname = 'x'\nhost = 'h'\nusername = 'u'\n").unwrap();
+        assert_eq!(legacy.servers[0].jump, None);
+
+        // 往返保留
+        let text = toml::to_string_pretty(&settings).unwrap();
+        let reloaded: Settings = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.servers, settings.servers);
+    }
+
+    #[test]
+    fn load_breaks_dangling_jump_refs_instead_of_dropping_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[servers]]
+name = "内网机"
+host = "192.168.1.10"
+username = "ops"
+jump = "幽灵"
+
+[[servers]]
+name = "正常"
+host = "10.0.0.9"
+username = "ops"
+"#,
+        )
+        .unwrap();
+        let settings = Settings::load(&path).unwrap();
+        assert_eq!(settings.servers.len(), 2, "悬空引用不能丢条目");
+        assert_eq!(settings.servers[0].jump, None, "悬空引用载入期即断链");
+        assert_eq!(settings.servers[0].name, "内网机");
+    }
+
+    #[test]
+    fn retarget_jump_refs_rewrites_only_matching_names() {
+        let mut settings = Settings {
+            servers: vec![
+                jump_entry("引用方", Some("旧名")),
+                jump_entry("旁人", Some("别人")),
+                jump_entry("旧名", None),
+            ],
+            ..Default::default()
+        };
+        settings.retarget_jump_refs("旧名", "新名");
+        assert_eq!(settings.servers[0].jump.as_deref(), Some("新名"));
+        assert_eq!(settings.servers[1].jump.as_deref(), Some("别人"));
+        // 改写后链路应可解析（重命名语义闭环）
+        settings.servers[2].name = "新名".into();
+        assert_eq!(
+            resolve_jump_chain(&settings.servers, "引用方").unwrap()[0].name,
+            "新名"
+        );
     }
 }
 

@@ -119,6 +119,25 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 > 点击外部关闭）。注：应用开启鼠标协议上报（vim/tmux mouse mode）时右键仍弹菜单不上报给应用——
 > 鼠标协议上报（mouse_button_report 已在 mouse.rs 备好）为独立后续项。
 
+> 主机分组与命令迁移收尾（2026-11-05）：ServerEntry 新增扁平 `group` 分组字段（TOML 可选、
+> 允许 `/`、无父子指针类型层面不成环；validate 严格报错 / normalize_group 宽容降级 None 成对，
+> 坏分组绝不丢条目，不 bump CURRENT_VERSION 双向兼容）——服务器页签按组折叠展示（组头 ▸/▾+计数，
+> 组名升序、未分组殿后，纯未分组保持旧版平铺外观），编辑弹窗「分组」字段进组/改组，组头支持
+> 批量重命名（同名并入/清空解散，折叠态随改名迁移，落盘 previous-clone 回滚）；Deepin GroupName
+> 导入进 group 字段不再拼备注，Xshell 目录树分组整串保留；command-config.conf 迁移落地——
+> config::importers 新增宽容版 parse_deepin_commands/load_deepin_commands（QSettings unescape
+> 一并补进 server 解析），命令页签新增「导入」按钮与计数提示（同名跳过/无效丢弃/解析跳过/
+> 剥除冲突快捷键全部可见），merge_commands_into 纯函数合并（批内快捷键互撞增量登记剥绑保命令，
+> confirm 统一 true），Deepin 服务器导入顺带迁移命令（两次独立落盘、计数拼进 server_notice）；
+> app 侧 laterterm-deepin 依赖移除（crate 本体保留为格式真值参照）。
+
+> 跳板机链 ProxyJump（2026-11-05）：`ServerEntry.jump` 按名引用 + `resolve_jump_chain` 环/自引/
+> 悬空/超深（>8 跳）全表清理（宁断链不丢条目，载入/导入/保存三路兜底），SshOptions.jump 改
+> Vec 逐跳 direct-tcpip 穿透（open_through + tunnels 保活逆序断开 + 超时 15s+10s×跳数双处联动），
+> 面板编辑弹窗「跳板」行、列表「· 经 X」标注、删除阻断、改名改写引用、补输重试保留跳板快照；
+> 跳板凭据 v1 只认密钥环已保存值（缺失硬错误不补输），回环 mock 两跳/三跳/拒转发负例 8 测试
+> 全过，真机多跳验收待实机跳板环境（LATERTERM_SSH_JUMP 支持逗号分隔链）。
+
 > 启动光标错位修复（2026-11-04）：PTY/网格初始尺寸改为按窗口内容区估算（cell 7.83×19.2 @13px 实测系数），
 > 消除「启动后 resize → bash readline 发 \r 把光标拉回提示符行首」的错位；隔离实测估算 193×42 与
 > 首帧实测一致（零 resize）。reader 数据链增加 GPUI 定时器保活轮询（100ms，独立于 flume 唤醒通道），
@@ -132,12 +151,12 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 | # | 任务 | 说明 |
 |---|------|------|
 | 1 | laterterm-ssh | russh + russh-sftp；tokio 仅限网络层，PTY 走线程泵（架构既定）；SSH 会话部分已落地，SFTP 随任务4 | 🚧
-| 2 | 服务器管理 | 主机分组、连接配置、凭据入 keyring（laterterm-secrets）；连接配置与凭据已接入右面板，主机分组待续 | 🚧
-| 3 | 跳板机链 | ProxyJump / keyboard-interrupt 认证链式穿透 |
+| 2 | 服务器管理 | 主机分组、连接配置、凭据入 keyring（laterterm-secrets） | ✅
+| 3 | 跳板机链 | ProxyJump 多跳链式穿透（keyboard-interactive 凭跳板条目自身认证复用，逐跳生效） | ✅ |
 | 4 | SFTP 面板 | 双栏文件传输，进度与断点续传 |
 | 5 | 编码 | GBK 远程会话转码（中文老服务器刚需） |
 | 6 | trzsz | rz/sz 兼容协议，ZMODEM 类传输 |
-| 7 | Deepin 配置一键导入 | `command-config.conf` / `server-config.conf` 已逆向（见 architecture.md）；server-config 导入已提前落地（含 Xshell .xsh 来源），命令模板迁移待续 | 🚧
+| 7 | Deepin 配置一键导入 | `command-config.conf` / `server-config.conf` 已逆向（见 architecture.md）；server-config 导入已提前落地（含 Xshell .xsh 来源），命令模板迁移已落地 | ✅
 
 **验收**：从 LaterTerm 完成一次「跳板机 → 内网机 → GBK 环境 → rz 拉文件」全链路操作。
 

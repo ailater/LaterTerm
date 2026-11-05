@@ -4,6 +4,30 @@
 发版时把 `Cargo.toml` 的 `workspace.package.version` 提到新版本号，并在顶部追加
 `## v<版本> - <日期>` 小节（两者同 PR 提交，合入后 auto-tag 自动打 tag 发布）。
 
+## Unreleased
+
+### 服务器管理
+
+- **主机分组**：服务器条目支持分组（TOML `group` 字段，允许「生产/入口层」式斜杠分层）
+- 右面板服务器页签按分组折叠展示：组头显示计数、点击折叠/展开，组名升序、未分组殿后
+- 编辑弹窗「分组」字段进组/改组；组头支持批量重命名（同名并入既有组、清空即解散）
+- Deepin 导入的 GroupName 进入分组字段（不再拼进备注），Xshell 目录树分组整串保留
+- 手改坏的分组（控制字符/超长）载入时降级为未分组，绝不丢服务器条目
+
+### 快捷命令
+
+- **Deepin 命令模板一键导入**：命令页签新增「导入」按钮，读取本机
+  `~/.config/deepin/deepin-terminal/command-config.conf`
+- 导入计数全可见：同名跳过 / 无效丢弃 / 解析跳过 / 剥除冲突快捷键
+- 导入命令的快捷键与现有绑定冲突时剥绑定保命令，绝不静默改变用户现有按键；
+  导入命令与主线一致默认执行前确认
+- Deepin 服务器导入顺带迁移命令模板（独立落盘，计数拼进导入提示）
+
+### 内部
+
+- laterterm-config 新增 `normalize_group` / `parse_deepin_commands` / `load_deepin_commands`
+  导出；laterterm-app 移除 laterterm-deepin 直接依赖（crate 本体保留为格式真值参照）
+
 ## v0.2.0 - 2026-11-03
 
 UI 走查与远程体验大版本：统一快捷键体系、服务器连接弹窗化、终端内文件传输全线上线。

@@ -707,7 +707,9 @@ impl TerminalView {
                         } else {
                             true
                         };
-                        let changed = view.blink_on.swap(next, std::sync::atomic::Ordering::Relaxed)
+                        let changed = view
+                            .blink_on
+                            .swap(next, std::sync::atomic::Ordering::Relaxed)
                             != next;
                         if changed {
                             cx.notify();
@@ -1061,7 +1063,11 @@ impl TerminalView {
         let origin = self.last_content_origin?;
         let (columns, screen_lines, display_offset) = self.state.with_term(|term| {
             let grid = term.grid();
-            (grid.columns(), grid.screen_lines(), grid.display_offset() as i32)
+            (
+                grid.columns(),
+                grid.screen_lines(),
+                grid.display_offset() as i32,
+            )
         });
         let cell = crate::mouse::pixel_to_cell(
             position,
@@ -1090,7 +1096,8 @@ impl TerminalView {
         // Request focus when clicking the terminal
         window.focus(&self.focus_handle);
         // 点击后光标立即回到可见相位，避免刚点完就停在熄灭态。
-        self.blink_on.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.blink_on
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         cx.notify();
 
         // URL 点击：把像素坐标换算为网格单元，提取 URL 并用系统浏览器打开
@@ -1119,25 +1126,23 @@ impl TerminalView {
             _ => AlacSelectionType::Lines,
         };
         let selection = AlacSelection::new(selection_type, point, Side::Left);
-        self.state.with_term_mut(|term| term.selection = Some(selection));
+        self.state
+            .with_term_mut(|term| term.selection = Some(selection));
         cx.notify();
     }
 
     /// Handle mouse up events: 结束拖拽；未成形的单击选区直接清除。
-    fn on_mouse_up(
-        &mut self,
-        _event: &MouseUpEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let had_selection = self.state.with_term(|term| term.selection.is_some());
         if !had_selection {
             return;
         }
         self.state.with_term_mut(|term| {
             // to_range 对空选区返回 None（单击未拖拽），据此保留或清除。
-            let finalized =
-                term.selection.take().filter(|selection| selection.to_range(term).is_some());
+            let finalized = term
+                .selection
+                .take()
+                .filter(|selection| selection.to_range(term).is_some());
             term.selection = finalized;
         });
         cx.notify();
@@ -1183,7 +1188,10 @@ impl TerminalView {
             let row = cell.line.0.max(0) as usize;
             self.state.extract_url_at(row, cell.column.0)
         });
-        cx.emit(TerminalMenuRequested { position: event.position, url });
+        cx.emit(TerminalMenuRequested {
+            position: event.position,
+            url,
+        });
     }
 
     /// Handle scroll events.
@@ -1464,7 +1472,8 @@ impl TerminalView {
 
     /// 清屏（等价 shell `clear`：清除可见区，回滚历史保留）。
     pub fn clear_screen(&mut self, cx: &mut Context<Self>) {
-        self.state.with_term_mut(|term| term.clear_screen(ClearMode::All));
+        self.state
+            .with_term_mut(|term| term.clear_screen(ClearMode::All));
         cx.notify();
     }
 
@@ -1582,7 +1591,8 @@ impl TerminalView {
         }
         // 光标闪烁开关变化时立即恢复常显，避免停留在熄灭相位。
         if config.cursor_blink != self.config.cursor_blink && config.cursor_blink {
-            self.blink_on.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.blink_on
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             cx.notify();
         }
 
@@ -1783,8 +1793,7 @@ impl Render for TerminalView {
         let focus_handle = self.focus_handle.clone();
         // 光标可见性快照：canvas 闭包在绘制阶段读取（闪烁相位由 blink 任务驱动）
         let cursor_visible =
-            !self.config.cursor_blink
-                || self.blink_on.load(std::sync::atomic::Ordering::Relaxed);
+            !self.config.cursor_blink || self.blink_on.load(std::sync::atomic::Ordering::Relaxed);
         let entity = cx.entity();
         let scroll_offset = if self.config.smooth_scrolling {
             self.scroll_residual
@@ -2098,7 +2107,7 @@ pub fn open_url(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::{TerminalConfig, TerminalExited, TerminalSession, TerminalView};
-    use gpui::{AppContext, MouseDownEvent, MouseButton, TestAppContext};
+    use gpui::{AppContext, MouseButton, MouseDownEvent, TestAppContext};
     use laterterm_core::{BackendKind, SessionStreams};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2144,10 +2153,17 @@ mod tests {
         use std::sync::Mutex;
         struct RecordingSession(Arc<Mutex<Vec<(u16, u16)>>>);
         impl TerminalSession for RecordingSession {
-            fn backend(&self) -> BackendKind { BackendKind::Local }
-            fn title(&self) -> String { String::new() }
+            fn backend(&self) -> BackendKind {
+                BackendKind::Local
+            }
+            fn title(&self) -> String {
+                String::new()
+            }
             fn take_streams(&self) -> std::io::Result<SessionStreams> {
-                Ok(SessionStreams { reader: Box::new(std::io::empty()), writer: Box::new(std::io::sink()) })
+                Ok(SessionStreams {
+                    reader: Box::new(std::io::empty()),
+                    writer: Box::new(std::io::sink()),
+                })
             }
             fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
                 self.0.lock().unwrap().push((cols, rows));
@@ -2157,20 +2173,36 @@ mod tests {
         }
         let sizes = Arc::new(Mutex::new(Vec::new()));
         let captured = sizes.clone();
-        let (terminal, cx) = cx.add_window_view(|_, cx| TerminalView::new(Arc::new(RecordingSession(captured)), TerminalConfig::default(), cx));
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(
+                Arc::new(RecordingSession(captured)),
+                TerminalConfig::default(),
+                cx,
+            )
+        });
         cx.run_until_parked();
-        let grid = terminal.read_with(cx, |view, _| view.state.with_term(|term| {
-            use alacritty_terminal::grid::Dimensions;
-            (term.columns() as u16, term.screen_lines() as u16)
-        }));
+        let grid = terminal.read_with(cx, |view, _| {
+            view.state.with_term(|term| {
+                use alacritty_terminal::grid::Dimensions;
+                (term.columns() as u16, term.screen_lines() as u16)
+            })
+        });
         sizes.lock().unwrap().clear();
         let captured = sizes.clone();
         let (_second, cx) = cx.add_window_view(|_, cx| {
-            let config = TerminalConfig { cols: grid.0 as usize, rows: grid.1 as usize, ..TerminalConfig::default() };
+            let config = TerminalConfig {
+                cols: grid.0 as usize,
+                rows: grid.1 as usize,
+                ..TerminalConfig::default()
+            };
             TerminalView::new(Arc::new(RecordingSession(captured)), config, cx)
         });
         cx.run_until_parked();
-        assert_eq!(sizes.lock().unwrap().last().copied(), Some(grid), "首次布局必须同步会话网格");
+        assert_eq!(
+            sizes.lock().unwrap().last().copied(),
+            Some(grid),
+            "首次布局必须同步会话网格"
+        );
     }
 
     #[gpui::test]
@@ -2185,7 +2217,10 @@ mod tests {
             for i in 0..20 {
                 view.state.process_bytes(format!("line {i}\r\n").as_bytes());
             }
-            view.last_content_origin = Some(gpui::Point { x: gpui::px(0.0), y: gpui::px(0.0) });
+            view.last_content_origin = Some(gpui::Point {
+                x: gpui::px(0.0),
+                y: gpui::px(0.0),
+            });
             view.renderer.cell_width = gpui::px(10.0);
             view.renderer.cell_height = gpui::px(20.0);
             // 向上滚 2 行后，可见首行对应网格 Line(-2)
@@ -2195,7 +2230,10 @@ mod tests {
             let point = view
                 .grid_point_at(gpui::point(gpui::px(5.0), gpui::px(10.0)))
                 .expect("网格点");
-            assert_eq!(point.line.0, -2, "可见首行在 display_offset=2 时应映射为 Line(-2)");
+            assert_eq!(
+                point.line.0, -2,
+                "可见首行在 display_offset=2 时应映射为 Line(-2)"
+            );
             assert_eq!(point.column.0, 0);
         });
     }
@@ -2209,7 +2247,10 @@ mod tests {
         });
         terminal.update_in(cx, |view, window, cx| {
             view.state.process_bytes(b"hello selection\r\n$ ");
-            view.last_content_origin = Some(gpui::Point { x: gpui::px(0.0), y: gpui::px(0.0) });
+            view.last_content_origin = Some(gpui::Point {
+                x: gpui::px(0.0),
+                y: gpui::px(0.0),
+            });
             view.renderer.cell_width = gpui::px(10.0);
             view.renderer.cell_height = gpui::px(20.0);
 
@@ -2233,7 +2274,11 @@ mod tests {
             };
 
             // 拖拽：down(0,0) → move(0,4) → up，应选中 "hello"
-            view.on_mouse_down(&down(gpui::point(gpui::px(5.0), gpui::px(10.0)), 1), window, cx);
+            view.on_mouse_down(
+                &down(gpui::point(gpui::px(5.0), gpui::px(10.0)), 1),
+                window,
+                cx,
+            );
             view.on_mouse_move(
                 &move_to(gpui::point(gpui::px(45.0), gpui::px(10.0))),
                 window,
@@ -2248,7 +2293,11 @@ mod tests {
             view.copy_selection(cx);
 
             // 单击（未拖拽）→ up 后选区清空
-            view.on_mouse_down(&down(gpui::point(gpui::px(5.0), gpui::px(10.0)), 1), window, cx);
+            view.on_mouse_down(
+                &down(gpui::point(gpui::px(5.0), gpui::px(10.0)), 1),
+                window,
+                cx,
+            );
             view.on_mouse_up(&up(gpui::point(gpui::px(5.0), gpui::px(10.0))), window, cx);
             assert!(!view.has_selection(), "单击未拖拽不应留下选区");
         });

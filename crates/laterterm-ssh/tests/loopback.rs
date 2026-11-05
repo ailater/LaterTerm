@@ -1,7 +1,8 @@
 //! 进程内回环集成测试：russh mock 服务器 + SshSession 全链路。
 //!
 //! 覆盖：密码认证 → PTY/shell 应答 → 双向数据泵 → resize → kill EOF，
-//! 以及 TOFU 主机键「首连记录 / 换键拒绝」。所有远端行为都在本进程内，
+//! TOFU 主机键「首连记录 / 换键拒绝」，以及跳板链 direct-tcpip 逐跳穿透
+//! （两跳/三跳/跳板拒转发负例）。所有远端行为都在本进程内，
 //! 不依赖外部 sshd。
 
 use laterterm_core::{BackendKind, TerminalSession};
@@ -10,17 +11,28 @@ use laterterm_ssh::{
 };
 use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
 use russh::server::Server as _;
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
 /// 最小 mock 服务器：任意密码/公钥放行，PTY+shell 回 Success，
 /// 数据原样加前缀回显——足够驱动 SshSession 的完整数据路径。
+///
+/// `forwarded` 为 `Some` 时实现 direct-tcpip 转发（等价 sshd 的
+/// AllowTcpForwarding yes：accept 后连向目标地址双向泵字节），
+/// 并对每次接受的转发请求计数；为 `None` 时不 accept（drop 后 russh
+/// 自动拒绝），等价「跳板机关闭转发」，供负例使用。
+/// 已接受的转发通道记录在 `forwarded_channels`：隧道原始字节绝不回显，
+/// 否则 "Got " 前缀会污染经隧道转发的 SSH 握手流。
 #[derive(Clone)]
 struct MockHandler {
     accepted_key: Option<russh::keys::PublicKey>,
+    forwarded: Option<Arc<AtomicUsize>>,
+    forwarded_channels: Arc<Mutex<HashSet<russh::ChannelId>>>,
 }
 
 impl russh::server::Server for MockHandler {
@@ -66,6 +78,43 @@ impl russh::server::Handler for MockHandler {
     ) -> Result<(), Self::Error> {
         reply.accept().await;
         drop(channel);
+        Ok(())
+    }
+
+    /// direct-tcpip（本地转发）：accept 后连向 (host, port) 双向泵字节。
+    /// 转发关闭时直接返回（不 accept），russh 对 drop 的 reply 自动拒绝。
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::server::Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: russh::server::ChannelOpenHandle,
+        _session: &mut russh::server::Session,
+    ) -> Result<(), Self::Error> {
+        let Some(counter) = &self.forwarded else {
+            eprintln!(
+                "[mock] 转发已关闭，拒绝 direct-tcpip 到 {host_to_connect}:{port_to_connect}"
+            );
+            return Ok(());
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
+        self.forwarded_channels.lock().unwrap().insert(channel.id());
+        reply.accept().await;
+        let target = format!("{host_to_connect}:{port_to_connect}");
+        tokio::spawn(async move {
+            let mut tcp = match tokio::net::TcpStream::connect(target.as_str()).await {
+                Ok(tcp) => tcp,
+                Err(error) => {
+                    eprintln!("[mock] 转发连 {target} 失败: {error}");
+                    return;
+                }
+            };
+            let mut stream = channel.into_stream();
+            let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
+            eprintln!("[mock] 转发 {target} 连接结束");
+        });
         Ok(())
     }
 
@@ -117,6 +166,10 @@ impl russh::server::Handler for MockHandler {
         data: &[u8],
         session: &mut russh::server::Session,
     ) -> Result<(), Self::Error> {
+        // 转发通道的字节属于隧道原始流（可能是内层 SSH 握手），交给泵任务，不回显
+        if self.forwarded_channels.lock().unwrap().contains(&channel) {
+            return Ok(());
+        }
         eprintln!("[mock] data 回调收到 {} 字节", data.len());
         let reply = format!("Got data: {}\r\n", String::from_utf8_lossy(data));
         session.data(channel, reply.into_bytes())?;
@@ -133,12 +186,39 @@ struct MockServer {
 
 impl MockServer {
     /// 在 `port` 上起服务器（0 = 临时端口）；端口被占用时短暂重试，
-    /// 以支持「同端口换主机键」的用例。
+    /// 以支持「同端口换主机键」的用例。转发默认关闭。
     fn start(port: u16) -> Self {
         Self::start_with_key(port, None)
     }
 
     fn start_with_key(port: u16, accepted_key: Option<russh::keys::PublicKey>) -> Self {
+        Self::start_handler(
+            port,
+            MockHandler {
+                accepted_key,
+                forwarded: None,
+                forwarded_channels: Arc::new(Mutex::new(HashSet::new())),
+            },
+        )
+    }
+
+    /// 起一台允许 direct-tcpip 转发的 mock；返回的计数器记录接受的转发请求数。
+    fn start_forwarding(port: u16) -> (Self, Arc<AtomicUsize>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        (
+            Self::start_handler(
+                port,
+                MockHandler {
+                    accepted_key: None,
+                    forwarded: Some(Arc::clone(&counter)),
+                    forwarded_channels: Arc::new(Mutex::new(HashSet::new())),
+                },
+            ),
+            counter,
+        )
+    }
+
+    fn start_handler(port: u16, handler: MockHandler) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -171,7 +251,7 @@ impl MockServer {
             if port_tx.send(listener.local_addr().unwrap().port()).is_err() {
                 return; // 启动方已放弃等待
             }
-            let mut handler = MockHandler { accepted_key };
+            let mut handler = handler;
             let running = handler.run_on_socket(Arc::clone(&config), &listener);
             let _ = running.await;
         });
@@ -208,9 +288,23 @@ fn options_for(port: u16, auth: SshAuth, dir: &std::path::Path) -> SshOptions {
             },
             encoding: SessionEncoding::Utf8,
         },
-        jump: None,
+        jump: Vec::new(),
         cols: 110,
         rows: 30,
+    }
+}
+
+/// 回环端点（known_hosts 策略与 options_for 相同），供跳板链逐跳拼装。
+fn endpoint_for(port: u16, dir: &std::path::Path) -> SshEndpoint {
+    SshEndpoint {
+        host: "127.0.0.1".into(),
+        port: Some(port),
+        username: "tester".into(),
+        auth: SshAuth::Password("secret".into()),
+        host_key_policy: HostKeyPolicy::KnownHosts {
+            path: Some(dir.join("known_hosts")),
+        },
+        encoding: SessionEncoding::Utf8,
     }
 }
 
@@ -426,4 +520,113 @@ fn tofu_learns_first_key_and_rejects_changed_key() {
         .filter(|line| !line.trim().is_empty())
         .count();
     assert_eq!(entries, 1, "应只记录首连一次: {recorded:?}");
+}
+
+/// 两跳穿透（ProxyJump）：目标机直连不可达参数由跳板 mock 转发达成——
+/// shell 回显走通 + 跳板端口恰好接受 1 次转发请求。
+#[test]
+fn jump_chain_two_hops_forwards_and_reaches_shell() {
+    let target = MockServer::start(0);
+    let (bastion, forward_count) = MockServer::start_forwarding(0);
+    let known_hosts = temp_known_hosts("jump2");
+
+    let mut options = options_for(
+        target.port,
+        SshAuth::Password("secret".into()),
+        known_hosts.path(),
+    );
+    options.jump = vec![endpoint_for(bastion.port, known_hosts.path())];
+
+    let session = SshSession::spawn(options).expect("经跳板连接 mock 服务器");
+    assert_eq!(
+        session.title(),
+        format!(
+            "tester@127.0.0.1:{} ⇢ tester@127.0.0.1:{}",
+            target.port, bastion.port
+        ),
+        "标题应标注跳板链"
+    );
+
+    let mut streams = session.take_streams().expect("take_streams");
+    streams.writer.write_all(b"via-jump\n").expect("写入");
+    read_until(&mut streams, "Got data: via-jump");
+    assert_eq!(
+        forward_count.load(Ordering::SeqCst),
+        1,
+        "跳板应恰好接受一次 direct-tcpip 转发"
+    );
+    session.kill();
+    wait_eof(&mut streams);
+}
+
+/// 三跳链：外→中→目标逐跳穿透；中间跳 Handle 必须保活到会话结束，
+/// 每台跳板各接受恰好 1 次转发。
+#[test]
+fn jump_chain_three_hops_keeps_tunnels_alive() {
+    let target = MockServer::start(0);
+    let (middle, middle_count) = MockServer::start_forwarding(0);
+    let (outer, outer_count) = MockServer::start_forwarding(0);
+    let known_hosts = temp_known_hosts("jump3");
+
+    let mut options = options_for(
+        target.port,
+        SshAuth::Password("secret".into()),
+        known_hosts.path(),
+    );
+    // 由外到内：先连 outer，经它到 middle，再经 middle 到目标机
+    options.jump = vec![
+        endpoint_for(outer.port, known_hosts.path()),
+        endpoint_for(middle.port, known_hosts.path()),
+    ];
+
+    let session = SshSession::spawn(options).expect("经两台跳板连接 mock 服务器");
+    let mut streams = session.take_streams().expect("take_streams");
+    streams.writer.write_all(b"via-chain\n").expect("写入");
+    read_until(&mut streams, "Got data: via-chain");
+    session.resize(60, 20).expect("三跳会话 resize 应正常");
+    assert_eq!(
+        outer_count.load(Ordering::SeqCst),
+        1,
+        "外层跳板应接受 1 次转发"
+    );
+    assert_eq!(
+        middle_count.load(Ordering::SeqCst),
+        1,
+        "中层跳板应接受 1 次转发"
+    );
+    session.kill();
+    wait_eof(&mut streams);
+}
+
+/// 负例：跳板机关闭转发（不实现 direct-tcpip accept）时必须失败，
+/// 错误文案含「转发通道」与目标端点名，可据此定位是哪一跳出了问题。
+#[test]
+fn jump_chain_fails_with_actionable_error_when_forwarding_rejected() {
+    let target = MockServer::start(0);
+    let bastion = MockServer::start(0); // forwarded: None → 拒绝 direct-tcpip
+    let known_hosts = temp_known_hosts("jump-reject");
+
+    let mut options = options_for(
+        target.port,
+        SshAuth::Password("secret".into()),
+        known_hosts.path(),
+    );
+    options.jump = vec![endpoint_for(bastion.port, known_hosts.path())];
+
+    let error = SshSession::spawn(options)
+        .err()
+        .expect("跳板拒转发必须失败");
+    let message = error.to_string();
+    assert!(
+        message.contains("转发通道"),
+        "错误应提示转发通道问题: {message}"
+    );
+    assert!(
+        message.contains(&format!("tester@127.0.0.1:{}", target.port)),
+        "错误应含目标端点名: {message}"
+    );
+    assert!(
+        message.contains(&"跳板[1/1]".to_string()),
+        "错误应标注跳板位置: {message}"
+    );
 }

@@ -423,9 +423,9 @@ impl SshEndpoint {
 pub struct SshOptions {
     /// 目标机（最终建立 shell 会话的主机）。
     pub endpoint: SshEndpoint,
-    /// 跳板机（ProxyJump 语义：先连它，再经 direct-tcpip 通道到目标机；
-    /// `None` = 直连）。
-    pub jump: Option<Box<SshEndpoint>>,
+    /// 跳板链（ProxyJump 语义，`ssh -J` 顺序）：从外到内，第 0 项最先直连；
+    /// 空 = 直连。链上任一中间跳的 Handle 都必须保活到会话结束（drop 即断流）。
+    pub jump: Vec<SshEndpoint>,
     /// 初始列数。
     pub cols: u16,
     /// 初始行数。
@@ -433,13 +433,21 @@ pub struct SshOptions {
 }
 
 impl SshOptions {
-    /// 标签标题：目标机为主；经跳板机时后缀 ` ⇢ 跳板机`，一眼区分直连/穿透。
+    /// 标签标题：目标机为主；经跳板机时按链路顺序后缀 ` ⇢ 跳1 ⇢ 跳2`，
+    /// 一眼区分直连/穿透与走的是哪条链。
     pub fn title(&self) -> String {
-        match &self.jump {
-            None => self.endpoint.title(),
-            Some(jump) => format!("{} ⇢ {}", self.endpoint.title(), jump.title()),
+        let mut title = self.endpoint.title();
+        for jump in &self.jump {
+            title = format!("{title} ⇢ {}", jump.title());
         }
+        title
     }
+}
+
+/// 连接超时秒数：基础 15s，每多一跳 +10s（多跳握手逐跳串行）。
+/// spawn 侧 `recv_timeout` 必须用同一公式再 +1s，两处联动否则多跳必超时假失败。
+fn connect_timeout_secs(jump_hops: usize) -> u64 {
+    15 + 10 * jump_hops as u64
 }
 
 /// 网络线程内的控制指令（tokio 无界通道，同步侧 send 永不阻塞）。
@@ -477,6 +485,8 @@ impl SshSession {
         let title = options.title();
         // 编码在 options move 进网络线程前取出（UTF-8 直通零开销）
         let encoding = options.endpoint.encoding;
+        // 超时按跳数缩放；spawn 侧比网络侧多留 1s，让网络线程先报真实原因
+        let timeout_secs = connect_timeout_secs(options.jump.len());
         let (ready_tx, ready_rx) = std_mpsc::channel::<SessionHandles>();
 
         let network = std::thread::Builder::new()
@@ -492,8 +502,13 @@ impl SshSession {
 
         let _ = network; // 线程自行退出，不需要 join
         let (writer_tx, cmd_tx, data_rx) = ready_rx
-            .recv_timeout(std::time::Duration::from_secs(16))
-            .map_err(|_| io::Error::new(ErrorKind::TimedOut, "SSH 连接超时（15s）"))??;
+            .recv_timeout(std::time::Duration::from_secs(timeout_secs + 1))
+            .map_err(|_| {
+                io::Error::new(
+                    ErrorKind::TimedOut,
+                    format!("SSH 连接超时（{}s）", timeout_secs + 1),
+                )
+            })??;
 
         let streams = SessionStreams {
             reader: Box::new(ChannelReader {
@@ -673,6 +688,16 @@ fn check_known_hosts(
     Ok(true)
 }
 
+/// 客户端连接参数（跳板机与目标机共用同一套 keepalive/无延迟策略）。
+fn client_config() -> std::sync::Arc<russh::client::Config> {
+    std::sync::Arc::new(russh::client::Config {
+        keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        keepalive_max: 3,
+        nodelay: true,
+        ..Default::default()
+    })
+}
+
 /// 连接并认证一个端点（直连 TCP；跳板机与目标机的第一跳共用）。
 async fn connect_and_auth(
     endpoint: &SshEndpoint,
@@ -683,12 +708,7 @@ async fn connect_and_auth(
         port: endpoint.port(),
     };
     let mut handle = russh::client::connect(
-        std::sync::Arc::new(russh::client::Config {
-            keepalive_interval: Some(std::time::Duration::from_secs(30)),
-            keepalive_max: 3,
-            nodelay: true,
-            ..Default::default()
-        }),
+        client_config(),
         (endpoint.host.as_str(), endpoint.port()),
         handler,
     )
@@ -699,6 +719,47 @@ async fn connect_and_auth(
             endpoint.title()
         ))
     })?;
+    authenticate(&mut handle, endpoint).await?;
+    Ok(handle)
+}
+
+/// 经上一跳的 direct-tcpip 通道建立下一跳的独立加密会话并认证。
+///
+/// `prev` 的 Handle 必须由调用方持有保活（drop 即断流，本跳连接随之消亡）。
+/// `prev_label` 描述隧道穿过的机器（如「跳板[1/2] ops@x」），只用于错误文案。
+async fn open_through(
+    prev: &russh::client::Handle<ClientHandler>,
+    prev_label: &str,
+    endpoint: &SshEndpoint,
+) -> io::Result<russh::client::Handle<ClientHandler>> {
+    let forward = prev
+        .channel_open_direct_tcpip(
+            endpoint.host.as_str(),
+            endpoint.port() as u32,
+            "127.0.0.1",
+            0,
+        )
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "经{prev_label}建立到 {} 的转发通道失败: {error}",
+                endpoint.title()
+            ))
+        })?;
+    let stream = forward.into_stream();
+    let handler = ClientHandler {
+        host_key_policy: endpoint.host_key_policy.clone(),
+        host: endpoint.host.clone(),
+        port: endpoint.port(),
+    };
+    let mut handle = russh::client::connect_stream(client_config(), stream, handler)
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "经{prev_label}连接 {} 失败: {error}",
+                endpoint.title()
+            ))
+        })?;
     authenticate(&mut handle, endpoint).await?;
     Ok(handle)
 }
@@ -825,11 +886,14 @@ async fn authenticate(
     Ok(())
 }
 
-/// 网络线程主循环：（可选跳板机）→ 目标机 → PTY/shell → 通知 spawn → 常驻收发。
+/// 网络线程主循环：（跳板链逐跳穿透）→ 目标机 → PTY/shell → 通知 spawn → 常驻收发。
 ///
-/// 跳板机穿透 = ProxyJump 语义：先与跳板机建立普通 SSH 连接并认证，
-/// 在其上开 direct-tcpip 通道指向目标机，把该通道当作目标机 SSH 会话的
-/// 传输流（`connect_stream`）——目标机的加密/认证独立于跳板机。
+/// 跳板链 = ProxyJump 语义（`ssh -J`）：先与外层跳板建立普通 SSH 连接并认证，
+/// 在其上开 direct-tcpip 通道指向下一跳，把该通道当作下一跳 SSH 会话的
+/// 传输流（`connect_stream`）——每一跳的加密/认证相互独立，逐跳串行建立。
+///
+/// 中间跳 Handle 全部存入 `tunnels` 保活到会话结束：链上任一中间 Handle 被
+/// drop 都会切断后续所有跳的传输流。退出时先断目标机，再逆序断跳板链。
 ///
 /// 两个常驻任务：
 /// - 收发任务：`select` 上 SSH 通道消息（Data/ExtendedData → std 通道）
@@ -837,64 +901,32 @@ async fn authenticate(
 /// - 写任务：tokio 通道的字节 → `make_writer` 异步写入
 async fn network_main(options: SshOptions, ready_tx: std_mpsc::Sender<SessionHandles>) {
     let connect_result: io::Result<()> = async {
-        let (handle, mut channel, bastion_handle) =
-            tokio::time::timeout(std::time::Duration::from_secs(15), async {
-                // 第一跳：跳板机（可选）。它的 Handle 必须存活到会话结束——
-                // drop 即断开转发通道，目标机连接随之消亡。
-                let bastion_handle = match &options.jump {
-                    Some(jump) => {
-                        let bastion = connect_and_auth(jump).await?;
-                        Some(bastion)
-                    }
-                    None => None,
-                };
-
-                // 目标机：直连，或经跳板机的 direct-tcpip 通道穿透
-                let handle = match &bastion_handle {
-                    Some(bastion) => {
-                        let endpoint = &options.endpoint;
-                        let forward = bastion
-                            .channel_open_direct_tcpip(
-                                endpoint.host.as_str(),
-                                endpoint.port() as u32,
-                                "127.0.0.1",
-                                0,
-                            )
-                            .await
-                            .map_err(|error| {
-                                io::Error::other(format!(
-                                    "跳板机开转发通道到 {} 失败: {error}",
-                                    endpoint.title()
-                                ))
-                            })?;
-                        let stream = forward.into_stream();
-                        let handler = ClientHandler {
-                            host_key_policy: endpoint.host_key_policy.clone(),
-                            host: endpoint.host.clone(),
-                            port: endpoint.port(),
-                        };
-                        let mut handle = russh::client::connect_stream(
-                            std::sync::Arc::new(russh::client::Config {
-                                keepalive_interval: Some(std::time::Duration::from_secs(30)),
-                                keepalive_max: 3,
-                                nodelay: true,
-                                ..Default::default()
-                            }),
-                            stream,
-                            handler,
-                        )
-                        .await
-                        .map_err(|error| {
-                            io::Error::other(format!(
-                                "经跳板机连接 {} 失败: {error}",
-                                endpoint.title()
-                            ))
-                        })?;
-                        authenticate(&mut handle, endpoint).await?;
-                        handle
-                    }
+        let (handle, mut channel, tunnels) = tokio::time::timeout(
+            std::time::Duration::from_secs(connect_timeout_secs(options.jump.len())),
+            async {
+                // 第一跳：外层跳板直连；无跳板链时第一跳就是目标机
+                let mut handle = match options.jump.first() {
+                    Some(first) => connect_and_auth(first).await?,
                     None => connect_and_auth(&options.endpoint).await?,
                 };
+                // 后续跳：跳板链剩余跳 + 目标机，都经上一跳的 direct-tcpip 穿透；
+                // 中间跳 Handle 存入 tunnels 保活（drop 即断流）。
+                let mut tunnels: Vec<russh::client::Handle<ClientHandler>> = Vec::new();
+                if !options.jump.is_empty() {
+                    let total = options.jump.len();
+                    let chain: Vec<&SshEndpoint> = options.jump[1..]
+                        .iter()
+                        .chain(std::iter::once(&options.endpoint))
+                        .collect();
+                    for (index, endpoint) in chain.iter().enumerate() {
+                        // 正在穿过的机器是第 index+1 跳（1 起），如「跳板[1/2] ops@x」
+                        let through = &options.jump[index];
+                        let label = format!("跳板[{}/{}] {}", index + 1, total, through.title());
+                        let next = open_through(&handle, &label, endpoint).await?;
+                        tunnels.push(handle);
+                        handle = next;
+                    }
+                }
 
                 let mut channel = handle
                     .channel_open_session()
@@ -931,10 +963,19 @@ async fn network_main(options: SshOptions, ready_tx: std_mpsc::Sender<SessionHan
                     }
                 }
 
-                Ok::<_, io::Error>((handle, channel, bastion_handle))
-            })
-            .await
-            .map_err(|_| io::Error::new(ErrorKind::TimedOut, "SSH 连接超时（15s）"))??;
+                Ok::<_, io::Error>((handle, channel, tunnels))
+            },
+        )
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                ErrorKind::TimedOut,
+                format!(
+                    "SSH 连接超时（{}s）",
+                    connect_timeout_secs(options.jump.len())
+                ),
+            )
+        })??;
 
         // 三条桥：视图写 → 写任务；控制指令 → 收发任务；收发任务 → 视图读
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -989,13 +1030,13 @@ async fn network_main(options: SshOptions, ready_tx: std_mpsc::Sender<SessionHan
                 },
             }
         }
-        // 退出路径统一：先断目标机，再断跳板机（尽力而为），
+        // 退出路径统一：先断目标机，再按建立顺序逆序断跳板链（尽力而为），
         // drop data_tx 让视图读端收 EOF
         let _ = handle
             .disconnect(russh::Disconnect::ByApplication, "session closed", "en")
             .await;
-        if let Some(bastion) = bastion_handle {
-            let _ = bastion
+        for tunnel in tunnels.iter().rev() {
+            let _ = tunnel
                 .disconnect(russh::Disconnect::ByApplication, "session closed", "en")
                 .await;
         }
@@ -1040,7 +1081,7 @@ mod tests {
     fn sample_options() -> SshOptions {
         SshOptions {
             endpoint: sample_endpoint("bastion.example.com"),
-            jump: None,
+            jump: Vec::new(),
             cols: 110,
             rows: 30,
         }
@@ -1198,7 +1239,7 @@ mod tests {
         assert_eq!(endpoint.title(), "ops@bastion.example.com:2222");
     }
 
-    /// 标签口径：直连只显示目标机；经跳板机穿透时后缀 ` ⇢ 跳板机`，
+    /// 标签口径：直连只显示目标机；经跳板链穿透时按连接顺序后缀 ` ⇢ 跳1 ⇢ 跳2`，
     /// 一眼区分「我登的是内网机哪台、走的哪条链」。
     #[test]
     fn title_marks_jump_chain() {
@@ -1208,11 +1249,26 @@ mod tests {
 
         let mut jump = sample_endpoint("bastion.example.com");
         jump.port = Some(2222);
-        options.jump = Some(Box::new(jump));
+        options.jump = vec![jump];
         assert_eq!(
             options.title(),
             "ops@intranet.internal ⇢ ops@bastion.example.com:2222"
         );
+
+        // 两跳链：按连接顺序（外→内）排列
+        options.jump.push(sample_endpoint("inner.example.com"));
+        assert_eq!(
+            options.title(),
+            "ops@intranet.internal ⇢ ops@bastion.example.com:2222 ⇢ ops@inner.example.com"
+        );
+    }
+
+    /// 连接超时按跳数缩放：0 跳 15s，每多一跳 +10s；spawn 侧 = 网络侧 + 1s。
+    #[test]
+    fn connect_timeout_scales_with_jump_hops() {
+        assert_eq!(connect_timeout_secs(0), 15);
+        assert_eq!(connect_timeout_secs(1), 25);
+        assert_eq!(connect_timeout_secs(3), 45);
     }
 
     /// 读桥契约：分块送达 + 发送端全退后 EOF（termview 的 Exit 触发源）。
@@ -1271,7 +1327,8 @@ mod tests {
 
     /// 真实主机集成测试（默认忽略）：
     /// 直连：`LATERTERM_SSH_TEST=user:pass@host[:port] cargo test -p laterterm-ssh -- --ignored`
-    /// 穿透：再设 `LATERTERM_SSH_JUMP=user:pass@bastion[:port]`——目标机经跳板机 direct-tcpip 建立。
+    /// 穿透：再设 `LATERTERM_SSH_JUMP=user:pass@bastion[:port]`（多跳用逗号分隔，
+    /// 按连接顺序外→内）——目标机经跳板链 direct-tcpip 逐跳建立。
     #[test]
     #[ignore = "需要真实 SSH 主机，经 LATERTERM_SSH_TEST 环境变量注入"]
     fn connect_shell_roundtrip_against_real_host() {
@@ -1296,9 +1353,16 @@ mod tests {
             }
         };
 
-        let jump = std::env::var("LATERTERM_SSH_JUMP")
-            .ok()
-            .map(|jump_spec| Box::new(parse(&jump_spec)));
+        let jump: Vec<SshEndpoint> = std::env::var("LATERTERM_SSH_JUMP")
+            .map(|specs| {
+                specs
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|spec| !spec.is_empty())
+                    .map(parse)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let session = SshSession::spawn(SshOptions {
             endpoint: parse(&spec),

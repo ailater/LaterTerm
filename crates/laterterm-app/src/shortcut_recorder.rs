@@ -286,7 +286,11 @@ mod tests {
             ("~", true, "ctrl+shift+~"),
         ] {
             let key = Keystroke {
-                modifiers: gpui::Modifiers { control: true, shift, ..Default::default() },
+                modifiers: gpui::Modifiers {
+                    control: true,
+                    shift,
+                    ..Default::default()
+                },
                 key: name.into(),
                 key_char: None,
             };

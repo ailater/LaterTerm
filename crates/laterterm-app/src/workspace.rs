@@ -5,16 +5,16 @@ use crate::server_connection::{self, ConnectionOutcome, CredentialKind};
 use crate::shortcut_recorder::{ShortcutChanged, ShortcutRecorder};
 use gpui::{
     App, AppContext, AsyncApp, Bounds, Context, CursorStyle, DispatchPhase, Div, Edges, Entity,
-    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, Pixels,
-    Point, ScrollHandle, MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Render,
-    StatefulInteractiveElement, Styled, WeakEntity, Window, anchored, canvas, deferred, div,
-    prelude::FluentBuilder, px, relative, rgb,
+    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render,
+    ScrollHandle, StatefulInteractiveElement, Styled, WeakEntity, Window, anchored, canvas,
+    deferred, div, prelude::FluentBuilder, px, relative, rgb,
 };
 use laterterm_config::{
     Appearance, CommandTemplate, ServerAuthKind, ServerEntry, ServersFile, Settings, Theme,
-    ThemeRegistry, TotpAlgorithm, TotpConfig, TotpEntry, app_config_dir, deepin_default_path,
-    generate_code, load_deepin_servers, load_xshell_sessions, normalize_shortcut,
-    parse_secret_input,
+    ThemeRegistry, TotpAlgorithm, TotpConfig, TotpEntry, app_config_dir,
+    deepin_commands_default_path, deepin_default_path, generate_code, load_deepin_commands,
+    load_deepin_servers, load_xshell_sessions, normalize_shortcut, parse_secret_input,
 };
 use laterterm_core::TerminalSession;
 use laterterm_local::{LocalOptions, LocalSession};
@@ -23,8 +23,8 @@ use laterterm_termview::view::ScrollSummary;
 use laterterm_termview::{ColorPalette, TerminalConfig, TerminalView};
 use notify::Watcher;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -289,7 +289,8 @@ impl RightPanelTab {
     const ALL: [Self; 3] = [Self::Commands, Self::Totp, Self::Servers];
 }
 
-/// 服务器侧面板对话框。Connect 用于缺凭据时补输（可选择记住入密钥环）。
+/// 服务器侧面板对话框。Connect 用于缺凭据时补输（可选择记住入密钥环）；
+/// GroupRename 批量改组名（同名并入既有组，留空即解散）。
 #[derive(Clone, Debug)]
 enum ServerDialog {
     Edit {
@@ -304,11 +305,18 @@ enum ServerDialog {
         kind: CredentialKind,
         request_id: u64,
     },
+    GroupRename {
+        original: String,
+    },
 }
 
 struct SshRequest {
     id: u64,
     entry: ServerEntry,
+    /// 跳板条目快照（由外到内，connect_server 时经 resolve_jump_chain 解析）。
+    /// 必须随请求持有：补输凭据重试路径（submit_server_connect →
+    /// start_ssh_connect）不再回查配置表，否则重连会退化成直连。
+    jump: Vec<ServerEntry>,
     active: Arc<AtomicBool>,
     running: bool,
 }
@@ -397,6 +405,197 @@ enum ServerImportSource {
     Xshell,
 }
 
+/// 命令导入合并统计（供提示文案计数）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MergeCommandsStats {
+    pub(crate) added: usize,
+    pub(crate) skipped_dup: usize,
+    pub(crate) skipped_bad: usize,
+    pub(crate) stripped_shortcut: usize,
+}
+
+/// 把导入命令合并进设置（纯函数，零 IO）：同名跳过、名称/模板无效丢弃。
+/// 快捷键归一化失败或与既有/批内绑定冲突时「剥绑定保命令」并计数——
+/// 绝不静默改变用户现有按键行为。批内互撞靠增量登记已接纳键捕获
+/// （静态快照查不出后导入的第二条）。
+pub(crate) fn merge_commands_into(
+    settings: &mut Settings,
+    commands: Vec<CommandTemplate>,
+    bindings: &[ShortcutBinding],
+) -> MergeCommandsStats {
+    let mut stats = MergeCommandsStats::default();
+    let mut taken: BTreeSet<String> = bindings
+        .iter()
+        .map(|binding| binding.normalized.clone())
+        .collect();
+    for mut command in commands {
+        command.name = command.name.trim().to_string();
+        // 先按「无快捷键」校验名称与模板体；快捷键单独走剥绑逻辑
+        let body_only = CommandTemplate {
+            shortcut: None,
+            ..command.clone()
+        };
+        if body_only.validate().is_err() {
+            stats.skipped_bad += 1;
+            continue;
+        }
+        if settings
+            .commands
+            .iter()
+            .any(|item| item.name == command.name)
+        {
+            stats.skipped_dup += 1;
+            continue;
+        }
+        if let Some(shortcut) = command.shortcut.clone() {
+            match normalize_shortcut(&shortcut) {
+                Ok(normalized) if taken.contains(&normalized) => {
+                    command.shortcut = None;
+                    stats.stripped_shortcut += 1;
+                }
+                Ok(normalized) => {
+                    taken.insert(normalized);
+                }
+                Err(_) => {
+                    command.shortcut = None;
+                    stats.stripped_shortcut += 1;
+                }
+            }
+        }
+        settings.commands.push(command);
+        stats.added += 1;
+    }
+    stats
+}
+
+/// 合并统计 → 提示文案：跳过/剥绑计数全部可见，绝不静默丢数据。
+fn format_merge_commands_notice(
+    stats: &MergeCommandsStats,
+    parse_skipped: usize,
+    prefix: &str,
+) -> String {
+    let mut notice = format!("{prefix}：导入 {}", stats.added);
+    if stats.skipped_dup > 0 {
+        notice += &format!("，同名跳过 {}", stats.skipped_dup);
+    }
+    if stats.skipped_bad > 0 {
+        notice += &format!("，无效丢弃 {}", stats.skipped_bad);
+    }
+    if parse_skipped > 0 {
+        notice += &format!("，解析跳过 {parse_skipped}");
+    }
+    if stats.stripped_shortcut > 0 {
+        notice += &format!("，剥除冲突快捷键 {}", stats.stripped_shortcut);
+    }
+    notice
+}
+
+/// 服务器分组分桶：组名字典序升序在前，未分组桶固定殿后。
+/// 返回 (组名, 该组条目在 `servers` 中的下标)；评审提醒：`BTreeMap<Option<_>>`
+/// 的 `None` 键排最前，不能用它的默认顺序，这里手动把未分组挪到最后。
+pub(crate) fn server_groups(servers: &[ServerEntry]) -> Vec<(Option<String>, Vec<usize>)> {
+    let mut grouped: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut ungrouped: Vec<usize> = Vec::new();
+    for (index, server) in servers.iter().enumerate() {
+        match server.group.clone() {
+            Some(group) => grouped.entry(group).or_default().push(index),
+            None => ungrouped.push(index),
+        }
+    }
+    let mut out: Vec<(Option<String>, Vec<usize>)> = grouped
+        .into_iter()
+        .map(|(name, indexes)| (Some(name), indexes))
+        .collect();
+    if !ungrouped.is_empty() {
+        out.push((None, ungrouped));
+    }
+    out
+}
+
+/// 批量改组/解散的核心（纯函数）：把组内所有条目的 group 改为 `new`
+/// （None = 解散；Some(已存在组名) = 并入该组）。返回受影响条目数；
+/// 新组名不合法时整体报错且不动任何条目。
+pub(crate) fn apply_server_group_change(
+    servers: &mut [ServerEntry],
+    old: &str,
+    new: Option<&str>,
+) -> anyhow::Result<usize> {
+    // Some + trim 后为空 = 报错（不允许重命名为纯空白）
+    // None = 解散分组（移除分组标签）——两个语义不能混
+    let new = match new {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                anyhow::bail!("分组名不能为纯空白");
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+    if let Some(name) = new
+        && (name.chars().count() > 80 || name.chars().any(char::is_control))
+    {
+        anyhow::bail!("分组名不能包含控制字符或超过 80 字");
+    }
+    let mut affected = 0usize;
+    for server in servers.iter_mut() {
+        if server.group.as_deref() == Some(old) {
+            server.group = new.map(str::to_string);
+            affected += 1;
+        }
+    }
+    Ok(affected)
+}
+
+/// 服务器保存的表更新（纯函数，零 IO，便于测试）：改名先删旧条目并
+/// 改写所有指向旧名的跳板引用（`Settings::retarget_jump_refs`），
+/// 再 upsert 新条目；upsert 失败回滚整表。
+pub(crate) fn apply_server_save(
+    settings: &mut Settings,
+    original: Option<&str>,
+    meta: ServerEntry,
+) -> anyhow::Result<()> {
+    let snapshot = settings.clone();
+    if let Some(old) = original
+        && old != meta.name
+    {
+        settings.remove_server(old);
+        settings.retarget_jump_refs(old, &meta.name);
+    }
+    if let Err(error) = settings.upsert_server(meta) {
+        *settings = snapshot;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// 合并导入条目的纯逻辑（零 IO，便于测试）：无效条目丢弃、同名跳过、
+/// 新条目并入 `existing`；随后对合并后的全表做跳板引用清理
+/// （格式非法/悬空/成环/超深一律断链保条目）。
+/// 返回 (新增数, 跳过同名数, 无效丢弃数, 跳板引用被清理的条目名)。
+pub(crate) fn merge_entries_into(
+    existing: &mut Vec<ServerEntry>,
+    entries: Vec<ServerEntry>,
+) -> (usize, usize, usize, Vec<String>) {
+    let mut added = 0usize;
+    let mut skipped_dup = 0usize;
+    let mut skipped_bad = 0usize;
+    for entry in entries {
+        let Some(entry) = entry.sanitized() else {
+            skipped_bad += 1;
+            continue;
+        };
+        if existing.iter().any(|item| item.name == entry.name) {
+            skipped_dup += 1;
+            continue;
+        }
+        existing.push(entry);
+        added += 1;
+    }
+    let cleared_jumps = laterterm_config::clear_broken_jump_refs(existing);
+    (added, skipped_dup, skipped_bad, cleared_jumps)
+}
+
 struct Pane {
     id: PaneId,
     title: String,
@@ -472,6 +671,8 @@ pub struct WorkspaceView {
     command_field_subscriptions: Vec<gpui::Subscription>,
     command_delete_confirm: Option<String>,
     command_error: Option<String>,
+    /// 命令区的一次性提示（导入计数等），下次操作时清除。
+    command_notice: Option<String>,
     totp_dialog: Option<TotpDialog>,
     totp_fields: Vec<(String, Entity<CommandTextField>)>,
     totp_meta_draft: TotpEntry,
@@ -489,6 +690,12 @@ pub struct WorkspaceView {
     server_error: Option<String>,
     /// 服务器区的一次性提示（导入/导出结果等），下次操作时清除。
     server_notice: Option<String>,
+    /// 分组折叠态（键 = 组名，None = 未分组桶；会话级，不持久化）。
+    server_groups_collapsed: BTreeSet<Option<String>>,
+    /// 待二次确认解散的分组名。
+    server_group_confirm: Option<String>,
+    /// 设置落盘路径（None = 用户默认配置；测试注入临时路径避免污染真实配置）。
+    settings_save_path: Option<PathBuf>,
     /// 导入来源选择弹窗（Some(已选来源) = 打开中）。
     server_import_dialog: Option<ServerImportSource>,
     /// 正在连接中的服务器名（None 表示空闲；期间禁止并发连接）。
@@ -560,6 +767,7 @@ impl WorkspaceView {
             command_field_subscriptions: Vec::new(),
             command_delete_confirm: None,
             command_error: None,
+            command_notice: None,
             totp_dialog: None,
             totp_fields: Vec::new(),
             totp_meta_draft: TotpEntry::default(),
@@ -576,6 +784,9 @@ impl WorkspaceView {
             server_delete_confirm: None,
             server_error: None,
             server_notice: None,
+            server_groups_collapsed: BTreeSet::new(),
+            server_group_confirm: None,
+            settings_save_path: None,
             server_import_dialog: None,
             ssh_connecting: None,
             ssh_request: None,
@@ -1126,104 +1337,174 @@ impl WorkspaceView {
 
         // 终端级动作统一按菜单来源窗格定位；窗格可能已被回收，找不到则静默跳过。
         let mut items: Vec<Div> = Vec::new();
-        let broadcast_label: &'static str =
-            if self.broadcast { "关闭广播输入" } else { "开启广播输入" };
+        let broadcast_label: &'static str = if self.broadcast {
+            "关闭广播输入"
+        } else {
+            "开启广播输入"
+        };
         if let Some(url) = &menu.url {
             let url = url.clone();
-            items.push(item(cx, "在浏览器打开", true, Box::new(move |_, _, _| {
-                laterterm_termview::open_url(&url);
-            })));
+            items.push(item(
+                cx,
+                "在浏览器打开",
+                true,
+                Box::new(move |_, _, _| {
+                    laterterm_termview::open_url(&url);
+                }),
+            ));
         }
-        items.push(item(cx, "复制", has_selection, Box::new(move |this, _, cx| {
-            if let Some(pane) = this.pane(menu_pane) {
-                let terminal = pane.terminal.clone();
-                terminal.update(cx, |view, cx| view.copy_selection(cx));
-            }
-        })));
-        items.push(item(cx, "粘贴", true, Box::new(move |this, _, cx| {
-            if let Some(pane) = this.pane(menu_pane) {
-                let terminal = pane.terminal.clone();
-                terminal.update(cx, |view, cx| view.paste_from_clipboard(cx));
-            }
-        })));
-        items.push(item(cx, "全选", true, Box::new(move |this, _, cx| {
-            if let Some(pane) = this.pane(menu_pane) {
-                let terminal = pane.terminal.clone();
-                terminal.update(cx, |view, cx| view.select_all(cx));
-            }
-        })));
+        items.push(item(
+            cx,
+            "复制",
+            has_selection,
+            Box::new(move |this, _, cx| {
+                if let Some(pane) = this.pane(menu_pane) {
+                    let terminal = pane.terminal.clone();
+                    terminal.update(cx, |view, cx| view.copy_selection(cx));
+                }
+            }),
+        ));
+        items.push(item(
+            cx,
+            "粘贴",
+            true,
+            Box::new(move |this, _, cx| {
+                if let Some(pane) = this.pane(menu_pane) {
+                    let terminal = pane.terminal.clone();
+                    terminal.update(cx, |view, cx| view.paste_from_clipboard(cx));
+                }
+            }),
+        ));
+        items.push(item(
+            cx,
+            "全选",
+            true,
+            Box::new(move |this, _, cx| {
+                if let Some(pane) = this.pane(menu_pane) {
+                    let terminal = pane.terminal.clone();
+                    terminal.update(cx, |view, cx| view.select_all(cx));
+                }
+            }),
+        ));
         items.push(separator());
-        items.push(item(cx, "搜索回滚内容", true, Box::new(move |this, _, cx| {
-            if let Some(pane) = this.pane(menu_pane) {
-                let terminal = pane.terminal.clone();
-                terminal.update(cx, |view, cx| view.open_search(cx));
-            }
-        })));
-        items.push(item(cx, "清屏", true, Box::new(move |this, _, cx| {
-            if let Some(pane) = this.pane(menu_pane) {
-                let terminal = pane.terminal.clone();
-                terminal.update(cx, |view, cx| view.clear_screen(cx));
-            }
-        })));
-        items.push(item(cx, "重置终端", true, Box::new(move |this, _, cx| {
-            if let Some(pane) = this.pane(menu_pane) {
-                let terminal = pane.terminal.clone();
-                terminal.update(cx, |view, cx| view.reset_terminal(cx));
-            }
-        })));
+        items.push(item(
+            cx,
+            "搜索回滚内容",
+            true,
+            Box::new(move |this, _, cx| {
+                if let Some(pane) = this.pane(menu_pane) {
+                    let terminal = pane.terminal.clone();
+                    terminal.update(cx, |view, cx| view.open_search(cx));
+                }
+            }),
+        ));
+        items.push(item(
+            cx,
+            "清屏",
+            true,
+            Box::new(move |this, _, cx| {
+                if let Some(pane) = this.pane(menu_pane) {
+                    let terminal = pane.terminal.clone();
+                    terminal.update(cx, |view, cx| view.clear_screen(cx));
+                }
+            }),
+        ));
+        items.push(item(
+            cx,
+            "重置终端",
+            true,
+            Box::new(move |this, _, cx| {
+                if let Some(pane) = this.pane(menu_pane) {
+                    let terminal = pane.terminal.clone();
+                    terminal.update(cx, |view, cx| view.reset_terminal(cx));
+                }
+            }),
+        ));
         items.push(separator());
-        items.push(item(cx, "向左分屏", true, Box::new(|this, window, cx| {
-            this.split_focused(SplitDirection::Horizontal, window, cx);
-        })));
-        items.push(item(cx, "向下分屏", true, Box::new(|this, window, cx| {
-            this.split_focused(SplitDirection::Vertical, window, cx);
-        })));
+        items.push(item(
+            cx,
+            "向左分屏",
+            true,
+            Box::new(|this, window, cx| {
+                this.split_focused(SplitDirection::Horizontal, window, cx);
+            }),
+        ));
+        items.push(item(
+            cx,
+            "向下分屏",
+            true,
+            Box::new(|this, window, cx| {
+                this.split_focused(SplitDirection::Vertical, window, cx);
+            }),
+        ));
         if !single_pane {
-            items.push(item(cx, "关闭窗格", true, Box::new(move |this, window, cx| {
-                this.close_pane(menu_pane, window, cx);
-            })));
+            items.push(item(
+                cx,
+                "关闭窗格",
+                true,
+                Box::new(move |this, window, cx| {
+                    this.close_pane(menu_pane, window, cx);
+                }),
+            ));
         }
-        items.push(item(cx, "新标签", true, Box::new(|this, window, cx| {
-            this.spawn_tab(window, cx);
-        })));
-        items.push(item(cx, "关闭标签", true, Box::new(move |this, window, cx| {
-            if let Some(tab) = this.tabs.iter().find(|tab| tab.layout.contains(menu_pane)) {
-                let tab_id = tab.id;
-                this.close_tab(tab_id, window, cx);
-            }
-        })));
+        items.push(item(
+            cx,
+            "新标签",
+            true,
+            Box::new(|this, window, cx| {
+                this.spawn_tab(window, cx);
+            }),
+        ));
+        items.push(item(
+            cx,
+            "关闭标签",
+            true,
+            Box::new(move |this, window, cx| {
+                if let Some(tab) = this.tabs.iter().find(|tab| tab.layout.contains(menu_pane)) {
+                    let tab_id = tab.id;
+                    this.close_tab(tab_id, window, cx);
+                }
+            }),
+        ));
         items.push(separator());
-        items.push(item(cx, broadcast_label, true, Box::new(|this, _, cx| {
-            this.toggle_broadcast(cx);
-        })));
-        items.push(item(cx, "设置", true, Box::new(|this, _, cx| {
-            this.toggle_settings(cx);
-        })));
+        items.push(item(
+            cx,
+            broadcast_label,
+            true,
+            Box::new(|this, _, cx| {
+                this.toggle_broadcast(cx);
+            }),
+        ));
+        items.push(item(
+            cx,
+            "设置",
+            true,
+            Box::new(|this, _, cx| {
+                this.toggle_settings(cx);
+            }),
+        ));
 
         deferred(
-            anchored()
-                .position(menu.position)
-                .snap_to_window()
-                .child(
-                    div()
-                        .w(px(176.0))
-                        .flex()
-                        .flex_col()
-                        .py_1()
-                        .bg(rgb(0x252837))
-                        .border_1()
-                        .border_color(rgb(0x3B3F5C))
-                        .rounded_md()
-                        // 点击菜单外任意处（含终端区）关闭
-                        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                            this.terminal_menu = None;
-                            cx.notify();
-                        }))
-                        // 菜单内的点击不穿透，避免误触终端或触发选区
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                        .children(items),
-                ),
+            anchored().position(menu.position).snap_to_window().child(
+                div()
+                    .w(px(176.0))
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .bg(rgb(0x252837))
+                    .border_1()
+                    .border_color(rgb(0x3B3F5C))
+                    .rounded_md()
+                    // 点击菜单外任意处（含终端区）关闭
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.terminal_menu = None;
+                        cx.notify();
+                    }))
+                    // 菜单内的点击不穿透，避免误触终端或触发选区
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                    .children(items),
+            ),
         )
         .with_priority(1)
     }
@@ -1396,15 +1677,24 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// 设置落盘统一入口：默认写用户配置文件；测试可注入
+    /// `settings_save_path`（临时目录），避免测试导入污染真实配置。
+    fn persist_settings(&self) -> anyhow::Result<()> {
+        let path = self
+            .settings_save_path
+            .clone()
+            .or_else(Settings::default_path)
+            .ok_or_else(|| anyhow::anyhow!("无法定位设置文件路径"))?;
+        self.settings.save_to(&path)
+    }
+
     fn save_command(&mut self, command: CommandTemplate, cx: &mut Context<Self>) {
         let previous = self.settings.clone();
         if let Err(error) = self.settings.upsert_command(command) {
             self.command_error = Some(error.to_string());
             return;
         }
-        if let Some(path) = Settings::default_path()
-            && let Err(error) = self.settings.save_to(&path)
-        {
+        if let Err(error) = self.persist_settings() {
             self.settings = previous;
             self.command_error = Some(format!("保存命令失败: {error}"));
         } else {
@@ -1421,14 +1711,13 @@ impl WorkspaceView {
         }
         let previous = self.settings.clone();
         self.settings.remove_command(name);
-        if let Some(path) = Settings::default_path()
-            && let Err(error) = self.settings.save_to(&path)
-        {
+        if let Err(error) = self.persist_settings() {
             self.settings = previous;
             self.command_error = Some(format!("删除命令失败: {error}"));
         } else {
             self.command_delete_confirm = None;
             self.command_error = None;
+            self.command_notice = None;
         }
         cx.notify();
     }
@@ -1480,6 +1769,7 @@ impl WorkspaceView {
             original_name: command.map(|item| item.name),
         });
         self.command_error = None;
+        self.command_notice = None;
         focus_first_field(&self.command_fields, window, cx);
         cx.notify();
     }
@@ -1644,6 +1934,7 @@ impl WorkspaceView {
     fn dismiss_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.command_dialog = None;
         self.command_error = None;
+        self.command_notice = None;
         self.command_target = None;
         self.shortcut_editor = None;
         self.command_fields.clear();
@@ -1800,9 +2091,7 @@ impl WorkspaceView {
                     if let Err(error) = workspace.settings.upsert_totp(meta) {
                         workspace.settings = previous_settings;
                         workspace.totp_error = Some(error.to_string());
-                    } else if let Some(path) = Settings::default_path()
-                        && let Err(error) = workspace.settings.save_to(&path)
-                    {
+                    } else if let Err(error) = workspace.persist_settings() {
                         workspace.settings = previous_settings;
                         workspace.totp_error = Some(format!("保存动态码失败: {error:#}"));
                     } else {
@@ -1955,9 +2244,7 @@ impl WorkspaceView {
             let _ = this.update(cx, |workspace, cx| match result {
                 Ok(()) => {
                     workspace.settings.remove_totp(&name);
-                    if let Some(path) = Settings::default_path()
-                        && let Err(error) = workspace.settings.save_to(&path)
-                    {
+                    if let Err(error) = workspace.persist_settings() {
                         workspace.totp_error = Some(format!("删除动态码失败: {error:#}"));
                     } else {
                         workspace.totp_delete_confirm = None;
@@ -2003,7 +2290,7 @@ impl WorkspaceView {
                 ServerAuthKind::Agent => "Agent（无需密码）",
             }
         };
-        let rows: [(&str, String, &str); 8] = [
+        let rows: [(&str, String, &str); 10] = [
             ("名称", meta.name, "如 跳板机A"),
             ("主机", meta.host, "host 或 IP"),
             ("端口", meta.port.to_string(), "22"),
@@ -2017,6 +2304,16 @@ impl WorkspaceView {
                 "编码",
                 meta.encoding.unwrap_or_else(|| "UTF-8".into()),
                 "UTF-8 / GBK / GB18030",
+            ),
+            (
+                "分组",
+                meta.group.unwrap_or_default(),
+                "可选；如 生产/入口层",
+            ),
+            (
+                "跳板",
+                meta.jump.unwrap_or_default(),
+                "可选；另一台服务器的名称",
             ),
             ("备注", meta.note, "备注（可选）"),
             ("凭据", String::new(), secret_placeholder),
@@ -2089,6 +2386,17 @@ impl WorkspaceView {
             .get("备注")
             .map(|v| v.trim().to_string())
             .unwrap_or_default();
+        // 分组：trim 后空 = 移出分组；合法性由 validate() 严格把关（报错留在弹窗内）。
+        // 改组只动元数据，凭据键是服务器名，密钥环后台迁移逻辑不受影响。
+        meta.group = values
+            .get("分组")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        // 跳板：trim 后空 = 直连；引用合法性结合全表在下方 resolve_jump_chain 查
+        meta.jump = values
+            .get("跳板")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
         meta.shortcut = self.shortcut_value(cx);
         let secret = values.get("凭据").cloned().unwrap_or_default();
         if let Some(conflict) = self.check_shortcut_conflict(
@@ -2100,6 +2408,33 @@ impl WorkspaceView {
             return;
         }
         if let Err(error) = meta.validate() {
+            self.server_error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        // 跳板引用一致性（改名后的全表快照上解析）：自引报专门文案，
+        // 缺失/成环/超深原样透出链路错误。同步早退，不发起后台保存、不落盘。
+        if meta.jump.as_deref() == Some(meta.name.as_str()) {
+            self.server_error = Some(format!("不能把「{}」自身设为跳板", meta.name));
+            cx.notify();
+            return;
+        }
+        let mut preview = self.settings.servers.clone();
+        if let Some(previous) = &original
+            && previous != &meta.name
+        {
+            preview.retain(|item| item.name != *previous);
+            for item in &mut preview {
+                if item.jump.as_deref() == Some(previous.as_str()) {
+                    item.jump = Some(meta.name.clone());
+                }
+            }
+        }
+        match preview.iter_mut().find(|item| item.name == meta.name) {
+            Some(slot) => *slot = meta.clone(),
+            None => preview.push(meta.clone()),
+        }
+        if let Err(error) = laterterm_config::resolve_jump_chain(&preview, &meta.name) {
             self.server_error = Some(error.to_string());
             cx.notify();
             return;
@@ -2183,17 +2518,12 @@ impl WorkspaceView {
                         }
                         let cleanup_meta = meta.clone();
                         let previous_settings = workspace.settings.clone();
-                        if let Some(previous) = &original
-                            && previous != &meta.name
+                        if let Err(error) =
+                            apply_server_save(&mut workspace.settings, original.as_deref(), meta)
                         {
-                            workspace.settings.remove_server(previous);
-                        }
-                        if let Err(error) = workspace.settings.upsert_server(meta) {
                             workspace.settings = previous_settings;
                             workspace.server_error = Some(error.to_string());
-                        } else if let Some(path) = Settings::default_path()
-                            && let Err(error) = workspace.settings.save_to(&path)
-                        {
+                        } else if let Err(error) = workspace.persist_settings() {
                             workspace.settings = previous_settings;
                             workspace.server_error = Some(format!("保存服务器失败: {error:#}"));
                         } else {
@@ -2255,6 +2585,7 @@ impl WorkspaceView {
         self.server_fields.clear();
         self.server_field_subscriptions.clear();
         self.server_delete_confirm = None;
+        self.server_group_confirm = None;
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -2263,6 +2594,18 @@ impl WorkspaceView {
     fn delete_server(&mut self, name: &str, cx: &mut Context<Self>) {
         if self.server_delete_confirm.as_deref() != Some(name) {
             self.server_delete_confirm = Some(name.to_string());
+            cx.notify();
+            return;
+        }
+        // 被其他条目按名引用为跳板时阻断删除：先解除引用，宁报错不断链。
+        let referrers = laterterm_config::servers_referencing_jump(&self.settings.servers, name);
+        if !referrers.is_empty() {
+            self.server_error = Some(format!(
+                "「{name}」正被 {} 台服务器作为跳板引用：{}，先解除引用再删除",
+                referrers.len(),
+                referrers.join("、")
+            ));
+            self.server_delete_confirm = None;
             cx.notify();
             return;
         }
@@ -2288,9 +2631,7 @@ impl WorkspaceView {
             let _ = this.update(cx, |workspace, cx| match result {
                 Ok(()) => {
                     workspace.settings.remove_server(&name);
-                    if let Some(path) = Settings::default_path()
-                        && let Err(error) = workspace.settings.save_to(&path)
-                    {
+                    if let Err(error) = workspace.persist_settings() {
                         workspace.server_error = Some(format!("删除服务器失败: {error:#}"));
                     } else {
                         workspace.server_delete_confirm = None;
@@ -2439,35 +2780,110 @@ impl WorkspaceView {
         }
     }
 
-    /// 来源二：Deepin 终端远程管理列表，一键读取默认路径（无需选文件）。
+    /// 来源二：Deepin 终端远程管理列表 + 命令模板迁移（任务 7 收尾）。
+    ///
+    /// 落盘取舍（定稿）：命令与服务器是**两次独立提交**，各自 previous-clone
+    /// 回滚——命令已生效而服务器保存失败时命令保留，不合成一次 clone（合成
+    /// 会让两个语义耦合，回滚时不知道该回滚谁）。命令计数拼进 server_notice，
+    /// 格式：`导入 N 台服务器…；命令模板 导入 X，同名 Y，…`。
     fn import_servers_deepin(&mut self, cx: &mut Context<Self>) {
         let Some(path) = deepin_default_path() else {
             self.server_error = Some("无法定位 HOME 目录，Deepin 导入失败".into());
             cx.notify();
             return;
         };
+        let command_summary = self.import_deepin_commands_beside(&path);
         match load_deepin_servers(&path) {
             Ok(entries) => {
-                if let Some(parent) = path.parent()
-                    && let Ok(text) = std::fs::read_to_string(parent.join("command-config.conf"))
-                    && let Ok(commands) = laterterm_deepin::parse_commands(&text)
-                {
-                    for command in crate::import::deepin_commands_batch(&commands) {
-                        if !self
-                            .settings
-                            .commands
-                            .iter()
-                            .any(|entry| entry.name == command.name)
-                        {
-                            self.settings.commands.push(command);
-                        }
-                    }
-                    self.settings.save();
-                }
                 self.merge_server_entries(entries, &path.display().to_string(), cx);
+                if let Some(summary) = command_summary {
+                    self.server_notice = Some(match self.server_notice.take() {
+                        Some(notice) => format!("{notice}；{summary}"),
+                        None => summary,
+                    });
+                }
             }
             Err(error) => {
                 self.server_error = Some(format!("Deepin 导入失败: {error:#}"));
+                if let Some(summary) = command_summary {
+                    self.server_notice = Some(summary);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    /// 顺带迁移 server-config.conf 同目录的 command-config.conf（宽容解析，
+    /// 跳过计数可见）。文件缺失/读取失败静默跳过——服务器导入不受影响；
+    /// 需要显式导入或看错误时走命令页签的「导入」按钮。
+    fn import_deepin_commands_beside(&mut self, server_path: &Path) -> Option<String> {
+        let commands_path = server_path.parent()?.join("command-config.conf");
+        if !commands_path.exists() {
+            return None;
+        }
+        let Ok((commands, skipped)) = load_deepin_commands(&commands_path) else {
+            eprintln!(
+                "Deepin 命令配置读取失败，已跳过: {}",
+                commands_path.display()
+            );
+            return None;
+        };
+        let bindings = self.all_shortcut_bindings();
+        let previous = self.settings.clone();
+        let stats = merge_commands_into(&mut self.settings, commands, &bindings);
+        if (stats.added > 0 || stats.stripped_shortcut > 0)
+            && let Err(error) = self.persist_settings()
+        {
+            self.settings = previous;
+            eprintln!("Deepin 命令迁移落盘失败: {error:#}");
+            return Some("命令模板迁移失败（落盘失败，服务器导入未受影响）".into());
+        }
+        if stats.added == 0
+            && stats.skipped_dup == 0
+            && stats.skipped_bad == 0
+            && stats.stripped_shortcut == 0
+            && skipped == 0
+        {
+            return None; // 没有任何命令数据，不占提示位
+        }
+        Some(format_merge_commands_notice(&stats, skipped, "命令模板"))
+    }
+
+    /// 命令页签「导入」：读取本机 Deepin command-config.conf（默认路径包装）。
+    fn import_commands_deepin(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = deepin_commands_default_path() else {
+            self.command_error = Some("无法定位 HOME 目录，Deepin 命令导入失败".into());
+            cx.notify();
+            return;
+        };
+        self.import_commands_deepin_with(&path, cx);
+    }
+
+    /// 指定路径的 Deepin 命令导入（路径参数化便于测试注入临时文件）。
+    /// 合并走纯函数 `merge_commands_into`；落盘走 `persist_settings`
+    /// （previous-clone 回滚），GPUI 测试注入 `settings_save_path` 后不碰真实配置。
+    fn import_commands_deepin_with(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.command_error = None;
+        self.command_notice = None;
+        match load_deepin_commands(path) {
+            Ok((commands, skipped)) => {
+                let bindings = self.all_shortcut_bindings();
+                let previous = self.settings.clone();
+                let stats = merge_commands_into(&mut self.settings, commands, &bindings);
+                if (stats.added > 0 || stats.stripped_shortcut > 0)
+                    && let Err(error) = self.persist_settings()
+                {
+                    self.settings = previous;
+                    self.command_error = Some(format!("Deepin 命令导入失败: {error:#}"));
+                    cx.notify();
+                    return;
+                }
+                self.command_notice =
+                    Some(format_merge_commands_notice(&stats, skipped, "Deepin 命令"));
+                cx.notify();
+            }
+            Err(error) => {
+                self.command_error = Some(format!("Deepin 命令导入失败: {error:#}"));
                 cx.notify();
             }
         }
@@ -2516,7 +2932,7 @@ impl WorkspaceView {
             };
             if let Ok(sessions) = sessions {
                 let (entries, skipped) = crate::import::xshell_batch(&sessions);
-                imported.extend(entries.into_iter().map(ServerEntry::from));
+                imported.extend(entries.into_iter());
                 rejected += skipped.len();
             } else if let Ok((entries, skipped)) = load_xshell_sessions(std::slice::from_ref(path))
             {
@@ -2549,6 +2965,7 @@ impl WorkspaceView {
     }
 
     /// 合并导入条目：同名跳过、无效丢弃，计数回报；有新增则落盘。
+    /// 合并后全表做跳板引用清理——宁断链不丢条目，清了多少要回报。
     fn merge_server_entries(
         &mut self,
         entries: Vec<ServerEntry>,
@@ -2556,29 +2973,10 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         let previous = self.settings.clone();
-        let mut added = 0usize;
-        let mut skipped_dup = 0usize;
-        let mut skipped_bad = 0usize;
-        for entry in entries {
-            let Some(entry) = entry.sanitized() else {
-                skipped_bad += 1;
-                continue;
-            };
-            if self
-                .settings
-                .servers
-                .iter()
-                .any(|item| item.name == entry.name)
-            {
-                skipped_dup += 1;
-                continue;
-            }
-            self.settings.servers.push(entry);
-            added += 1;
-        }
+        let (added, skipped_dup, skipped_bad, cleared_jumps) =
+            merge_entries_into(&mut self.settings.servers, entries);
         if added > 0
-            && let Some(config_path) = Settings::default_path()
-            && let Err(error) = self.settings.save_to(&config_path)
+            && let Err(error) = self.persist_settings()
         {
             self.settings = previous;
             self.server_error = Some(format!("导入失败: {error:#}"));
@@ -2592,8 +2990,15 @@ impl WorkspaceView {
         if skipped_bad > 0 {
             notice += &format!("，无效条目 {skipped_bad}");
         }
+        if !cleared_jumps.is_empty() {
+            notice += &format!(
+                "，无效跳板引用已清除 {}（{}）",
+                cleared_jumps.len(),
+                cleared_jumps.join("、")
+            );
+        }
         if added == 0 {
-            if skipped_dup == 0 && skipped_bad == 0 {
+            if skipped_dup == 0 && skipped_bad == 0 && cleared_jumps.is_empty() {
                 self.server_error = Some(format!("没有可导入的服务器条目（{source_desc}）"));
             } else {
                 self.server_error = Some(notice);
@@ -2602,6 +3007,124 @@ impl WorkspaceView {
             self.server_notice = Some(notice);
         }
         cx.notify();
+    }
+
+    // ---------- 主机分组（批量改组/解散/折叠）----------
+
+    /// 批量组操作的落盘包装：previous-clone（含折叠态）→ 改内存 → 落盘 →
+    /// 失败整体回滚（照 merge_server_entries 的口径）。
+    /// 返回是否成功（失败已写入 server_error，调用方不要展示成功提示）。
+    fn save_group_change(
+        &mut self,
+        change: impl FnOnce(&mut Self) -> anyhow::Result<usize>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let previous = self.settings.clone();
+        let previous_collapsed = self.server_groups_collapsed.clone();
+        match change(self) {
+            Ok(affected) => {
+                self.server_group_confirm = None;
+                if affected > 0
+                    && let Err(error) = self.persist_settings()
+                {
+                    self.settings = previous;
+                    self.server_groups_collapsed = previous_collapsed;
+                    self.server_error = Some(format!("分组更新失败: {error:#}"));
+                    cx.notify();
+                    return false;
+                }
+                cx.notify();
+                true
+            }
+            Err(error) => {
+                self.server_group_confirm = None;
+                self.server_error = Some(error.to_string());
+                cx.notify();
+                false
+            }
+        }
+    }
+
+    /// 重命名分组（批量改组内条目，只改内存；落盘回滚由 [`Self::save_group_change`] 负责）。
+    /// 同名并入既有组；折叠键随改名迁移，避免「改名的组折叠态漂移成展开」。
+    fn rename_server_group(&mut self, old: &str, new: Option<String>) -> anyhow::Result<usize> {
+        let affected = apply_server_group_change(&mut self.settings.servers, old, new.as_deref())?;
+        let was_collapsed = self.server_groups_collapsed.remove(&Some(old.to_string()));
+        if let Some(name) = new
+            && was_collapsed
+        {
+            self.server_groups_collapsed.insert(Some(name));
+        }
+        Ok(affected)
+    }
+
+    /// 组头「解散」二次确认后的执行：成员转未分组（改内存 + 落盘回滚）。
+    fn disband_server_group(&mut self, group: String, cx: &mut Context<Self>) {
+        let mut notice = None;
+        let succeeded = self.save_group_change(
+            |workspace| {
+                let affected = workspace.rename_server_group(&group, None)?;
+                if affected > 0 {
+                    notice = Some(format!("已解散分组「{group}」（{affected} 台转入未分组）"));
+                }
+                Ok(affected)
+            },
+            cx,
+        );
+        if succeeded && let Some(notice) = notice {
+            self.server_notice = Some(notice);
+        }
+    }
+
+    /// 组头「重命名」：打开批量改组弹窗（输入框预填旧组名）。
+    fn edit_server_group(&mut self, group: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_ssh_request();
+        self.shortcut_editor = None;
+        self.server_fields.clear();
+        self.server_field_subscriptions.clear();
+        let field =
+            cx.new(|cx| CommandTextField::new(group.to_string(), "新分组名（同名并入该组）", cx));
+        self.server_fields.push(("分组名".into(), field));
+        self.server_dialog = Some(ServerDialog::GroupRename {
+            original: group.to_string(),
+        });
+        self.server_error = None;
+        focus_first_field(&self.server_fields, window, cx);
+        cx.notify();
+    }
+
+    /// 批量改组弹窗的保存：清空输入框 = 解散该组。
+    fn save_group_rename(&mut self, original: String, cx: &mut Context<Self>) {
+        let value = self
+            .server_fields
+            .first()
+            .map(|(_, field)| field.read(cx).value().to_string())
+            .unwrap_or_default();
+        let new = value.trim().to_string();
+        let new = (!new.is_empty()).then_some(new);
+        let mut notice = None;
+        let succeeded = self.save_group_change(
+            |workspace| {
+                let affected = workspace.rename_server_group(&original, new.clone())?;
+                if affected > 0 {
+                    notice = Some(match &new {
+                        Some(name) => {
+                            format!("已将 {affected} 台服务器移入分组「{name}」")
+                        }
+                        None => format!("已解散分组「{original}」（{affected} 台转入未分组）"),
+                    });
+                }
+                Ok(affected)
+            },
+            cx,
+        );
+        if succeeded {
+            self.server_dialog = None;
+            self.server_fields.clear();
+            if let Some(notice) = notice {
+                self.server_notice = Some(notice);
+            }
+        }
     }
 
     /// 点连接立即占用请求槽，准备私钥和密钥环操作都在后台进行。
@@ -2625,9 +3148,23 @@ impl WorkspaceView {
         self.server_field_subscriptions.clear();
         let id = self.next_ssh_request_id;
         self.next_ssh_request_id += 1;
+        // 跳板链快照：连接发起时解析一次，随请求持有（补输凭据重试复用，不回查配置表）。
+        // 载入/导入期已断开坏引用，这里失败只剩会话中途配置被改的极端情形——
+        // 双保险：直接报错不发起连接，绝不静默降级成直连（把本该走跳板的
+        // 内网机暴露到公网路径，比连不上更糟）。
+        let jump_entries: Vec<ServerEntry> =
+            match laterterm_config::resolve_jump_chain(&self.settings.servers, &entry.name) {
+                Ok(chain) => chain.into_iter().cloned().collect(),
+                Err(error) => {
+                    self.server_error = Some(format!("解析跳板链失败: {error}"));
+                    cx.notify();
+                    return;
+                }
+            };
         self.ssh_request = Some(SshRequest {
             id,
             entry: entry.clone(),
+            jump: jump_entries,
             active: Arc::new(AtomicBool::new(true)),
             running: false,
         });
@@ -2682,9 +3219,11 @@ impl WorkspaceView {
         self.ssh_connecting = Some(entry.name.clone());
         self.server_error = None;
         let store = self.secret_store.clone();
+        let jump_entries = request.jump.clone();
         let (tx, rx) = flume::bounded(1);
         std::thread::spawn(move || {
-            let result = server_connection::connect(&entry, supplied, remember, store, active);
+            let result =
+                server_connection::connect(&entry, jump_entries, supplied, remember, store, active);
             if let Err(error) = tx.send((request_id, entry, result))
                 && let Ok(ConnectionOutcome::Connected { session, .. }) = error.0.2
             {
@@ -2930,11 +3469,11 @@ impl WorkspaceView {
             BindingOwner::ServersPanel => self.settings.shortcuts.servers_panel = value,
             _ => return,
         }
-        let result = self.settings.shortcuts.validate().and_then(|()| {
-            let path =
-                Settings::default_path().ok_or_else(|| anyhow::anyhow!("无法确定配置目录"))?;
-            self.settings.save_to(&path)
-        });
+        let result = self
+            .settings
+            .shortcuts
+            .validate()
+            .and_then(|()| self.persist_settings());
         if let Err(error) = result {
             self.settings = previous;
             self.shortcut_error = Some(format!("保存快捷键失败: {error:#}"));
@@ -3435,7 +3974,10 @@ impl Render for WorkspaceView {
                         }),
                     ))
                     .child(button("▣", cx.listener(Self::toggle_right_panel)))
-                    .child(button("⚙", cx.listener(|this, _, _, cx| this.toggle_settings(cx))))
+                    .child(button(
+                        "⚙",
+                        cx.listener(|this, _, _, cx| this.toggle_settings(cx)),
+                    ))
                     .when(!cfg!(target_os = "macos"), |titlebar| {
                         titlebar
                             .child(button("—", cx.listener(Self::minimize)))
@@ -3766,7 +4308,12 @@ fn render_layout(
                 );
                 if *id == focused {
                     pane_div = pane_div.child(
-                        div().absolute().top_0().left_0().right_0().h(px(2.0))
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .h(px(2.0))
                             .bg(gpui::Hsla::from(rgb(0x7AA2F7)).opacity(0.7)),
                     );
                 }
@@ -3890,9 +4437,16 @@ fn left_sidebar(
                 .justify_between()
                 .text_size(px(12.0))
                 .text_color(rgb(0xA9B1D6))
-                .child(div().flex().items_center().gap_2()
-                    .child("会话")
-                    .child(div().px_1().rounded_sm().bg(rgb(0x303548)).text_color(rgb(0xC0CAF5)).child(tab_labels.len().to_string())))
+                .child(
+                    div().flex().items_center().gap_2().child("会话").child(
+                        div()
+                            .px_1()
+                            .rounded_sm()
+                            .bg(rgb(0x303548))
+                            .text_color(rgb(0xC0CAF5))
+                            .child(tab_labels.len().to_string()),
+                    ),
+                )
                 .child(button("+", cx.listener(WorkspaceView::new_tab))),
         )
         .child(
@@ -3911,7 +4465,13 @@ fn left_sidebar(
                     let label = title.clone();
                     let count = *count;
                     div()
-                        .debug_selector(move || if selected { "sidebar-active-tab".into() } else { "sidebar-other-tab".into() })
+                        .debug_selector(move || {
+                            if selected {
+                                "sidebar-active-tab".into()
+                            } else {
+                                "sidebar-other-tab".into()
+                            }
+                        })
                         .group("session-row")
                         .h(px(38.0))
                         .mb_1()
@@ -3948,9 +4508,28 @@ fn left_sidebar(
                         } else {
                             rgb(0x1C1E2C)
                         }))
-                        .child(div().text_size(px(13.0)).text_color(rgb(0x7AA2F7)).child("›_"))
-                        .child(div().flex_1().min_w(px(0.0)).truncate().text_size(px(13.0)).child(label))
-                        .when(count > 1, |row| row.child(div().text_size(px(11.0)).text_color(rgb(0xA9B1D6)).child(count.to_string())))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(rgb(0x7AA2F7))
+                                .child("›_"),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(13.0))
+                                .child(label),
+                        )
+                        .when(count > 1, |row| {
+                            row.child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0xA9B1D6))
+                                    .child(count.to_string()),
+                            )
+                        })
                         .child(
                             div()
                                 .px_1()
@@ -3977,6 +4556,7 @@ fn sidebar_shortcut_label(shortcut: Option<&str>) -> &str {
 fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
     let commands = workspace.settings.commands.clone();
     let error = workspace.command_error.clone();
+    let notice = workspace.command_notice.clone();
     let delete_confirm = workspace.command_delete_confirm.clone();
     let active_tab = workspace.right_panel_tab;
     let item_count = match active_tab {
@@ -3993,14 +4573,37 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
     let panel = div().w_full().text_color(rgb(0xC0CAF5));
     let panel = match active_tab {
         RightPanelTab::Commands => panel
-            .child(setting_button(
-                "新建命令",
-                true,
-                cx.listener(|this, _event, window, cx| this.edit_command(None, window, cx)),
-            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .debug_selector(|| "command-new-button".into())
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .child(setting_button(
+                                "新建命令",
+                                true,
+                                cx.listener(|this, _event, window, cx| {
+                                    this.edit_command(None, window, cx)
+                                }),
+                            )),
+                    )
+                    .child(setting_button(
+                        "导入",
+                        false,
+                        cx.listener(|this, _event, _window, cx| this.import_commands_deepin(cx)),
+                    )),
+            )
             .child(panel_caption("命令模板与快捷键"))
             .when_some(error, |panel, error| {
                 panel.child(div().text_color(rgb(0xF7768E)).child(error))
+            })
+            // 导入/批量操作的一次性计数提示（同 server_notice 的绿色口径）
+            .when_some(notice, |panel, notice| {
+                panel.child(div().pt_2().text_color(rgb(0x9ECE6A)).child(notice))
             })
             .when(commands.is_empty(), |panel| {
                 panel.child(sidebar_empty("还没有命令", "点击上方按钮新建常用命令"))
@@ -4047,7 +4650,9 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(sidebar_shortcut_chip(sidebar_shortcut_label(command.shortcut.as_deref())))
+                            .child(sidebar_shortcut_chip(sidebar_shortcut_label(
+                                command.shortcut.as_deref(),
+                            )))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener({
@@ -4224,6 +4829,9 @@ fn render_active_dialog(
     }
     if let Some(ServerDialog::Edit { original }) = workspace.server_dialog.clone() {
         return Some(server_edit_modal(workspace, original, cx));
+    }
+    if let Some(ServerDialog::GroupRename { original }) = workspace.server_dialog.clone() {
+        return Some(server_group_rename_modal(workspace, original, cx));
     }
     if let Some(ServerDialog::Connecting { name }) = workspace.server_dialog.clone() {
         let body = div()
@@ -4660,6 +5268,46 @@ fn server_edit_modal(
     )
 }
 
+/// 批量改组弹窗：单个「分组名」输入框（预填旧组名）；清空保存 = 解散，
+/// 填已存在组名 = 并入该组。改组只动元数据，不触碰密钥环。
+fn server_group_rename_modal(
+    workspace: &WorkspaceView,
+    original: String,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let fields = workspace.server_fields.clone();
+    let error = workspace.server_error.clone();
+    let title = format!("重命名分组 {original}");
+    let body = div()
+        .flex()
+        .flex_col()
+        .p_4()
+        .when_some(error, |body, error| body.child(dialog_error_line(error)))
+        .child(div().text_color(rgb(0x7D829F)).child(format!(
+            "修改分组「{original}」下所有服务器的归属；填入已存在的分组名会并入该组，清空则解散。"
+        )))
+        .children(
+            fields
+                .into_iter()
+                .map(|(name, field)| dialog_field_row(&name, field)),
+        )
+        .child(dialog_footer(vec![
+            setting_button(
+                "保存",
+                true,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.save_group_rename(original.clone(), cx)
+                }),
+            ),
+            setting_button("取消", false, cx.listener(WorkspaceView::cancel_server)),
+        ]));
+    modal_dialog(
+        title,
+        body,
+        dismiss_listener(cx, WorkspaceView::dismiss_server),
+    )
+}
+
 fn server_connect_modal(
     workspace: &WorkspaceView,
     name: String,
@@ -4913,6 +5561,7 @@ fn render_totp_section(
 }
 
 /// 右面板「服务器」区：条目列表（编辑/连接凭据走窗口级模态弹窗）。
+/// 有分组时按组折叠展示（组名升序、未分组殿后）；纯未分组时与旧版平铺外观一致。
 fn render_server_section(
     workspace: &mut WorkspaceView,
     panel: gpui::Div,
@@ -4923,6 +5572,8 @@ fn render_server_section(
     let error = workspace.server_error.clone();
     let notice = workspace.server_notice.clone();
     let connecting = workspace.ssh_connecting.clone();
+    let collapsed = workspace.server_groups_collapsed.clone();
+    let disband_confirm = workspace.server_group_confirm.clone();
 
     panel
         .child(
@@ -4930,21 +5581,33 @@ fn render_server_section(
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(div().debug_selector(|| "server-new-button".into()).flex_1().min_w(px(0.0)).child(setting_button(
-                    "+ 新建",
-                    true,
-                    cx.listener(|this, _event, window, cx| this.edit_server(None, window, cx)),
-                )))
+                .child(
+                    div()
+                        .debug_selector(|| "server-new-button".into())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(setting_button(
+                            "+ 新建",
+                            true,
+                            cx.listener(|this, _event, window, cx| {
+                                this.edit_server(None, window, cx)
+                            }),
+                        )),
+                )
                 .child(setting_button(
                     "导入",
                     false,
                     cx.listener(|this, _event, _window, cx| this.open_server_import(cx)),
                 ))
-                .child(div().debug_selector(|| "server-export-button".into()).child(setting_button(
-                    "导出",
-                    false,
-                    cx.listener(|this, _event, _window, cx| this.export_servers(cx)),
-                ))),
+                .child(
+                    div()
+                        .debug_selector(|| "server-export-button".into())
+                        .child(setting_button(
+                            "导出",
+                            false,
+                            cx.listener(|this, _event, _window, cx| this.export_servers(cx)),
+                        )),
+                ),
         )
         .child(panel_caption("凭据保存在系统密钥环中"))
         .when(servers.is_empty(), |panel| {
@@ -4967,111 +5630,287 @@ fn render_server_section(
         .when_some(error, |panel, error| {
             panel.child(div().text_color(rgb(0xF7768E)).child(error))
         })
-        // 两行式条目：220px 面板放不下「长文本 + 三个按钮」单行排布（会被压到逐字换行）
-        .children(servers.iter().map(|entry| {
-            let auth_label = match entry.auth {
-                ServerAuthKind::Password => "密码",
-                ServerAuthKind::KeyboardInteractive => "交互",
-                ServerAuthKind::PrivateKey => "密钥",
-                ServerAuthKind::Agent => "Agent",
-            };
-            let pending_delete = delete_confirm.as_deref() == Some(entry.name.as_str());
-            server_list_item()
-                // 第一行：名称 + 连接
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .truncate()
-                                .text_color(rgb(0xC0CAF5))
-                                .child(entry.name.clone()),
+        // 分组渲染：组头（▸/▾ + 组名 + 计数）+ 成员条目；折叠的组不渲染成员行。
+        // 硬约束：纯未分组（无任何命名组）时保持旧版平铺外观，一个组头都不渲染。
+        .children({
+            let mut groups = server_groups(&servers);
+            if groups.len() == 1 && groups[0].0.is_none() {
+                let (_, indexes) = groups.swap_remove(0);
+                indexes
+                    .into_iter()
+                    .map(|index| {
+                        let entry = &servers[index];
+                        server_entry_row(
+                            entry,
+                            delete_confirm.as_deref() == Some(entry.name.as_str()),
+                            cx,
                         )
-                        .child(
-                            div()
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .text_size(px(12.0))
-                                .text_color(rgb(0xB7CEFF))
-                                .bg(rgb(0x303E58))
-                                .hover(|style| style.bg(rgb(0x405578)))
-                                .on_mouse_down(MouseButton::Left, cx.listener({
-                                    let name = entry.name.clone();
-                                    move |this, _event, _window, cx| this.connect_server(&name, cx)
-                                }))
-                                .child("连接"),
-                        ),
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                groups
+                    .into_iter()
+                    .flat_map(|(group, indexes)| {
+                        let is_collapsed = collapsed.contains(&group);
+                        let mut rows = Vec::new();
+                        rows.push(server_group_header(
+                            &group,
+                            indexes.len(),
+                            is_collapsed,
+                            disband_confirm.as_deref(),
+                            cx,
+                        ));
+                        if !is_collapsed {
+                            rows.extend(indexes.into_iter().map(|index| {
+                                let entry = &servers[index];
+                                server_entry_row(
+                                    entry,
+                                    delete_confirm.as_deref() == Some(entry.name.as_str()),
+                                    cx,
+                                )
+                            }));
+                        }
+                        rows
+                    })
+                    .collect::<Vec<_>>()
+            }
+        })
+}
+
+/// 分组组头行：▸/▾ + 组名 + 计数；点整行切换折叠。命名组附带「重命名/解散」
+/// （低对比常显 + hover 提亮，与条目「编辑/删除」同一模式；解散需二次确认）。
+fn server_group_header(
+    group: &Option<String>,
+    count: usize,
+    is_collapsed: bool,
+    disband_confirm: Option<&str>,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let label = group.clone().unwrap_or_else(|| "未分组".into());
+    let key = group.clone();
+    let selector = format!("server-group-header-{label}");
+    let header = div()
+        .debug_selector(move || selector.clone())
+        .pt_3()
+        .pb_1()
+        .px_1()
+        .flex()
+        .items_center()
+        .gap_1()
+        .text_size(px(12.0))
+        .text_color(rgb(0x7D829F))
+        .hover(|style| style.text_color(rgb(0xA9B1D6)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                if this.server_groups_collapsed.contains(&key) {
+                    this.server_groups_collapsed.remove(&key);
+                } else {
+                    this.server_groups_collapsed.insert(key.clone());
+                }
+                cx.notify();
+            }),
+        )
+        .child(if is_collapsed { "▸" } else { "▾" })
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_color(rgb(0xA9B1D6))
+                .child(label),
+        )
+        .child(
+            div()
+                .px_1()
+                .rounded_sm()
+                .bg(rgb(0x303548))
+                .text_size(px(11.0))
+                .text_color(rgb(0xC0CAF5))
+                .child(count.to_string()),
+        );
+    // 未分组桶没有组级操作（成员各自在编辑弹窗里进组）
+    let Some(group_name) = group.clone() else {
+        return header;
+    };
+    header
+        .child(
+            div()
+                .debug_selector(|| "server-group-rename".into())
+                .text_size(px(11.0))
+                .text_color(rgb(0xA9B1D6))
+                .hover(|style| style.text_color(rgb(0xC0D6FF)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener({
+                        let group_name = group_name.clone();
+                        move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.edit_server_group(&group_name, window, cx);
+                        }
+                    }),
                 )
-                // 优先展示连接目标；快捷键属于次要操作。
+                .child("重命名"),
+        )
+        .child({
+            let disbanding = disband_confirm == Some(group_name.as_str());
+            div()
+                .debug_selector(|| "server-group-disband".into())
+                .text_size(px(11.0))
+                .text_color(rgb(if disbanding { 0xF7768E } else { 0xA9B1D6 }))
+                .hover(|style| style.text_color(rgb(0xF7768E)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if disbanding {
+                            this.disband_server_group(group_name.clone(), cx);
+                        } else {
+                            this.server_group_confirm = Some(group_name.clone());
+                            cx.notify();
+                        }
+                    }),
+                )
+                .child(if disbanding { "确认解散" } else { "解散" })
+        })
+}
+
+/// 服务器条目三行结构：名称+连接 / 地址·认证 / 快捷键·编辑·删除。
+/// 卡片带 `server-card-<名称>` 选择器（分组折叠冒烟测试按名定位成员）。
+fn server_entry_row(
+    entry: &ServerEntry,
+    pending_delete: bool,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let auth_label = match entry.auth {
+        ServerAuthKind::Password => "密码",
+        ServerAuthKind::KeyboardInteractive => "交互",
+        ServerAuthKind::PrivateKey => "密钥",
+        ServerAuthKind::Agent => "Agent",
+    };
+    let name = entry.name.clone();
+    server_list_item()
+        .debug_selector(move || format!("server-card-{name}"))
+        // 第一行：名称 + 连接
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
                 .child(
                     div()
-                        .debug_selector(|| "server-address".into())
-                        .w_full()
-                        .pt_1()
+                        .flex_1()
+                        .min_w(px(0.0))
                         .truncate()
-                        .text_size(px(12.0))
-                        .text_color(rgb(0xA9B1D6))
-                        .child(format!(
-                            "{}@{}:{} · {}",
-                            entry.username, entry.host, entry.port, auth_label
-                        )),
+                        .text_color(rgb(0xC0CAF5))
+                        .child(entry.name.clone()),
                 )
                 .child(
                     div()
-                        .pt_2()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(
-                            div()
-                                .debug_selector(|| "server-shortcut".into())
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .truncate()
-                                .text_size(px(11.0))
-                                .text_color(rgb(0xA9B1D6))
-                                .hover(|style| style.text_color(rgb(0xC0D6FF)))
-                                .on_mouse_down(MouseButton::Left, cx.listener({
-                                    let entry = entry.clone();
-                                    move |this, _, window, cx| {
-                                        cx.stop_propagation();
-                                        this.edit_server(Some(&entry), window, cx);
-                                        this.start_shortcut_recording(window, cx);
-                                    }
-                                }))
-                                .child(sidebar_shortcut_label(entry.shortcut.as_deref()).to_string()),
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0xB7CEFF))
+                        .bg(rgb(0x303E58))
+                        .hover(|style| style.bg(rgb(0x405578)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener({
+                                let name = entry.name.clone();
+                                move |this, _event, _window, cx| this.connect_server(&name, cx)
+                            }),
                         )
-                        .child(
-                            div()
-                                .debug_selector(|| "server-edit".into())
-                                .text_size(px(11.0))
-                                .text_color(rgb(0xA9B1D6))
-                                .hover(|style| style.text_color(rgb(0xC0D6FF)))
-                                .on_mouse_down(MouseButton::Left, cx.listener({
-                                    let entry = entry.clone();
-                                    move |this, _event, window, cx| this.edit_server(Some(&entry), window, cx)
-                                }))
-                                .child("编辑"),
+                        .child("连接"),
+                ),
+        )
+        // 优先展示连接目标；快捷键属于次要操作。
+        .child(
+            div()
+                .debug_selector(|| "server-address".into())
+                .w_full()
+                .pt_1()
+                .truncate()
+                .text_size(px(12.0))
+                .text_color(rgb(0xA9B1D6))
+                .child({
+                    // 跳板引用一眼可见：走哪条链直连/穿透不分家
+                    let mut line = format!(
+                        "{}@{}:{} · {}",
+                        entry.username, entry.host, entry.port, auth_label
+                    );
+                    if let Some(jump) = &entry.jump {
+                        line += &format!(" · 经 {jump}");
+                    }
+                    line
+                }),
+        )
+        .child(
+            div()
+                .pt_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .debug_selector(|| "server-shortcut".into())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(11.0))
+                        .text_color(rgb(0xA9B1D6))
+                        .hover(|style| style.text_color(rgb(0xC0D6FF)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener({
+                                let entry = entry.clone();
+                                move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.edit_server(Some(&entry), window, cx);
+                                    this.start_shortcut_recording(window, cx);
+                                }
+                            }),
                         )
-                        .child(
-                            div()
-                                .debug_selector(|| "server-delete".into())
-                                .text_size(px(11.0))
-                                .text_color(rgb(if pending_delete { 0xF7768E } else { 0xA9B1D6 }))
-                                .hover(|style| style.text_color(rgb(0xF7768E)))
-                                .on_mouse_down(MouseButton::Left, cx.listener({
-                                    let name = entry.name.clone();
-                                    move |this, _event, _window, cx| this.delete_server(&name, cx)
-                                }))
-                                .child(if pending_delete { "确认删除" } else { "删除" }),
-                        ),
+                        .child(sidebar_shortcut_label(entry.shortcut.as_deref()).to_string()),
                 )
-        }))
+                .child(
+                    div()
+                        .debug_selector(|| "server-edit".into())
+                        .text_size(px(11.0))
+                        .text_color(rgb(0xA9B1D6))
+                        .hover(|style| style.text_color(rgb(0xC0D6FF)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener({
+                                let entry = entry.clone();
+                                move |this, _event, window, cx| {
+                                    this.edit_server(Some(&entry), window, cx)
+                                }
+                            }),
+                        )
+                        .child("编辑"),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "server-delete".into())
+                        .text_size(px(11.0))
+                        .text_color(rgb(if pending_delete { 0xF7768E } else { 0xA9B1D6 }))
+                        .hover(|style| style.text_color(rgb(0xF7768E)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener({
+                                let name = entry.name.clone();
+                                move |this, _event, _window, cx| this.delete_server(&name, cx)
+                            }),
+                        )
+                        .child(if pending_delete {
+                            "确认删除"
+                        } else {
+                            "删除"
+                        }),
+                ),
+        )
 }
 
 fn settings_overlay(
@@ -5185,7 +6024,13 @@ fn settings_navigation(page: SettingsPage, cx: &mut Context<WorkspaceView>) -> g
                 } else {
                     rgb(0xA9B1D6)
                 })
-                .hover(|style| style.bg(if selected { rgb(0x35415B) } else { rgb(0x292D40) }))
+                .hover(|style| {
+                    style.bg(if selected {
+                        rgb(0x35415B)
+                    } else {
+                        rgb(0x292D40)
+                    })
+                })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event, window, cx| {
@@ -6407,8 +7252,13 @@ mod exit_regression_tests {
         });
         cx.run_until_parked();
         let list = cx.debug_bounds("sidebar-tabs").expect("侧栏列表必须存在");
-        let active = cx.debug_bounds("sidebar-active-tab").expect("活动标签必须存在");
-        assert!(active.top() >= list.top() && active.bottom() <= list.bottom(), "新建的活动标签应滚入可视区域");
+        let active = cx
+            .debug_bounds("sidebar-active-tab")
+            .expect("活动标签必须存在");
+        assert!(
+            active.top() >= list.top() && active.bottom() <= list.bottom(),
+            "新建的活动标签应滚入可视区域"
+        );
         workspace.update_in(cx, |view, window, cx| {
             let first = view.tabs[0].focused_pane;
             view.focus_pane(first, window, cx);
@@ -6416,16 +7266,25 @@ mod exit_regression_tests {
         cx.run_until_parked();
         let list = cx.debug_bounds("sidebar-tabs").unwrap();
         let active = cx.debug_bounds("sidebar-active-tab").unwrap();
-        assert!(active.top() >= list.top() && active.bottom() <= list.bottom(), "切换至顶部标签时应滚入可视区域");
+        assert!(
+            active.top() >= list.top() && active.bottom() <= list.bottom(),
+            "切换至顶部标签时应滚入可视区域"
+        );
         workspace.update_in(cx, |view, window, cx| {
-            view.tab_scroll.set_offset(gpui::point(gpui::px(0.0), -view.tab_scroll.max_offset().height));
+            view.tab_scroll.set_offset(gpui::point(
+                gpui::px(0.0),
+                -view.tab_scroll.max_offset().height,
+            ));
             view.toggle_left_panel(&MouseDownEvent::default(), window, cx);
             view.toggle_left_panel(&MouseDownEvent::default(), window, cx);
         });
         cx.run_until_parked();
         let list = cx.debug_bounds("sidebar-tabs").unwrap();
         let active = cx.debug_bounds("sidebar-active-tab").unwrap();
-        assert!(active.top() >= list.top() && active.bottom() <= list.bottom(), "重新打开侧栏应显示活动标签");
+        assert!(
+            active.top() >= list.top() && active.bottom() <= list.bottom(),
+            "重新打开侧栏应显示活动标签"
+        );
         workspace.read_with(cx, |view, _| {
             for pane in &view.panes {
                 pane.session.close();
@@ -6488,25 +7347,169 @@ mod exit_regression_tests {
             cx.notify();
         });
         cx.run_until_parked();
-        let new_button = cx.debug_bounds("server-new-button").expect("新建按钮应可见");
-        let export = cx.debug_bounds("server-export-button").expect("导出按钮应可见");
-        assert!(new_button.right() <= export.left(), "服务器工具栏按钮不可重叠");
+        let new_button = cx
+            .debug_bounds("server-new-button")
+            .expect("新建按钮应可见");
+        let export = cx
+            .debug_bounds("server-export-button")
+            .expect("导出按钮应可见");
+        assert!(
+            new_button.right() <= export.left(),
+            "服务器工具栏按钮不可重叠"
+        );
         let address = cx.debug_bounds("server-address").expect("服务器地址应可见");
-        let shortcut = cx.debug_bounds("server-shortcut").expect("快捷键入口应可见");
-        assert!(address.bottom() <= shortcut.top(), "服务器地址应排在快捷键之前");
+        let shortcut = cx
+            .debug_bounds("server-shortcut")
+            .expect("快捷键入口应可见");
+        assert!(
+            address.bottom() <= shortcut.top(),
+            "服务器地址应排在快捷键之前"
+        );
         let edit = cx.debug_bounds("server-edit").expect("编辑按钮应可见");
         let delete = cx.debug_bounds("server-delete").expect("删除按钮应可见");
         assert_eq!(shortcut.top(), edit.top(), "次要操作应在同一行");
         assert_eq!(edit.top(), delete.top(), "编辑和删除应在同一行");
         workspace.read_with(cx, |view, _| {
-            for pane in &view.panes { pane.session.close(); }
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    /// 分组渲染与折叠冒烟：组头可见、成员排组头之后、未分组殿后；
+    /// 折叠后组内成员消失、未分组桶不受影响；重命名/解散按钮存在。
+    #[gpui::test]
+    fn server_group_headers_render_and_collapse_members(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let mk = |name: &str, group: Option<&str>| laterterm_config::ServerEntry {
+            name: name.into(),
+            host: "example.com".into(),
+            username: "user".into(),
+            group: group.map(str::to_string),
+            ..Default::default()
+        };
+        workspace.update_in(cx, |view, _, cx| {
+            view.welcome_visible = false;
+            view.right_panel = true;
+            view.right_panel_tab = super::RightPanelTab::Servers;
+            // 先只放未分组：硬约束——纯未分组外观与旧版一致（无组头）
+            view.settings.servers = vec![mk("游离机", None)];
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("server-group-header-未分组").is_none(),
+            "纯未分组不应出现组头（旧版平铺外观）"
+        );
+        workspace.update_in(cx, |view, _, cx| {
+            view.settings.servers = vec![
+                mk("生产一", Some("生产")),
+                mk("生产二", Some("生产")),
+                mk("游离机", None),
+            ];
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let header = cx
+            .debug_bounds("server-group-header-生产")
+            .expect("命名组组头应可见");
+        let member = cx.debug_bounds("server-card-生产一").expect("组成员应可见");
+        let ungrouped = cx
+            .debug_bounds("server-card-游离机")
+            .expect("未分组成员应可见");
+        assert!(header.bottom() <= member.top(), "成员应排在组头之后");
+        assert!(member.top() < ungrouped.top(), "未分组桶应殿后于命名组成员");
+        cx.debug_bounds("server-group-rename")
+            .expect("重命名入口应可见");
+        cx.debug_bounds("server-group-disband")
+            .expect("解散入口应可见");
+        // 折叠：组内成员消失，未分组不受影响
+        workspace.update(cx, |view, cx| {
+            view.server_groups_collapsed.insert(Some("生产".into()));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("server-card-生产一").is_none(),
+            "折叠后组成员应隐藏"
+        );
+        assert!(
+            cx.debug_bounds("server-card-游离机").is_some(),
+            "折叠命名组不能影响未分组桶"
+        );
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    /// Deepin 命令导入冒烟：tempdir 注入 command-config.conf + 注入落盘路径，
+    /// 断言内存态与计数提示，且真实用户配置（默认路径）绝不被测试写入。
+    #[gpui::test]
+    fn deepin_command_import_merges_in_memory_with_injected_paths(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!(
+            "laterterm-deepin-import-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("command-config.conf");
+        std::fs::write(
+            &conf,
+            "[更新系统]\nCommand = sudo apt update\nShortcut = Ctrl+Shift+G\n\n[空命令]\nCommand =\n",
+        )
+        .unwrap();
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, _, cx| {
+            view.welcome_visible = false;
+            view.right_panel = true;
+            view.right_panel_tab = super::RightPanelTab::Commands;
+            // 屏蔽本机真实配置对计数的影响；落盘路径指向 tempdir（评审缺口 3 的口径：
+            // 测试绝不写 Settings::default_path()，也不用改进程 HOME 的竞态方案）
+            view.settings.commands.clear();
+            view.settings.servers.clear();
+            view.settings.totp.clear();
+            view.settings.shortcuts = Default::default();
+            view.settings_save_path = Some(dir.join("settings.toml"));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        workspace.update(cx, |view, cx| {
+            view.import_commands_deepin_with(&conf, cx);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(view.settings.commands.len(), 1, "空命令节应被跳过");
+            assert_eq!(view.settings.commands[0].name, "更新系统");
+            assert_eq!(view.settings.commands[0].template, "sudo apt update");
+            assert_eq!(
+                view.settings.commands[0].shortcut.as_deref(),
+                Some("Ctrl+Shift+G")
+            );
+            assert!(view.settings.commands[0].confirm, "导入命令默认需确认");
+            let notice = view.command_notice.clone().expect("导入后应有计数提示");
+            assert!(notice.contains("导入 1"), "{notice}");
+            assert!(notice.contains("解析跳过 1"), "{notice}");
+        });
+        // 落盘写进了注入路径（而非真实配置）
+        let saved = std::fs::read_to_string(dir.join("settings.toml")).unwrap();
+        assert!(saved.contains("更新系统"), "导入命令应写入注入路径");
+        let _ = std::fs::remove_dir_all(&dir);
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
         });
     }
 
     #[test]
     fn sidebar_shortcut_label_remains_concise_and_identifiable() {
         assert_eq!(super::sidebar_shortcut_label(None), "设置快捷键");
-        assert_eq!(super::sidebar_shortcut_label(Some("ctrl+shift+k")), "ctrl+shift+k");
+        assert_eq!(
+            super::sidebar_shortcut_label(Some("ctrl+shift+k")),
+            "ctrl+shift+k"
+        );
     }
 
     #[test]
@@ -6526,6 +7529,7 @@ mod exit_regression_tests {
             view.ssh_request = Some(super::SshRequest {
                 id: 1,
                 entry: laterterm_config::ServerEntry::default(),
+                jump: Vec::new(),
                 active: connect.clone(),
                 running: true,
             });
@@ -6685,6 +7689,7 @@ mod exit_regression_tests {
             view.ssh_request = Some(super::SshRequest {
                 id: 9,
                 entry: entry.clone(),
+                jump: Vec::new(),
                 active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 running: true,
             });
@@ -6949,5 +7954,239 @@ mod exit_regression_tests {
                 pane.session.close();
             }
         });
+    }
+}
+
+/// 跳板机链（ProxyJump）的面板语义测试：保存校验早退不落盘、删除阻断、
+/// 改名改写引用、导入悬空断链。保存成功路径要写真实配置文件，故改名
+/// 改写只测纯函数 [`apply_server_save`]；补输重试与凭据硬错误在
+/// server_connection 的 MemoryStore 测试里覆盖。
+#[cfg(test)]
+mod server_jump_tests {
+    use super::{WorkspaceView, apply_server_save, merge_entries_into};
+    use gpui::TestAppContext;
+    use laterterm_config::{ServerEntry, Settings};
+
+    fn entry(name: &str, jump: Option<&str>) -> ServerEntry {
+        ServerEntry {
+            name: name.into(),
+            host: "10.0.0.1".into(),
+            username: "ops".into(),
+            jump: jump.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// 在编辑弹窗里把指定字段的文本整体替换为 `value`（模拟键入）。
+    fn fill_field(
+        view: &mut WorkspaceView,
+        label: &str,
+        value: &str,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<WorkspaceView>,
+    ) {
+        use gpui::EntityInputHandler;
+        let field = view
+            .server_fields
+            .iter()
+            .find(|(name, _)| name == label)
+            .unwrap_or_else(|| panic!("弹窗缺少「{label}」字段"))
+            .1
+            .clone();
+        field.update(cx, |field, cx| {
+            field.replace_text_in_range(None, value, window, cx)
+        });
+    }
+
+    /// 保存自引条目必须同步报错且不落盘：早退发生在后台保存 spawn 之前，
+    /// 断言报错文案与配置表未被改动。
+    #[gpui::test]
+    fn save_rejects_self_referencing_jump_without_persisting(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            let self_ref = entry("自引机", Some("自引机"));
+            view.settings.servers = vec![self_ref.clone()];
+            view.welcome_visible = false;
+            view.edit_server(Some(&self_ref), window, cx);
+            // 弹窗应含「跳板」行且预填当前引用
+            let jump_field = view
+                .server_fields
+                .iter()
+                .find(|(name, _)| name == "跳板")
+                .expect("编辑弹窗必须有「跳板」字段");
+            assert_eq!(jump_field.1.read(cx).value(), "自引机");
+            view.save_server(Some("自引机".into()), cx);
+            assert!(
+                view.server_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("自身设为跳板")),
+                "应报自引错误: {:?}",
+                view.server_error
+            );
+            assert_eq!(
+                view.settings.servers,
+                vec![self_ref],
+                "校验失败不得改动配置表（不落盘）"
+            );
+            assert!(view.server_save.is_none(), "同步早退不应进入后台保存");
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    /// 双节点环（A→B→A）在保存 B 时被 preview 全表解析拦下，报环链路且不落盘。
+    #[gpui::test]
+    fn save_rejects_jump_cycle_with_chain_in_error(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            let a = entry("A", Some("B"));
+            let b = entry("B", None);
+            view.settings.servers = vec![a, b.clone()];
+            view.edit_server(Some(&b), window, cx);
+            fill_field(view, "跳板", "A", window, cx);
+            view.save_server(Some("B".into()), cx);
+            let error = view.server_error.clone().expect("环必须报错");
+            assert!(error.contains("环"), "{error}");
+            assert!(error.contains("B→A→B"), "{error}");
+            assert_eq!(view.settings.servers.len(), 2, "不落盘");
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    /// 删除被引用跳板被阻断：提示引用方清单，条目保留（宁报错不断链）。
+    #[gpui::test]
+    fn delete_blocks_bastion_still_referenced_by_others(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, _window, cx| {
+            let bastion = entry("堡垒机", None);
+            let user = entry("内网机", Some("堡垒机"));
+            view.settings.servers = vec![bastion, user];
+            // 第一次点击进入确认态，第二次点击触发阻断
+            view.delete_server("堡垒机", cx);
+            assert_eq!(view.server_delete_confirm.as_deref(), Some("堡垒机"));
+            view.delete_server("堡垒机", cx);
+            let error = view.server_error.clone().expect("被引用必须阻断");
+            assert!(error.contains("堡垒机"), "{error}");
+            assert!(error.contains("内网机"), "应列出引用方: {error}");
+            assert!(error.contains("先解除引用"), "{error}");
+            assert!(
+                view.settings
+                    .servers
+                    .iter()
+                    .any(|item| item.name == "堡垒机"),
+                "被引用条目必须保留"
+            );
+            assert_eq!(view.server_delete_confirm, None, "阻断后退出确认态");
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    /// 改名跳板机：所有指向旧名的引用改写为新名，无关引用不动，
+    /// 改名条目自身的 jump 原样保留；改写后全表链路可解析。
+    #[test]
+    fn rename_rewrites_jump_refs_and_keeps_own_chain() {
+        let mut settings = Settings {
+            servers: vec![
+                entry("引用方", Some("旧名")),
+                entry("旁人", Some("别人")),
+                entry("上游", None),
+                {
+                    let mut old = entry("旧名", Some("上游"));
+                    old.host = "bastion.example.com".into();
+                    old
+                },
+            ],
+            ..Default::default()
+        };
+        let mut renamed = entry("旧名", Some("上游"));
+        renamed.name = "新名".into();
+        renamed.host = "bastion.example.com".into();
+        apply_server_save(&mut settings, Some("旧名"), renamed).expect("保存应成功");
+        assert_eq!(settings.servers.len(), 4, "改名不增删条目");
+        assert_eq!(
+            settings
+                .servers
+                .iter()
+                .find(|item| item.name == "引用方")
+                .unwrap()
+                .jump
+                .as_deref(),
+            Some("新名"),
+            "指向旧名的引用必须改写"
+        );
+        assert_eq!(
+            settings
+                .servers
+                .iter()
+                .find(|item| item.name == "旁人")
+                .unwrap()
+                .jump
+                .as_deref(),
+            Some("别人"),
+            "无关引用不动"
+        );
+        assert_eq!(
+            settings
+                .servers
+                .iter()
+                .find(|item| item.name == "新名")
+                .unwrap()
+                .jump
+                .as_deref(),
+            Some("上游"),
+            "改名条目自身的跳板链保留"
+        );
+        let chain = laterterm_config::resolve_jump_chain(&settings.servers, "引用方").unwrap();
+        let names: Vec<&str> = chain.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, vec!["上游", "新名"], "改写后链路必须可解析");
+    }
+
+    /// 导入含悬空 jump 的条目：条目保留、jump 被清空，且计入回报。
+    #[test]
+    fn import_clears_dangling_jump_but_keeps_entry() {
+        let mut existing = vec![entry("老机", None)];
+        let incoming = vec![
+            {
+                let mut dangling = entry("悬空机", Some("幽灵"));
+                dangling.host = "10.0.0.9".into();
+                dangling
+            },
+            {
+                let mut good = entry("正常机", Some("老机"));
+                good.host = "10.0.0.10".into();
+                good
+            },
+        ];
+        let (added, skipped_dup, skipped_bad, cleared) =
+            merge_entries_into(&mut existing, incoming);
+        assert_eq!((added, skipped_dup, skipped_bad), (2, 0, 0));
+        assert_eq!(cleared, vec!["悬空机".to_string()]);
+        assert_eq!(existing.len(), 3, "宁断链不丢条目");
+        assert_eq!(
+            existing
+                .iter()
+                .find(|item| item.name == "悬空机")
+                .unwrap()
+                .jump,
+            None,
+            "悬空引用必须被清空"
+        );
+        assert_eq!(
+            existing
+                .iter()
+                .find(|item| item.name == "正常机")
+                .unwrap()
+                .jump
+                .as_deref(),
+            Some("老机"),
+            "有效引用不动"
+        );
+        // 清理后全表可解析
+        assert!(laterterm_config::resolve_jump_chain(&existing, "正常机").is_ok());
     }
 }

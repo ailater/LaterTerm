@@ -1,24 +1,18 @@
-//! 配置导入转换层（M3）：XShell / deepin-terminal → LaterTerm 模型。
+//! 配置导入转换层（M3）：Xshell 会话 → LaterTerm 模型。
 //!
-//! 纯函数、无 I/O——解析（laterterm-xshell / laterterm-deepin）与
-//! 落盘（laterterm-config）分居两端，本模块只做字段映射与安全过滤。
+//! 纯函数、无 I/O——解析（laterterm-xshell）与落盘（laterterm-config）分居两端，
+//! 本模块只做字段映射与安全过滤。
 //!
 //! 安全口径：
 //! - XShell 密码不迁移（私有加密不可解，见 laterterm-xshell 文档）
 //! - 编码只认 UTF-8 / GBK / GB18030 三个已知值，未知→None（默认 UTF-8）
 //! - 服务器名冲突由调用方 upsert 语义覆盖
+//!
+//! deepin-terminal 的解析与转换已并入 `laterterm_config::importers`
+//! （宽容口径 + QSettings unescape + 分组字段），本文件不再保留严格版镜像实现。
 
-// UI 面板接线在下一提交——本模块是纯函数转换层，先行落地并全量测试
-#![allow(dead_code)]
-
-use laterterm_config::commands::CommandTemplate;
-use laterterm_config::servers::{
-    StoredAuthKind as ServerAuthKind, StoredServerEntry as ServerEntry,
-};
-use laterterm_deepin::{DeepinCommand, DeepinServer};
+use laterterm_config::servers::{ServerAuthKind, ServerEntry};
 use laterterm_xshell::XshellSession;
-
-// ───────────────────────── XShell → ServerEntry ─────────────────────────
 
 /// XShell 会话 → LaterTerm 服务器条目。非 SSH 协议（TELNET/SERIAL…）跳过。
 pub fn xshell_to_server(session: &XshellSession) -> Option<ServerEntry> {
@@ -35,15 +29,16 @@ pub fn xshell_to_server(session: &XshellSession) -> Option<ServerEntry> {
         host,
         port: session.port.unwrap_or(22),
         username,
-        auth: match session.auth_method {
-            laterterm_xshell::XshellAuthMethod::PublicKey => {
-                // XShell 的 UserKey 是密钥名（非路径），LaterTerm 要路径——
-                // 无法自动映射，回落 agent（用户后续在编辑里改）
-                ServerAuthKind::Agent
-            }
-            _ => ServerAuthKind::Agent,
-        },
+        // XShell 的 UserKey 是密钥名（非路径），LaterTerm 要路径——无法自动映射；
+        // 密码绑定原机器加密不可迁移。统一回落 agent，用户在编辑弹窗里改。
+        auth: ServerAuthKind::Agent,
+        key_path: None,
+        note: String::new(),
+        // 目录树分组（如「生产/入口层」）整串保留，进结构化分组字段
+        group: session.group.clone(),
+        shortcut: None,
         encoding: normalize_encoding(session.encoding.as_deref()),
+        jump: None,
     })
 }
 
@@ -77,69 +72,6 @@ pub fn xshell_batch(sessions: &[XshellSession]) -> (Vec<ServerEntry>, Vec<(Strin
     }
     (servers, skipped)
 }
-
-// ─────────────────────── deepin → ServerEntry ───────────────────────────
-
-/// deepin-terminal 服务器 → LaterTerm 服务器条目。
-pub fn deepin_to_server(server: &DeepinServer) -> Option<ServerEntry> {
-    if server.address.is_empty() || server.username.is_empty() {
-        return None;
-    }
-    Some(ServerEntry {
-        name: if server.name.is_empty() {
-            server.address.clone()
-        } else {
-            server.name.clone()
-        },
-        host: server.address.clone(),
-        port: server.port,
-        username: server.username.clone(),
-        auth: match &server.private_key {
-            Some(path) if !path.is_empty() => ServerAuthKind::KeyFile(path.clone()),
-            _ => ServerAuthKind::Keyring, // 密码默认走密钥环（deepin 密码不入配置文件）
-        },
-        encoding: normalize_encoding(server.encoding.as_deref()),
-    })
-}
-
-/// deepin 配置文件不存密码（在 dde 密钥环里），导入后用户在编辑表单重填。
-pub fn deepin_needs_password(server: &DeepinServer) -> bool {
-    server.private_key.as_deref().unwrap_or("").is_empty()
-}
-
-/// 批量转换。
-pub fn deepin_servers_batch(servers: &[DeepinServer]) -> (Vec<ServerEntry>, Vec<(String, String)>) {
-    let mut out = Vec::new();
-    let mut skipped = Vec::new();
-    for server in servers {
-        match deepin_to_server(server) {
-            Some(entry) => out.push(entry),
-            None => skipped.push((server.name.clone(), "缺地址或用户名".into())),
-        }
-    }
-    (out, skipped)
-}
-
-// ─────────────────── deepin → CommandTemplate ───────────────────────────
-
-/// deepin 命令模板 → LaterTerm 命令模板（直映射，模板体不做变量化——
-/// deepin 没有 `{{var}}` 语法，原样迁移）。
-pub fn deepin_to_command(command: &DeepinCommand) -> CommandTemplate {
-    CommandTemplate {
-        name: command.name.clone(),
-        template: command.command.clone(),
-        shortcut: command.shortcut.clone(),
-        confirm: false,
-    }
-}
-
-/// deepin 快捷键格式（`Ctrl+Shift+G`）与 LaterTerm 相同，原样透传；
-/// 空的快捷键映射为 None。
-pub fn deepin_commands_batch(commands: &[DeepinCommand]) -> Vec<CommandTemplate> {
-    commands.iter().map(deepin_to_command).collect()
-}
-
-// ───────────────────────────── 工具函数 ────────────────────────────────
 
 /// 编码归一化：只认 UTF-8/GBK/GB18030（大小写不敏感），未知返回 None。
 pub fn normalize_encoding(raw: Option<&str>) -> Option<String> {
@@ -182,6 +114,8 @@ mod tests {
         assert_eq!(entry.auth, ServerAuthKind::Agent);
         // UTF-8 是默认，编码不显式存
         assert_eq!(entry.encoding, None);
+        // 目录树分组整串进结构化字段
+        assert_eq!(entry.group.as_deref(), Some("生产/入口层"));
     }
 
     #[test]
@@ -211,59 +145,6 @@ mod tests {
         let mut no_host = xshell_ssh();
         no_host.host = None;
         assert!(xshell_to_server(&no_host).is_none());
-    }
-
-    fn deepin_server() -> DeepinServer {
-        DeepinServer {
-            name: "跳板机".into(),
-            group: Some("生产".into()),
-            username: "ops".into(),
-            address: "10.0.0.1".into(),
-            port: 22,
-            encoding: Some("GBK".into()),
-            post_command: None,
-            start_path: None,
-            private_key: None,
-            backspace: None,
-            delete: None,
-        }
-    }
-
-    #[test]
-    fn deepin_server_maps_with_password_auth() {
-        let entry = deepin_to_server(&deepin_server()).expect("映射");
-        assert_eq!(entry.name, "跳板机");
-        assert_eq!(entry.host, "10.0.0.1");
-        assert_eq!(entry.port, 22);
-        assert_eq!(entry.auth, ServerAuthKind::Keyring);
-        assert_eq!(entry.encoding.as_deref(), Some("GBK"));
-        // 密码不在配置文件里，导入后需手动填
-        assert!(deepin_needs_password(&deepin_server()));
-    }
-
-    #[test]
-    fn deepin_keyfile_auth_maps_directly() {
-        let mut server = deepin_server();
-        server.private_key = Some("/home/me/.ssh/id_ed25519".into());
-        let entry = deepin_to_server(&server).expect("映射");
-        assert_eq!(
-            entry.auth,
-            ServerAuthKind::KeyFile("/home/me/.ssh/id_ed25519".into())
-        );
-    }
-
-    #[test]
-    fn deepin_command_direct_mapping() {
-        let command = DeepinCommand {
-            name: "更新系统".into(),
-            command: "sudo apt update".into(),
-            shortcut: Some("Ctrl+Shift+G".into()),
-        };
-        let template = deepin_to_command(&command);
-        assert_eq!(template.name, "更新系统");
-        assert_eq!(template.template, "sudo apt update");
-        assert_eq!(template.shortcut.as_deref(), Some("Ctrl+Shift+G"));
-        assert!(!template.confirm, "deepin 命令无确认语义，默认不确认");
     }
 
     #[test]

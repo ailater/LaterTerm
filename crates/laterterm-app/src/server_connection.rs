@@ -50,8 +50,13 @@ pub(crate) enum ConnectionOutcome {
 }
 
 /// 阻塞入口，仅允许后台线程调用；成功连接后才记住本次输入的凭据。
+///
+/// `jump_entries` 是 UI 侧用 `resolve_jump_chain` 预先解析好的跳板条目快照
+/// （由外到内），与目标机 `entry` 同进同出：补输凭据重试路径必须原样带回，
+/// 否则重连会退化成直连。
 pub(crate) fn connect(
     entry: &ServerEntry,
+    jump_entries: Vec<ServerEntry>,
     supplied: Option<(CredentialKind, String)>,
     remember: bool,
     store: Arc<dyn SecretStore>,
@@ -59,12 +64,13 @@ pub(crate) fn connect(
 ) -> Result<ConnectionOutcome> {
     connect_with(
         entry,
+        jump_entries,
         supplied,
         remember,
         store,
         active,
         prepare_private_key,
-        |auth| {
+        |auth, hops| {
             let auth = match auth {
                 AuthMethod::Agent => SshAuth::Agent,
                 AuthMethod::Password { password } => SshAuth::Password(password),
@@ -78,29 +84,12 @@ pub(crate) fn connect(
                 },
                 AuthMethod::PreparedPrivateKey { keys } => SshAuth::PreparedPrivateKey { keys },
             };
-            let primary = laterterm_config::app_config_dir()
-                .map(|dir| dir.join("known_hosts"))
-                .ok_or_else(|| anyhow::anyhow!("无法确定 known_hosts 路径"))?;
-            let mut fallback_paths = Vec::new();
-            if let Some(home) = std::env::home_dir() {
-                for path in [
-                    home.join(".config/laterterm/known_hosts"),
-                    home.join(".ssh/known_hosts"),
-                ] {
-                    if path != primary && !fallback_paths.contains(&path) {
-                        fallback_paths.push(path);
-                    }
-                }
-            }
             let endpoint = SshEndpoint {
                 host: entry.host.clone(),
                 port: Some(entry.port),
                 username: entry.username.clone(),
                 auth,
-                host_key_policy: HostKeyPolicy::KnownHostsWithFallback {
-                    path: primary,
-                    fallback_paths,
-                },
+                host_key_policy: known_hosts_policy()?,
                 encoding: match entry.encoding.as_deref() {
                     Some("gbk") => SessionEncoding::Gbk,
                     Some("gb18030") => SessionEncoding::Gb18030,
@@ -109,13 +98,35 @@ pub(crate) fn connect(
             };
             let options = SshOptions {
                 endpoint,
-                jump: None,
+                jump: hops,
                 cols: 110,
                 rows: 30,
             };
             Ok(Arc::new(SshSession::spawn(options)?) as Arc<dyn TerminalSession>)
         },
     )
+}
+
+/// 目标机与每跳共用的 known_hosts 校验策略（应用目录为主、系统既有路径兜底）。
+fn known_hosts_policy() -> Result<HostKeyPolicy> {
+    let primary = laterterm_config::app_config_dir()
+        .map(|dir| dir.join("known_hosts"))
+        .ok_or_else(|| anyhow::anyhow!("无法确定 known_hosts 路径"))?;
+    let mut fallback_paths = Vec::new();
+    if let Some(home) = std::env::home_dir() {
+        for path in [
+            home.join(".config/laterterm/known_hosts"),
+            home.join(".ssh/known_hosts"),
+        ] {
+            if path != primary && !fallback_paths.contains(&path) {
+                fallback_paths.push(path);
+            }
+        }
+    }
+    Ok(HostKeyPolicy::KnownHostsWithFallback {
+        path: primary,
+        fallback_paths,
+    })
 }
 
 fn get_secret(store: &Arc<dyn SecretStore>, account: String) -> Result<Option<String>> {
@@ -131,8 +142,14 @@ fn prompt(kind: CredentialKind, warning: Option<&str>) -> ConnectionOutcome {
 }
 
 /// 注入准备器和连接器使测试不读取真实私钥、不访问网络。
+///
+/// 跳板凭据在这里解析成 `SshEndpoint` 列表交给 establish；缺失即硬错误
+/// （v1 刻意不做 per-hop 补输：跳板本身是面板条目，凭据经其自身
+/// 连接/编辑入库即可，避免 Prompt 状态机叠加 per-hop 归属的复杂度）。
+#[allow(clippy::too_many_arguments)]
 fn connect_with<P, C>(
     entry: &ServerEntry,
+    jump_entries: Vec<ServerEntry>,
     supplied: Option<(CredentialKind, String)>,
     remember: bool,
     store: Arc<dyn SecretStore>,
@@ -142,7 +159,7 @@ fn connect_with<P, C>(
 ) -> Result<ConnectionOutcome>
 where
     P: Fn(Option<&Path>, Option<&str>) -> std::io::Result<AuthMethod>,
-    C: FnOnce(AuthMethod) -> Result<Arc<dyn TerminalSession>>,
+    C: FnOnce(AuthMethod, Vec<SshEndpoint>) -> Result<Arc<dyn TerminalSession>>,
 {
     anyhow::ensure!(active.load(Ordering::Acquire), "连接已取消");
     let mut to_remember = None;
@@ -220,7 +237,13 @@ where
         },
     };
     anyhow::ensure!(active.load(Ordering::Acquire), "连接已取消");
-    let session = establish(auth)?;
+    // 跳板链认证快照：每跳按其条目的认证方式解析；顺序保持由外到内
+    let mut hops = Vec::with_capacity(jump_entries.len());
+    for hop in &jump_entries {
+        anyhow::ensure!(active.load(Ordering::Acquire), "连接已取消");
+        hops.push(hop_endpoint(hop, &store, &prepare)?);
+    }
+    let session = establish(auth, hops)?;
     if !active.load(Ordering::Acquire) {
         session.kill();
         bail!("连接已取消");
@@ -258,6 +281,93 @@ fn login_auth(kind: ServerAuthKind, secret: &str) -> AuthMethod {
             password: secret.into(),
         }
     }
+}
+
+/// 跳板机单跳认证：按该跳条目的认证方式读取密钥环已保存凭据。
+///
+/// 与目标机同序（Agent 直通；PrivateKey 走 key_path + ssh-passphrase 密钥环
+/// 口令，兼容旧登录槽；Password/KeyboardInteractive 读 ssh/<名>，回退旧
+/// laterterm-server-<名> 槽位），但**缺凭据返回硬错误**而非 Prompt。
+fn hop_auth<P>(entry: &ServerEntry, store: &Arc<dyn SecretStore>, prepare: &P) -> Result<SshAuth>
+where
+    P: Fn(Option<&Path>, Option<&str>) -> std::io::Result<AuthMethod>,
+{
+    match entry.auth {
+        ServerAuthKind::Agent => Ok(SshAuth::Agent),
+        ServerAuthKind::PrivateKey => {
+            let path = entry
+                .key_path
+                .as_deref()
+                .filter(|path| !path.is_empty())
+                .map(Path::new);
+            // 口令先读 ssh-passphrase 槽，再按旧条目语义回退登录槽（遗留解密口令）
+            let mut passphrase = get_secret(store, ssh_passphrase_account(&entry.name)?)?
+                .filter(|secret| !secret.is_empty());
+            if passphrase.is_none() {
+                passphrase = get_secret(store, ssh_account(&entry.name)?)?
+                    .filter(|secret| !secret.is_empty());
+            }
+            match prepare(path, passphrase.as_deref())
+                .map_err(|error| anyhow::anyhow!("跳板机「{}」私钥不可用: {error}", entry.name))?
+            {
+                AuthMethod::PrivateKey {
+                    key_path,
+                    passphrase,
+                } => Ok(SshAuth::KeyFile {
+                    path: key_path,
+                    passphrase,
+                }),
+                AuthMethod::PreparedPrivateKey { keys } => Ok(SshAuth::PreparedPrivateKey { keys }),
+                AuthMethod::Agent => Ok(SshAuth::Agent),
+                AuthMethod::Password { password } => Ok(SshAuth::Password(password)),
+                AuthMethod::KeyboardInteractive { secret } => {
+                    Ok(SshAuth::KeyboardInteractive(secret))
+                }
+            }
+        }
+        ServerAuthKind::Password | ServerAuthKind::KeyboardInteractive => {
+            let legacy_account = laterterm_config::servers::password_account(&entry.name);
+            let secret = get_secret(store, ssh_account(&entry.name)?)?
+                .filter(|secret| !secret.is_empty())
+                .or_else(|| {
+                    get_secret(store, legacy_account)
+                        .ok()
+                        .flatten()
+                        .filter(|secret| !secret.is_empty())
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "跳板机「{}」缺少已保存凭据，请先在服务器列表连接或编辑它保存凭据",
+                        entry.name
+                    )
+                })?;
+            Ok(if entry.auth == ServerAuthKind::KeyboardInteractive {
+                SshAuth::KeyboardInteractive(secret)
+            } else {
+                SshAuth::Password(secret)
+            })
+        }
+    }
+}
+
+/// 组装跳板端点：认证解析硬错误；known_hosts 策略与目标机一致；编码固定
+/// UTF-8（`SshEndpoint.encoding` 仅目标机生效，跳板只承载加密隧道）。
+fn hop_endpoint<P>(
+    entry: &ServerEntry,
+    store: &Arc<dyn SecretStore>,
+    prepare: &P,
+) -> Result<SshEndpoint>
+where
+    P: Fn(Option<&Path>, Option<&str>) -> std::io::Result<AuthMethod>,
+{
+    Ok(SshEndpoint {
+        host: entry.host.clone(),
+        port: Some(entry.port),
+        username: entry.username.clone(),
+        auth: hop_auth(entry, store, prepare)?,
+        host_key_policy: known_hosts_policy()?,
+        encoding: SessionEncoding::Utf8,
+    })
 }
 
 fn passphrase_required(error: &std::io::Error) -> Option<PathBuf> {
@@ -579,12 +689,13 @@ mod tests {
         store.fail.store(true, Ordering::SeqCst);
         let outcome = connect_with(
             &entry(ServerAuthKind::Agent),
+            Vec::new(),
             None,
             true,
             store.clone(),
             active(),
             |_, _| panic!("Agent 不读取私钥"),
-            |auth| {
+            |auth, _hops| {
                 assert!(matches!(auth, AuthMethod::Agent));
                 Ok(Arc::new(Session::default()))
             },
@@ -592,6 +703,107 @@ mod tests {
         .unwrap();
         assert!(matches!(outcome, ConnectionOutcome::Connected { .. }));
         assert!(store.calls.lock().unwrap().is_empty());
+    }
+
+    /// 跳板机凭据 v1 只认密钥环已保存值：缺失即硬错误（不是 Prompt），
+    /// 错误文案必须点名是哪台跳板，且不发起连接。
+    #[test]
+    fn jump_hop_missing_credentials_is_hard_error_naming_the_bastion() {
+        let store = Arc::new(MemoryStore::default());
+        let mut bastion = entry(ServerAuthKind::Password);
+        bastion.name = "堡垒机".into();
+        bastion.host = "bastion.test".into();
+        bastion.key_path = None;
+        // 目标机凭据齐备（走 supplied 登录密码），只有跳板缺凭据
+        let error = connect_with(
+            &entry(ServerAuthKind::Password),
+            vec![bastion],
+            Some((CredentialKind::Login, "secret".into())),
+            false,
+            store,
+            active(),
+            |_, _| panic!("不读私钥"),
+            |_, _| panic!("缺凭据时不连接"),
+        )
+        .err()
+        .expect("跳板缺凭据必须硬错误");
+        let message = error.to_string();
+        assert!(message.contains("堡垒机"), "{message}");
+        assert!(message.contains("缺少已保存凭据"), "{message}");
+    }
+
+    /// 跳板凭据齐备时按链组装端点：顺序保持由外到内，编码固定 UTF-8，
+    /// 主机/端口/用户名取自跳板条目。
+    #[test]
+    fn jump_hops_assemble_endpoints_outer_to_inner() {
+        let store = Arc::new(MemoryStore::default());
+        store
+            .values
+            .lock()
+            .unwrap()
+            .insert(ssh_account("堡垒机").unwrap(), "hop-secret".into());
+        let outer = ServerEntry {
+            name: "堡垒机".into(),
+            host: "outer.test".into(),
+            port: 2222,
+            username: "ops".into(),
+            ..entry(ServerAuthKind::Password)
+        };
+        let inner = ServerEntry {
+            name: "内层".into(),
+            host: "inner.test".into(),
+            port: 2200,
+            username: "root".into(),
+            auth: ServerAuthKind::KeyboardInteractive,
+            key_path: None,
+            ..Default::default()
+        };
+        store
+            .values
+            .lock()
+            .unwrap()
+            .insert(ssh_account("内层").unwrap(), "inner-secret".into());
+        let result = connect_with(
+            &entry(ServerAuthKind::Password),
+            vec![outer, inner],
+            Some((CredentialKind::Login, "secret".into())),
+            false,
+            store,
+            active(),
+            |_, _| panic!("不读私钥"),
+            |_, hops| {
+                assert_eq!(hops.len(), 2);
+                assert_eq!(
+                    (
+                        hops[0].host.as_str(),
+                        hops[0].port,
+                        hops[0].username.as_str()
+                    ),
+                    ("outer.test", Some(2222), "ops")
+                );
+                assert!(
+                    matches!(&hops[0].auth, SshAuth::Password(secret) if secret == "hop-secret")
+                );
+                assert_eq!(
+                    (
+                        hops[1].host.as_str(),
+                        hops[1].port,
+                        hops[1].username.as_str()
+                    ),
+                    ("inner.test", Some(2200), "root")
+                );
+                assert!(matches!(
+                    &hops[1].auth,
+                    SshAuth::KeyboardInteractive(secret) if secret == "inner-secret"
+                ));
+                for hop in &hops {
+                    assert_eq!(hop.encoding, SessionEncoding::Utf8, "跳板编码固定 UTF-8");
+                }
+                Ok(Arc::new(Session::default()))
+            },
+        )
+        .unwrap();
+        assert!(matches!(result, ConnectionOutcome::Connected { .. }));
     }
 
     #[test]
@@ -605,12 +817,13 @@ mod tests {
             .insert(old.clone(), "old-login".into());
         connect_with(
             &entry(ServerAuthKind::Password),
+            Vec::new(),
             None,
             true,
             store.clone(),
             active(),
             |_, _| panic!("不读取私钥"),
-            |auth| {
+            |auth, _hops| {
                 assert!(
                     matches!(auth, AuthMethod::Password { password } if password == "old-login")
                 );
@@ -629,12 +842,13 @@ mod tests {
         store.calls.lock().unwrap().clear();
         let outcome = connect_with(
             &entry(ServerAuthKind::PrivateKey),
+            Vec::new(),
             None,
             false,
             store.clone(),
             active(),
             |path, password| encrypted(path.unwrap(), password),
-            |_| panic!("必须询问私钥口令"),
+            |_, _| panic!("必须询问私钥口令"),
         )
         .unwrap();
         assert!(matches!(
@@ -654,12 +868,13 @@ mod tests {
             store.fail.store(failure, Ordering::SeqCst);
             let outcome = connect_with(
                 &entry(ServerAuthKind::Password),
+                Vec::new(),
                 None,
                 false,
                 store,
                 active(),
                 |_, _| panic!("不读私钥"),
-                |_| panic!("不连接"),
+                |_, _| panic!("不连接"),
             )
             .unwrap();
             let ConnectionOutcome::Prompt { kind, warning } = outcome else {
@@ -676,6 +891,7 @@ mod tests {
         let store = Arc::new(MemoryStore::default());
         let result = connect_with(
             &entry(ServerAuthKind::PrivateKey),
+            Vec::new(),
             None,
             false,
             store.clone(),
@@ -685,7 +901,7 @@ mod tests {
                 assert!(pass.is_none());
                 Ok(prepared())
             },
-            |_| Ok(Arc::new(Session::default())),
+            |_, _| Ok(Arc::new(Session::default())),
         )
         .unwrap();
         assert!(matches!(result, ConnectionOutcome::Connected { .. }));
@@ -701,12 +917,13 @@ mod tests {
         store.calls.lock().unwrap().clear();
         let result = connect_with(
             &entry(ServerAuthKind::PrivateKey),
+            Vec::new(),
             None,
             false,
             store.clone(),
             active(),
             |path, pass| encrypted(path.unwrap(), pass),
-            |_| Ok(Arc::new(Session::default())),
+            |_, _| Ok(Arc::new(Session::default())),
         )
         .unwrap();
         assert!(matches!(result, ConnectionOutcome::Connected { .. }));
@@ -720,12 +937,13 @@ mod tests {
         store.calls.lock().unwrap().clear();
         let result = connect_with(
             &entry(ServerAuthKind::Password),
+            Vec::new(),
             Some((CredentialKind::Login, String::new())),
             false,
             store.clone(),
             active(),
             |_, pass| encrypted(Path::new("/selected/default"), pass),
-            |_| panic!("无口令不连接"),
+            |_, _| panic!("无口令不连接"),
         )
         .unwrap();
         let ConnectionOutcome::Prompt { kind, .. } = result else {
@@ -756,6 +974,7 @@ mod tests {
         ));
         let result = connect_with(
             &entry(ServerAuthKind::Password),
+            Vec::new(),
             supplied.clone(),
             true,
             store.clone(),
@@ -764,18 +983,19 @@ mod tests {
                 assert_eq!(path, Some(Path::new("/prompt/key")));
                 encrypted(path.unwrap(), pass)
             },
-            |_| Err(anyhow::anyhow!("server rejected")),
+            |_, _| Err(anyhow::anyhow!("server rejected")),
         );
         assert!(result.is_err());
         assert!(store.calls.lock().unwrap().is_empty());
         connect_with(
             &entry(ServerAuthKind::Password),
+            Vec::new(),
             supplied,
             true,
             store.clone(),
             active(),
             |path, pass| encrypted(path.unwrap(), pass),
-            |_| Ok(Arc::new(Session::default())),
+            |_, _| Ok(Arc::new(Session::default())),
         )
         .unwrap();
         assert_eq!(
@@ -793,6 +1013,7 @@ mod tests {
         let store = Arc::new(MemoryStore::default());
         let result = connect_with(
             &entry(ServerAuthKind::PrivateKey),
+            Vec::new(),
             Some((
                 CredentialKind::PrivateKey {
                     key_path: "/prompt/key".into(),
@@ -804,7 +1025,7 @@ mod tests {
             store.clone(),
             active(),
             |path, pass| encrypted(path.unwrap(), pass),
-            |_| panic!("不连接"),
+            |_, _| panic!("不连接"),
         )
         .unwrap();
         assert!(matches!(
@@ -820,12 +1041,13 @@ mod tests {
         ] {
             connect_with(
                 &entry(auth),
+                Vec::new(),
                 Some((CredentialKind::Login, "  ".into())),
                 false,
                 store.clone(),
                 active(),
                 |_, _| panic!("空白不是空串"),
-                |auth| {
+                |auth, _hops| {
                     match auth {
                         AuthMethod::Password { password } => assert_eq!(password, "  "),
                         AuthMethod::KeyboardInteractive { secret } => assert_eq!(secret, "  "),
@@ -845,12 +1067,13 @@ mod tests {
         let flag = active();
         let result = connect_with(
             &entry(ServerAuthKind::Password),
+            Vec::new(),
             Some((CredentialKind::Login, "secret".into())),
             true,
             store.clone(),
             flag.clone(),
             |_, _| unreachable!(),
-            |_| {
+            |_, _| {
                 flag.store(false, Ordering::SeqCst);
                 Ok(session.clone())
             },
@@ -866,12 +1089,13 @@ mod tests {
         store.fail.store(true, Ordering::SeqCst);
         let result = connect_with(
             &entry(ServerAuthKind::Password),
+            Vec::new(),
             Some((CredentialKind::Login, "secret".into())),
             true,
             store,
             active(),
             |_, _| unreachable!(),
-            |_| Ok(Arc::new(Session::default())),
+            |_, _| Ok(Arc::new(Session::default())),
         )
         .unwrap();
         let ConnectionOutcome::Connected { warning, .. } = result else {
@@ -937,12 +1161,13 @@ mod tests {
         meta.key_path = None;
         let outcome = connect_with(
             &meta,
+            Vec::new(),
             None,
             false,
             store.clone(),
             active(),
             |path, pass| encrypted(path.unwrap(), pass),
-            |_| panic!("等待口令"),
+            |_, _| panic!("等待口令"),
         )
         .unwrap();
         let ConnectionOutcome::Prompt { kind, .. } = outcome else {
@@ -951,6 +1176,7 @@ mod tests {
         let calls = Mutex::new(Vec::new());
         connect_with(
             &meta,
+            Vec::new(),
             Some((kind, " correct ".into())),
             false,
             store,
@@ -963,7 +1189,7 @@ mod tests {
                 ));
                 Ok(prepared())
             },
-            |_| Ok(Arc::new(Session::default())),
+            |_, _| Ok(Arc::new(Session::default())),
         )
         .unwrap();
         assert_eq!(
@@ -979,6 +1205,7 @@ mod tests {
         meta.key_path = None;
         let first = connect_with(
             &meta,
+            Vec::new(),
             None,
             false,
             store.clone(),
@@ -991,7 +1218,7 @@ mod tests {
                     encrypted(path, pass)
                 }
             },
-            |_| panic!("等待解锁"),
+            |_, _| panic!("等待解锁"),
         )
         .unwrap();
         let ConnectionOutcome::Prompt { kind, .. } = first else {
@@ -1007,12 +1234,13 @@ mod tests {
         assert_eq!(context.prepared.len(), 1, "保留已加载的第一把钥匙");
         connect_with(
             &meta,
+            Vec::new(),
             Some((kind, " correct ".into())),
             false,
             store,
             active(),
             |path, pass| encrypted(path.unwrap(), pass),
-            |auth| {
+            |auth, _hops| {
                 let AuthMethod::PreparedPrivateKey { keys } = auth else {
                     panic!("预加载")
                 };
