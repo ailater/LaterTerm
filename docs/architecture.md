@@ -58,3 +58,24 @@ M0 骨架 ✅ → M1 交互完善（本阶段，主题热加载/设置已落地�
 落地形态（M4）：独立线程 `async_io::block_on` 跑注册+监听，触发经 flume 通道回
 主线程；与 LaterScreen 不同点：LaterTerm 的全局键默认只保留一个「呼出/隐藏主窗」
 （Quake），命令/服务器/动态码绑定仍为应用内——避免占用户全局键位引发冲突投诉。
+
+**Quake 落地差异（2026-11-06 实现时核对源码后的修正，代码在
+`crates/laterterm-app/src/quake.rs`）**：
+
+- **失焦收起走 `is_window_active()` 200ms 轮询**：gpui 的 `on_active_status_change`
+  回调是 `pub(crate)` 无公开订阅口（platform.rs/window.rs），轮询是唯一可行路径；
+  独立 200ms 循环，不并入 1s 的动态码 ticker（周期语义不同）。
+- **Wayland activate 可能被合成器拒绝**：gpui 的 xdg-activation token serial 取自
+  `SerialKind::MousePress`（wayland/window.rs:923），portal 热键触发时无用户手势
+  token，激活大概率被拒（vendor 源码自注）——表现为**呼出后不置顶**，窗口已 map、
+  用户点一下即可；portal `Activated.options` 虽有 activation_token 但 gpui 未暴露
+  消费口，不能自造（AGENTS.md 红线）。配套防线：状态机要求「shown 后观测到过
+  焦点（seen_focused）」才允许失焦收起，否则 activate 永拒 × 失焦自动收起 =
+  呼出即收起死循环；`ashpd` 锁 0.11 且 `default-features = false`（仅 async-std），
+  与 gpui 的声明对齐——若并集混入 default 的 tokio feature，zbus 5 会从 lock 现有
+  的纯 async-io flavor 变双 flavor，独立线程 `async_io::block_on` 失效。
+- **收起是最小化，不是 Guake 式 unmap**：gpui 公开层无 hide/unmap（仅
+  activate/minimize），任务栏保留图标；窗口 Quake 几何（全屏宽 × 50% 高、顶部
+  居中）只能创建时经 `WindowOptions.window_bounds` 给出，运行期无 `set_position`
+  公开口——**开关切换后几何在下一次启动生效**（X11 定位可靠，Wayland 忽略
+  origin 由合成器摆位）。无逐帧滑出动画。

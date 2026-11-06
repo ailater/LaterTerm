@@ -23,6 +23,14 @@ hmac = "0.13"
 sha1 = "0.11"
 sha2 = "0.11"
 keyring = "4.2"
+# Quake 全局热键走 xdg-desktop-portal GlobalShortcuts。必须 0.11 且关 default
+# （default = ["tokio"]）与 gpui 的声明（default-features=false + async-std）对齐，
+# 否则 feature 并集会把 zbus 拉成 tokio flavor，独立线程 async_io::block_on 失效；
+# 写 0.12 会与 gpui 的 0.11.1 并存双份（lock 里 0.12.3 系 keyring 生态传递引入）。
+ashpd = { version = "0.11", default-features = false, features = ["async-std"] }
+# 供 portal worker 独立线程 block_on 与 race/StreamExt（lock 已有 2.6.0，零新增）。
+async-io = "2"
+futures-lite = "2"
 base64 = "0.23"
 flate2 = "1"
 md5 = "0.8"

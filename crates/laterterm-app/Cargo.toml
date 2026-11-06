@@ -30,5 +30,12 @@ laterterm-xshell.workspace = true
 shellexpand = "3.1.2"
 laterterm-transfer.workspace = true
 
+# Quake 全局热键（portal worker）仅 Linux：ashpd feature 并集由 workspace 声明补齐
+# （default-features=false + async-std，与 gpui 一致），async-io 供独立线程 block_on。
+[target.'cfg(target_os = "linux")'.dependencies]
+ashpd.workspace = true
+async-io.workspace = true
+futures-lite.workspace = true
+
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }

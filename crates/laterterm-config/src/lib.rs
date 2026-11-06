@@ -331,6 +331,7 @@ impl Settings {
         let mut settings: Settings =
             toml::from_str(&raw).with_context(|| format!("解析设置失败: {}", path.display()))?;
         settings.appearance.sanitize();
+        settings.quake.sanitize();
         settings.sanitize_totp();
         settings.sanitize_servers();
         Ok(settings)
@@ -675,6 +676,32 @@ shortcut = "  legacy shortcut  "
         // 手改坏值：serde(other) 兜底为 Block，整份配置不解析失败
         let patched: Settings = toml::from_str("[appearance]\ncursor_style = \"wave\"\n").unwrap();
         assert_eq!(patched.appearance.cursor_style, CursorStyle::Block);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn quake_defaults_roundtrip_and_unknown_fields_tolerated() {
+        // 旧文件缺 [quake] 段 → Quake 惯例默认：未启用、失焦自动收起
+        let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert!(!legacy.quake.enabled);
+        assert!(legacy.quake.auto_hide_on_blur);
+
+        // 显式 false 值保存/加载相等（不会被默认值覆盖）
+        let path = temp_settings_path("quake");
+        let mut settings = Settings::default();
+        settings.quake.enabled = true;
+        settings.quake.auto_hide_on_blur = false;
+        settings.save_to(&path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("[quake]"), "{body}");
+        assert!(body.contains("auto_hide_on_blur = false"), "{body}");
+        assert_eq!(Settings::load(&path).unwrap(), settings);
+
+        // [quake] 内出现未知字段（未来版本新增）不破坏整份文件解析
+        let forward: Settings =
+            toml::from_str("[quake]\nenabled = true\nfuture_field = 42\n").unwrap();
+        assert!(forward.quake.enabled);
+        assert!(forward.quake.auto_hide_on_blur);
         std::fs::remove_file(&path).unwrap();
     }
 

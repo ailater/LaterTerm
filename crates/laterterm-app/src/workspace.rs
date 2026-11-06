@@ -1,6 +1,7 @@
 use crate::branding::titlebar_logo;
 use crate::command_text_field::{CommandTextChanged, CommandTextField, FieldSubmit};
 use crate::pane_navigation::{Direction as PaneDirection, PaneRect, neighbor};
+use crate::quake::{QuakeAction, QuakeInput, QuakePortalEvent, QuakePortalStatus};
 use crate::server_connection::{self, ConnectionOutcome, CredentialKind, SftpOutcome};
 use crate::sftp_panel::{
     self, PaneSide, SftpEvent, SftpPanelState, SftpPromptKind, SftpTransfer, TransferKind,
@@ -744,6 +745,19 @@ pub struct WorkspaceView {
     /// 待生效的焦点请求：异步上下文拿不到 window，先记下 handle，render 期统一 focus。
     pending_focus: Option<FocusHandle>,
     secret_store: Arc<dyn SecretStore>,
+    /// 主窗口句柄：Quake 泵/失焦轮询在实体更新之外用它驱动窗口动作
+    /// （activate/minimize 需要 &mut Window，不能嵌套在窗口自身的更新里）。
+    window_handle: gpui::AnyWindowHandle,
+    /// Quake 呼出/收起状态机（纯逻辑，见 quake.rs）。
+    quake: crate::quake::QuakeMachine,
+    /// portal worker 事件 → 泵。
+    quake_tx: flume::Sender<QuakePortalEvent>,
+    quake_rx: flume::Receiver<QuakePortalEvent>,
+    /// 设置面板状态行（portal 授权/绑定/降级）。
+    quake_status: QuakePortalStatus,
+    /// portal worker 停止句柄；None = 未启动/已停止（仅 Linux 编译）。
+    #[cfg(target_os = "linux")]
+    quake_worker: Option<crate::quake::QuakeWorkerHandle>,
 }
 
 impl WorkspaceView {
@@ -761,6 +775,8 @@ impl WorkspaceView {
         let (shortcut_tx, shortcut_rx) = flume::unbounded();
         let (broadcast_tx, broadcast_rx) = flume::unbounded();
         let (sftp_events_tx, sftp_events_rx) = flume::unbounded();
+        let (quake_tx, quake_rx) = flume::unbounded();
+        let quake_machine = crate::quake::QuakeMachine::new(settings.quake.auto_hide_on_blur);
         let first_pane = PaneId(1);
         let first_tab = TabId(1);
         let theme = themes.resolve(&settings.appearance.theme).clone();
@@ -792,7 +808,7 @@ impl WorkspaceView {
         )
         .detach();
         subscribe_terminal_menu(&terminal, first_pane, window, cx).detach();
-        let view = Self {
+        let mut view = Self {
             settings,
             themes,
             shortcut_tx,
@@ -839,6 +855,13 @@ impl WorkspaceView {
             sftp_prompt_fields: Vec::new(),
             sftp_prompt_subscriptions: Vec::new(),
             pending_focus: None,
+            window_handle: window.window_handle(),
+            quake: quake_machine,
+            quake_tx,
+            quake_rx,
+            quake_status: QuakePortalStatus::Disabled,
+            #[cfg(target_os = "linux")]
+            quake_worker: None,
             next_split_id: 1,
             pane_geometry: Rc::new(RefCell::new(None)),
             split_drag: None,
@@ -877,6 +900,15 @@ impl WorkspaceView {
         view.start_broadcast_pump(cx);
         view.start_totp_ticker(cx);
         view.start_sftp_pump(cx);
+        view.start_quake_pump(cx);
+        view.start_quake_focus_poller(cx);
+        // 启动时已持久化启用 Quake：重启后必须重新拉起 portal worker 并同步
+        // 状态机启用门（直接 spawn 会绕过 SetEnabled(true)，热键静默失效——
+        // 评审缺口3 + 2026-11-06 复核修复）。
+        #[cfg(target_os = "linux")]
+        if view.settings.quake.enabled {
+            view.sync_quake_worker(cx);
+        }
         view
     }
 
@@ -891,6 +923,205 @@ impl WorkspaceView {
             }
         })
         .detach();
+    }
+
+    // ------------------------------------------------------------------
+    // Quake 下拉模式：portal 事件泵 + 失焦轮询 + 设置接线（见 quake.rs）
+    // ------------------------------------------------------------------
+
+    /// portal 事件泵：worker 事件 → 状态机/状态行（实体更新）→ 窗口动作
+    /// （窗口更新）。两段更新刻意分开——在窗口自身更新内再 update 同一窗口
+    /// 会重入借用，pump 跑在异步上下文里没有这个约束。
+    fn start_quake_pump(&self, cx: &mut Context<Self>) {
+        let rx = self.quake_rx.clone();
+        let window = self.window_handle;
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = rx.recv_async().await {
+                let action = this
+                    .update(cx, |workspace, cx| workspace.handle_quake_event(event, cx))
+                    .unwrap_or(QuakeAction::None);
+                let result = match action {
+                    QuakeAction::None => Ok(()),
+                    QuakeAction::Activate => window.update(cx, |_, window, _| {
+                        window.activate_window();
+                    }),
+                    QuakeAction::Minimize => window.update(cx, |_, window, _| {
+                        window.minimize_window();
+                    }),
+                };
+                if result.is_err() {
+                    break; // 窗口已关闭，泵随 workspace 析构自然退出
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 失焦轮询（200ms 独立循环）：周期语义与 1s 的 totp ticker 不同，不并入。
+    /// 读 `window.is_window_active()` 喂状态机；on_active_status_change 回调是
+    /// pub(crate) 无公开订阅口，轮询是唯一可行路径（2026-11-06 落地口径）。
+    /// 状态机未翻转时不 notify，常驻空转不产生重绘。
+    fn start_quake_focus_poller(&self, cx: &mut Context<Self>) {
+        let window = self.window_handle;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let active = match window.update(cx, |_, window, _| window.is_window_active()) {
+                    Ok(active) => active,
+                    Err(_) => break, // 窗口已关闭
+                };
+                let action = this
+                    .update(cx, |workspace, cx| {
+                        if !workspace.settings.quake.enabled {
+                            return QuakeAction::None;
+                        }
+                        let input = if active {
+                            QuakeInput::FocusGained
+                        } else {
+                            QuakeInput::FocusLost {
+                                now: crate::quake::monotonic_now(),
+                            }
+                        };
+                        let action = workspace.quake.handle(input);
+                        if action != QuakeAction::None {
+                            cx.notify();
+                        }
+                        action
+                    })
+                    .ok()
+                    .unwrap_or(QuakeAction::None);
+                let result = match action {
+                    QuakeAction::None => Ok(()),
+                    QuakeAction::Activate => window.update(cx, |_, window, _| {
+                        window.activate_window();
+                    }),
+                    QuakeAction::Minimize => window.update(cx, |_, window, _| {
+                        window.minimize_window();
+                    }),
+                };
+                if result.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// portal 事件进状态机/状态行，返回待执行的窗口动作。
+    fn handle_quake_event(
+        &mut self,
+        event: QuakePortalEvent,
+        cx: &mut Context<Self>,
+    ) -> QuakeAction {
+        match event {
+            // 关闭开关瞬间可能仍有 worker 迟到事件在途，禁用态一律忽略。
+            QuakePortalEvent::Toggled if !self.settings.quake.enabled => QuakeAction::None,
+            QuakePortalEvent::Toggled => {
+                let action = self.quake.handle(QuakeInput::PortalToggle {
+                    now: crate::quake::monotonic_now(),
+                });
+                if action != QuakeAction::None {
+                    cx.notify();
+                }
+                action
+            }
+            // RestoreWindow 必须无条件放行：它恰恰发生在 enabled 已切 false
+            // 之后（关闭 Quake 且窗口停在收起态时呼回，防止「消失」只剩
+            // 任务栏）；走泵执行避免实体更新内嵌套窗口更新。
+            QuakePortalEvent::RestoreWindow => QuakeAction::Activate,
+            QuakePortalEvent::AwaitingConsent if self.settings.quake.enabled => {
+                self.quake_status = QuakePortalStatus::AwaitingConsent;
+                cx.notify();
+                QuakeAction::None
+            }
+            QuakePortalEvent::Ready { trigger } if self.settings.quake.enabled => {
+                self.quake_status = QuakePortalStatus::Ready(trigger);
+                cx.notify();
+                QuakeAction::None
+            }
+            // 改绑只对已就绪/等待中的状态有意义，降级态不必回跳。
+            QuakePortalEvent::TriggerUpdated { trigger }
+                if self.settings.quake.enabled
+                    && !matches!(self.quake_status, QuakePortalStatus::Failed(_)) =>
+            {
+                self.quake_status = QuakePortalStatus::Ready(trigger);
+                cx.notify();
+                QuakeAction::None
+            }
+            QuakePortalEvent::Failed { reason } if self.settings.quake.enabled => {
+                self.quake_status = QuakePortalStatus::Failed(reason);
+                cx.notify();
+                QuakeAction::None
+            }
+            // 其余 = 禁用态的迟到状态事件，忽略。
+            _ => QuakeAction::None,
+        }
+    }
+
+    /// 设置→快捷键页的 Quake 开关：落盘 + worker 生命周期联动 + 需要时呼回窗口。
+    fn change_quake_setting(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut laterterm_config::QuakeSettings),
+    ) {
+        cx.stop_propagation();
+        let previous = self.settings.quake.clone();
+        change(&mut self.settings.quake);
+        if self.settings.quake == previous {
+            return;
+        }
+        self.settings.save();
+        self.sync_quake_worker(cx);
+        cx.notify();
+    }
+
+    /// 把 settings.quake 同步到 worker 与状态机：启用则确保 worker 在跑，
+    /// 关闭则停线程、复位状态机，并返回「窗口需要呼回」。
+    /// 由面板开关、启动、热加载三条路径共用（评审缺口5：外部改 settings.toml
+    /// 也要联动，不能只覆盖面板路径）。
+    #[cfg(target_os = "linux")]
+    fn sync_quake_worker(&mut self, cx: &mut Context<Self>) {
+        self.quake
+            .set_auto_hide(self.settings.quake.auto_hide_on_blur);
+        if self.settings.quake.enabled {
+            // 启用门同步：状态机构造即禁用，漏喂 SetEnabled(true) 会让
+            // Toggled/失焦全部落进禁用兜底（热键静默失效，2026-11-06 复核修复）。
+            // 用 is_enabled 门保证幂等——已启用时的重复 sync（auto_hide 单独
+            // 变化 / 保存回声 reload）不得复位 shown_at/seen_focused/Hidden 瞬态。
+            if !self.quake.is_enabled() {
+                let _ = self.quake.handle(QuakeInput::SetEnabled(true));
+            }
+            if self.quake_worker.is_none() {
+                self.spawn_quake_worker();
+            }
+        } else {
+            // Drop 停止句柄即发停止消息，worker 在事件循环赛跑分支自然退出。
+            self.quake_worker = None;
+            let was_hidden = self.quake.is_hidden();
+            let _ = self.quake.handle(QuakeInput::SetEnabled(false));
+            self.quake_status = QuakePortalStatus::Disabled;
+            if was_hidden {
+                let _ = self.quake_tx.send(QuakePortalEvent::RestoreWindow);
+            }
+        }
+        cx.notify();
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn sync_quake_worker(&mut self, cx: &mut Context<Self>) {
+        let _ = cx;
+    }
+
+    /// 拉起 portal worker；状态行先切「等待授权」覆盖连接+授权两个阶段，
+    /// worker 事件（Ready/Failed）随后细化。
+    #[cfg(target_os = "linux")]
+    fn spawn_quake_worker(&mut self) {
+        self.quake_status = QuakePortalStatus::AwaitingConsent;
+        self.quake_worker = Some(crate::quake::spawn_portal_worker(self.quake_tx.clone()));
     }
 
     fn process_shortcuts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1624,8 +1855,15 @@ impl WorkspaceView {
             .unwrap_or_else(|| self.settings.clone());
         let themes = ThemeRegistry::load();
         if settings != self.settings || themes != self.themes {
+            let quake_changed = settings.quake != self.settings.quake;
             self.settings = settings;
             self.themes = themes;
+            // 外部编辑 settings.toml 改 quake 开关也要联动 worker 生命周期，
+            // 否则面板开关与 portal 实际状态漂移（评审缺口5）。自身保存触发的
+            // 回声 reload 走等值比较幂等吸收，不会重复 spawn/stop。
+            if quake_changed {
+                self.sync_quake_worker(cx);
+            }
             self.apply_appearance(cx);
         }
     }
@@ -6979,6 +7217,56 @@ fn shortcuts_page(workspace: &WorkspaceView, cx: &mut Context<WorkspaceView>) ->
         ))
     };
     let mut page = div().pt_4().flex().flex_col().gap_3();
+    // 系统级热键（Quake）：仅 Linux 提供——portal GlobalShortcuts 是 Wayland 下
+    // 全局热键的唯一正道，其余平台无此卡片（cfg 隔离，AGENTS.md 平台差异约定）。
+    #[cfg(target_os = "linux")]
+    {
+        let quake = workspace.settings.quake.clone();
+        let status = workspace.quake_status.clone();
+        page = page.child(section_title("系统级热键（Quake）"));
+        page = page.child(
+            setting_card()
+                .child(setting_row(
+                    "全局呼出",
+                    div(),
+                    quake_toggle_controls(
+                        cx,
+                        ("开", true),
+                        ("关", false),
+                        quake.enabled,
+                        |settings, value| settings.enabled = value,
+                    ),
+                ))
+                .child(setting_row(
+                    "失焦收起",
+                    div(),
+                    quake_toggle_controls(
+                        cx,
+                        ("开", true),
+                        ("关", false),
+                        quake.auto_hide_on_blur,
+                        |settings, value| settings.auto_hide_on_blur = value,
+                    ),
+                ))
+                .child(
+                    div()
+                        .py_1()
+                        .text_color(gpui::rgb(status.text_color()))
+                        .child(status.text()),
+                )
+                .child(
+                    div()
+                        .pt_1()
+                        .text_size(px(11.0))
+                        .text_color(rgb(0x565A78))
+                        .child(
+                            "首次启用会弹出系统确认对话框，请在桌面环境快捷键设置中授权；\
+                             实际键位可在桌面快捷键设置中修改。窗口的 Quake 几何（全屏宽 × \
+                             50% 高、顶部居中）在下次启动时生效。",
+                        ),
+                ),
+        );
+    }
     page = page.child(section_title("内置"));
     for binding in bindings
         .iter()
@@ -7433,6 +7721,36 @@ fn toggle_controls(
                         selected,
                         cx.listener(move |this, event, window, cx| {
                             this.change_setting(event, window, cx, |s| apply(s, value));
+                        }),
+                    )
+                }),
+        )
+}
+
+/// Quake 设置的二值开关控件：与 `toggle_controls` 同形，但落点是
+/// `QuakeSettings` 并联动 worker 生命周期（change_quake_setting）。
+#[cfg(target_os = "linux")]
+fn quake_toggle_controls(
+    cx: &mut Context<WorkspaceView>,
+    on: (&'static str, bool),
+    off: (&'static str, bool),
+    current: bool,
+    apply: impl Fn(&mut laterterm_config::QuakeSettings, bool) + Clone + 'static,
+) -> gpui::Div {
+    div()
+        .flex()
+        .gap_1()
+        .children(
+            [(on, true), (off, false)]
+                .into_iter()
+                .map(|((label, value), _)| {
+                    let selected = value == current;
+                    let apply = apply.clone();
+                    setting_button(
+                        label,
+                        selected,
+                        cx.listener(move |this, event, window, cx| {
+                            this.change_quake_setting(event, window, cx, |s| apply(s, value));
                         }),
                     )
                 }),

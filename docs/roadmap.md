@@ -200,11 +200,12 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 > 品牌与平台资源（2026-11-02）：用户原始 Logo 已入仓，标题栏使用编译期嵌入 PNG 与缓存对象，新增 9 档 PNG、多尺寸 ICO、标准 ICNS/Retina 槽位及可重复生成校验。Linux app_id / WM_CLASS / desktop / icon 统一为 laterterm；显式用户级安装或临时暂存，不在应用启动时改系统。Windows build.rs 嵌入图标 ID 1、默认 shell 按平台选择；macOS 提供 Info.plist 与未签名 .app 组装，原生交通灯安全区和关闭清理已接入。资源静态检查加入 Linux CI，Windows/macOS release/资源验证为手动原生工作流；本轮未触发远程 CI。详见 [跨平台与品牌资源](platforms.md)。
 > 本轮资源与兼容门禁：隔离 HOME/XDG + 私有 DBus 下 workspace lib/bins 216 通过、1 个既有真实密钥环测试 ignored；SSH 回环 5 通过；图标测试 6、打包测试 8、Windows RC 路径纯逻辑测试 1 通过；严格 clippy、全工作区格式、构建、desktop/plist 与 diff 检查通过。Windows/macOS 原生工作流未触发，不能视为目标平台构建已验。
 > 验收边界：隔离 HOME/XDG 与私有 DBus 的交互测试、图标/容器/临时安装布局检查不等于真实像素验收。本机无私有 X11/Wayland compositor，未对当前桌面注入按键；Windows/macOS 原生构建、Dock/任务栏与 DPI 视觉仍待验。AppImage/deb/MSI/DMG、签名、公证及自动发版仍未完成。
+> Quake 下拉模式代码落地（2026-11-06，任务2 转 🚧）：portal GlobalShortcuts worker + 状态机 + 设置卡片 + 失焦收起轮询，落地差异（activate/minimize 无 unmap、几何仅启动生效、Wayland activate 可能被拒、ashpd 锁 0.11 关 default）见 architecture.md「系统级」段注记。workspace lib/bins 门禁 358 通过 / 2 ignored（新增 quake 状态机 10 测 + config roundtrip 1 测）；真机验收（桌面端授权弹窗、热键呼出/收起、失焦收起、portal 缺失降级文案）待 X11/Wayland 实机，热键注入不在本机能力内。
 
 | # | 任务 |
 |---|------|
 | 1 | 三平台打包矩阵：Linux（AppImage + deb）、Windows（msi）、macOS（dmg），CI 发版链照抄 LaterMD 经验（auto-tag + 版本注入 Release 正文） |
-| 2 | Quake 下拉模式（全局快捷键顶部滑出） |
+| 2 | Quake 下拉模式 🚧 ——2026-11-06 代码落地（真机验收待 X11/Wayland 实机）：设置→快捷键「系统级热键（Quake）」卡片（enabled + auto_hide_on_blur 持久化，热加载联动 worker）；Linux portal GlobalShortcuts worker（独立线程 async_io::block_on，先订阅 Activated 再 bind、注册 8s deadline + 1s 重试一次后降级、授权等待期发「等待桌面端授权确认」状态，bind 返回的 trigger_description 经 ShortcutsChanged 流跟随改绑，应用侧永不持有键位真值）。落地形态与 gpui 能力边界：呼出/收起 = activate/minimize 切换（gpui 无公开 unmap，初始 Shown 故首次热键为收起；任务栏保留图标），失焦收起走 is_window_active 200ms 轮询 + 600ms 宽限 + seen_focused 门（防 Wayland activate 被拒时呼出即收起死循环），顶部几何（全屏宽 × 50% 高）仅创建时生效——开关切换后下次启动生效，X11 定位可靠、Wayland 由合成器摆位，无逐帧滑出动画。非 Linux 平台无此卡片。ashpd 锁 0.11 且关 default-features（防 tokio flavor 混入破坏 block_on），详见 architecture.md 落地差异注记 |
 | 3 | 广播输入（多会话同步键入） |
 | 4 | 动效与无障碍打磨；首启动引导（默认 shell/字体探测）；终端光标样式可配置（方块/竖线/下划线 + 闪烁）——2026-11-06 落地：闪烁随 M1 完成，形状三选一（设置面板 + apply_appearance 热更新 + serde 旧配置兼容）已实现；Quake 全局热键走 portal GlobalShortcuts（方案与 LaterScreen 四坑结论见 architecture.md） |
 
