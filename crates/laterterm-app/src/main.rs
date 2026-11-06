@@ -3,6 +3,7 @@
 mod branding;
 mod command_text_field;
 mod import;
+mod onboarding;
 mod pane_navigation;
 mod quake;
 mod server_connection;

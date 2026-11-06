@@ -55,6 +55,10 @@ pub struct Settings {
     /// 旧主线 servers.toml 只迁移一次，避免已删除条目重启后复活。
     #[serde(default)]
     pub legacy_servers_migrated: bool,
+    /// 本地终端 shell 可执行文件路径；None = 跟随 $SHELL / 平台默认（动态解析，
+    /// 用户日后改登录 shell 应用自动跟随）。首启引导可将其固化为具体路径。
+    #[serde(default)]
+    pub shell: Option<String>,
 }
 
 /// Quake 下拉模式设置（设置→快捷键页「系统级热键」卡片）。
@@ -279,6 +283,21 @@ impl Settings {
         before != self.servers.len()
     }
 
+    /// shell 字段载入期校验：非法值归 None（回退动态默认），不让坏值活到
+    /// spawn 期才炸（LocalSession::spawn 失败是 .expect panic）。
+    ///
+    /// 结构性规则与 laterterm-local 的 `is_valid_shell_path` 一致——config
+    /// 不依赖 laterterm-local（避免反向引入 portable-pty），谓词在此复制一份，
+    /// 两处修改必须同步。残余风险（路径存在但非可执行文件）与 $SHELL 注入
+    /// 路径风险相同，v1 不做 exists 校验（测试环境路径不稳定）。
+    fn sanitize_shell(&mut self) {
+        self.shell = self
+            .shell
+            .take()
+            .map(|shell| shell.trim().to_string())
+            .filter(|shell| is_valid_shell_path(shell));
+    }
+
     /// 修正加载中的连接信息；错误快捷键保留原值供用户修正。
     ///
     /// 跳板引用（jump）单独走全表清理：格式非法、悬空、成环、超深一律断链
@@ -334,6 +353,7 @@ impl Settings {
         settings.quake.sanitize();
         settings.sanitize_totp();
         settings.sanitize_servers();
+        settings.sanitize_shell();
         Ok(settings)
     }
 
@@ -451,6 +471,16 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .map(PathBuf::from)
+}
+
+/// shell 路径结构性校验：非空、无控制字符/引号、绝对路径。
+/// 与 laterterm-local 的 `is_valid_shell_path` 规则一致（见 sanitize_shell 注释）。
+fn is_valid_shell_path(value: &str) -> bool {
+    !value.is_empty()
+        && !value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '\'' | '"'))
+        && Path::new(value).is_absolute()
 }
 
 #[cfg(test)]
@@ -702,6 +732,42 @@ shortcut = "  legacy shortcut  "
             toml::from_str("[quake]\nenabled = true\nfuture_field = 42\n").unwrap();
         assert!(forward.quake.enabled);
         assert!(forward.quake.auto_hide_on_blur);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn shell_defaults_roundtrip_and_bad_values_sanitize_to_none() {
+        // 旧文件缺 shell 字段 → 容器级 serde(default) 得 None（跟随 $SHELL 动态解析）
+        let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert_eq!(legacy.shell, None);
+
+        // 合法值 roundtrip：TOML 输出顶层 shell 行，保存/加载相等
+        let path = temp_settings_path("shell");
+        let settings = Settings {
+            shell: Some("/usr/bin/fish".into()),
+            ..Default::default()
+        };
+        settings.save_to(&path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("shell = \"/usr/bin/fish\""), "{body}");
+        assert_eq!(Settings::load(&path).unwrap(), settings);
+        // 原子写不应留下临时文件
+        assert!(!path.with_extension("toml.tmp").exists());
+
+        // 手改坏值：载入期归 None，整份配置不解析失败
+        for raw in [
+            "shell = \"bash -l\"\n",     // 带参数——不是纯路径
+            "shell = \"\"\n",            // 空串
+            "shell = \"relative/sh\"\n", // 相对路径
+            "shell = \"/bin/sh' -x\"\n", // 引号注入
+        ] {
+            let patched: Settings =
+                toml::from_str(&format!("[appearance]\nfont_size = 14.0\n{raw}")).unwrap();
+            assert_eq!(patched.shell, None, "坏值应归 None: {raw}");
+        }
+        // 显式写坏值再走完整 load 路径同样归 None
+        std::fs::write(&path, "shell = \"bash -l\"\n").unwrap();
+        assert_eq!(Settings::load(&path).unwrap().shell, None);
         std::fs::remove_file(&path).unwrap();
     }
 

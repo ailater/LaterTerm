@@ -1,5 +1,6 @@
 use crate::branding::titlebar_logo;
 use crate::command_text_field::{CommandTextChanged, CommandTextField, FieldSubmit};
+use crate::onboarding::{self, FONT_PRESETS, OnboardingState, ProbeResults};
 use crate::pane_navigation::{Direction as PaneDirection, PaneRect, neighbor};
 use crate::quake::{QuakeAction, QuakeInput, QuakePortalEvent, QuakePortalStatus};
 use crate::server_connection::{self, ConnectionOutcome, CredentialKind, SftpOutcome};
@@ -677,6 +678,13 @@ pub struct WorkspaceView {
     settings_open: bool,
     broadcast: bool,
     welcome_visible: bool,
+    /// 首启引导：探测结果与 shell 暂选（None = 跟随默认），见 onboarding.rs。
+    onboarding: OnboardingState,
+    /// 引导探测后台线程结果 → 泵（单发即弃，见 start_onboarding_pump）。
+    /// 测试构建不 spawn 真线程，仅保留通道，放行 dead_code。
+    #[cfg_attr(test, allow(dead_code))]
+    onboarding_tx: flume::Sender<ProbeResults>,
+    onboarding_rx: flume::Receiver<ProbeResults>,
     broadcast_tx: flume::Sender<(PaneId, Vec<u8>)>,
     broadcast_rx: flume::Receiver<(PaneId, Vec<u8>)>,
     settings_page: SettingsPage,
@@ -776,6 +784,7 @@ impl WorkspaceView {
         let (broadcast_tx, broadcast_rx) = flume::unbounded();
         let (sftp_events_tx, sftp_events_rx) = flume::unbounded();
         let (quake_tx, quake_rx) = flume::unbounded();
+        let (onboarding_tx, onboarding_rx) = flume::unbounded();
         let quake_machine = crate::quake::QuakeMachine::new(settings.quake.auto_hide_on_blur);
         let first_pane = PaneId(1);
         let first_tab = TabId(1);
@@ -798,6 +807,7 @@ impl WorkspaceView {
             broadcast_tx.clone(),
             initial_cols,
             initial_rows,
+            resolve_shell(settings.shell.as_deref()),
         );
         cx.subscribe_in(
             &terminal,
@@ -808,6 +818,12 @@ impl WorkspaceView {
         )
         .detach();
         subscribe_terminal_menu(&terminal, first_pane, window, cx).detach();
+        // 引导暂选从当前设置出发（正常首启为 None = 跟随默认；settings 在
+        // 上面的字面量里被移动，需提前取值）。变量名避开模块别名 onboarding。
+        let onboarding_state = OnboardingState {
+            probe: None,
+            selected_shell: settings.shell.clone(),
+        };
         let mut view = Self {
             settings,
             themes,
@@ -892,6 +908,9 @@ impl WorkspaceView {
             settings_open: false,
             broadcast: false,
             welcome_visible: first_run,
+            onboarding: onboarding_state,
+            onboarding_tx,
+            onboarding_rx,
             broadcast_tx,
             broadcast_rx,
         };
@@ -902,6 +921,17 @@ impl WorkspaceView {
         view.start_sftp_pump(cx);
         view.start_quake_pump(cx);
         view.start_quake_focus_poller(cx);
+        view.start_onboarding_pump(cx);
+        // 首启才探测（IO：/etc/shells + fc-list 子进程，约几十毫秒），结果经
+        // flume 泵回主线程。cfg(not(test))：gpui 测试统一走 deliver_probe 注入，
+        // 真线程结果晚到会与注入值竞争（评审阻断4 的 flaky 隐患）。
+        #[cfg(not(test))]
+        if first_run {
+            let onboarding_tx = view.onboarding_tx.clone();
+            std::thread::spawn(move || {
+                let _ = onboarding_tx.send(onboarding::probe());
+            });
+        }
         // 启动时已持久化启用 Quake：重启后必须重新拉起 portal worker 并同步
         // 状态机启用门（直接 spawn 会绕过 SetEnabled(true)，热键静默失效——
         // 评审缺口3 + 2026-11-06 复核修复）。
@@ -1203,6 +1233,75 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    // ------------------------------------------------------------------
+    // 首启引导（onboarding.rs）：探测泵 + 暂选 + 完成/跳过
+    // ------------------------------------------------------------------
+
+    /// 探测结果泵：后台线程 → 实体更新（模式同 start_quake_pump，但无窗口动作）。
+    fn start_onboarding_pump(&self, cx: &mut Context<Self>) {
+        let rx = self.onboarding_rx.clone();
+        cx.spawn(async move |this, cx| {
+            while let Ok(results) = rx.recv_async().await {
+                let _ = this.update(cx, |workspace, cx| {
+                    workspace.deliver_probe(results);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// 探测结果统一入口（生产泵与测试注入共用）：单发闩——已有结果即丢弃
+    /// 后到者，保证注入值不被迟到的真线程结果覆盖。
+    fn deliver_probe(&mut self, results: ProbeResults) {
+        if self.onboarding.probe.is_some() {
+            return;
+        }
+        self.onboarding.probe = Some(results);
+    }
+
+    /// 点选 shell 芯片：仅暂存，完成时才落盘。
+    /// `choice = None` 表示「跟随默认」——选中「当前」芯片时保持动态解析，
+    /// 不把 $SHELL 固化成具体路径（用户日后改登录 shell 仍自动跟随）。
+    fn onboarding_select_shell(&mut self, choice: Option<String>, cx: &mut Context<Self>) {
+        self.onboarding.selected_shell = choice;
+        cx.notify();
+    }
+
+    /// 点选字体芯片：与设置面板字体芯片同效果（等值短路 + apply_appearance
+    /// 热更新即时生效），但落盘统一走 persist_settings——change_setting 内部
+    /// 的 settings.save() 写死默认路径，测试注入的 settings_save_path 会被
+    /// 绕过、拿内存态覆盖真实配置（评审阻断3，同一覆盖层只留一条持久化路径）。
+    fn onboarding_apply_font(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.settings.appearance.font_family == name {
+            return; // 等值短路：不重复保存/重应用
+        }
+        self.settings.appearance.font_family = name.to_owned();
+        if let Err(error) = self.persist_settings() {
+            eprintln!("保存首启引导字体设置失败: {error:#}");
+        }
+        self.apply_appearance(cx);
+        cx.notify();
+    }
+
+    /// 「完成」：shell 暂选与当前设置不同则落盘（字体芯片已即时落盘），随后
+    /// 关闭引导层。探测未到就点完成 = 暂选 None = 保持跟随默认，不写。
+    fn complete_onboarding(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.onboarding.selected_shell != self.settings.shell {
+            self.settings.shell = self.onboarding.selected_shell.clone();
+            if let Err(error) = self.persist_settings() {
+                eprintln!("保存首启引导 shell 设置失败: {error:#}");
+            }
+        }
+        self.welcome_visible = false;
+        cx.notify();
+    }
+
     fn active_tab_index(&self) -> usize {
         self.tabs
             .iter()
@@ -1345,7 +1444,7 @@ impl WorkspaceView {
     /// 新建标签：一个标签一个全新窗格与分屏树根。
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let title = format!("终端 {}", self.next_pane_id);
-        let session = spawn_local_session();
+        let session = spawn_local_session(self.settings.shell.as_deref());
         let pane_id = self.attach_pane(title, session, window, cx);
         let tab_id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
@@ -1366,7 +1465,7 @@ impl WorkspaceView {
     ) {
         let old = self.focused_pane_id();
         let title = format!("终端 {}", self.next_pane_id);
-        let session = spawn_local_session();
+        let session = spawn_local_session(self.settings.shell.as_deref());
         let pane_id = self.attach_pane(title, session, window, cx);
         let tab_index = self.active_tab_index();
         let split_id = self.next_split_id;
@@ -5060,10 +5159,7 @@ impl Render for WorkspaceView {
             // SFTP 双栏面板：窗口级大覆盖层（右面板 240px 放不下双栏）
             .when_some(sftp_overlay(self, cx), |root, overlay| root.child(overlay))
             .when(self.welcome_visible, |root| {
-                root.child(welcome_overlay(
-                    cx.listener(Self::dismiss_welcome),
-                    cx.listener(Self::dismiss_welcome),
-                ))
+                root.child(self.welcome_overlay(cx))
             })
             // 命令/动态码/服务器对话框：窗口级模态弹窗（最上层）
             .when_some(render_active_dialog(self, cx), |root, overlay| {
@@ -5127,82 +5223,219 @@ impl Render for WorkspaceView {
     }
 }
 
-/// 首启欢迎覆盖层：快捷键速查 + 开始按钮。
-fn welcome_overlay(
-    scrim_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-    button_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> gpui::Div {
-    div()
-        .absolute()
-        .top_0()
-        .right_0()
-        .bottom_0()
-        .left_0()
-        .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.96))
-        .flex()
-        .items_center()
-        .justify_center()
-        .on_mouse_down(MouseButton::Left, scrim_listener)
-        .child(
-            div()
-                .w(px(520.0))
-                .p_8()
-                .bg(rgb(0x1A1B26))
-                .flex()
-                .flex_col()
-                .gap_4()
-                .on_mouse_down(MouseButton::Left, |_, _, _| {})
-                .child(
-                    div()
-                        .text_size(px(28.0))
-                        .text_color(rgb(0x7DCFFF))
-                        .child("LaterTerm"),
+impl WorkspaceView {
+    /// 首启欢迎 + 引导一体覆盖层：品牌区 → 默认 Shell 芯片区 → 终端字体
+    /// 芯片区 → 快捷键速查与导入提示（原样保留）→ 完成/跳过。
+    /// 口径：
+    /// - shell 点选仅暂存，「完成」时统一落盘；只对新标签/分屏生效（已开
+    ///   窗格不重启，首窗格重开不做——范围控制）；「当前」芯片选回 None，
+    ///   保持动态跟随默认而不是固化 $SHELL 路径；
+    /// - 字体点选即时生效并落盘（onboarding_apply_font → persist_settings），
+    ///   跳过引导也会保留已选字体；
+    /// - 跳过/点遮罩 = dismiss_welcome，不写 shell。
+    fn welcome_overlay(&self, cx: &mut Context<Self>) -> gpui::Div {
+        // —— 默认 Shell 芯片：探测未到时显示平台默认 + 「探测中」占位 ——
+        let (shell_candidates, probing) = match &self.onboarding.probe {
+            Some(probe) => (probe.shells.clone(), false),
+            None => (
+                vec![onboarding::ShellCandidate {
+                    path: laterterm_local::default_shell(),
+                    is_current: true,
+                    source: onboarding::ShellSource::Default,
+                }],
+                true,
+            ),
+        };
+        let shell_chips: Vec<gpui::Div> = shell_candidates
+            .iter()
+            .map(|candidate| {
+                let selected = match &self.onboarding.selected_shell {
+                    Some(choice) => choice == &candidate.path,
+                    None => candidate.is_current,
+                };
+                // 标注按来源：$SHELL=当前、平台兜底=默认、列表项被补标当前时
+                // 同样显示当前（source 与 is_current 都是 UI 语义的一部分）
+                let suffix = match candidate.source {
+                    onboarding::ShellSource::Current => "（当前）",
+                    onboarding::ShellSource::Default => "（默认）",
+                    onboarding::ShellSource::Listed if candidate.is_current => "（当前）",
+                    onboarding::ShellSource::Listed => "",
+                };
+                let label = format!("{}{suffix}", candidate.path);
+                let choice = (!candidate.is_current).then(|| candidate.path.clone());
+                setting_button(
+                    label,
+                    selected,
+                    cx.listener(move |this, _, _, cx| {
+                        this.onboarding_select_shell(choice.clone(), cx);
+                    }),
                 )
-                .child(
-                    div()
-                        .text_color(rgb(0xA9B1D6))
-                        .child("跨平台 GPU 终端 · 为中文开发者打造"),
-                )
-                .child(
-                    div()
-                        .pt_4()
-                        .flex()
-                        .flex_col()
-                        .gap_2()
-                        .child(
-                            div()
-                                .text_color(rgb(0xC0CAF5))
-                                .text_size(px(14.0))
-                                .child("常用快捷键"),
-                        )
-                        .child(welcome_shortcut("新建标签", "Ctrl+T"))
-                        .child(welcome_shortcut("分屏（横向 / 纵向）", "Ctrl+J / K"))
-                        .child(welcome_shortcut("窗格切换", "Ctrl+Shift+[ / ]"))
-                        .child(welcome_shortcut("搜索回滚", "Ctrl+Shift+F"))
-                        .child(welcome_shortcut("广播输入（多窗格同步）", "Ctrl+Shift+B"))
-                        .child(welcome_shortcut("设置 / 服务器管理", "Ctrl+,")),
-                )
-                .child(
-                    div()
-                        .pt_4()
-                        .text_color(rgb(0x565A78))
-                        .text_size(px(12.0))
-                        .child("提示：右侧面板 → 服务器 可添加 SSH 连接或从 XShell / deepin 导入"),
-                )
-                .child(
-                    div().pt_4().child(
+            })
+            .collect();
+        let shell_section = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_color(rgb(0xC0CAF5))
+                    .text_size(px(14.0))
+                    .child("默认 Shell"),
+            )
+            .child(div().flex().flex_wrap().gap_1().children(shell_chips))
+            .child(
+                div()
+                    .text_color(rgb(0x565A78))
+                    .text_size(px(12.0))
+                    .child(if probing {
+                        "正在探测本机可用 shell…（切换仅对新标签/分屏生效，已开窗格不变）"
+                    } else {
+                        "切换默认 shell 仅对新标签/分屏生效，已开窗格不变"
+                    }),
+            );
+        // —— 终端字体芯片：fc-list 探测失败/未到时回退静态预设 ——
+        let font_candidates = match &self.onboarding.probe {
+            Some(probe) => probe.fonts.clone(),
+            None => onboarding::preset_fonts(FONT_PRESETS.as_slice()),
+        };
+        let font_chips = font_candidates.iter().map(|candidate| {
+            let selected = self.settings.appearance.font_family == candidate.name;
+            let label = if candidate.recommended {
+                format!("{}（推荐）", candidate.name)
+            } else {
+                candidate.name.clone()
+            };
+            let name = candidate.name.clone();
+            setting_button(
+                label,
+                selected,
+                cx.listener(move |this, _, _, cx| {
+                    this.onboarding_apply_font(&name, cx);
+                }),
+            )
+        });
+        let font_section = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_color(rgb(0xC0CAF5))
+                    .text_size(px(14.0))
+                    .child("终端字体"),
+            )
+            .child(div().flex().flex_wrap().gap_1().children(font_chips))
+            .child(
+                div()
+                    .text_color(rgb(0x565A78))
+                    .text_size(px(12.0))
+                    .child("点击字体立即生效并保存（之后跳过引导也会保留）"),
+            );
+        div()
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .left_0()
+            .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.96))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::dismiss_welcome))
+            .child(
+                div()
+                    .w(px(640.0))
+                    .max_h(px(680.0))
+                    .p_8()
+                    .bg(rgb(0x1A1B26))
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    // 卡片内点击不再穿透到遮罩关闭（芯片/完成/跳过各有自己的
+                    // listener，卡片空白处误触不应关掉引导）；点遮罩仍走 dismiss。
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .child(
                         div()
-                            .px_6()
-                            .py_2()
-                            .bg(rgb(0x7AA2F7))
-                            .text_color(rgb(0x1A1B26))
-                            .text_size(px(16.0))
-                            .cursor_pointer()
-                            .on_mouse_down(MouseButton::Left, button_listener)
-                            .child("开始使用"),
+                            .text_size(px(28.0))
+                            .text_color(rgb(0x7DCFFF))
+                            .child("LaterTerm"),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(0xA9B1D6))
+                            .child("跨平台 GPU 终端 · 为中文开发者打造"),
+                    )
+                    .child(
+                        // 引导内容区：芯片组可能较高，小屏限高滚动（评审风险5）
+                        div()
+                            .id("welcome-content")
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .max_h(px(460.0))
+                            .overflow_y_scroll()
+                            .child(shell_section)
+                            .child(font_section)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_color(rgb(0xC0CAF5))
+                                            .text_size(px(14.0))
+                                            .child("常用快捷键"),
+                                    )
+                                    .child(welcome_shortcut("新建标签", "Ctrl+T"))
+                                    .child(welcome_shortcut("分屏（横向 / 纵向）", "Ctrl+J / K"))
+                                    .child(welcome_shortcut("窗格切换", "Ctrl+Shift+[ / ]"))
+                                    .child(welcome_shortcut("搜索回滚", "Ctrl+Shift+F"))
+                                    .child(welcome_shortcut(
+                                        "广播输入（多窗格同步）",
+                                        "Ctrl+Shift+B",
+                                    ))
+                                    .child(welcome_shortcut("设置 / 服务器管理", "Ctrl+,")),
+                            )
+                            .child(div().text_color(rgb(0x565A78)).text_size(px(12.0)).child(
+                                "提示：右侧面板 → 服务器 可添加 SSH 连接或从 XShell / deepin 导入",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .px_6()
+                                    .py_2()
+                                    .bg(rgb(0x252637))
+                                    .text_color(rgb(0xA9B1D6))
+                                    .text_size(px(16.0))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(Self::dismiss_welcome),
+                                    )
+                                    .child("跳过"),
+                            )
+                            .child(
+                                div()
+                                    .px_6()
+                                    .py_2()
+                                    .bg(rgb(0x7AA2F7))
+                                    .text_color(rgb(0x1A1B26))
+                                    .text_size(px(16.0))
+                                    .cursor_pointer()
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(Self::complete_onboarding),
+                                    )
+                                    .child("完成"),
+                            ),
                     ),
-                ),
-        )
+            )
+    }
 }
 
 fn welcome_shortcut(label: &str, keys: &str) -> gpui::Div {
@@ -7638,16 +7871,6 @@ fn scrollback_controls(cx: &mut Context<WorkspaceView>, settings: &Appearance) -
     )
 }
 
-/// 常用等宽字体预设（fontconfig 解析不到的名称会自然回退系统默认）。
-const FONT_PRESETS: [&str; 6] = [
-    "JetBrainsMono Nerd Font",
-    "CaskaydiaCove Nerd Font",
-    "FiraCode Nerd Font",
-    "Sarasa Mono SC",
-    "Noto Sans Mono CJK SC",
-    "monospace",
-];
-
 /// 常用 CJK 备选字体预设；空表表示交回系统默认回退。
 const FALLBACK_PRESETS: [&str; 3] = ["Sarasa Mono SC", "Noto Sans Mono CJK SC", "无"];
 
@@ -8124,6 +8347,15 @@ fn wrap_transfer(
         download_dir,
     })
 }
+/// 解析本地会话 shell：显式配置（首启引导固化 / 手改 settings.toml）优先，
+/// 否则跟随平台默认（$SHELL / COMSPEC，由 laterterm-local 动态解析）。
+fn resolve_shell(shell: Option<&str>) -> String {
+    match shell {
+        Some(explicit) => explicit.to_owned(),
+        None => laterterm_local::default_shell(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // 装配函数：显式传参比打包结构更直观
 fn create_local_terminal(
     id: PaneId,
@@ -8135,11 +8367,11 @@ fn create_local_terminal(
     broadcast_tx: flume::Sender<(PaneId, Vec<u8>)>,
     cols: usize,
     rows: usize,
+    shell: String,
 ) -> (Entity<TerminalView>, Arc<SessionControl>) {
     // 会话的开启/spawn/回收线程全部内聚在 LocalSession（laterterm-local）。
     // PTY 初始尺寸直接用窗口实际尺寸：避免启动后 resize 触发 bash readline
     // 的 \r 重画，把光标拉回提示符行首。
-    let shell = laterterm_local::default_shell();
     let session: Arc<dyn TerminalSession> = Arc::new(
         LocalSession::spawn(LocalOptions {
             shell,
@@ -8184,8 +8416,10 @@ where
 }
 
 /// 开一个本地 shell 会话（attach_pane 之外仅差标题命名，故独立成函数）。
-fn spawn_local_session() -> Arc<dyn TerminalSession> {
-    let shell = laterterm_local::default_shell();
+/// shell 由调用方传入设置（None = 跟随平台默认）；已开窗格不随设置改动重启，
+/// 只对新标签/分屏生效。
+fn spawn_local_session(shell: Option<&str>) -> Arc<dyn TerminalSession> {
+    let shell = resolve_shell(shell);
     Arc::new(
         LocalSession::spawn(LocalOptions {
             shell,
@@ -9443,5 +9677,207 @@ mod server_jump_tests {
         );
         // 清理后全表可解析
         assert!(laterterm_config::resolve_jump_chain(&existing, "正常机").is_ok());
+    }
+}
+
+/// 首启引导的完成链路（gpui::test）：探测结果注入 → 完成 → shell 落盘 +
+/// 引导层关闭 + 新标签使用所选 shell；跳过路径不写任何东西。
+/// 全部走 `deliver_probe` 注入与 `settings_save_path` 注入，不依赖真机探测、
+/// 不写真实配置（评审阻断1：私有字段仅 workspace 内联测试可达）。
+#[cfg(test)]
+mod onboarding_tests {
+    use super::WorkspaceView;
+    use crate::onboarding::{self, FONT_PRESETS, ProbeResults};
+    use gpui::{MouseDownEvent, TestAppContext};
+    use std::path::Path;
+
+    fn temp_settings_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "laterterm-onboarding-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.subsec_nanos())
+                .unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn fake_probe() -> ProbeResults {
+        ProbeResults {
+            // 候选：/bin/bash（当前）+ /bin/sh（列表项）——后续测试点选
+            // 非“当前”的 /bin/sh 芯片验证固化路径；/bin/sh 各发行版必有。
+            shells: onboarding::parse_shells(
+                Some("/bin/bash"),
+                "# 注释\n/bin/bash\n/bin/sh\n",
+                "/bin/bash",
+                &|_: &Path| true,
+            ),
+            fonts: onboarding::preset_fonts(FONT_PRESETS.as_slice()),
+        }
+    }
+
+    /// 完成：点选非「当前」芯片（即真实芯片 listener 调用的
+    /// onboarding_select_shell）→ 完成落盘到注入路径、引导层关闭、新标签用
+    /// 所选 shell 启动。断言走会话级 title（Pane.title 仍是「终端 N」硬编码，
+    /// 评审阻断2 口径：不改 title 语义，会话 title 才是 shell basename）。
+    #[gpui::test]
+    fn completion_persists_shell_closes_welcome_and_spawns_selected_shell(cx: &mut TestAppContext) {
+        let dir = temp_settings_dir("complete");
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, _, cx| {
+            view.welcome_visible = true;
+            view.settings.shell = None;
+            view.onboarding.selected_shell = None;
+            view.settings_save_path = Some(dir.join("settings.toml"));
+            view.deliver_probe(fake_probe());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // 模拟点选「/bin/sh」芯片（芯片 listener 的实际动作）
+        workspace.update(cx, |view, cx| {
+            view.onboarding_select_shell(Some("/bin/sh".into()), cx);
+            assert_eq!(view.onboarding.selected_shell.as_deref(), Some("/bin/sh"));
+        });
+        assert!(
+            !dir.join("settings.toml").exists(),
+            "芯片点选仅暂存，完成前不应落盘"
+        );
+        workspace.update_in(cx, |view, window, cx| {
+            view.complete_onboarding(&MouseDownEvent::default(), window, cx);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |view, _| {
+            assert!(!view.welcome_visible, "完成后引导层应关闭");
+            assert_eq!(view.settings.shell.as_deref(), Some("/bin/sh"));
+        });
+        let saved = std::fs::read_to_string(dir.join("settings.toml")).unwrap();
+        assert!(saved.contains("shell = \"/bin/sh\""), "{saved}");
+        // 新标签按所选 shell 启动（真开 PTY，与本模块既有测试同口径）
+        workspace.update_in(cx, |view, window, cx| {
+            view.spawn_tab(window, cx);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |view, _| {
+            let pane = view.panes.last().unwrap();
+            assert_eq!(
+                pane.session.session.title(),
+                "sh",
+                "新窗格会话应使用引导所选 shell"
+            );
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 什么都没点直接「完成」（探测未到/未选芯片）：暂选 None = 保持跟随
+    /// 默认，不写 shell，文件也不落。
+    #[gpui::test]
+    fn completing_without_selection_keeps_dynamic_default(cx: &mut TestAppContext) {
+        let dir = temp_settings_dir("untouched");
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, _, cx| {
+            view.welcome_visible = true;
+            view.settings.shell = None;
+            view.onboarding.selected_shell = None;
+            view.settings_save_path = Some(dir.join("settings.toml"));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // 「当前」芯片的语义是回选 None（保持动态跟随默认），同样不固化
+        workspace.update(cx, |view, cx| {
+            view.onboarding_select_shell(Some("/bin/sh".into()), cx);
+            view.onboarding_select_shell(None, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |view, window, cx| {
+            view.complete_onboarding(&MouseDownEvent::default(), window, cx);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |view, _| {
+            assert!(!view.welcome_visible);
+            assert_eq!(view.settings.shell, None, "未选择时不应固化 shell");
+        });
+        assert!(
+            !dir.join("settings.toml").exists(),
+            "无变更不应产生落盘文件"
+        );
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 跳过（dismiss_welcome，即点遮罩/跳过按钮同路径）：不写 shell；字体
+    /// 芯片是即时落盘的（onboarding_apply_font → persist_settings 注入路径），
+    /// 跳过后保留。
+    #[gpui::test]
+    fn skipping_writes_nothing_but_font_chip_choice_survives(cx: &mut TestAppContext) {
+        let dir = temp_settings_dir("skip");
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, _, cx| {
+            view.welcome_visible = true;
+            view.settings.shell = None;
+            view.onboarding.selected_shell = None;
+            view.settings_save_path = Some(dir.join("settings.toml"));
+            view.deliver_probe(fake_probe());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        // 点字体芯片（直接调 handler：持久化走注入路径，等值短路不触发）
+        workspace.update(cx, |view, cx| {
+            view.onboarding_apply_font("DejaVu Sans Mono", cx);
+        });
+        cx.run_until_parked();
+        let saved = std::fs::read_to_string(dir.join("settings.toml")).unwrap();
+        assert!(
+            saved.contains("font_family = \"DejaVu Sans Mono\""),
+            "字体芯片应即时落盘: {saved}"
+        );
+        assert!(!saved.contains("shell ="), "字体落盘不应顺带写 shell");
+        // 跳过：shell 保持 None
+        workspace.update_in(cx, |view, window, cx| {
+            view.dismiss_welcome(&MouseDownEvent::default(), window, cx);
+        });
+        workspace.read_with(cx, |view, _| {
+            assert!(!view.welcome_visible);
+            assert_eq!(view.settings.shell, None, "跳过不写 shell");
+            assert_eq!(
+                view.settings.appearance.font_family, "DejaVu Sans Mono",
+                "已选字体在跳过后保留"
+            );
+        });
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 泵单发闩：probe 已有结果时后到的注入/线程结果被丢弃（评审阻断4）。
+    #[gpui::test]
+    fn deliver_probe_is_first_wins(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update(cx, |view, _| {
+            view.welcome_visible = true;
+            view.deliver_probe(fake_probe());
+            // 第二次投递（无论来自真线程还是测试）必须被闩掉
+            view.deliver_probe(ProbeResults {
+                shells: Vec::new(),
+                fonts: Vec::new(),
+            });
+            assert_eq!(
+                view.onboarding.probe.as_ref().unwrap().shells.len(),
+                2,
+                "保留的应是先到的 fake_probe（bash 当前 + sh 列表项）"
+            );
+        });
     }
 }
