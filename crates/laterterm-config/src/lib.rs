@@ -48,9 +48,38 @@ pub struct Settings {
     /// 服务器连接元数据；凭据同样只在密钥环。
     #[serde(default)]
     pub servers: Vec<servers::ServerEntry>,
+    /// Quake 下拉模式设置；热键本体由桌面端 portal 存储与改绑，
+    /// 应用侧不持有键位文本，避免与桌面端真实绑定漂移。
+    #[serde(default)]
+    pub quake: QuakeSettings,
     /// 旧主线 servers.toml 只迁移一次，避免已删除条目重启后复活。
     #[serde(default)]
     pub legacy_servers_migrated: bool,
+}
+
+/// Quake 下拉模式设置（设置→快捷键页「系统级热键」卡片）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QuakeSettings {
+    /// 是否启用系统级全局热键（Linux 走 xdg-desktop-portal GlobalShortcuts）。
+    pub enabled: bool,
+    /// 窗口失焦时自动最小化收起（Quake 惯例默认开）。
+    pub auto_hide_on_blur: bool,
+}
+
+impl Default for QuakeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_hide_on_blur: true,
+        }
+    }
+}
+
+impl QuakeSettings {
+    /// 载入期钳制。当前全为布尔字段无可钳制范围，保留入口与外观项对齐，
+    /// 后续新增数值字段（如宽限期）时在此收紧。
+    pub fn sanitize(&mut self) {}
 }
 
 /// 内置面板的快捷键覆盖；`None` 表示使用默认绑定，原始文本保持不变。

@@ -1382,10 +1382,9 @@ impl TerminalView {
         let fallback_mode = if mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE) {
             mode
         } else {
-            mode
-                - (alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
-                    | alacritty_terminal::term::TermMode::MOUSE_MOTION
-                    | alacritty_terminal::term::TermMode::MOUSE_DRAG)
+            mode - (alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
+                | alacritty_terminal::term::TermMode::MOUSE_MOTION
+                | alacritty_terminal::term::TermMode::MOUSE_DRAG)
         };
         if let Some(bytes) = crate::mouse::scroll_report(lines, point, 0, fallback_mode) {
             let mut writer = self.stdin_writer.lock();
@@ -2515,7 +2514,11 @@ mod tests {
                 first_mouse: false,
             };
             view.on_mouse_down(&down, window, cx);
-            assert_eq!(*buffer.lock().unwrap(), b"\x1b[<0;1;1M", "按下上报 SGR press");
+            assert_eq!(
+                *buffer.lock().unwrap(),
+                b"\x1b[<0;1;1M",
+                "按下上报 SGR press"
+            );
             assert!(!view.has_selection(), "上报接管时本地选区让位");
 
             // 1000 模式不报移动
@@ -2525,7 +2528,11 @@ mod tests {
                 modifiers: Modifiers::default(),
             };
             view.on_mouse_move(&motion, window, cx);
-            assert_eq!(*buffer.lock().unwrap(), b"\x1b[<0;1;1M", "1000 模式移动不上报");
+            assert_eq!(
+                *buffer.lock().unwrap(),
+                b"\x1b[<0;1;1M",
+                "1000 模式移动不上报"
+            );
             assert!(!view.has_selection(), "上报接管期间不建本地选区");
 
             let up = MouseUpEvent {
@@ -2581,11 +2588,19 @@ mod tests {
                 click_count: 1,
             };
 
-            view.on_mouse_down(&down(gpui::point(gpui::px(5.0), gpui::px(10.0))), window, cx);
+            view.on_mouse_down(
+                &down(gpui::point(gpui::px(5.0), gpui::px(10.0))),
+                window,
+                cx,
+            );
             assert_eq!(*buffer.lock().unwrap(), b"\x1b[<0;1;1M", "press 上报");
 
             // 拖到 col 4 → 32;5;1
-            view.on_mouse_move(&drag_to(gpui::point(gpui::px(45.0), gpui::px(10.0))), window, cx);
+            view.on_mouse_move(
+                &drag_to(gpui::point(gpui::px(45.0), gpui::px(10.0))),
+                window,
+                cx,
+            );
             assert_eq!(
                 *buffer.lock().unwrap(),
                 b"\x1b[<0;1;1M\x1b[<32;5;1M",
@@ -2594,7 +2609,11 @@ mod tests {
             assert!(!view.has_selection(), "拖拽期间不建本地选区");
 
             // 同格重复移动去重，不重发
-            view.on_mouse_move(&drag_to(gpui::point(gpui::px(45.0), gpui::px(10.0))), window, cx);
+            view.on_mouse_move(
+                &drag_to(gpui::point(gpui::px(45.0), gpui::px(10.0))),
+                window,
+                cx,
+            );
             assert_eq!(
                 *buffer.lock().unwrap(),
                 b"\x1b[<0;1;1M\x1b[<32;5;1M",
@@ -2602,7 +2621,11 @@ mod tests {
             );
 
             // 跨格移动再次上报（col 6 → 7）
-            view.on_mouse_move(&drag_to(gpui::point(gpui::px(65.0), gpui::px(10.0))), window, cx);
+            view.on_mouse_move(
+                &drag_to(gpui::point(gpui::px(65.0), gpui::px(10.0))),
+                window,
+                cx,
+            );
             assert_eq!(
                 *buffer.lock().unwrap(),
                 b"\x1b[<0;1;1M\x1b[<32;5;1M\x1b[<32;7;1M"
@@ -2659,7 +2682,10 @@ mod tests {
             view.on_mouse_down(&down, window, cx);
             view.on_mouse_move(&drag_to, window, cx);
             view.on_mouse_up(&up, window, cx);
-            assert!(buffer.lock().unwrap().is_empty(), "Shift 绕过：全程零上报字节");
+            assert!(
+                buffer.lock().unwrap().is_empty(),
+                "Shift 绕过：全程零上报字节"
+            );
             assert!(view.has_selection(), "Shift 绕过走本地选区");
             let text = view.state.with_term(|term| term.selection_to_string());
             assert_eq!(text.as_deref(), Some("hello"));
@@ -2704,8 +2730,16 @@ mod tests {
             };
 
             // 关闭后 down/move/up 重建本地选区，零上报字节
-            view.on_mouse_down(&down(gpui::point(gpui::px(5.0), gpui::px(10.0)), 1), window, cx);
-            view.on_mouse_move(&drag_to(gpui::point(gpui::px(45.0), gpui::px(10.0))), window, cx);
+            view.on_mouse_down(
+                &down(gpui::point(gpui::px(5.0), gpui::px(10.0)), 1),
+                window,
+                cx,
+            );
+            view.on_mouse_move(
+                &drag_to(gpui::point(gpui::px(45.0), gpui::px(10.0))),
+                window,
+                cx,
+            );
             view.on_mouse_up(&up(gpui::point(gpui::px(45.0), gpui::px(10.0))), window, cx);
             assert!(buffer.lock().unwrap().is_empty(), "关闭上报后零字节");
             assert!(view.has_selection(), "关闭后恢复本地选区");

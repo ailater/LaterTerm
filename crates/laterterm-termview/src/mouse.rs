@@ -830,13 +830,15 @@ mod tests {
         assert_eq!(bytes, b"\x1b[<48;10;5M");
 
         // 1000 不报移动；空模式不报移动
-        assert!(mouse_motion_report(
-            Some(MouseButton::Left),
-            point,
-            0,
-            TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE
-        )
-        .is_none());
+        assert!(
+            mouse_motion_report(
+                Some(MouseButton::Left),
+                point,
+                0,
+                TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE
+            )
+            .is_none()
+        );
         assert!(mouse_motion_report(None, point, 0, TermMode::empty()).is_none());
     }
 
