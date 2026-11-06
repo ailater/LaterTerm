@@ -4,6 +4,9 @@
 //!
 //! - [`pixel_to_cell`]: Convert pixel coordinates to grid coordinates
 //! - [`mouse_button_report`]: Generate SGR mouse report sequences
+//! - [`mouse_motion_report`]: Generate SGR motion/drag/hover report sequences
+//! - [`mouse_reporting_active`]: SGR 1006 上报统一门控（Shift 绕过 + 1006 才上报）
+//! - [`should_report_motion`]: 1002/1003 移动上报语义判定
 //! - [`scroll_report`]: Handle scroll wheel events
 //! - [`Selection`]: Text selection data structure
 //!
@@ -445,6 +448,73 @@ pub fn encode_modifiers(shift: bool, alt: bool, control: bool) -> u8 {
     modifiers
 }
 
+/// 判断鼠标事件是否应上报给终端应用（SGR 1006 专用统一门控）。
+///
+/// 按下/移动/滚轮三个事件入口共用此策略：
+/// - Shift 按住时绕过上报，事件留给本地选区/回滚（终端惯例）；
+/// - 必须同时开启 SGR（1006）与任一鼠标模式位（1000/1002/1003）：
+///   只开 1000 的旧应用期望 X10/UTF-8 编码，绝不能把 SGR 字节发给它。
+///
+/// # Arguments
+///
+/// * `mode` - 当前终端模式位
+/// * `shift` - 事件发生时 Shift 是否按住
+pub fn mouse_reporting_active(mode: TermMode, shift: bool) -> bool {
+    !shift && mode.contains(TermMode::SGR_MOUSE) && mode.intersects(TermMode::MOUSE_MODE)
+}
+
+/// 编码鼠标移动上报（SGR 1006）。
+///
+/// `pressed` 指明移动时按住的键：左/中/右 → 32/33/34（拖拽），`None` → 35
+/// （1003 悬停）。模式不含 MOUSE_MOTION(1003)/MOUSE_DRAG(1002) 时返回
+/// `None`——1000 只报按下/松开，不报移动。坐标须为已经
+/// `alacritty_terminal::term::point_to_viewport` 换算的视口坐标，本函数
+/// 只负责 +1 转 1-based。
+pub fn mouse_motion_report(
+    pressed: Option<MouseButton>,
+    point: AlacPoint,
+    modifiers: u8,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    if !mode.intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG) {
+        return None;
+    }
+
+    // 移动事件按钮码 = 基础按钮码 + 32；无按键悬停固定 35
+    let button_code = match pressed {
+        Some(MouseButton::Left) => 32,
+        Some(MouseButton::Middle) => 33,
+        Some(MouseButton::Right) => 34,
+        None => 35,
+        _ => return None, // 忽略其余按键
+    };
+    let button_value = button_code | modifiers;
+
+    // SGR 格式使用 1-based 坐标
+    let col = point.column.0 + 1;
+    let row = point.line.0 + 1;
+
+    let sequence = format!("\x1b[<{};{};{}M", button_value, col, row);
+    Some(sequence.into_bytes())
+}
+
+/// 判断移动事件当前是否应上报。
+///
+/// - MOUSE_MOTION(1003)：任何移动都上报（含无按键悬停）；
+/// - MOUSE_DRAG(1002)：仅当该次按下已上报给应用时上报拖拽；
+/// - 仅 1000：不报移动。
+///
+/// # Arguments
+///
+/// * `mode` - 当前终端模式位
+/// * `reported_press_active` - 按住的键是否已作为 press 上报给应用
+pub fn should_report_motion(mode: TermMode, reported_press_active: bool) -> bool {
+    if mode.contains(TermMode::MOUSE_MOTION) {
+        return true;
+    }
+    mode.contains(TermMode::MOUSE_DRAG) && reported_press_active
+}
+
 /// Calculate the number of lines to scroll based on pixel delta.
 ///
 /// This converts a pixel-based scroll delta (from a scroll wheel or trackpad)
@@ -707,5 +777,110 @@ mod tests {
         let bytes = scroll_to_arrow_keys(-100, mode);
         let expected = b"\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B";
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn test_mouse_reporting_active_matrix() {
+        let click = TermMode::MOUSE_REPORT_CLICK;
+        let drag = TermMode::MOUSE_DRAG;
+        let motion = TermMode::MOUSE_MOTION;
+        let sgr = TermMode::SGR_MOUSE;
+
+        assert!(!mouse_reporting_active(TermMode::empty(), false));
+        // 只开鼠标位无 SGR：1000-only 旧编码应用，防误发 SGR 字节
+        assert!(!mouse_reporting_active(click, false));
+        // 只有 SGR 无鼠标位：应用没要鼠标事件
+        assert!(!mouse_reporting_active(sgr, false));
+        // 鼠标位 + SGR：三种鼠标模式（1000/1002/1003）均开启上报
+        assert!(mouse_reporting_active(click | sgr, false));
+        assert!(mouse_reporting_active(drag | sgr, false));
+        assert!(mouse_reporting_active(motion | sgr, false));
+        // Shift 绕过：任一组合下都走本地
+        assert!(!mouse_reporting_active(TermMode::empty(), true));
+        assert!(!mouse_reporting_active(click | sgr, true));
+        assert!(!mouse_reporting_active(motion | sgr, true));
+    }
+
+    #[test]
+    fn test_mouse_motion_report_bytes() {
+        let point = AlacPoint::new(Line(4), Column(9)); // 1-based: 10;5
+        let drag_mode = TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE;
+        let motion_mode = TermMode::MOUSE_MOTION | TermMode::SGR_MOUSE;
+
+        // 1002 左键拖拽 = 32
+        let bytes = mouse_motion_report(Some(MouseButton::Left), point, 0, drag_mode).unwrap();
+        assert_eq!(bytes, b"\x1b[<32;10;5M");
+
+        // 1003 无按键悬停 = 35
+        let bytes = mouse_motion_report(None, point, 0, motion_mode).unwrap();
+        assert_eq!(bytes, b"\x1b[<35;10;5M");
+
+        // 中/右键拖拽 = 33/34
+        assert_eq!(
+            mouse_motion_report(Some(MouseButton::Middle), point, 0, drag_mode).unwrap(),
+            b"\x1b[<33;10;5M"
+        );
+        assert_eq!(
+            mouse_motion_report(Some(MouseButton::Right), point, 0, drag_mode).unwrap(),
+            b"\x1b[<34;10;5M"
+        );
+
+        // Ctrl 修饰位 16：32|16 = 48
+        let bytes = mouse_motion_report(Some(MouseButton::Left), point, 16, drag_mode).unwrap();
+        assert_eq!(bytes, b"\x1b[<48;10;5M");
+
+        // 1000 不报移动；空模式不报移动
+        assert!(mouse_motion_report(
+            Some(MouseButton::Left),
+            point,
+            0,
+            TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE
+        )
+        .is_none());
+        assert!(mouse_motion_report(None, point, 0, TermMode::empty()).is_none());
+    }
+
+    #[test]
+    fn test_should_report_motion_mode_semantics() {
+        let click_sgr = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        // 1000 恒不报移动
+        assert!(!should_report_motion(click_sgr, false));
+        assert!(!should_report_motion(click_sgr, true));
+
+        let drag_sgr = TermMode::MOUSE_DRAG | TermMode::SGR_MOUSE;
+        // 1002 仅已上报按下的拖拽才报
+        assert!(!should_report_motion(drag_sgr, false));
+        assert!(should_report_motion(drag_sgr, true));
+
+        let motion_sgr = TermMode::MOUSE_MOTION | TermMode::SGR_MOUSE;
+        // 1003 悬停也上报
+        assert!(should_report_motion(motion_sgr, false));
+        assert!(should_report_motion(motion_sgr, true));
+
+        assert!(!should_report_motion(TermMode::empty(), true));
+    }
+
+    #[test]
+    fn test_point_to_viewport_keeps_sgr_coordinates_non_negative() {
+        use alacritty_terminal::term::point_to_viewport;
+
+        // 回滚历史负行 + display_offset=2 换算为视口行 0
+        let viewport =
+            point_to_viewport(2, AlacPoint::new(Line(-2), Column(0))).expect("偏移覆盖负行");
+        assert_eq!(viewport.line, 0);
+        assert_eq!(viewport.column.0, 0);
+
+        // 换算后再编码：SGR 序列不得出现负号（网格负行直接 +1 会产出 `;-1;`）
+        let bytes = mouse_button_report(
+            MouseButton::Left,
+            true,
+            AlacPoint::new(Line(viewport.line as i32), viewport.column),
+            0,
+            TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE,
+        )
+        .unwrap();
+        let sequence = String::from_utf8(bytes).unwrap();
+        assert_eq!(sequence, "\x1b[<0;1;1M");
+        assert!(!sequence.contains('-'), "SGR 上报坐标不得含负号");
     }
 }

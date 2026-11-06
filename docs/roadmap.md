@@ -117,7 +117,18 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 > Selection 存于 Term.selection，渲染侧逐行画高亮段），右键经 TerminalMenuRequested 事件交工作区
 > 渲染 anchored 浮层菜单（复制/粘贴/全选/URL 打开/搜索/清屏/重置/分屏/标签/广播/设置，Esc 与
 > 点击外部关闭）。注：应用开启鼠标协议上报（vim/tmux mouse mode）时右键仍弹菜单不上报给应用——
-> 鼠标协议上报（mouse_button_report 已在 mouse.rs 备好）为独立后续项。
+> 该决策随鼠标协议上报落地保持不变，见下一段（2026-11-06）。
+
+> 鼠标协议上报（2026-11-06）：应用开启 TermMode 鼠标位（1000/1002/1003 + 1006）时，左键
+> down/up/move 与滚轮按 SGR 1006 编码 write_input 上报（复用 mouse_button_report/scroll_report，
+> 新增 mouse_reporting_active 统一门控、mouse_motion_report 拖拽(32)/中(33)/右(34)/悬停(35)编码、
+> should_report_motion 的 1002/1003 语义判定；上报坐标一律过 alacritty point_to_viewport 换视口
+> 行，回滚负行不会产出 `;-1;` 非法序列）。上报接管时本地选区/URL 打开/平滑滚动残差让位，Shift
+> 按终端惯例绕过走本地选择与回滚；右键保持本地菜单不上报（既定决策）；1000-only 旧编码（X10/
+> UTF-8）应用一律不上报回退本地（顺带修复存量滚轮对其误发 SGR 字节，回落 ALT 平移/本地回滚）；
+> 右/中键按住时移动不上报（应用未收到对应 press 不编造事件），1003 移动按（格点+修饰位）去重
+> 防逐像素刷 PTY。测试口径：mouse.rs 纯逻辑 + view.rs gpui::test（真实 process_bytes 置位后
+> 驱动事件断言写入字节与本地让位）。
 
 > 主机分组与命令迁移收尾（2026-11-05）：ServerEntry 新增扁平 `group` 分组字段（TOML 可选、
 > 允许 `/`、无父子指针类型层面不成环；validate 严格报错 / normalize_group 宽容降级 None 成对，

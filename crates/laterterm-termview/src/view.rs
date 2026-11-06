@@ -503,6 +503,14 @@ pub struct TerminalView {
     /// 防抖在途标记：输出洪峰时合并为每 150ms 至多一次宿主刷新。
     scroll_report_scheduled: bool,
 
+    /// 已按 SGR 1006 上报给应用的按下键（目前仅左键）；
+    /// 用于拖拽移动的按钮编码与 release 配对，take() 释放防悬挂标记。
+    mouse_down_reported: Option<MouseButton>,
+
+    /// 最近一次移动上报的去重键（视口列, 视口行, 修饰位）；
+    /// 同格且修饰位未变的连续 move 不重发（按 cell 上报语义，防逐像素刷 PTY）。
+    last_motion_report: Option<(usize, usize, u8)>,
+
     /// Text currently being composed by the system input method.
     marked_text: String,
 
@@ -798,6 +806,8 @@ impl TerminalView {
             scroll_callback: None,
             last_scroll: None,
             scroll_report_scheduled: false,
+            mouse_down_reported: None,
+            last_motion_report: None,
             marked_text: String::new(),
             search: None,
             window_handle: None,
@@ -1101,6 +1111,22 @@ impl TerminalView {
         ))
     }
 
+    /// 鼠标上报统一取点：像素坐标 → 网格点（含 display_offset）→ SGR 视口坐标。
+    ///
+    /// 网格负行（回滚历史）必须经 alacritty 的 `point_to_viewport` 换算成非负
+    /// 视口行再上报（SGR 坐标 1-based，直接对网格点 +1 会产出 `;-1;` 非法序列）；
+    /// 换算失败回退 (0,0)。首帧渲染前（无内容原点）返回 `None`，调用方回落
+    /// 本地路径，与既有选区行为一致。
+    fn mouse_report_point(&self, position: Point<Pixels>) -> Option<AlacPoint> {
+        let grid_point = self.grid_point_at(position)?;
+        let display_offset = self.state.with_term(|term| term.grid().display_offset());
+        Some(
+            alacritty_terminal::term::point_to_viewport(display_offset, grid_point)
+                .map(|viewport| AlacPoint::new(Line(viewport.line as i32), viewport.column))
+                .unwrap_or_else(|| AlacPoint::new(Line(0), Column(0))),
+        )
+    }
+
     /// Handle mouse down events.
     ///
     /// 左键负责 URL 打开与文本选区（单击字符 / 双击词 / 三击行），
@@ -1117,6 +1143,30 @@ impl TerminalView {
         self.blink_on
             .store(true, std::sync::atomic::Ordering::Relaxed);
         cx.notify();
+
+        // SGR 鼠标上报接管：应用开启 1000/1002/1003 + 1006 且未按 Shift 时，
+        // 左键按下按 SGR 1006 编码 write_input 上报（鼠标坐标属单窗格，不走
+        // commit_input 广播），本地 URL 打开与选区让位。Shift 绕过是终端惯例；
+        // 1000-only 旧编码应用由 mouse_reporting_active 拦下回退本地。
+        let mode = self.state.mode();
+        if event.button == MouseButton::Left
+            && crate::mouse::mouse_reporting_active(mode, event.modifiers.shift)
+            && let Some(point) = self.mouse_report_point(event.position)
+        {
+            let modifiers =
+                crate::mouse::encode_modifiers(false, event.modifiers.alt, event.modifiers.control);
+            if let Some(bytes) =
+                crate::mouse::mouse_button_report(MouseButton::Left, true, point, modifiers, mode)
+            {
+                self.write_input(&bytes);
+                self.mouse_down_reported = Some(MouseButton::Left);
+                // 以按下点初始化移动去重：同格的首个 move 不重发。
+                self.last_motion_report = Some((point.column.0, point.line.0 as usize, modifiers));
+                return;
+            }
+            // 编码被拒（模式中途翻转等）：回落本地路径。
+        }
+        // 网格点不可得（首帧渲染前）：回落本地路径。
 
         // URL 点击：把像素坐标换算为网格单元，提取 URL 并用系统浏览器打开
         if let Some(origin) = self.last_content_origin {
@@ -1150,7 +1200,28 @@ impl TerminalView {
     }
 
     /// Handle mouse up events: 结束拖拽；未成形的单击选区直接清除。
-    fn on_mouse_up(&mut self, _event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // 上报期间的 release：与已上报的 press 配对发给应用。take() 立即清理
+        // 按下标记（含模式中途翻转——mouse_button_report 返回 None 时静默丢弃
+        // 不写字节，也绝无悬挂标记）；期间不存在本地选区，直接返回。
+        if let Some(button) = self.mouse_down_reported.take() {
+            self.last_motion_report = None;
+            let mode = self.state.mode();
+            if let Some(point) = self.mouse_report_point(event.position) {
+                let modifiers = crate::mouse::encode_modifiers(
+                    false,
+                    event.modifiers.alt,
+                    event.modifiers.control,
+                );
+                if let Some(bytes) =
+                    crate::mouse::mouse_button_report(button, false, point, modifiers, mode)
+                {
+                    self.write_input(&bytes);
+                }
+            }
+            return;
+        }
+
         let had_selection = self.state.with_term(|term| term.selection.is_some());
         if !had_selection {
             return;
@@ -1173,18 +1244,53 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if event.pressed_button != Some(MouseButton::Left) {
+        // 门控必须先于本地按键 early-return：1003 悬停（无按键）也要上报，
+        // 否则移动上报是死路。
+        let mode = self.state.mode();
+        if !crate::mouse::mouse_reporting_active(mode, event.modifiers.shift) {
+            if event.pressed_button != Some(MouseButton::Left) {
+                return;
+            }
+            let Some(point) = self.grid_point_at(event.position) else {
+                return;
+            };
+            self.state.with_term_mut(|term| {
+                if let Some(selection) = term.selection.as_mut() {
+                    selection.update(point, Side::Right);
+                }
+            });
+            cx.notify();
             return;
         }
-        let Some(point) = self.grid_point_at(event.position) else {
+
+        // 上报接管：只编「已上报的左键拖拽(32)」与「无按键悬停(35)」。
+        // 右/中键按住时应用从未收到对应 press，编按钮码或 35 都是编造事件，
+        // 一律跳过；左键按住但 press 未上报（Shift 起拖后松开 Shift）同理跳过，
+        // 保证按钮码与已上报的 press/release 严格配对。
+        let pressed = match event.pressed_button {
+            None => None,
+            Some(MouseButton::Left) if self.mouse_down_reported == Some(MouseButton::Left) => {
+                Some(MouseButton::Left)
+            }
+            Some(_) => return,
+        };
+        if !crate::mouse::should_report_motion(mode, pressed.is_some()) {
+            return;
+        }
+        let Some(point) = self.mouse_report_point(event.position) else {
             return;
         };
-        self.state.with_term_mut(|term| {
-            if let Some(selection) = term.selection.as_mut() {
-                selection.update(point, Side::Right);
-            }
-        });
-        cx.notify();
+        let modifiers =
+            crate::mouse::encode_modifiers(false, event.modifiers.alt, event.modifiers.control);
+        // 同格去重：同一 cell 且修饰位未变的连续移动不重发。
+        let dedupe_key = (point.column.0, point.line.0 as usize, modifiers);
+        if self.last_motion_report == Some(dedupe_key) {
+            return;
+        }
+        if let Some(bytes) = crate::mouse::mouse_motion_report(pressed, point, modifiers, mode) {
+            self.write_input(&bytes);
+            self.last_motion_report = Some(dedupe_key);
+        }
     }
 
     /// 右键：向宿主发菜单请求（锚点 + 命中的 URL），菜单由工作区渲染。
@@ -1249,11 +1355,39 @@ impl TerminalView {
         }
 
         let mode = self.state.mode();
+
+        // SGR 鼠标模式（1000/1002/1003 + 1006，无 Shift）：滚轮按真实格点
+        // 上报（替代旧恒 1;1），平滑滚动残差作废——滚轮已让位给应用。
+        if crate::mouse::mouse_reporting_active(mode, event.modifiers.shift)
+            && let Some(point) = self.mouse_report_point(event.position)
+        {
+            let modifiers =
+                crate::mouse::encode_modifiers(false, event.modifiers.alt, event.modifiers.control);
+            if let Some(bytes) = crate::mouse::scroll_report(lines, point, modifiers, mode) {
+                self.scroll_residual = 0.0;
+                self.write_input(&bytes);
+                cx.notify();
+                return;
+            }
+            // 网格点不可得（首帧渲染前）：回落下方老路（1;1 点位），行为不回归。
+        }
+
+        // 老路：1000-only（X10/UTF-8 旧编码）的应用绝不收 SGR 滚轮字节——
+        // 剥掉鼠标模式位后交给 scroll_report，让其回落 ALT 平移或本地回滚；
+        // SGR 已协商时保留原样（含 Shift 按住时的存量转发行为）。
         let point = alacritty_terminal::index::Point::new(
             alacritty_terminal::index::Line(0),
             alacritty_terminal::index::Column(0),
         );
-        if let Some(bytes) = crate::mouse::scroll_report(lines, point, 0, mode) {
+        let fallback_mode = if mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE) {
+            mode
+        } else {
+            mode
+                - (alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
+                    | alacritty_terminal::term::TermMode::MOUSE_MOTION
+                    | alacritty_terminal::term::TermMode::MOUSE_DRAG)
+        };
+        if let Some(bytes) = crate::mouse::scroll_report(lines, point, 0, fallback_mode) {
             let mut writer = self.stdin_writer.lock();
             if let Err(error) = writer.write_all(&bytes).and_then(|_| writer.flush()) {
                 eprintln!("写入滚轮事件失败: {error}");
@@ -2321,6 +2455,406 @@ mod tests {
             view.on_mouse_up(&up(gpui::point(gpui::px(5.0), gpui::px(10.0))), window, cx);
             assert!(!view.has_selection(), "单击未拖拽不应留下选区");
         });
+    }
+
+    /// 录制写入字节的 stdin 替身；断言鼠标上报编码用。
+    struct RecordingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 固定网格度量，并用真实 VTE 解析置位鼠标模式后清空字节缓冲。
+    fn enable_mouse_reporting(
+        view: &mut TerminalView,
+        enable_sequence: &[u8],
+        buffer: &Arc<std::sync::Mutex<Vec<u8>>>,
+    ) {
+        view.state.process_bytes(b"hello selection\r\n$ ");
+        view.state.process_bytes(enable_sequence);
+        view.last_content_origin = Some(gpui::Point {
+            x: gpui::px(0.0),
+            y: gpui::px(0.0),
+        });
+        view.renderer.cell_width = gpui::px(10.0);
+        view.renderer.cell_height = gpui::px(20.0);
+        buffer.lock().unwrap().clear();
+    }
+
+    #[gpui::test]
+    fn sgr_click_reports_bytes_and_suppresses_local_selection(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseMoveEvent, MouseUpEvent};
+        use std::sync::Mutex;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let recorded = buffer.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let view = TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx);
+            *view.stdin_writer.lock() = Box::new(RecordingWriter(recorded));
+            view
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            enable_mouse_reporting(view, b"\x1b[?1000;1006h", &buffer);
+            let term_mode = alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK
+                | alacritty_terminal::term::TermMode::SGR_MOUSE;
+            assert!(
+                view.state.mode().contains(term_mode),
+                "?1000;1006h 必须真实置位 CLICK|SGR"
+            );
+
+            let down = MouseDownEvent {
+                button: MouseButton::Left,
+                position: gpui::point(gpui::px(5.0), gpui::px(10.0)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            view.on_mouse_down(&down, window, cx);
+            assert_eq!(*buffer.lock().unwrap(), b"\x1b[<0;1;1M", "按下上报 SGR press");
+            assert!(!view.has_selection(), "上报接管时本地选区让位");
+
+            // 1000 模式不报移动
+            let motion = MouseMoveEvent {
+                position: gpui::point(gpui::px(45.0), gpui::px(10.0)),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            };
+            view.on_mouse_move(&motion, window, cx);
+            assert_eq!(*buffer.lock().unwrap(), b"\x1b[<0;1;1M", "1000 模式移动不上报");
+            assert!(!view.has_selection(), "上报接管期间不建本地选区");
+
+            let up = MouseUpEvent {
+                button: MouseButton::Left,
+                position: gpui::point(gpui::px(5.0), gpui::px(10.0)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+            view.on_mouse_up(&up, window, cx);
+            assert_eq!(
+                *buffer.lock().unwrap(),
+                b"\x1b[<0;1;1M\x1b[<0;1;1m",
+                "松开上报 SGR release"
+            );
+            assert!(
+                view.mouse_down_reported.is_none(),
+                "release 后不得悬挂按下标记"
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn sgr_drag_reports_motion_bytes_without_local_selection(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseMoveEvent, MouseUpEvent};
+        use std::sync::Mutex;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let recorded = buffer.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let view = TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx);
+            *view.stdin_writer.lock() = Box::new(RecordingWriter(recorded));
+            view
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            enable_mouse_reporting(view, b"\x1b[?1002;1006h", &buffer);
+
+            let down = |position| MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            let drag_to = |position| MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            };
+            let up = |position| MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+
+            view.on_mouse_down(&down(gpui::point(gpui::px(5.0), gpui::px(10.0))), window, cx);
+            assert_eq!(*buffer.lock().unwrap(), b"\x1b[<0;1;1M", "press 上报");
+
+            // 拖到 col 4 → 32;5;1
+            view.on_mouse_move(&drag_to(gpui::point(gpui::px(45.0), gpui::px(10.0))), window, cx);
+            assert_eq!(
+                *buffer.lock().unwrap(),
+                b"\x1b[<0;1;1M\x1b[<32;5;1M",
+                "拖拽移动按 32 上报"
+            );
+            assert!(!view.has_selection(), "拖拽期间不建本地选区");
+
+            // 同格重复移动去重，不重发
+            view.on_mouse_move(&drag_to(gpui::point(gpui::px(45.0), gpui::px(10.0))), window, cx);
+            assert_eq!(
+                *buffer.lock().unwrap(),
+                b"\x1b[<0;1;1M\x1b[<32;5;1M",
+                "同格移动不重发"
+            );
+
+            // 跨格移动再次上报（col 6 → 7）
+            view.on_mouse_move(&drag_to(gpui::point(gpui::px(65.0), gpui::px(10.0))), window, cx);
+            assert_eq!(
+                *buffer.lock().unwrap(),
+                b"\x1b[<0;1;1M\x1b[<32;5;1M\x1b[<32;7;1M"
+            );
+
+            view.on_mouse_up(&up(gpui::point(gpui::px(65.0), gpui::px(10.0))), window, cx);
+            assert_eq!(
+                *buffer.lock().unwrap(),
+                b"\x1b[<0;1;1M\x1b[<32;5;1M\x1b[<32;7;1M\x1b[<0;7;1m",
+                "release 与 press 配对上报"
+            );
+            assert!(!view.has_selection(), "全程无本地选区");
+        });
+    }
+
+    #[gpui::test]
+    fn shift_bypass_keeps_local_selection_while_reporting(cx: &mut TestAppContext) {
+        use gpui::{MouseMoveEvent, MouseUpEvent};
+        use std::sync::Mutex;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let recorded = buffer.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let view = TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx);
+            *view.stdin_writer.lock() = Box::new(RecordingWriter(recorded));
+            view
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            enable_mouse_reporting(view, b"\x1b[?1000;1006h", &buffer);
+
+            let shift = gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            };
+            let down = MouseDownEvent {
+                button: MouseButton::Left,
+                position: gpui::point(gpui::px(5.0), gpui::px(10.0)),
+                modifiers: shift,
+                click_count: 1,
+                first_mouse: false,
+            };
+            let drag_to = MouseMoveEvent {
+                position: gpui::point(gpui::px(45.0), gpui::px(10.0)),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: shift,
+            };
+            let up = MouseUpEvent {
+                button: MouseButton::Left,
+                position: gpui::point(gpui::px(45.0), gpui::px(10.0)),
+                modifiers: shift,
+                click_count: 1,
+            };
+
+            view.on_mouse_down(&down, window, cx);
+            view.on_mouse_move(&drag_to, window, cx);
+            view.on_mouse_up(&up, window, cx);
+            assert!(buffer.lock().unwrap().is_empty(), "Shift 绕过：全程零上报字节");
+            assert!(view.has_selection(), "Shift 绕过走本地选区");
+            let text = view.state.with_term(|term| term.selection_to_string());
+            assert_eq!(text.as_deref(), Some("hello"));
+            assert!(view.mouse_down_reported.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn disabled_reporting_restores_local_selection(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseMoveEvent, MouseUpEvent};
+        use std::sync::Mutex;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let recorded = buffer.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let view = TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx);
+            *view.stdin_writer.lock() = Box::new(RecordingWriter(recorded));
+            view
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            enable_mouse_reporting(view, b"\x1b[?1000;1006h", &buffer);
+            view.state.process_bytes(b"\x1b[?1000l\x1b[?1006l");
+            buffer.lock().unwrap().clear();
+
+            let down = |position, click_count| MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count,
+                first_mouse: false,
+            };
+            let drag_to = |position| MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            };
+            let up = |position| MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+
+            // 关闭后 down/move/up 重建本地选区，零上报字节
+            view.on_mouse_down(&down(gpui::point(gpui::px(5.0), gpui::px(10.0)), 1), window, cx);
+            view.on_mouse_move(&drag_to(gpui::point(gpui::px(45.0), gpui::px(10.0))), window, cx);
+            view.on_mouse_up(&up(gpui::point(gpui::px(45.0), gpui::px(10.0))), window, cx);
+            assert!(buffer.lock().unwrap().is_empty(), "关闭上报后零字节");
+            assert!(view.has_selection(), "关闭后恢复本地选区");
+            let text = view.state.with_term(|term| term.selection_to_string());
+            assert_eq!(text.as_deref(), Some("hello"));
+        });
+    }
+
+    #[gpui::test]
+    fn mode_flip_mid_press_drops_release_without_dangling_flag(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseUpEvent};
+        use std::sync::Mutex;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let recorded = buffer.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let view = TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx);
+            *view.stdin_writer.lock() = Box::new(RecordingWriter(recorded));
+            view
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            enable_mouse_reporting(view, b"\x1b[?1000;1006h", &buffer);
+
+            let down = MouseDownEvent {
+                button: MouseButton::Left,
+                position: gpui::point(gpui::px(5.0), gpui::px(10.0)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            view.on_mouse_down(&down, window, cx);
+            assert_eq!(*buffer.lock().unwrap(), b"\x1b[<0;1;1M");
+
+            // 应用在按住期间退出鼠标模式：release 静默丢弃、无悬挂标记
+            view.state.process_bytes(b"\x1b[?1000l");
+            let up = MouseUpEvent {
+                button: MouseButton::Left,
+                position: gpui::point(gpui::px(5.0), gpui::px(10.0)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+            view.on_mouse_up(&up, window, cx);
+            assert_eq!(
+                *buffer.lock().unwrap(),
+                b"\x1b[<0;1;1M",
+                "模式翻转后 release 不写字节"
+            );
+            assert!(view.mouse_down_reported.is_none(), "无悬挂按下标记");
+            assert!(!view.has_selection(), "翻转路径不落本地选区");
+        });
+    }
+
+    #[gpui::test]
+    fn scroll_reports_wheel_in_sgr_mode_and_falls_back_locally_when_off(cx: &mut TestAppContext) {
+        use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase};
+        use std::sync::Mutex;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let recorded = buffer.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let view = TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx);
+            *view.stdin_writer.lock() = Box::new(RecordingWriter(recorded));
+            view
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            // 显式固定小网格并灌出回滚历史，供本地滚动断言（测试窗口首帧会
+            // 按窗口尺寸重排网格，必须显式 resize，照既有 grid_point_at 测试）
+            view.resize(10, 5);
+            for i in 0..20 {
+                view.state.process_bytes(format!("line {i}\r\n").as_bytes());
+            }
+            view.state.process_bytes(b"\x1b[?1000;1006h");
+            view.last_content_origin = Some(gpui::Point {
+                x: gpui::px(0.0),
+                y: gpui::px(0.0),
+            });
+            view.renderer.cell_width = gpui::px(10.0);
+            view.renderer.cell_height = gpui::px(20.0);
+            buffer.lock().unwrap().clear();
+
+            let wheel = |lines: f32| ScrollWheelEvent {
+                position: gpui::point(gpui::px(5.0), gpui::px(10.0)),
+                delta: ScrollDelta::Lines(gpui::point(0.0, lines)),
+                modifiers: Default::default(),
+                touch_phase: TouchPhase::Moved,
+            };
+            let display_offset =
+                |view: &TerminalView| view.state.with_term(|term| term.grid().display_offset());
+            assert_eq!(display_offset(view), 0);
+
+            view.on_scroll(&wheel(1.0), window, cx);
+            assert_eq!(
+                *buffer.lock().unwrap(),
+                b"\x1b[<64;1;1M",
+                "滚轮按 64 上报真实格点"
+            );
+            assert_eq!(display_offset(view), 0, "上报接管时本地回滚不动");
+
+            // 关闭上报：同事件回落本地滚动，零字节
+            view.state.process_bytes(b"\x1b[?1000l\x1b[?1006l");
+            buffer.lock().unwrap().clear();
+            view.on_scroll(&wheel(1.0), window, cx);
+            assert!(buffer.lock().unwrap().is_empty(), "关闭后滚轮零字节");
+            assert_eq!(display_offset(view), 1, "关闭后滚轮走本地回滚");
+        });
+    }
+
+    #[gpui::test]
+    fn right_click_stays_local_menu_while_reporting(cx: &mut TestAppContext) {
+        use super::TerminalMenuRequested;
+        use gpui::Modifiers;
+        use std::sync::Mutex;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let recorded = buffer.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let view = TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx);
+            *view.stdin_writer.lock() = Box::new(RecordingWriter(recorded));
+            view
+        });
+        let menus = Arc::new(AtomicUsize::new(0));
+        let count = menus.clone();
+        let _subscription = cx.update(|_, cx| {
+            cx.subscribe(&terminal, move |_, _: &TerminalMenuRequested, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            enable_mouse_reporting(view, b"\x1b[?1000;1006h", &buffer);
+
+            let right_down = MouseDownEvent {
+                button: MouseButton::Right,
+                position: gpui::point(gpui::px(5.0), gpui::px(10.0)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            view.on_right_click(&right_down, window, cx);
+        });
+        // GPUI 事件经 effect flush 送达订阅者，先跑空任务队列再断言
+        cx.run_until_parked();
+        terminal.read_with(cx, |view, _| {
+            assert_eq!(menus.load(Ordering::SeqCst), 1, "右键仍发本地菜单请求");
+            assert!(!view.has_selection(), "右键不建选区");
+        });
+        assert!(
+            buffer.lock().unwrap().is_empty(),
+            "右键不上报字节（既定决策）"
+        );
     }
 
     #[gpui::test]
