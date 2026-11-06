@@ -1,7 +1,11 @@
 use crate::branding::titlebar_logo;
 use crate::command_text_field::{CommandTextChanged, CommandTextField, FieldSubmit};
 use crate::pane_navigation::{Direction as PaneDirection, PaneRect, neighbor};
-use crate::server_connection::{self, ConnectionOutcome, CredentialKind};
+use crate::server_connection::{self, ConnectionOutcome, CredentialKind, SftpOutcome};
+use crate::sftp_panel::{
+    self, PaneSide, SftpEvent, SftpPanelState, SftpPromptKind, SftpTransfer, TransferKind,
+    load_remote_into, sftp_overlay,
+};
 use crate::shortcut_recorder::{ShortcutChanged, ShortcutRecorder};
 use gpui::{
     App, AppContext, AsyncApp, Bounds, Context, CursorStyle, DispatchPhase, Div, Edges, Entity,
@@ -310,6 +314,13 @@ enum ServerDialog {
     },
 }
 
+/// 连接去向：shell 新标签，或 SFTP 双栏面板（凭据解析同流程，产物不同）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectDest {
+    Shell,
+    SftpPanel,
+}
+
 struct SshRequest {
     id: u64,
     entry: ServerEntry,
@@ -317,11 +328,23 @@ struct SshRequest {
     /// 必须随请求持有：补输凭据重试路径（submit_server_connect →
     /// start_ssh_connect）不再回查配置表，否则重连会退化成直连。
     jump: Vec<ServerEntry>,
+    /// 去向：决定后台函数（connect vs connect_sftp）与结果管道。
+    dest: ConnectDest,
     active: Arc<AtomicBool>,
     running: bool,
 }
 
 type PendingSshResult = (u64, ServerEntry, anyhow::Result<ConnectionOutcome>);
+/// SFTP 连接结果与 shell 分管道：产物类型不同（SftpHandle vs
+/// TerminalSession），迟到取消各自处置（close vs kill）。
+type PendingSftpResult = (u64, ServerEntry, anyhow::Result<SftpOutcome>);
+
+/// SFTP 栏内操作弹窗（新建目录/重命名；走窗口级模态弹窗模式）。
+#[derive(Clone)]
+struct SftpPromptDialog {
+    side: PaneSide,
+    kind: SftpPromptKind,
+}
 
 /// 内置快捷键（不可改，但参与全局冲突检测）。
 const BUILTIN_SHORTCUTS: &[(&str, &str)] = &[
@@ -704,6 +727,20 @@ pub struct WorkspaceView {
     next_ssh_request_id: u64,
     /// 后台结果按请求标识校验，过期成功会话立即关闭。
     pending_ssh_results: Vec<PendingSshResult>,
+    /// SFTP 连接结果（与 shell 分管道，见 PendingSftpResult 注记）。
+    pending_sftp_results: Vec<PendingSftpResult>,
+    /// SFTP 双栏面板状态（None = 关闭；同一时刻至多一个面板）。
+    /// 跨模块只读访问限于 sftp_panel.rs 的覆盖层渲染。
+    pub(crate) sftp_panel: Option<SftpPanelState>,
+    /// SFTP 面板后台事件（列表/传输进度）→ UI pump。
+    sftp_events_tx: flume::Sender<SftpEvent>,
+    sftp_events_rx: flume::Receiver<SftpEvent>,
+    /// 传输任务自增 id。
+    next_sftp_transfer_id: u64,
+    /// 栏内新建目录/重命名弹窗（走窗口级模态弹窗模式）。
+    sftp_prompt: Option<SftpPromptDialog>,
+    sftp_prompt_fields: Vec<(String, Entity<CommandTextField>)>,
+    sftp_prompt_subscriptions: Vec<gpui::Subscription>,
     /// 待生效的焦点请求：异步上下文拿不到 window，先记下 handle，render 期统一 focus。
     pending_focus: Option<FocusHandle>,
     secret_store: Arc<dyn SecretStore>,
@@ -723,6 +760,7 @@ impl WorkspaceView {
         let themes = ThemeRegistry::load();
         let (shortcut_tx, shortcut_rx) = flume::unbounded();
         let (broadcast_tx, broadcast_rx) = flume::unbounded();
+        let (sftp_events_tx, sftp_events_rx) = flume::unbounded();
         let first_pane = PaneId(1);
         let first_tab = TabId(1);
         let theme = themes.resolve(&settings.appearance.theme).clone();
@@ -792,6 +830,14 @@ impl WorkspaceView {
             ssh_request: None,
             next_ssh_request_id: 1,
             pending_ssh_results: Vec::new(),
+            pending_sftp_results: Vec::new(),
+            sftp_panel: None,
+            sftp_events_tx,
+            sftp_events_rx,
+            next_sftp_transfer_id: 1,
+            sftp_prompt: None,
+            sftp_prompt_fields: Vec::new(),
+            sftp_prompt_subscriptions: Vec::new(),
             pending_focus: None,
             next_split_id: 1,
             pane_geometry: Rc::new(RefCell::new(None)),
@@ -830,6 +876,7 @@ impl WorkspaceView {
         view.start_shortcut_pump(cx);
         view.start_broadcast_pump(cx);
         view.start_totp_ticker(cx);
+        view.start_sftp_pump(cx);
         view
     }
 
@@ -3129,6 +3176,17 @@ impl WorkspaceView {
 
     /// 点连接立即占用请求槽，准备私钥和密钥环操作都在后台进行。
     fn connect_server(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.begin_ssh_connect(name, ConnectDest::Shell, cx);
+    }
+
+    /// 打开服务器的 SFTP 双栏面板：与 shell 连接同一套请求槽/补输流程
+    /// （复用 ServerDialog::Connect 弹窗，仅标题按去向区分），成功后建面板。
+    fn open_sftp_panel(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.begin_ssh_connect(name, ConnectDest::SftpPanel, cx);
+    }
+
+    /// 连接发起的公共前置：请求槽互斥 + 跳板链快照 + Connecting 弹窗。
+    fn begin_ssh_connect(&mut self, name: &str, dest: ConnectDest, cx: &mut Context<Self>) {
         if self.ssh_request.is_some() {
             return;
         }
@@ -3165,6 +3223,7 @@ impl WorkspaceView {
             id,
             entry: entry.clone(),
             jump: jump_entries,
+            dest,
             active: Arc::new(AtomicBool::new(true)),
             running: false,
         });
@@ -3220,34 +3279,83 @@ impl WorkspaceView {
         self.server_error = None;
         let store = self.secret_store.clone();
         let jump_entries = request.jump.clone();
-        let (tx, rx) = flume::bounded(1);
-        std::thread::spawn(move || {
-            let result =
-                server_connection::connect(&entry, jump_entries, supplied, remember, store, active);
-            if let Err(error) = tx.send((request_id, entry, result))
-                && let Ok(ConnectionOutcome::Connected { session, .. }) = error.0.2
-            {
-                session.kill();
+        match request.dest {
+            ConnectDest::Shell => {
+                let (tx, rx) = flume::bounded(1);
+                std::thread::spawn(move || {
+                    let result = server_connection::connect(
+                        &entry,
+                        jump_entries,
+                        supplied,
+                        remember,
+                        store,
+                        active,
+                    );
+                    if let Err(error) = tx.send((request_id, entry, result))
+                        && let Ok(ConnectionOutcome::Connected { session, .. }) = error.0.2
+                    {
+                        session.kill();
+                    }
+                });
+                cx.spawn(async move |this, cx| {
+                    if let Ok(result) = rx.recv_async().await {
+                        let mut result = Some(result);
+                        if this
+                            .update(cx, |workspace, cx| {
+                                workspace
+                                    .pending_ssh_results
+                                    .push(result.take().expect("连接结果只消费一次"));
+                                cx.notify();
+                            })
+                            .is_err()
+                            && let Some((_, _, Ok(ConnectionOutcome::Connected { session, .. }))) =
+                                result
+                        {
+                            session.kill();
+                        }
+                    }
+                })
+                .detach();
             }
-        });
-        cx.spawn(async move |this, cx| {
-            if let Ok(result) = rx.recv_async().await {
-                let mut result = Some(result);
-                if this
-                    .update(cx, |workspace, cx| {
-                        workspace
-                            .pending_ssh_results
-                            .push(result.take().expect("连接结果只消费一次"));
-                        cx.notify();
-                    })
-                    .is_err()
-                    && let Some((_, _, Ok(ConnectionOutcome::Connected { session, .. }))) = result
-                {
-                    session.kill();
-                }
+            ConnectDest::SftpPanel => {
+                // 与 shell 分函数分管道（P2 评审口径）：产物是 SftpHandle，
+                // 迟到取消由 connect_sftp 内部 close() 处置，无需外部 kill。
+                let (tx, rx) = flume::bounded(1);
+                std::thread::spawn(move || {
+                    let result = server_connection::connect_sftp(
+                        &entry,
+                        jump_entries,
+                        supplied,
+                        remember,
+                        store,
+                        active,
+                    );
+                    if let Err(error) = tx.send((request_id, entry, result))
+                        && let Ok(SftpOutcome::Connected { browse, .. }) = error.0.2
+                    {
+                        browse.close();
+                    }
+                });
+                cx.spawn(async move |this, cx| {
+                    if let Ok(result) = rx.recv_async().await {
+                        let mut result = Some(result);
+                        if this
+                            .update(cx, |workspace, cx| {
+                                workspace
+                                    .pending_sftp_results
+                                    .push(result.take().expect("连接结果只消费一次"));
+                                cx.notify();
+                            })
+                            .is_err()
+                            && let Some((_, _, Ok(SftpOutcome::Connected { browse, .. }))) = result
+                        {
+                            browse.close();
+                        }
+                    }
+                })
+                .detach();
             }
-        })
-        .detach();
+        }
         cx.notify();
     }
 
@@ -3301,28 +3409,7 @@ impl WorkspaceView {
                 self.focus_pane(pane_id, window, cx);
             }
             Ok(ConnectionOutcome::Prompt { kind, warning }) => {
-                self.server_fields.clear();
-                self.server_field_subscriptions.clear();
-                self.server_error = warning;
-                let label = if matches!(kind, CredentialKind::PrivateKey { .. }) {
-                    "私钥解锁口令"
-                } else {
-                    "登录密码 / 交互口令（可留空使用私钥）"
-                };
-                let field = cx.new(|cx| CommandTextField::new(String::new(), label, cx).masked());
-                self.server_field_subscriptions.push(
-                    cx.subscribe(&field, |workspace, _, _: &FieldSubmit, cx| {
-                        workspace.submit_server_connect(cx)
-                    }),
-                );
-                field.read(cx).focus_handle().focus(window);
-                self.server_fields.push((label.into(), field));
-                self.server_dialog = Some(ServerDialog::Connect {
-                    name: entry.name,
-                    kind,
-                    request_id,
-                    remember: false,
-                });
+                self.present_credential_prompt(request_id, entry.name, kind, warning, window, cx);
             }
             Err(error) => {
                 self.server_error = Some(format!("连接 {} 失败: {error:#}", entry.name));
@@ -3338,11 +3425,672 @@ impl WorkspaceView {
         cx.notify();
     }
 
+    /// 补输凭据弹窗（shell 与 SFTP 连接共用；ServerDialog::Connect 复用，
+    /// 标题按 ssh_request 去向区分）。
+    fn present_credential_prompt(
+        &mut self,
+        request_id: u64,
+        name: String,
+        kind: CredentialKind,
+        warning: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.server_fields.clear();
+        self.server_field_subscriptions.clear();
+        self.server_error = warning;
+        let label = if matches!(kind, CredentialKind::PrivateKey { .. }) {
+            "私钥解锁口令"
+        } else {
+            "登录密码 / 交互口令（可留空使用私钥）"
+        };
+        let field = cx.new(|cx| CommandTextField::new(String::new(), label, cx).masked());
+        self.server_field_subscriptions.push(
+            cx.subscribe(&field, |workspace, _, _: &FieldSubmit, cx| {
+                workspace.submit_server_connect(cx)
+            }),
+        );
+        field.read(cx).focus_handle().focus(window);
+        self.server_fields.push((label.into(), field));
+        self.server_dialog = Some(ServerDialog::Connect {
+            name,
+            kind,
+            request_id,
+            remember: false,
+        });
+    }
+
+    /// 需要 window 的 SFTP 连接结果在 render 期消费（与 shell 同模式）。
+    fn process_sftp_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for (request_id, entry, result) in std::mem::take(&mut self.pending_sftp_results) {
+            self.finish_sftp_connect(request_id, entry, result, window, cx);
+        }
+    }
+
+    /// SFTP 连接结果落地：Prompt 走共用补输弹窗；Connected 建面板并
+    /// 触发初始加载（远端 realpath + 列目录、本地列目录，全部后台线程）。
+    fn finish_sftp_connect(
+        &mut self,
+        request_id: u64,
+        entry: ServerEntry,
+        result: anyhow::Result<SftpOutcome>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.ssh_request.as_ref().is_some_and(|request| {
+            request.id == request_id && request.active.load(Ordering::Acquire)
+        }) && self.settings.servers.iter().any(|item| item == &entry);
+        if !current {
+            // 迟到/取消的结果：丢弃并关闭通道（无 session 可 kill，SFTP 无
+            // TerminalSession——这正是分管道的原因）
+            if let Ok(SftpOutcome::Connected { browse, .. }) = result {
+                browse.close();
+            }
+            if self
+                .ssh_request
+                .as_ref()
+                .is_some_and(|request| request.id == request_id)
+            {
+                self.cancel_ssh_request();
+                self.server_dialog = None;
+                self.server_fields.clear();
+                self.server_field_subscriptions.clear();
+            }
+            return;
+        }
+        if let Some(request) = &mut self.ssh_request {
+            request.running = false;
+        }
+        self.ssh_connecting = None;
+        match result {
+            Ok(SftpOutcome::Connected {
+                browse,
+                endpoint,
+                hops,
+                warning,
+            }) => {
+                self.ssh_request = None;
+                self.server_dialog = None;
+                self.server_fields.clear();
+                self.server_field_subscriptions.clear();
+                self.server_error = None;
+                self.server_notice = warning;
+                let local_dir = std::env::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+                let mut panel = SftpPanelState::new(
+                    sftp_panel::panel_title(&endpoint, &hops),
+                    browse,
+                    endpoint,
+                    hops,
+                    local_dir,
+                );
+                panel.initial_load(&self.sftp_events_tx);
+                self.sftp_panel = Some(panel);
+                cx.notify();
+            }
+            Ok(SftpOutcome::Prompt { kind, warning }) => {
+                self.present_credential_prompt(request_id, entry.name, kind, warning, window, cx);
+                cx.notify();
+            }
+            Err(error) => {
+                self.server_error = Some(format!("打开 SFTP 面板失败: {error:#}"));
+                if matches!(self.server_dialog, Some(ServerDialog::Connecting { .. })) {
+                    self.cancel_ssh_request();
+                    self.server_dialog = None;
+                    self.right_panel = true;
+                    self.right_panel_tab = RightPanelTab::Servers;
+                    self.focus_active(window, cx);
+                }
+                cx.notify();
+            }
+        }
+    }
+
     /// 需要 window 的结果在 render 期消费。
     fn process_ssh_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for (request_id, entry, result) in std::mem::take(&mut self.pending_ssh_results) {
             self.finish_ssh_connect(request_id, entry, result, window, cx);
         }
+    }
+
+    // ---------- SFTP 双栏面板 ----------
+
+    /// 后台事件泵：列表/传输进度全部经此回 UI（面板关闭后事件自然丢弃）。
+    fn start_sftp_pump(&self, cx: &mut Context<Self>) {
+        let rx = self.sftp_events_rx.clone();
+        cx.spawn(async move |this, cx| {
+            while let Ok(event) = rx.recv_async().await {
+                if this
+                    .update(cx, |workspace, cx| workspace.handle_sftp_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 面板事件落地：状态应用 + 队列推进（半成品清理在传输工作线程内完成）。
+    fn handle_sftp_event(&mut self, event: SftpEvent, cx: &mut Context<Self>) {
+        let transfer_finished = self
+            .sftp_panel
+            .as_mut()
+            .map(|panel| panel.apply_event(event))
+            .unwrap_or(false);
+        if transfer_finished && let Some(panel) = &mut self.sftp_panel {
+            panel.promote_next(&self.sftp_events_tx);
+        }
+        cx.notify();
+    }
+
+    /// 双栏行点击：单击切换选中；双击目录进入（后台列目录）。
+    pub(crate) fn sftp_row_click(
+        &mut self,
+        is_local: bool,
+        double: bool,
+        name: String,
+        is_dir: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = &mut self.sftp_panel else {
+            return;
+        };
+        panel.error = None;
+        panel.notice = None;
+        if double && is_dir {
+            if is_local {
+                let dir = panel.local.dir.join(&name);
+                panel.local.selected.clear();
+                panel.refresh_local(&dir, &self.sftp_events_tx);
+            } else {
+                match sftp_panel::remote_join(&panel.remote.dir, &name) {
+                    Ok(dir) => {
+                        panel.remote.selected.clear();
+                        panel.refresh_remote(&dir, &self.sftp_events_tx);
+                    }
+                    Err(message) => panel.error = Some(message),
+                }
+            }
+        } else {
+            let selected = if is_local {
+                &mut panel.local.selected
+            } else {
+                &mut panel.remote.selected
+            };
+            if selected.contains(&name) {
+                selected.remove(&name);
+            } else {
+                selected.insert(name);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 上级目录导航：远端走 remote_parent（`..` 被 remote_join 拒绝），
+    /// 本地走 Path::parent。
+    pub(crate) fn sftp_go_up(&mut self, side: PaneSide, path: &str, cx: &mut Context<Self>) {
+        let Some(panel) = &mut self.sftp_panel else {
+            return;
+        };
+        panel.error = None;
+        match side {
+            PaneSide::Local => {
+                if let Some(parent) = sftp_panel::local_parent(Path::new(path)) {
+                    panel.local.selected.clear();
+                    panel.refresh_local(&parent, &self.sftp_events_tx);
+                }
+            }
+            PaneSide::Remote => {
+                if let Some(parent) = sftp_panel::remote_parent(path) {
+                    panel.remote.selected.clear();
+                    panel.refresh_remote(&parent, &self.sftp_events_tx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// 刷新当前目录。
+    pub(crate) fn sftp_refresh(&mut self, side: PaneSide, path: &str, cx: &mut Context<Self>) {
+        let Some(panel) = &mut self.sftp_panel else {
+            return;
+        };
+        panel.error = None;
+        match side {
+            PaneSide::Local => {
+                let dir = PathBuf::from(path);
+                panel.refresh_local(&dir, &self.sftp_events_tx);
+            }
+            PaneSide::Remote => {
+                if path.is_empty() {
+                    // 初始列表尚未落地（remote.dir 仍为空）：read_dir("")
+                    // 在真实 sshd 上必然报错，此刻也没有可刷新的内容
+                    cx.notify();
+                    return;
+                }
+                let dir = path.to_string();
+                panel.refresh_remote(&dir, &self.sftp_events_tx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// 系统目录对话框选择本机目录（xdg-desktop-portal，与服务器导出同模式）。
+    pub(crate) fn sftp_browse_local(&mut self, cx: &mut Context<Self>) {
+        // 注：gpui 的 PathPromptOptions 不带起始目录参数，从当前目录打开
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择本机目录".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = receiver
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("对话框已关闭")));
+            let _ = this.update(cx, |workspace, cx| workspace.finish_sftp_browse(picked, cx));
+        })
+        .detach();
+    }
+
+    fn finish_sftp_browse(
+        &mut self,
+        picked: anyhow::Result<Option<Vec<PathBuf>>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = &mut self.sftp_panel else {
+            return;
+        };
+        match picked {
+            Err(error) => panel.error = Some(format!("打开目录对话框失败: {error:#}")),
+            Ok(None) => {}
+            Ok(Some(paths)) => {
+                if let Some(dir) = paths.into_iter().next() {
+                    panel.local.selected.clear();
+                    panel.refresh_local(&dir, &self.sftp_events_tx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// 入队传输：本栏选中集里的文件逐条排队（目录 v1 不支持，提示可见）；
+    /// 同名去重；然后尝试推进队列。
+    pub(crate) fn sftp_enqueue(&mut self, kind: TransferKind, cx: &mut Context<Self>) {
+        let Some(panel) = &mut self.sftp_panel else {
+            return;
+        };
+        panel.error = None;
+        panel.notice = None;
+        let source_selected = match kind {
+            TransferKind::Upload => panel.local.selected.clone(),
+            TransferKind::Download => panel.remote.selected.clone(),
+        };
+        if source_selected.is_empty() {
+            panel.notice = Some(match kind {
+                TransferKind::Upload => "先在左栏（本机）选择要上传的文件".to_string(),
+                TransferKind::Download => "先在右栏（远端）选择要下载的文件".to_string(),
+            });
+            cx.notify();
+            return;
+        }
+        let is_upload = kind == TransferKind::Upload;
+        let mut queued = 0usize;
+        let mut skipped_dirs = 0usize;
+        for name in &source_selected {
+            let is_dir = if is_upload {
+                panel
+                    .local
+                    .entries
+                    .iter()
+                    .find(|entry| &entry.name == name)
+                    .map(|entry| entry.is_dir)
+            } else {
+                panel
+                    .remote
+                    .entries
+                    .iter()
+                    .find(|entry| &entry.name == name)
+                    .map(|entry| entry.is_dir)
+            };
+            if is_dir == Some(true) {
+                skipped_dirs += 1;
+                continue;
+            }
+            // 同名且仍在排队/传输：跳过（防重复入队）
+            if panel.transfers.iter().any(|transfer| {
+                transfer.is_active() && transfer.kind == kind && &transfer.file_name == name
+            }) {
+                continue;
+            }
+            let remote_path = match sftp_panel::remote_join(&panel.remote.dir, name) {
+                Ok(remote_path) => remote_path,
+                Err(message) => {
+                    panel.error = Some(message);
+                    continue;
+                }
+            };
+            let id = self.next_sftp_transfer_id;
+            self.next_sftp_transfer_id += 1;
+            panel.transfers.push(SftpTransfer {
+                id,
+                kind,
+                file_name: name.clone(),
+                local_path: panel.local.dir.join(name),
+                remote_path,
+                total: 0,
+                transferred: 0,
+                status: sftp_panel::TransferStatus::Queued,
+                error: None,
+                cancel: Arc::new(AtomicBool::new(false)),
+            });
+            queued += 1;
+        }
+        if skipped_dirs > 0 {
+            panel.notice = Some(format!(
+                "{skipped_dirs} 个目录已跳过（v1 仅支持文件传输，目录递归待后续）"
+            ));
+        } else if queued > 0 {
+            panel.notice = Some(format!("已入队 {queued} 个传输任务"));
+        }
+        panel.promote_next(&self.sftp_events_tx);
+        cx.notify();
+    }
+
+    /// 取消一条传输（排队/传输中均可；半成品清理在终结事件后由
+    /// 传输工作线程自身完成）。
+    pub(crate) fn sftp_cancel_transfer(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(panel) = &mut self.sftp_panel else {
+            return;
+        };
+        panel.cancel_transfer(id);
+        cx.notify();
+    }
+
+    /// 打开栏内操作弹窗（新建目录/重命名）。
+    pub(crate) fn sftp_open_prompt(
+        &mut self,
+        side: PaneSide,
+        kind: SftpPromptKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = &mut self.sftp_panel else {
+            return;
+        };
+        panel.error = None;
+        panel.notice = None;
+        self.sftp_prompt_fields.clear();
+        self.sftp_prompt_subscriptions.clear();
+        let initial = kind.initial();
+        let field = cx.new(|cx| CommandTextField::new(initial, "名称", cx));
+        self.sftp_prompt_subscriptions.push(
+            cx.subscribe(&field, |workspace, _, _: &FieldSubmit, cx| {
+                workspace.submit_sftp_prompt(cx)
+            }),
+        );
+        field.read(cx).focus_handle().focus(window);
+        self.sftp_prompt_fields.push(("名称".into(), field));
+        self.sftp_prompt = Some(SftpPromptDialog { side, kind });
+        cx.notify();
+    }
+
+    fn dismiss_sftp_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sftp_prompt = None;
+        self.sftp_prompt_fields.clear();
+        self.sftp_prompt_subscriptions.clear();
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// 提交新建目录/重命名：名称先过 remote_join 纯校验，操作本身在
+    /// 后台线程执行（远端走浏览通道，本地走 std::fs；均不允许阻塞 UI），
+    /// 完成后同线程续列目录；UI 侧立即关弹窗（乐观口径，错误经事件回显）。
+    fn submit_sftp_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.sftp_prompt.clone() else {
+            return;
+        };
+        let value = self
+            .sftp_prompt_fields
+            .first()
+            .map(|(_, field)| field.read(cx).value().trim().to_string())
+            .unwrap_or_default();
+        if value.is_empty() {
+            return;
+        }
+        let Some(panel) = &mut self.sftp_panel else {
+            return;
+        };
+        let side = prompt.side;
+        let is_local = side == PaneSide::Local;
+        let base_dir = if is_local {
+            panel.local.dir.display().to_string()
+        } else {
+            panel.remote.dir.clone()
+        };
+        let target = match sftp_panel::remote_join(&base_dir, &value) {
+            Ok(target) => target,
+            Err(message) => {
+                panel.error = Some(message);
+                cx.notify();
+                return;
+            }
+        };
+        let kind = prompt.kind;
+        // UI 侧先行：关弹窗、清选中、给进行中提示；操作结果经事件回显
+        self.sftp_prompt = None;
+        self.sftp_prompt_fields.clear();
+        self.sftp_prompt_subscriptions.clear();
+        panel.error = None;
+        panel.notice = Some("正在执行…".to_string());
+        if is_local {
+            panel.local.selected.clear();
+        } else {
+            panel.remote.selected.clear();
+        }
+        let events = self.sftp_events_tx.clone();
+        let browse = Arc::clone(&panel.browse);
+        let local_dir = panel.local.dir.clone();
+        let remote_dir = panel.remote.dir.clone();
+        std::thread::Builder::new()
+            .name("laterterm-sftp-op".into())
+            .spawn(move || {
+                let failure = match &kind {
+                    SftpPromptKind::Mkdir => {
+                        let result = if is_local {
+                            std::fs::create_dir(&target)
+                        } else {
+                            browse.create_dir(&target)
+                        };
+                        result.err().map(|error| format!("新建目录失败: {error}"))
+                    }
+                    SftpPromptKind::Rename { from } => {
+                        let base = if is_local {
+                            local_dir.display().to_string()
+                        } else {
+                            remote_dir.clone()
+                        };
+                        match sftp_panel::remote_join(&base, from) {
+                            Ok(old_path) => {
+                                let result = if is_local {
+                                    std::fs::rename(&old_path, &target)
+                                } else {
+                                    browse.rename(&old_path, &target)
+                                };
+                                result.err().map(|error| format!("重命名失败: {error}"))
+                            }
+                            Err(message) => Some(message),
+                        }
+                    }
+                };
+                if let Some(message) = failure {
+                    let _ = events.send(SftpEvent::Notice {
+                        error: true,
+                        message,
+                    });
+                }
+                // 成败都刷新该栏（失败时也刷，呈现真实状态）
+                if is_local {
+                    sftp_panel::load_local_into(local_dir, &events);
+                } else {
+                    load_remote_into(&browse, &remote_dir, &remote_dir, None, &events);
+                }
+            })
+            .ok();
+        cx.notify();
+    }
+
+    /// 重命名入口：恰好选中一项时弹重命名框。
+    pub(crate) fn sftp_rename_selected(
+        &mut self,
+        side: PaneSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(panel) = &mut self.sftp_panel else {
+            return;
+        };
+        let selected = match side {
+            PaneSide::Local => &panel.local.selected,
+            PaneSide::Remote => &panel.remote.selected,
+        };
+        if selected.len() != 1 {
+            panel.notice = Some("重命名需要恰好选中一项".to_string());
+            cx.notify();
+            return;
+        }
+        let from = selected.iter().next().cloned().unwrap_or_default();
+        self.sftp_open_prompt(side, SftpPromptKind::Rename { from }, window, cx);
+    }
+
+    /// 删除入口：二次确认对齐 sidebar 模式（再点一次「删除」执行）。
+    /// 删除在后台线程执行（远端按条目类型走 remove_file/remove_dir），
+    /// 完成后续列该栏。
+    pub(crate) fn sftp_delete_selected(&mut self, side: PaneSide, cx: &mut Context<Self>) {
+        let Some(panel) = &mut self.sftp_panel else {
+            return;
+        };
+        panel.error = None;
+        let selected: Vec<(String, bool)> = match side {
+            PaneSide::Local => panel
+                .local
+                .selected
+                .iter()
+                .map(|name| {
+                    let is_dir = panel
+                        .local
+                        .entries
+                        .iter()
+                        .find(|entry| &entry.name == name)
+                        .is_some_and(|entry| entry.is_dir);
+                    (name.clone(), is_dir)
+                })
+                .collect(),
+            PaneSide::Remote => panel
+                .remote
+                .selected
+                .iter()
+                .map(|name| {
+                    let is_dir = panel
+                        .remote
+                        .entries
+                        .iter()
+                        .find(|entry| &entry.name == name)
+                        .is_some_and(|entry| entry.is_dir);
+                    (name.clone(), is_dir)
+                })
+                .collect(),
+        };
+        if selected.is_empty() {
+            panel.notice = Some("先选择要删除的条目".to_string());
+            cx.notify();
+            return;
+        }
+        let confirm_key = {
+            let mut names = selected
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            names.sort();
+            format!("{side:?}:{}", names.join(","))
+        };
+        if panel.delete_confirm.as_deref() != Some(confirm_key.as_str()) {
+            panel.delete_confirm = Some(confirm_key);
+            panel.notice = Some("再点一次「删除」确认（删除不可恢复）".to_string());
+            cx.notify();
+            return;
+        }
+        panel.delete_confirm = None;
+        panel.notice = Some("正在删除…".to_string());
+        let is_local = side == PaneSide::Local;
+        let events = self.sftp_events_tx.clone();
+        let base_dir = if is_local {
+            panel.local.dir.clone()
+        } else {
+            PathBuf::from(panel.remote.dir.clone())
+        };
+        let browse = Arc::clone(&panel.browse);
+        let local_dir = panel.local.dir.clone();
+        let remote_dir = panel.remote.dir.clone();
+        std::thread::Builder::new()
+            .name("laterterm-sftp-op".into())
+            .spawn(move || {
+                for (name, is_dir) in &selected {
+                    let Ok(path) = sftp_panel::remote_join(&base_dir.display().to_string(), name)
+                    else {
+                        continue;
+                    };
+                    let result = if is_local {
+                        // 目录先尝试删目录，失败按文件删（非空目录两者皆败，错误可见）
+                        match std::fs::remove_dir(&path) {
+                            Ok(()) => Ok(()),
+                            Err(_) => std::fs::remove_file(&path),
+                        }
+                    } else if *is_dir {
+                        browse.remove_dir(&path)
+                    } else {
+                        browse.remove_file(&path)
+                    };
+                    if let Err(error) = result {
+                        let _ = events.send(SftpEvent::Notice {
+                            error: true,
+                            message: format!("删除 {name} 失败: {error}"),
+                        });
+                    }
+                }
+                // 删除完成后续列该栏（无论成败，呈现真实状态）
+                if is_local {
+                    sftp_panel::load_local_into(local_dir, &events);
+                } else {
+                    load_remote_into(&browse, &remote_dir, &remote_dir, None, &events);
+                }
+            })
+            .ok();
+        if is_local {
+            panel.local.selected.clear();
+        } else {
+            panel.remote.selected.clear();
+        }
+        cx.notify();
+    }
+
+    /// 关闭面板（Esc/×/遮罩）：取消全部传输 + 关浏览通道 + 焦点归还终端。
+    pub(crate) fn close_sftp_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.teardown_sftp_panel();
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// 面板清理（关窗/退出共用，无窗口依赖）。在途传输靠取消标志终结
+    /// （close() 只能关浏览通道，打断不了在途传输——sftp.rs 取消语义）。
+    fn teardown_sftp_panel(&mut self) {
+        if let Some(mut panel) = self.sftp_panel.take() {
+            let _running = panel.cancel_all();
+            panel.browse.close();
+        }
+        self.sftp_prompt = None;
+        self.sftp_prompt_fields.clear();
+        self.sftp_prompt_subscriptions.clear();
     }
 
     fn close_window(
@@ -3359,6 +4107,7 @@ impl WorkspaceView {
     /// 自绘与原生关闭入口共用；重复调用不会重复终止会话。
     pub(crate) fn shutdown(&mut self) {
         self.cancel_ssh_request();
+        self.teardown_sftp_panel();
         if let Some(save) = self.server_save.take() {
             save.store(false, Ordering::Release);
         }
@@ -3647,6 +4396,44 @@ impl WorkspaceView {
             }
             return;
         }
+        // SFTP 双栏面板：Esc 关闭（输入弹窗打开时先关弹窗）；面板打开期间
+        // 拦截 pane 方向导航与全局快捷键（终端被覆盖，键盘穿过去只会打进
+        // 看不见的 shell——口径对齐模态弹窗分支）。必须位于下方 pane 方向
+        // 捕获与 settings 检查之前。
+        if self.sftp_panel.is_some() {
+            if plain_escape {
+                if self.sftp_prompt.is_some() {
+                    let field_with_menu = self
+                        .sftp_prompt_fields
+                        .iter()
+                        .find(|(_, field)| field.read(cx).has_context_menu())
+                        .map(|(_, field)| field.clone());
+                    if let Some(field) = field_with_menu {
+                        field.update(cx, |field, cx| field.close_context_menu(cx));
+                    } else {
+                        self.dismiss_sftp_prompt(window, cx);
+                    }
+                } else {
+                    self.close_sftp_panel(window, cx);
+                }
+                cx.stop_propagation();
+                return;
+            }
+            if self.sftp_prompt.is_some() {
+                // 输入弹窗持有焦点，按键交给输入框自身
+                return;
+            }
+            if pane_direction_for_keystroke(&event.keystroke).is_some()
+                && self
+                    .focused_terminal()
+                    .read(cx)
+                    .focus_handle()
+                    .is_focused(window)
+            {
+                cx.stop_propagation();
+            }
+            return;
+        }
         // 仅在真实终端焦点上捕获；设置与输入框应保留自己的方向键行为。
         if !self.settings_open
             && self
@@ -3823,6 +4610,7 @@ impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.process_shortcuts(window, cx);
         self.process_ssh_results(window, cx);
+        self.process_sftp_results(window, cx);
         if let Some(handle) = self.pending_focus.take() {
             handle.focus(window);
         }
@@ -4030,6 +4818,8 @@ impl Render for WorkspaceView {
                     settings_content(self.settings_page, self, cx),
                 ))
             })
+            // SFTP 双栏面板：窗口级大覆盖层（右面板 240px 放不下双栏）
+            .when_some(sftp_overlay(self, cx), |root, overlay| root.child(overlay))
             .when(self.welcome_visible, |root| {
                 root.child(welcome_overlay(
                     cx.listener(Self::dismiss_welcome),
@@ -4751,6 +5541,41 @@ fn render_active_dialog(
     workspace: &mut WorkspaceView,
     cx: &mut Context<WorkspaceView>,
 ) -> Option<gpui::Div> {
+    // SFTP 栏内操作弹窗（新建目录/重命名）：窗口级模态，与其它弹窗同骨架
+    if let Some(prompt) = workspace.sftp_prompt.clone() {
+        let fields = workspace.sftp_prompt_fields.clone();
+        let error = workspace
+            .sftp_panel
+            .as_ref()
+            .and_then(|panel| panel.error.clone());
+        let body = div()
+            .flex()
+            .flex_col()
+            .p_4()
+            .when_some(error, |body, error| body.child(dialog_error_line(error)))
+            .children(
+                fields
+                    .into_iter()
+                    .map(|(name, field)| dialog_field_row(&name, field)),
+            )
+            .child(dialog_footer(vec![
+                setting_button(
+                    "确定",
+                    true,
+                    cx.listener(|this, _event, _window, cx| this.submit_sftp_prompt(cx)),
+                ),
+                setting_button(
+                    "取消",
+                    false,
+                    cx.listener(|this, _event, window, cx| this.dismiss_sftp_prompt(window, cx)),
+                ),
+            ]));
+        return Some(modal_dialog(
+            format!("SFTP · {}", prompt.kind.title()),
+            body,
+            dismiss_listener(cx, WorkspaceView::dismiss_sftp_prompt),
+        ));
+    }
     if let Some(owner) = &workspace.panel_shortcut_dialog {
         let body = div()
             .p_4()
@@ -4842,8 +5667,17 @@ fn render_active_dialog(
                 false,
                 cx.listener(WorkspaceView::cancel_server),
             )]));
+        let title = if workspace
+            .ssh_request
+            .as_ref()
+            .is_some_and(|request| request.dest == ConnectDest::SftpPanel)
+        {
+            format!("SFTP 面板 · 连接 {name}")
+        } else {
+            format!("连接 {name}")
+        };
         return Some(modal_dialog(
-            format!("连接 {name}"),
+            title,
             body,
             dismiss_listener(cx, WorkspaceView::dismiss_server),
         ));
@@ -5372,8 +6206,18 @@ fn server_connect_modal(
             ),
             setting_button("取消", false, cx.listener(WorkspaceView::cancel_server)),
         ]));
+    // SFTP 面板补输与 shell 连接共用弹窗，标题标注去向
+    let title = if workspace
+        .ssh_request
+        .as_ref()
+        .is_some_and(|request| request.dest == ConnectDest::SftpPanel)
+    {
+        format!("SFTP 面板 · 连接 {name}")
+    } else {
+        format!("连接 {name}")
+    };
     modal_dialog(
-        format!("连接 {name}"),
+        title,
         body,
         dismiss_listener(cx, WorkspaceView::dismiss_server),
     )
@@ -5823,6 +6667,25 @@ fn server_entry_row(
                             }),
                         )
                         .child("连接"),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "server-sftp".into())
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .text_size(px(12.0))
+                        .text_color(rgb(0x7DCFFF))
+                        .bg(rgb(0x2A3450))
+                        .hover(|style| style.bg(rgb(0x364468)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener({
+                                let name = entry.name.clone();
+                                move |this, _event, _window, cx| this.open_sftp_panel(&name, cx)
+                            }),
+                        )
+                        .child("文件"),
                 ),
         )
         // 优先展示连接目标；快捷键属于次要操作。
@@ -7530,6 +8393,7 @@ mod exit_regression_tests {
                 id: 1,
                 entry: laterterm_config::ServerEntry::default(),
                 jump: Vec::new(),
+                dest: super::ConnectDest::Shell,
                 active: connect.clone(),
                 running: true,
             });
@@ -7690,6 +8554,7 @@ mod exit_regression_tests {
                 id: 9,
                 entry: entry.clone(),
                 jump: Vec::new(),
+                dest: super::ConnectDest::Shell,
                 active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 running: true,
             });

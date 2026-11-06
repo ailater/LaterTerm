@@ -138,6 +138,28 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 > 跳板凭据 v1 只认密钥环已保存值（缺失硬错误不补输），回环 mock 两跳/三跳/拒转发负例 8 测试
 > 全过，真机多跳验收待实机跳板环境（LATERTERM_SSH_JUMP 支持逗号分隔链）。
 
+> SFTP 双栏面板部分交付（2026-11-05，任务4 保持 🚧）：后端 laterterm-ssh/src/sftp.rs 补齐——
+> SftpHandle::spawn 跳板链 Option 单跳改 Vec 多跳（与 shell 同款 open_through 链式穿透 + tunnels
+> 保活逆序断开，就绪超时按 15s+10s×跳数联动，spawn 侧再 +1s）；新增 stat/realpath 指令
+> （进度条取总量 / 初始目录规范化）；**逐传输取消**走 Download/Upload 携带的 Arc<AtomicBool>
+> 标志（传输循环逐块检查，置位即 Interrupted「传输已取消」）——close() 只是排队 Shutdown，
+> 打断不了在途传输（russh 0.65 CHANNEL_CLOSE 缺口），文档与回环测试均已按此口径落实；
+> 取消后半成品由传输工作线程用专属连接自行清理。app 侧 connect_sftp 复用抽出的
+> resolve_credentials（shell/SFTP 同一套凭据解析，establish 注入点与 20 个既有测试零改动），
+> SFTP 连接走独立后台函数与结果管道（产物是 SftpHandle 而非 TerminalSession）；UI 为
+> 窗口级 SFTP 双栏覆盖层（880×560，settings_overlay 骨架）：本机 ↔ 远端双栏 uniform_list
+> 文件列表（目录优先名称升序、5000 条截断提示、上级/刷新/本机目录对话框）、上传/下载
+> 串行队列（每条传输一条独立 SSH 连接，浏览通道不被传输阻塞）、进度条（100ms/1% 节流，
+> 总量未知降级为文本）与逐条取消、栏内新建目录/重命名/删除（二次确认），补输凭据弹窗与
+> shell 连接共用（标题标注 SFTP），Esc 关闭面板。回环测试 8→13（SFTP 直连读列/上传/下载
+> 字节级一致 + 进度触发 + stat/realpath、单跳/两跳穿透、取消中途置位→Interrupted + 半成品
+> 可清理、拒转发负例），workspace lib/bins 328 通过 2 ignored（新增 sftp_panel 纯逻辑 11 测：
+> 路径归一/穿越拒绝、父子推导、排序、截断、节流、状态机幂等、格式化）。**defer：断点续传**
+> （russh-sftp open_with_flags + File start_seek 技术上已具备，待后续）；目录递归传输、
+> 拖拽、右面板第四页签不做（范围控制）；远端文件名恒按 UTF-8（SFTP 协议规范，
+> SshEndpoint.encoding 仅 shell 消费，GBK 老服务器 SFTP 名字不做转码）；真机（含跳板链）
+> 传中文文件名与中途取消验收待实机。
+
 > 启动光标错位修复（2026-11-04）：PTY/网格初始尺寸改为按窗口内容区估算（cell 7.83×19.2 @13px 实测系数），
 > 消除「启动后 resize → bash readline 发 \r 把光标拉回提示符行首」的错位；隔离实测估算 193×42 与
 > 首帧实测一致（零 resize）。reader 数据链增加 GPUI 定时器保活轮询（100ms，独立于 flume 唤醒通道），
@@ -150,11 +172,11 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 
 | # | 任务 | 说明 |
 |---|------|------|
-| 1 | laterterm-ssh | russh + russh-sftp；tokio 仅限网络层，PTY 走线程泵（架构既定）；SSH 会话部分已落地，SFTP 随任务4 | 🚧
+| 1 | laterterm-ssh | russh + russh-sftp；tokio 仅限网络层，PTY 走线程泵（架构既定）；SSH 会话与 SFTP 通道（多跳穿透/取消/stat）均已落地 | ✅
 | 2 | 服务器管理 | 主机分组、连接配置、凭据入 keyring（laterterm-secrets） | ✅
 | 3 | 跳板机链 | ProxyJump 多跳链式穿透（keyboard-interactive 凭跳板条目自身认证复用，逐跳生效） | ✅ |
-| 4 | SFTP 面板 | 双栏文件传输，进度与断点续传 |
-| 5 | 编码 | GBK 远程会话转码（中文老服务器刚需） |
+| 4 | SFTP 面板 | 双栏文件传输，进度与取消已落地（2026-11-05）；断点续传 defer（open_with_flags + seek 已具备，待后续） | 🚧 |
+| 5 | 编码 | GBK 远程会话转码（中文老服务器刚需；SFTP 路径恒 UTF-8 不转码） |
 | 6 | trzsz | rz/sz 兼容协议，ZMODEM 类传输 |
 | 7 | Deepin 配置一键导入 | `command-config.conf` / `server-config.conf` 已逆向（见 architecture.md）；server-config 导入已提前落地（含 Xshell .xsh 来源），命令模板迁移已落地 | ✅
 

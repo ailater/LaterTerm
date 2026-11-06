@@ -5,6 +5,7 @@ use anyhow::{Result, bail};
 use laterterm_config::{ServerAuthKind, ServerEntry};
 use laterterm_core::TerminalSession;
 use laterterm_secrets::{SecretStore, ssh_account, ssh_passphrase_account};
+use laterterm_ssh::sftp::SftpHandle;
 use laterterm_ssh::{
     AuthMethod, HostKeyPolicy, PrivateKeyPassphraseRequired, SessionEncoding, SshAuth, SshEndpoint,
     SshOptions, SshSession, prepare_private_key,
@@ -49,6 +50,40 @@ pub(crate) enum ConnectionOutcome {
     },
 }
 
+/// 凭据解析结果（shell 与 SFTP 两条连接路径共用）。
+///
+/// 返回的是解析后的 `AuthMethod` + 跳板端点链：目标机 `SshEndpoint` 的组装
+/// （known_hosts 策略 + encoding）留给各调用方，这样 shell 侧既有 establish
+/// 注入点（及其全部测试断言）保持不变，SFTP 侧按需组装自己的端点。
+pub(crate) enum CredentialOutcome {
+    Resolved {
+        auth: AuthMethod,
+        hops: Vec<SshEndpoint>,
+        to_remember: Option<(String, String)>,
+    },
+    Prompt {
+        kind: CredentialKind,
+        warning: Option<String>,
+    },
+}
+
+/// SFTP 连接结果：Connected 携带浏览通道与端点快照。
+///
+/// `endpoint`/`hops` 随面板保存：每条传输要用同一链路重建专属 SFTP 连接
+/// （浏览通道永不被大传输阻塞）。
+pub(crate) enum SftpOutcome {
+    Connected {
+        browse: Arc<SftpHandle>,
+        endpoint: SshEndpoint,
+        hops: Vec<SshEndpoint>,
+        warning: Option<String>,
+    },
+    Prompt {
+        kind: CredentialKind,
+        warning: Option<String>,
+    },
+}
+
 /// 阻塞入口，仅允许后台线程调用；成功连接后才记住本次输入的凭据。
 ///
 /// `jump_entries` 是 UI 侧用 `resolve_jump_chain` 预先解析好的跳板条目快照
@@ -71,33 +106,8 @@ pub(crate) fn connect(
         active,
         prepare_private_key,
         |auth, hops| {
-            let auth = match auth {
-                AuthMethod::Agent => SshAuth::Agent,
-                AuthMethod::Password { password } => SshAuth::Password(password),
-                AuthMethod::KeyboardInteractive { secret } => SshAuth::KeyboardInteractive(secret),
-                AuthMethod::PrivateKey {
-                    key_path,
-                    passphrase,
-                } => SshAuth::KeyFile {
-                    path: key_path,
-                    passphrase,
-                },
-                AuthMethod::PreparedPrivateKey { keys } => SshAuth::PreparedPrivateKey { keys },
-            };
-            let endpoint = SshEndpoint {
-                host: entry.host.clone(),
-                port: Some(entry.port),
-                username: entry.username.clone(),
-                auth,
-                host_key_policy: known_hosts_policy()?,
-                encoding: match entry.encoding.as_deref() {
-                    Some("gbk") => SessionEncoding::Gbk,
-                    Some("gb18030") => SessionEncoding::Gb18030,
-                    _ => SessionEncoding::Utf8,
-                },
-            };
             let options = SshOptions {
-                endpoint,
+                endpoint: endpoint_for_entry(entry, auth)?,
                 jump: hops,
                 cols: 110,
                 rows: 30,
@@ -105,6 +115,101 @@ pub(crate) fn connect(
             Ok(Arc::new(SshSession::spawn(options)?) as Arc<dyn TerminalSession>)
         },
     )
+}
+
+/// SFTP 连接（阻塞，仅后台线程）：凭据解析与 shell 同一套（含补输重试
+/// 语义与跳板链硬错误口径），establish 换成 `SftpHandle::spawn`。
+/// 成功连接后才记住本次输入的凭据；取消/迟到取消时自行关闭通道。
+pub(crate) fn connect_sftp(
+    entry: &ServerEntry,
+    jump_entries: Vec<ServerEntry>,
+    supplied: Option<(CredentialKind, String)>,
+    remember: bool,
+    store: Arc<dyn SecretStore>,
+    active: Arc<AtomicBool>,
+) -> Result<SftpOutcome> {
+    let resolved = match resolve_credentials(
+        entry,
+        jump_entries,
+        supplied,
+        &store,
+        &active,
+        &prepare_private_key,
+    )? {
+        CredentialOutcome::Prompt { kind, warning } => {
+            return Ok(SftpOutcome::Prompt { kind, warning });
+        }
+        CredentialOutcome::Resolved {
+            auth,
+            hops,
+            to_remember,
+        } => (auth, hops, to_remember),
+    };
+    let (auth, hops, to_remember) = resolved;
+    let endpoint = endpoint_for_entry(entry, auth)?;
+    anyhow::ensure!(active.load(Ordering::Acquire), "连接已取消");
+    let browse = Arc::new(SftpHandle::spawn(endpoint.clone(), hops.clone())?);
+    if !active.load(Ordering::Acquire) {
+        browse.close();
+        bail!("连接已取消");
+    }
+    let mut warning = None;
+    if remember && let Some((account, secret)) = to_remember {
+        let store = Arc::clone(&store);
+        let active = Arc::clone(&active);
+        // 与 shell 同口径：在实际执行密钥环操作的线程再检查一次取消标记。
+        if run_secret_op(move || {
+            if active.load(Ordering::Acquire) {
+                store.set(&account, &secret)?;
+            }
+            Ok(())
+        })
+        .is_err()
+        {
+            warning = Some("连接成功，但凭据未能保存到密钥环".into());
+        }
+    }
+    if !active.load(Ordering::Acquire) {
+        browse.close();
+        bail!("连接已取消");
+    }
+    Ok(SftpOutcome::Connected {
+        browse,
+        endpoint,
+        hops,
+        warning,
+    })
+}
+
+/// 目标机端点组装（shell 与 SFTP 共用）：AuthMethod→SshAuth 转换 +
+/// known_hosts 策略 + 会话编码。encoding 只被 shell 会话消费，
+/// SFTP 路径恒 UTF-8（见 laterterm-ssh::sftp 模块注记）。
+fn endpoint_for_entry(entry: &ServerEntry, auth: AuthMethod) -> Result<SshEndpoint> {
+    let auth = match auth {
+        AuthMethod::Agent => SshAuth::Agent,
+        AuthMethod::Password { password } => SshAuth::Password(password),
+        AuthMethod::KeyboardInteractive { secret } => SshAuth::KeyboardInteractive(secret),
+        AuthMethod::PrivateKey {
+            key_path,
+            passphrase,
+        } => SshAuth::KeyFile {
+            path: key_path,
+            passphrase,
+        },
+        AuthMethod::PreparedPrivateKey { keys } => SshAuth::PreparedPrivateKey { keys },
+    };
+    Ok(SshEndpoint {
+        host: entry.host.clone(),
+        port: Some(entry.port),
+        username: entry.username.clone(),
+        auth,
+        host_key_policy: known_hosts_policy()?,
+        encoding: match entry.encoding.as_deref() {
+            Some("gbk") => SessionEncoding::Gbk,
+            Some("gb18030") => SessionEncoding::Gb18030,
+            _ => SessionEncoding::Utf8,
+        },
+    })
 }
 
 /// 目标机与每跳共用的 known_hosts 校验策略（应用目录为主、系统既有路径兜底）。
@@ -141,11 +246,120 @@ fn prompt(kind: CredentialKind, warning: Option<&str>) -> ConnectionOutcome {
     }
 }
 
+/// 凭据解析阶段（shell 与 SFTP 共用， establish 之前的全部逻辑）：
+/// 按条目认证方式 / 补输凭据 / 密钥环解析出 `AuthMethod`，跳板链逐跳
+/// 组装端点；缺失即 Prompt（目标机）或硬错误（跳板）。取消检查的时点
+/// 与原 connect_with 完全一致（入口、认证解析后、每跳之前）。
+#[allow(clippy::too_many_arguments)]
+fn resolve_credentials(
+    entry: &ServerEntry,
+    jump_entries: Vec<ServerEntry>,
+    supplied: Option<(CredentialKind, String)>,
+    store: &Arc<dyn SecretStore>,
+    active: &Arc<AtomicBool>,
+    prepare: &impl Fn(Option<&Path>, Option<&str>) -> std::io::Result<AuthMethod>,
+) -> Result<CredentialOutcome> {
+    anyhow::ensure!(active.load(Ordering::Acquire), "连接已取消");
+    let mut to_remember = None;
+    let auth = match supplied {
+        _ if entry.auth == ServerAuthKind::Agent => AuthMethod::Agent,
+        Some((CredentialKind::PrivateKey { key_path, context }, secret)) => {
+            match prepare(Some(&key_path), Some(&secret)) {
+                Ok(auth) => {
+                    to_remember = Some((ssh_passphrase_account(&entry.name)?, secret));
+                    if let Some(context) = context {
+                        let mut prepared = context.prepared.clone();
+                        prepared.push(auth);
+                        match prepare_candidates(
+                            entry,
+                            store,
+                            prepare,
+                            context.remaining.clone(),
+                            prepared,
+                        )? {
+                            Ok(auth) => auth,
+                            Err(outcome) => return Ok(credential_prompt(outcome)),
+                        }
+                    } else {
+                        auth
+                    }
+                }
+                Err(error) => {
+                    if let Some(required) = passphrase_required(&error) {
+                        return Ok(CredentialOutcome::Prompt {
+                            kind: CredentialKind::PrivateKey {
+                                key_path: required,
+                                context,
+                            },
+                            warning: Some("私钥口令不正确，请重试".into()),
+                        });
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        Some((CredentialKind::Login, secret)) if !secret.is_empty() => {
+            let auth = login_auth(entry.auth, &secret);
+            to_remember = Some((ssh_account(&entry.name)?, secret));
+            auth
+        }
+        // 空字符串显式选择私钥；全空白但非空的字符串仍是原样密码。
+        Some((CredentialKind::Login, _)) => match prepare_key_auth(entry, store, prepare)? {
+            Ok(auth) => auth,
+            Err(outcome) => return Ok(credential_prompt(outcome)),
+        },
+        None if entry.auth == ServerAuthKind::PrivateKey => {
+            match prepare_key_auth(entry, store, prepare)? {
+                Ok(auth) => auth,
+                Err(outcome) => return Ok(credential_prompt(outcome)),
+            }
+        }
+        None => match get_secret(store, ssh_account(&entry.name)?).and_then(|secret| {
+            if secret.as_ref().is_some_and(|s| !s.is_empty()) {
+                Ok(secret)
+            } else {
+                get_secret(
+                    store,
+                    laterterm_config::servers::password_account(&entry.name),
+                )
+            }
+        }) {
+            Ok(Some(secret)) if !secret.is_empty() => login_auth(entry.auth, &secret),
+            Ok(_) => {
+                return Ok(CredentialOutcome::Prompt {
+                    kind: CredentialKind::Login,
+                    warning: None,
+                });
+            }
+            Err(_) => {
+                return Ok(CredentialOutcome::Prompt {
+                    kind: CredentialKind::Login,
+                    warning: Some("无法读取密钥环，请手动输入登录凭据".into()),
+                });
+            }
+        },
+    };
+    anyhow::ensure!(active.load(Ordering::Acquire), "连接已取消");
+    // 跳板链认证快照：每跳按其条目的认证方式解析；顺序保持由外到内
+    let mut hops = Vec::with_capacity(jump_entries.len());
+    for hop in &jump_entries {
+        anyhow::ensure!(active.load(Ordering::Acquire), "连接已取消");
+        hops.push(hop_endpoint(hop, store, prepare)?);
+    }
+    Ok(CredentialOutcome::Resolved {
+        auth,
+        hops,
+        to_remember,
+    })
+}
+
 /// 注入准备器和连接器使测试不读取真实私钥、不访问网络。
 ///
-/// 跳板凭据在这里解析成 `SshEndpoint` 列表交给 establish；缺失即硬错误
-/// （v1 刻意不做 per-hop 补输：跳板本身是面板条目，凭据经其自身
-/// 连接/编辑入库即可，避免 Prompt 状态机叠加 per-hop 归属的复杂度）。
+/// 凭据解析已抽出为 [`resolve_credentials`]（SFTP 路径共用同一套注入与
+/// 语义）；本函数只保留 shell 特有的 establish 与「成功后保存凭据」收尾。
+/// 跳板凭据解析中缺失即硬错误（v1 刻意不做 per-hop 补输：跳板本身是面板
+/// 条目，凭据经其自身连接/编辑入库即可，避免 Prompt 状态机叠加 per-hop
+/// 归属的复杂度）。
 #[allow(clippy::too_many_arguments)]
 fn connect_with<P, C>(
     entry: &ServerEntry,
@@ -161,88 +375,17 @@ where
     P: Fn(Option<&Path>, Option<&str>) -> std::io::Result<AuthMethod>,
     C: FnOnce(AuthMethod, Vec<SshEndpoint>) -> Result<Arc<dyn TerminalSession>>,
 {
-    anyhow::ensure!(active.load(Ordering::Acquire), "连接已取消");
-    let mut to_remember = None;
-    let auth = match supplied {
-        _ if entry.auth == ServerAuthKind::Agent => AuthMethod::Agent,
-        Some((CredentialKind::PrivateKey { key_path, context }, secret)) => {
-            match prepare(Some(&key_path), Some(&secret)) {
-                Ok(auth) => {
-                    to_remember = Some((ssh_passphrase_account(&entry.name)?, secret));
-                    if let Some(context) = context {
-                        let mut prepared = context.prepared.clone();
-                        prepared.push(auth);
-                        match prepare_candidates(
-                            entry,
-                            &store,
-                            &prepare,
-                            context.remaining.clone(),
-                            prepared,
-                        )? {
-                            Ok(auth) => auth,
-                            Err(outcome) => return Ok(outcome),
-                        }
-                    } else {
-                        auth
-                    }
-                }
-                Err(error) => {
-                    if let Some(required) = passphrase_required(&error) {
-                        return Ok(prompt(
-                            CredentialKind::PrivateKey {
-                                key_path: required,
-                                context,
-                            },
-                            Some("私钥口令不正确，请重试"),
-                        ));
-                    }
-                    return Err(error.into());
-                }
+    let (auth, hops, to_remember) =
+        match resolve_credentials(entry, jump_entries, supplied, &store, &active, &prepare)? {
+            CredentialOutcome::Prompt { kind, warning } => {
+                return Ok(prompt(kind, warning.as_deref()));
             }
-        }
-        Some((CredentialKind::Login, secret)) if !secret.is_empty() => {
-            let auth = login_auth(entry.auth, &secret);
-            to_remember = Some((ssh_account(&entry.name)?, secret));
-            auth
-        }
-        // 空字符串显式选择私钥；全空白但非空的字符串仍是原样密码。
-        Some((CredentialKind::Login, _)) => match prepare_key_auth(entry, &store, &prepare)? {
-            Ok(auth) => auth,
-            Err(outcome) => return Ok(outcome),
-        },
-        None if entry.auth == ServerAuthKind::PrivateKey => {
-            match prepare_key_auth(entry, &store, &prepare)? {
-                Ok(auth) => auth,
-                Err(outcome) => return Ok(outcome),
-            }
-        }
-        None => match get_secret(&store, ssh_account(&entry.name)?).and_then(|secret| {
-            if secret.as_ref().is_some_and(|s| !s.is_empty()) {
-                Ok(secret)
-            } else {
-                get_secret(
-                    &store,
-                    laterterm_config::servers::password_account(&entry.name),
-                )
-            }
-        }) {
-            Ok(Some(secret)) if !secret.is_empty() => login_auth(entry.auth, &secret),
-            Ok(_) => return Ok(prompt(CredentialKind::Login, None)),
-            Err(_) => {
-                return Ok(prompt(
-                    CredentialKind::Login,
-                    Some("无法读取密钥环，请手动输入登录凭据"),
-                ));
-            }
-        },
-    };
-    anyhow::ensure!(active.load(Ordering::Acquire), "连接已取消");
-    // 跳板链认证快照：每跳按其条目的认证方式解析；顺序保持由外到内
-    let mut hops = Vec::with_capacity(jump_entries.len());
-    for hop in &jump_entries {
-        anyhow::ensure!(active.load(Ordering::Acquire), "连接已取消");
-        hops.push(hop_endpoint(hop, &store, &prepare)?);
-    }
+            CredentialOutcome::Resolved {
+                auth,
+                hops,
+                to_remember,
+            } => (auth, hops, to_remember),
+        };
     let session = establish(auth, hops)?;
     if !active.load(Ordering::Acquire) {
         session.kill();
@@ -269,6 +412,17 @@ where
         bail!("连接已取消");
     }
     Ok(ConnectionOutcome::Connected { session, warning })
+}
+
+/// prepare_candidates / prepare_key_auth 内部产出的 Prompt 形态转换。
+/// 凭据解析阶段不会产生 Connected，出现即内部不变量被破坏。
+fn credential_prompt(outcome: ConnectionOutcome) -> CredentialOutcome {
+    match outcome {
+        ConnectionOutcome::Prompt { kind, warning } => CredentialOutcome::Prompt { kind, warning },
+        ConnectionOutcome::Connected { .. } => {
+            unreachable!("凭据解析阶段只会产出 Prompt")
+        }
+    }
 }
 
 fn login_auth(kind: ServerAuthKind, secret: &str) -> AuthMethod {

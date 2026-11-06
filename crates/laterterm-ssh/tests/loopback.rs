@@ -1,9 +1,9 @@
-//! 进程内回环集成测试：russh mock 服务器 + SshSession 全链路。
+//! 进程内回环集成测试：russh mock 服务器 + SshSession/SftpHandle 全链路。
 //!
 //! 覆盖：密码认证 → PTY/shell 应答 → 双向数据泵 → resize → kill EOF，
-//! TOFU 主机键「首连记录 / 换键拒绝」，以及跳板链 direct-tcpip 逐跳穿透
-//! （两跳/三跳/跳板拒转发负例）。所有远端行为都在本进程内，
-//! 不依赖外部 sshd。
+//! TOFU 主机键「首连记录 / 换键拒绝」，跳板链 direct-tcpip 逐跳穿透
+//! （两跳/三跳/跳板拒转发负例），以及 SFTP 通道（直连读写回环、经跳板
+//! 穿透、逐传输取消标志）。所有远端行为都在本进程内，不依赖外部 sshd。
 
 use laterterm_core::{BackendKind, TerminalSession};
 use laterterm_ssh::{
@@ -11,13 +11,19 @@ use laterterm_ssh::{
 };
 use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
 use russh::server::Server as _;
-use std::collections::HashSet;
+use russh_sftp::protocol::{
+    Attrs, Data, FileAttributes, Handle as HandlePacket, Name, OpenFlags, Status, StatusCode,
+};
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
+
+use laterterm_ssh::sftp::{CancelFlag, ProgressFn, SftpHandle};
 
 /// 最小 mock 服务器：任意密码/公钥放行，PTY+shell 回 Success，
 /// 数据原样加前缀回显——足够驱动 SshSession 的完整数据路径。
@@ -28,11 +34,20 @@ use tokio::net::TcpListener;
 /// 自动拒绝），等价「跳板机关闭转发」，供负例使用。
 /// 已接受的转发通道记录在 `forwarded_channels`：隧道原始字节绝不回显，
 /// 否则 "Got " 前缀会污染经隧道转发的 SSH 握手流。
+///
+/// `sftp_root` 为 `Some` 时支持 `sftp` 子系统：channel_open_session 把
+/// Channel 暂存进共享 map，subsystem_request("sftp") 时取出并交给
+/// russh-sftp 的 server::run，文件系统 Handler 以该目录扮演远端 fs。
 #[derive(Clone)]
 struct MockHandler {
     accepted_key: Option<russh::keys::PublicKey>,
     forwarded: Option<Arc<AtomicUsize>>,
     forwarded_channels: Arc<Mutex<HashSet<russh::ChannelId>>>,
+    open_channels: Arc<Mutex<HashMap<russh::ChannelId, russh::Channel<russh::server::Msg>>>>,
+    /// 已交给 russh-sftp server::run 的通道：二进制 SFTP 流绝不回显，
+    /// 也不得走 data() 回调的 "Got data:" 回显路径。
+    sftp_channels: Arc<Mutex<HashSet<russh::ChannelId>>>,
+    sftp_root: Option<Arc<std::path::Path>>,
 }
 
 impl russh::server::Server for MockHandler {
@@ -77,7 +92,46 @@ impl russh::server::Handler for MockHandler {
         _session: &mut russh::server::Session,
     ) -> Result<(), Self::Error> {
         reply.accept().await;
-        drop(channel);
+        // 暂存 Channel 供 subsystem_request 取用（shell 路径不取也无害）
+        self.open_channels
+            .lock()
+            .unwrap()
+            .insert(channel.id(), channel);
+        Ok(())
+    }
+
+    /// `sftp` 子系统：取出暂存的 Channel → channel_success → 交给
+    /// russh-sftp server::run，以 `sftp_root` 扮演远端文件系统。
+    async fn subsystem_request(
+        &mut self,
+        channel: russh::ChannelId,
+        name: &str,
+        session: &mut russh::server::Session,
+    ) -> Result<(), Self::Error> {
+        if name != "sftp" {
+            return Ok(());
+        }
+        let Some(root) = self.sftp_root.clone() else {
+            let _ = session.channel_failure(channel);
+            return Ok(());
+        };
+        let Some(stashed) = self.open_channels.lock().unwrap().remove(&channel) else {
+            let _ = session.channel_failure(channel);
+            return Ok(());
+        };
+        let _ = session.channel_success(channel);
+        self.sftp_channels.lock().unwrap().insert(channel);
+        tokio::spawn(async move {
+            russh_sftp::server::run(
+                stashed.into_stream(),
+                MockFsHandler {
+                    root,
+                    next_handle: 0,
+                    open: HashMap::new(),
+                },
+            )
+            .await;
+        });
         Ok(())
     }
 
@@ -170,6 +224,11 @@ impl russh::server::Handler for MockHandler {
         if self.forwarded_channels.lock().unwrap().contains(&channel) {
             return Ok(());
         }
+        // SFTP 通道的二进制流已由 russh-sftp server::run 消费（russh 会同时
+        // 投递给通道缓冲与本回调），回显会污染 SFTP 报文流。
+        if self.sftp_channels.lock().unwrap().contains(&channel) {
+            return Ok(());
+        }
         eprintln!("[mock] data 回调收到 {} 字节", data.len());
         let reply = format!("Got data: {}\r\n", String::from_utf8_lossy(data));
         session.data(channel, reply.into_bytes())?;
@@ -179,9 +238,13 @@ impl russh::server::Handler for MockHandler {
 }
 
 /// 独立线程 + 独立 tokio runtime 里的 mock 服务器；drop 即整体收场。
+/// `sftp_dir` 持有 SFTP 模式下扮演远端 fs 的临时目录（晚于 runtime 收场），
+/// 只为续命而持有，从不读取。
 struct MockServer {
     runtime: Option<tokio::runtime::Runtime>,
     port: u16,
+    #[allow(dead_code)] // 续命锚点
+    sftp_dir: Option<tempfile::TempDir>,
 }
 
 impl MockServer {
@@ -192,12 +255,20 @@ impl MockServer {
     }
 
     fn start_with_key(port: u16, accepted_key: Option<russh::keys::PublicKey>) -> Self {
-        Self::start_handler(
+        Self {
+            runtime: None,
+            port: 0,
+            sftp_dir: None,
+        }
+        .into_started(
             port,
             MockHandler {
                 accepted_key,
                 forwarded: None,
                 forwarded_channels: Arc::new(Mutex::new(HashSet::new())),
+                open_channels: Arc::new(Mutex::new(HashMap::new())),
+                sftp_channels: Arc::new(Mutex::new(HashSet::new())),
+                sftp_root: None,
             },
         )
     }
@@ -205,20 +276,54 @@ impl MockServer {
     /// 起一台允许 direct-tcpip 转发的 mock；返回的计数器记录接受的转发请求数。
     fn start_forwarding(port: u16) -> (Self, Arc<AtomicUsize>) {
         let counter = Arc::new(AtomicUsize::new(0));
-        (
-            Self::start_handler(
-                port,
-                MockHandler {
-                    accepted_key: None,
-                    forwarded: Some(Arc::clone(&counter)),
-                    forwarded_channels: Arc::new(Mutex::new(HashSet::new())),
-                },
-            ),
-            counter,
-        )
+        let server = Self {
+            runtime: None,
+            port: 0,
+            sftp_dir: None,
+        }
+        .into_started(
+            port,
+            MockHandler {
+                accepted_key: None,
+                forwarded: Some(Arc::clone(&counter)),
+                forwarded_channels: Arc::new(Mutex::new(HashSet::new())),
+                open_channels: Arc::new(Mutex::new(HashMap::new())),
+                sftp_channels: Arc::new(Mutex::new(HashSet::new())),
+                sftp_root: None,
+            },
+        );
+        (server, counter)
     }
 
-    fn start_handler(port: u16, handler: MockHandler) -> Self {
+    /// 起一台带 SFTP 子系统的 mock；远端 fs 根目录为临时目录，
+    /// 返回其路径供测试播种/核对文件。转发默认关闭。
+    fn start_sftp(port: u16) -> (Self, Arc<std::path::Path>) {
+        let dir = tempfile::Builder::new()
+            .prefix("laterterm-sftp-mock-")
+            .tempdir()
+            .expect("sftp 根临时目录");
+        let root: Arc<std::path::Path> = Arc::from(dir.path().to_path_buf());
+        let mut server = Self {
+            runtime: None,
+            port: 0,
+            sftp_dir: Some(dir),
+        };
+        server = server.into_started(
+            port,
+            MockHandler {
+                accepted_key: None,
+                forwarded: None,
+                forwarded_channels: Arc::new(Mutex::new(HashSet::new())),
+                open_channels: Arc::new(Mutex::new(HashMap::new())),
+                sftp_channels: Arc::new(Mutex::new(HashSet::new())),
+                sftp_root: Some(Arc::clone(&root)),
+            },
+        );
+        (server, root)
+    }
+
+    /// 把自身从占位结构补全为已启动服务器（保留 sftp_dir 的持有权）。
+    fn into_started(mut self, port: u16, handler: MockHandler) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -260,10 +365,9 @@ impl MockServer {
             .recv_timeout(Duration::from_secs(5))
             .expect("mock 服务器启动超时");
 
-        Self {
-            runtime: Some(runtime),
-            port: bound_port,
-        }
+        self.port = bound_port;
+        self.runtime = Some(runtime);
+        self
     }
 }
 
@@ -272,6 +376,255 @@ impl Drop for MockServer {
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_timeout(Duration::from_secs(2));
         }
+    }
+}
+
+// ---------- SFTP 服务端 mock：tempdir 扮演远端 fs ----------
+
+/// 打开的句柄表条目：文件（读写位置由句柄内 File 自持）或目录（一次性枚举）。
+enum MockOpen {
+    File(std::fs::File),
+    Dir {
+        files: Vec<russh_sftp::protocol::File>,
+        sent: bool,
+    },
+}
+
+/// russh-sftp 服务端 Handler：把客户端路径约束在根目录内（拒绝 `..` 穿越），
+/// open/read/write/opendir/readdir/mkdir/remove/rmdir/rename/stat/realpath
+/// 全部落到 std::fs——客户端侧 SftpHandle 的每条指令都有真实对端语义。
+struct MockFsHandler {
+    root: Arc<std::path::Path>,
+    next_handle: u64,
+    open: HashMap<String, MockOpen>,
+}
+
+impl MockFsHandler {
+    /// 解析客户端路径：恒视为相对根的绝对路径（SFTP 语义），拒绝 `..` 穿越。
+    fn resolve(&self, path: &str) -> Result<std::path::PathBuf, StatusCode> {
+        let relative = path.trim_start_matches('/');
+        if relative.split('/').any(|part| part == "..") {
+            return Err(StatusCode::PermissionDenied);
+        }
+        Ok(self.root.join(relative))
+    }
+
+    fn alloc_handle(&mut self) -> String {
+        self.next_handle += 1;
+        format!("h{}", self.next_handle)
+    }
+
+    fn attrs_of(path: &std::path::Path) -> Result<FileAttributes, StatusCode> {
+        std::fs::metadata(path)
+            .map(|metadata| FileAttributes::from(&metadata))
+            .map_err(|_| StatusCode::NoSuchFile)
+    }
+
+    fn list_dir(path: &std::path::Path) -> Result<Vec<russh_sftp::protocol::File>, StatusCode> {
+        let entries = std::fs::read_dir(path).map_err(|_| StatusCode::NoSuchFile)?;
+        let mut files = Vec::new();
+        for entry in entries.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            files.push(russh_sftp::protocol::File::new(
+                entry.file_name().to_string_lossy().to_string(),
+                FileAttributes::from(&metadata),
+            ));
+        }
+        Ok(files)
+    }
+}
+
+impl russh_sftp::server::Handler for MockFsHandler {
+    type Error = StatusCode;
+
+    fn unimplemented(&self) -> Self::Error {
+        StatusCode::OpUnsupported
+    }
+
+    async fn open(
+        &mut self,
+        id: u32,
+        filename: String,
+        pflags: OpenFlags,
+        _attrs: FileAttributes,
+    ) -> Result<HandlePacket, Self::Error> {
+        let path = self.resolve(&filename)?;
+        let file = if pflags.contains(OpenFlags::CREATE) {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(pflags.contains(OpenFlags::TRUNCATE))
+                .write(true)
+                .read(pflags.contains(OpenFlags::READ))
+                .open(path)
+                .map_err(|_| StatusCode::PermissionDenied)?
+        } else if pflags.contains(OpenFlags::WRITE) {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .map_err(|_| StatusCode::PermissionDenied)?
+        } else {
+            std::fs::File::open(path).map_err(|_| StatusCode::NoSuchFile)?
+        };
+        let handle = self.alloc_handle();
+        self.open.insert(handle.clone(), MockOpen::File(file));
+        Ok(HandlePacket { id, handle })
+    }
+
+    async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
+        self.open.remove(&handle);
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".into(),
+            language_tag: "en-US".into(),
+        })
+    }
+
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Data, Self::Error> {
+        use std::io::{Seek, SeekFrom};
+        let MockOpen::File(file) = self.open.get_mut(&handle).ok_or(StatusCode::Failure)? else {
+            return Err(StatusCode::Failure);
+        };
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|_| StatusCode::Failure)?;
+        let mut buffer = vec![0u8; len as usize];
+        let n = file.read(&mut buffer).map_err(|_| StatusCode::Failure)?;
+        buffer.truncate(n);
+        if n == 0 {
+            return Err(StatusCode::Eof);
+        }
+        Ok(Data { id, data: buffer })
+    }
+
+    async fn write(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<Status, Self::Error> {
+        use std::io::{Seek, SeekFrom};
+        let MockOpen::File(file) = self.open.get_mut(&handle).ok_or(StatusCode::Failure)? else {
+            return Err(StatusCode::Failure);
+        };
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|_| StatusCode::Failure)?;
+        file.write_all(&data).map_err(|_| StatusCode::Failure)?;
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".into(),
+            language_tag: "en-US".into(),
+        })
+    }
+
+    async fn opendir(&mut self, id: u32, path: String) -> Result<HandlePacket, Self::Error> {
+        let resolved = self.resolve(&path)?;
+        let files = Self::list_dir(&resolved)?;
+        let handle = self.alloc_handle();
+        self.open
+            .insert(handle.clone(), MockOpen::Dir { files, sent: false });
+        Ok(HandlePacket { id, handle })
+    }
+
+    /// 客户端循环读取直到 Eof：首次返回全量条目，其后返回 Eof。
+    async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
+        let MockOpen::Dir { files, sent } =
+            self.open.get_mut(&handle).ok_or(StatusCode::Failure)?
+        else {
+            return Err(StatusCode::Failure);
+        };
+        if *sent {
+            return Err(StatusCode::Eof);
+        }
+        *sent = true;
+        Ok(Name {
+            id,
+            files: std::mem::take(files),
+        })
+    }
+
+    async fn mkdir(
+        &mut self,
+        id: u32,
+        path: String,
+        _: FileAttributes,
+    ) -> Result<Status, Self::Error> {
+        let resolved = self.resolve(&path)?;
+        std::fs::create_dir(resolved).map_err(|_| StatusCode::Failure)?;
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".into(),
+            language_tag: "en-US".into(),
+        })
+    }
+
+    async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
+        let resolved = self.resolve(&filename)?;
+        std::fs::remove_file(resolved).map_err(|_| StatusCode::Failure)?;
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".into(),
+            language_tag: "en-US".into(),
+        })
+    }
+
+    async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
+        let resolved = self.resolve(&path)?;
+        std::fs::remove_dir(resolved).map_err(|_| StatusCode::Failure)?;
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".into(),
+            language_tag: "en-US".into(),
+        })
+    }
+
+    async fn rename(
+        &mut self,
+        id: u32,
+        oldpath: String,
+        newpath: String,
+    ) -> Result<Status, Self::Error> {
+        let from = self.resolve(&oldpath)?;
+        let to = self.resolve(&newpath)?;
+        std::fs::rename(from, to).map_err(|_| StatusCode::Failure)?;
+        Ok(Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".into(),
+            language_tag: "en-US".into(),
+        })
+    }
+
+    async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        let resolved = self.resolve(&path)?;
+        Ok(Attrs {
+            id,
+            attrs: Self::attrs_of(&resolved)?,
+        })
+    }
+
+    /// mock 命名空间以根为准：`.`/`` → `/`，其余路径回显其绝对形态。
+    async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
+        let resolved = match path.trim_start_matches('/') {
+            "" | "." => "/".to_string(),
+            relative => format!("/{relative}"),
+        };
+        Ok(Name {
+            id,
+            files: vec![russh_sftp::protocol::File::dummy(resolved)],
+        })
     }
 }
 
@@ -628,5 +981,288 @@ fn jump_chain_fails_with_actionable_error_when_forwarding_rejected() {
     assert!(
         message.contains(&"跳板[1/1]".to_string()),
         "错误应标注跳板位置: {message}"
+    );
+}
+
+// ---------- SFTP 通道回环 ----------
+
+/// 构造指向回环 mock 的 SFTP 端点（known_hosts 与 shell 用例同策略）。
+fn sftp_endpoint_for(port: u16, dir: &std::path::Path) -> SshEndpoint {
+    endpoint_for(port, dir)
+}
+
+/// 播种测试内容：`len` 字节的确定性伪随机模式（跨块边界可校验字节级一致）。
+fn pattern_bytes(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// 直连 SFTP 全回环：列目录 / 上传 / 下载字节级一致 / 进度回调触发 /
+/// stat 与 realpath / 新建目录与重命名与删除。
+#[test]
+fn sftp_direct_roundtrip_upload_download_stat_realpath() {
+    let (server, root) = MockServer::start_sftp(0);
+    let known_hosts = temp_known_hosts("sftp-direct");
+    let handle = SftpHandle::spawn(
+        sftp_endpoint_for(server.port, known_hosts.path()),
+        Vec::new(),
+    )
+    .expect("连接 SFTP mock");
+
+    // 上传：300KiB + 零头，跨多个 64KiB 分块
+    let payload = pattern_bytes(3 * 64 * 1024 + 12345);
+    let src_dir = tempfile::Builder::new()
+        .prefix("sftp-src-")
+        .tempdir()
+        .expect("本地临时目录");
+    let local_src = src_dir.path().join("数据 文件.bin");
+    std::fs::write(&local_src, &payload).expect("写本地源文件");
+
+    // 进度回调：累计字节单调不减，且被真实触发
+    let seen = Arc::new(AtomicUsize::new(0));
+    let seen_cb = Arc::clone(&seen);
+    let progress: ProgressFn = Arc::new(move |total| {
+        seen_cb.store(total as usize, Ordering::SeqCst);
+    });
+    let uploaded = handle
+        .upload(&local_src, "/数据 文件.bin", Some(progress), None)
+        .expect("上传");
+    assert_eq!(uploaded as usize, payload.len(), "上传返回总字节数");
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        payload.len(),
+        "进度回调最终累计到文件大小"
+    );
+    assert_eq!(
+        std::fs::read(root.join("数据 文件.bin")).expect("mock 远端落盘"),
+        payload,
+        "上传字节级一致"
+    );
+
+    // 下载：原路读回并逐字节比对
+    let local_dst = src_dir.path().join("下载回来.bin");
+    let downloaded = handle
+        .download("/数据 文件.bin", &local_dst, None, None)
+        .expect("下载");
+    assert_eq!(downloaded as usize, payload.len());
+    assert_eq!(std::fs::read(&local_dst).expect("读本地"), payload);
+
+    // 目录操作 + 列目录：新建目录、重命名、条目在列
+    handle.create_dir("/子目录").expect("新建目录");
+    handle
+        .rename("/数据 文件.bin", "/改名后.bin")
+        .expect("重命名");
+    let entries = handle.read_dir("/").expect("列目录");
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    assert!(names.contains(&"改名后.bin"), "{names:?}");
+    assert!(names.contains(&"子目录"), "{names:?}");
+    assert!(!names.contains(&"数据 文件.bin"), "旧名不应在列: {names:?}");
+    let dir_entry = entries
+        .iter()
+        .find(|e| e.name == "子目录")
+        .expect("目录条目");
+    assert!(dir_entry.is_dir, "目录权限位应判为目录");
+    let file_entry = entries
+        .iter()
+        .find(|e| e.name == "改名后.bin")
+        .expect("文件条目");
+    assert!(!file_entry.is_dir);
+    assert_eq!(
+        file_entry.size as usize,
+        payload.len(),
+        "stat 尺寸来自目录属性"
+    );
+
+    // stat 单文件：大小与名称；realpath(".") 规范化为根
+    let stat = handle.stat("/改名后.bin").expect("stat 文件");
+    assert_eq!(stat.name, "改名后.bin");
+    assert_eq!(stat.size as usize, payload.len());
+    assert!(!stat.is_dir);
+    assert_eq!(
+        handle.realpath(".").expect("realpath"),
+        "/",
+        "mock 命名空间以根为准"
+    );
+
+    // 清理语义：删文件 + 删空目录
+    handle.remove_file("/改名后.bin").expect("删文件");
+    handle.remove_dir("/子目录").expect("删目录");
+    assert!(!root.join("改名后.bin").exists());
+
+    handle.close();
+    handle.close(); // 幂等
+}
+
+/// 跳板穿透到 SFTP 目标：单跳（旧 Option 单跳语义在 Vec 下的等价形态）
+/// 与两跳链各走一遍上传/下载回环，跳板各恰好接受一次转发。
+#[test]
+fn sftp_via_jump_chain_reaches_sftp_target() {
+    let (server_target, _sftp_root_unused) = MockServer::start_sftp(0);
+    let target = &server_target;
+    let (bastion, bastion_count) = MockServer::start_forwarding(0);
+    let (middle, middle_count) = MockServer::start_forwarding(0);
+    let known_hosts = temp_known_hosts("sftp-jump");
+
+    let payload = pattern_bytes(128 * 1024 + 7);
+    let src_dir = tempfile::tempdir().expect("本地临时目录");
+    let local_src = src_dir.path().join("via-jump.bin");
+    std::fs::write(&local_src, &payload).expect("写本地源文件");
+
+    // 单跳：等价于旧「Option<Box<SshEndpoint>>」单跳语义
+    let handle = SftpHandle::spawn(
+        sftp_endpoint_for(target.port, known_hosts.path()),
+        vec![sftp_endpoint_for(bastion.port, known_hosts.path())],
+    )
+    .expect("经单跳跳板连 SFTP");
+    handle
+        .upload(&local_src, "/one-hop.bin", None, None)
+        .expect("单跳上传");
+    handle.close();
+    assert_eq!(bastion_count.load(Ordering::SeqCst), 1, "跳板恰好 1 次转发");
+
+    // 两跳链：外→中→目标逐跳穿透（与 shell 会话 tunnels 保活同语义），
+    // 上传 + 下载回环字节级一致；每台跳板各恰好接受 1 次转发。
+    let handle = SftpHandle::spawn(
+        sftp_endpoint_for(target.port, known_hosts.path()),
+        vec![
+            sftp_endpoint_for(bastion.port, known_hosts.path()),
+            sftp_endpoint_for(middle.port, known_hosts.path()),
+        ],
+    )
+    .expect("经两跳跳板连 SFTP");
+    let local_dst = src_dir.path().join("两跳下载.bin");
+    handle
+        .upload(&local_src, "/两跳文件.bin", None, None)
+        .expect("两跳上传");
+    let downloaded = handle
+        .download("/两跳文件.bin", &local_dst, None, None)
+        .expect("两跳下载");
+    assert_eq!(downloaded as usize, payload.len());
+    assert_eq!(std::fs::read(&local_dst).expect("读本地"), payload);
+    handle.close();
+    assert_eq!(
+        bastion_count.load(Ordering::SeqCst),
+        2,
+        "外层跳板共 2 次转发"
+    );
+    assert_eq!(
+        middle_count.load(Ordering::SeqCst),
+        1,
+        "中层跳板恰好 1 次转发"
+    );
+}
+
+/// 取消语义：cancel 标志在进度回调里置位后，上传循环在下一次分块检查
+/// 以 Interrupted 返回；远端留半成品（< 源大小）且可被 remove_file 清理。
+#[test]
+fn sftp_upload_cancel_flag_stops_mid_transfer_and_partial_is_cleanable() {
+    let (server, root) = MockServer::start_sftp(0);
+    let known_hosts = temp_known_hosts("sftp-cancel");
+    let handle = SftpHandle::spawn(
+        sftp_endpoint_for(server.port, known_hosts.path()),
+        Vec::new(),
+    )
+    .expect("连接 SFTP mock");
+
+    let payload = pattern_bytes(4 * 1024 * 1024);
+    let src_dir = tempfile::tempdir().expect("本地临时目录");
+    let local_src = src_dir.path().join("big.bin");
+    std::fs::write(&local_src, &payload).expect("写本地源文件");
+
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let cancel_cb = Arc::clone(&cancel);
+    // 进度回调跑在网络线程的传输循环里：置位后下一次分块检查必然看到，
+    // 取消时机因此是确定性的（不靠竞态睡眠）。
+    let progress: ProgressFn = Arc::new(move |total| {
+        if total >= 64 * 1024 {
+            cancel_cb.store(true, Ordering::Relaxed);
+        }
+    });
+    let error = handle
+        .upload(
+            &local_src,
+            "/big.bin",
+            Some(progress),
+            Some(Arc::clone(&cancel)),
+        )
+        .expect_err("取消必须以错误返回");
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+    assert_eq!(error.to_string(), "传输已取消");
+
+    // 半成品存在且小于源文件；随后可正常删除（不残留半开句柄）
+    let partial = std::fs::metadata(root.join("big.bin"))
+        .expect("远端应留半成品")
+        .len() as usize;
+    assert!(
+        partial < payload.len(),
+        "半成品 {partial} 应小于源 {}",
+        payload.len()
+    );
+    handle.remove_file("/big.bin").expect("半成品可清理");
+    assert!(!root.join("big.bin").exists());
+
+    // 取消后同通道仍可继续执行指令（取消只终结传输，不终结通道）
+    handle.create_dir("/still-alive").expect("取消后通道仍可用");
+    handle.remove_dir("/still-alive").expect("清理");
+    handle.close();
+}
+
+/// close() 幂等且不能打断在途传输（Shutdown 只是排队）；网络线程退出后
+/// 后续指令以「SFTP 网络线程已退出」可靠报错（russh 0.65 CHANNEL_CLOSE
+/// 缺口注记见 roadmap——关闭依赖本地信号终结，不依赖远端回包）。
+#[test]
+fn sftp_close_is_idempotent_and_later_calls_fail_reliably() {
+    let (server, _root) = MockServer::start_sftp(0);
+    let known_hosts = temp_known_hosts("sftp-close");
+    let handle = SftpHandle::spawn(
+        sftp_endpoint_for(server.port, known_hosts.path()),
+        Vec::new(),
+    )
+    .expect("连接 SFTP mock");
+
+    handle.close();
+    handle.close(); // 幂等
+
+    // 网络线程处理 Shutdown 需要一点时间；此后指令可靠失败（轮询至多 5s）
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match handle.read_dir("/") {
+            Err(error) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains("SFTP 网络线程已退出"),
+                    "错误应说明通道已退出: {message}"
+                );
+                break;
+            }
+            Ok(_) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "close 后网络线程应退出并让后续指令失败"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+/// 负例：跳板拒转发时 SFTP spawn 必须失败，错误文案定位到跳板与目标。
+#[test]
+fn sftp_via_jump_rejected_forwarding_fails_actionably() {
+    let (server_target, _sftp_root_unused) = MockServer::start_sftp(0);
+    let target = &server_target;
+    let bastion = MockServer::start(0); // forwarded: None → 拒绝 direct-tcpip
+    let known_hosts = temp_known_hosts("sftp-jump-reject");
+
+    let error = SftpHandle::spawn(
+        sftp_endpoint_for(target.port, known_hosts.path()),
+        vec![sftp_endpoint_for(bastion.port, known_hosts.path())],
+    )
+    .err()
+    .expect("跳板拒转发时 SFTP 必须失败");
+    let message = error.to_string();
+    assert!(message.contains("转发通道"), "{message}");
+    assert!(
+        message.contains(&format!("tester@127.0.0.1:{}", target.port)),
+        "错误应含目标端点名: {message}"
     );
 }

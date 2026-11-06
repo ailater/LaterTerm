@@ -5,6 +5,7 @@ mod command_text_field;
 mod import;
 mod pane_navigation;
 mod server_connection;
+mod sftp_panel;
 mod shortcut_recorder;
 mod workspace;
 #[cfg(test)]
