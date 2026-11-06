@@ -35,6 +35,11 @@ base64 = "0.23"
 flate2 = "1"
 md5 = "0.8"
 serde_json = "1"
+# 检查更新（GitHub /releases/latest）：同步 API 免 async runtime；rustls feature
+# 自带 ring provider + webpki-roots 内嵌根证书（见 update_check.rs 模块头注记）。
+# 不启 json/gzip：解析走 serde_json 纯函数；不启用时 ureq 不发 Accept-Encoding，
+# GitHub 返回 identity，无需解压。
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 laterterm-core = { path = "crates/laterterm-core" }
 laterterm-local = { path = "crates/laterterm-local" }
 laterterm-secrets = { path = "crates/laterterm-secrets" }

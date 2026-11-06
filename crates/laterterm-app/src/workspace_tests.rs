@@ -241,7 +241,11 @@ fn palette_preview_orders_ansi_rows_and_copies_values() {
     use super::workspace::{PalettePreview, palette_preview};
     use laterterm_config::theme::ThemeColors;
 
-    fn assert_rows(preview: &PalettePreview, expected_normal: [(&str, u32); 8], expected_bright: [(&str, u32); 8]) {
+    fn assert_rows(
+        preview: &PalettePreview,
+        expected_normal: [(&str, u32); 8],
+        expected_bright: [(&str, u32); 8],
+    ) {
         assert_eq!(preview.normal, expected_normal, "ANSI 普通行序或取值串位");
         assert_eq!(preview.bright, expected_bright, "ANSI 亮色行序或取值串位");
     }

@@ -27,6 +27,23 @@ pub(crate) fn titlebar_logo() -> impl IntoElement {
         )
 }
 
+/// 设置面板「关于」卡的品牌标：40px 大尺寸版（同一编译期嵌入 PNG，
+/// ObjectFit::Contain 防非方形拉伸；不改动标题栏 20px 版）。
+pub(crate) fn about_logo() -> impl IntoElement {
+    use gpui::InteractiveElement;
+
+    div()
+        .debug_selector(|| "about-logo".into())
+        .size(px(40.0))
+        .flex_shrink_0()
+        .child(
+            img(logo_image())
+                .size_full()
+                .object_fit(gpui::ObjectFit::Contain)
+                .with_fallback(|| div().size_full().into_any_element()),
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

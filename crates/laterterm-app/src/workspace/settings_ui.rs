@@ -19,13 +19,14 @@
 
 use super::{BindingOwner, ShortcutBinding, WorkspaceView};
 use crate::onboarding::FONT_PRESETS;
+use crate::update_check::{self, Outcome};
 use gpui::{
     App, Context, Div, InteractiveElement, MouseButton, MouseDownEvent, ParentElement,
     SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px, rgb, rgba,
 };
-use laterterm_config::{Appearance, normalize_shortcut};
 use laterterm_config::theme::ThemeColors;
+use laterterm_config::{Appearance, normalize_shortcut};
 
 // ---------------------------------------------------------------------------
 // Tokyo Night 色板收敛（评审硬伤5：逐处替换、只动本模块，不按色值全局替换
@@ -86,18 +87,24 @@ pub(crate) enum SettingsSection {
     Terminal,
     /// 服务器。
     Servers,
+    /// 关于（品牌卡 + 仓库/许可信息）。
+    About,
+    /// 检查更新（手动触发，见 update_check.rs）。
+    UpdateCheck,
 }
 
 impl SettingsSection {
     /// 导航/内容顺序即滚动容器直接子元素顺序；label / anchor_title /
     /// debug_key 的 match 均不带通配分支，新增变体漏加任一处都会编译失败。
-    pub(crate) const ALL: [Self; 6] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Appearance,
         Self::Font,
         Self::Scrolling,
         Self::Shortcuts,
         Self::Terminal,
         Self::Servers,
+        Self::About,
+        Self::UpdateCheck,
     ];
 
     /// 左导航短标签。
@@ -109,6 +116,8 @@ impl SettingsSection {
             Self::Shortcuts => "快捷键",
             Self::Terminal => "终端",
             Self::Servers => "服务器",
+            Self::About => "关于",
+            Self::UpdateCheck => "更新",
         }
     }
 
@@ -121,6 +130,8 @@ impl SettingsSection {
             Self::Shortcuts => "快捷键",
             Self::Terminal => "终端",
             Self::Servers => "服务器",
+            Self::About => "关于",
+            Self::UpdateCheck => "检查更新",
         }
     }
 
@@ -133,6 +144,8 @@ impl SettingsSection {
             Self::Shortcuts => "shortcuts",
             Self::Terminal => "terminal",
             Self::Servers => "servers",
+            Self::About => "about",
+            Self::UpdateCheck => "update",
         }
     }
 
@@ -401,6 +414,8 @@ pub(crate) fn settings_content(
             SettingsSection::Shortcuts => settings_shortcuts_body(workspace, cx),
             SettingsSection::Terminal => settings_terminal_body(),
             SettingsSection::Servers => settings_servers_body(),
+            SettingsSection::About => settings_about_body(cx),
+            SettingsSection::UpdateCheck => settings_update_body(workspace, cx),
         };
         let block = div()
             .debug_selector(move || format!("settings-section-{}", section.debug_key()))
@@ -713,25 +728,24 @@ fn theme_preview_card(preview: &PalettePreview) -> Div {
                                 .text_color(rgb(preview.foreground))
                                 .child("user@laterterm:~$ ls"),
                         )
-                        .child(
-                            div()
-                                .w(px(6.0))
-                                .h(px(12.0))
-                                .bg(rgb(preview.cursor)),
-                        ),
+                        .child(div().w(px(6.0)).h(px(12.0)).bg(rgb(preview.cursor))),
                 ),
         )
         .child(
-            div()
-                .flex()
-                .gap_1()
-                .children(preview.normal.iter().map(|(name, color)| color_chip(name, *color))),
+            div().flex().gap_1().children(
+                preview
+                    .normal
+                    .iter()
+                    .map(|(name, color)| color_chip(name, *color)),
+            ),
         )
         .child(
-            div()
-                .flex()
-                .gap_1()
-                .children(preview.bright.iter().map(|(name, color)| color_chip(name, *color))),
+            div().flex().gap_1().children(
+                preview
+                    .bright
+                    .iter()
+                    .map(|(name, color)| color_chip(name, *color)),
+            ),
         )
 }
 
@@ -753,6 +767,180 @@ fn settings_servers_body() -> Vec<Div> {
             .child(info_row("本地 Shell", "已内置"))
             .child(info_row("SSH", "远程模块接入后可用")),
     ]
+}
+
+/// 「关于」节：品牌卡（40px logo + 名称 + 版本芯片 + 一句话简介）与
+/// 仓库链接 / 许可行。版本号读 workspace 单一真源 CARGO_PKG_VERSION；
+/// 简介取自仓库 AGENTS.md 的定位一句话。
+fn settings_about_body(cx: &mut Context<WorkspaceView>) -> Vec<Div> {
+    vec![
+        setting_card()
+            .child(
+                div()
+                    .debug_selector(|| "about-brand".into())
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .py_1()
+                    .child(crate::branding::about_logo())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(px(15.0))
+                                            .text_color(rgb(COLOR_TEXT))
+                                            .child("LaterTerm"),
+                                    )
+                                    .child(value_chip(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(COLOR_TEXT_MUTED))
+                                    .child(
+                                        "跨平台 GPU 终端：Deepin 终端功能 × Tabby 颜值 × 原生性能",
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "about-repo-link".into())
+                    .flex()
+                    .items_center()
+                    .py_1()
+                    .text_size(px(12.0))
+                    .text_color(rgb(COLOR_ACCENT))
+                    .cursor_pointer()
+                    .hover(|style| style.text_color(rgb(COLOR_TEXT)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _event, _window, cx| {
+                            cx.stop_propagation();
+                            laterterm_termview::open_url(&update_check::release_page_url());
+                        }),
+                    )
+                    .child("github.com/ailater/LaterTerm"),
+            )
+            .child(info_row("许可", "MIT OR Apache-2.0")),
+    ]
+}
+
+/// 「检查更新」节：结果横幅 + 按钮 + 状态行三态（Idle / 已是最新 / 未能确认）。
+/// 手动触发而非后台自动联网（静默外连是黑盒行为）；网络 IO 在后台执行器
+/// （workspace.rs check_for_update），失败一律「未能确认」静默文案不弹窗，
+/// 绝不把失败说成「已是最新」。
+fn settings_update_body(workspace: &WorkspaceView, cx: &mut Context<WorkspaceView>) -> Vec<Div> {
+    let check = &workspace.update_check;
+    let checking = check.checking();
+    let mut card = setting_card();
+    // 新版本横幅：只在确实查到更新时出现，紧贴按钮上方——检查动作发生在
+    // 哪，结果就出现在哪；放页顶会落在滚动视野外（LaterScreen v0.11.4 教训）
+    if let Some(Ok(Outcome::Newer(tag))) = check.result() {
+        card = card.child(
+            div()
+                .debug_selector(|| "update-newer-banner".into())
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .bg(rgba(COLOR_ACCENT_TINT))
+                .border_1()
+                .border_color(rgb(COLOR_ACCENT))
+                .rounded_sm()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(12.0))
+                        .text_color(rgb(COLOR_ACCENT))
+                        .child(format!("发现新版本 {tag}")),
+                )
+                .child(
+                    setting_button(
+                        "去下载",
+                        true,
+                        cx.listener(|_, _event, _window, cx| {
+                            cx.stop_propagation();
+                            laterterm_termview::open_url(&update_check::release_page_url());
+                        }),
+                    )
+                    .debug_selector(|| "update-download-btn".into()),
+                )
+                .child(setting_button(
+                    "知道了",
+                    false,
+                    cx.listener(|this, _event, _window, cx| {
+                        cx.stop_propagation();
+                        this.update_check.clear();
+                        cx.notify();
+                    }),
+                )),
+        );
+    }
+    // 检查按钮：checking 时 listener 内被 start 幂等短路（不重复发请求），
+    // 渲染用 muted 色 + 文案区分禁用感——不给 setting_button 扩禁用签名，
+    // 避免波及全部既有调用点（评审风险4）
+    let mut check_button = setting_button(
+        if checking {
+            "检查中…"
+        } else {
+            "检查更新"
+        },
+        false,
+        cx.listener(|this, _event, _window, cx| this.check_for_update(cx)),
+    );
+    if checking {
+        check_button = check_button.text_color(rgb(COLOR_TEXT_MUTED));
+    }
+    let mut row = div().flex().items_center().gap_3().py_1().child(
+        check_button
+            .debug_selector(|| "update-check-btn".into())
+            .cursor_pointer(),
+    );
+    // 状态行三态：未检查过只报当前版本，不暗示任何结论；失败可读但静默
+    //（无弹窗）；有新版本时不重复文案——横幅就在按钮正上方
+    match check.result() {
+        None if !checking => {
+            row = row.child(
+                div()
+                    .debug_selector(|| "update-status-idle".into())
+                    .text_size(px(12.0))
+                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .child(format!("当前 v{}", env!("CARGO_PKG_VERSION"))),
+            );
+        }
+        Some(Ok(Outcome::UpToDate)) => {
+            row = row.child(
+                div()
+                    .debug_selector(|| "update-status-uptodate".into())
+                    .text_size(px(12.0))
+                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .child(format!("当前 v{}，已是最新", env!("CARGO_PKG_VERSION"))),
+            );
+        }
+        Some(Err(message)) => {
+            row = row.child(
+                div()
+                    .debug_selector(|| "update-status-error".into())
+                    .text_size(px(12.0))
+                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .child(format!("未能确认：{message}")),
+            );
+        }
+        // 检查中 / 有新版本：不追加状态文字
+        _ => {}
+    }
+    vec![card.child(row)]
 }
 
 /// 「快捷键」节：全量绑定总览（内置 + 命令 + 服务器 + 动态码），冲突标红。

@@ -9,6 +9,7 @@ use crate::sftp_panel::{
     load_remote_into, sftp_overlay,
 };
 use crate::shortcut_recorder::{ShortcutChanged, ShortcutRecorder};
+use crate::update_check::{self, UpdateCheck};
 use gpui::{
     App, AppContext, AsyncApp, Bounds, Context, CursorStyle, DispatchPhase, Div, Edges, Entity,
     FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
@@ -700,6 +701,9 @@ pub struct WorkspaceView {
     /// 设置内容单页滚动容器句柄（offset 存 handle 内的 Rc，跨面板开关持久，
     /// 打开时必须复位——见 toggle_settings）。
     settings_scroll: ScrollHandle,
+    /// 手动检查更新状态机（update_check.rs；结果落实体字段，面板关闭不取消
+    /// 在途任务，下次打开显示）。
+    update_check: UpdateCheck,
     shortcut_editor: Option<ShortcutEditor>,
     panel_shortcut_dialog: Option<BindingOwner>,
     shortcut_error: Option<String>,
@@ -903,6 +907,7 @@ impl WorkspaceView {
             settings_section: SettingsSection::Appearance,
             settings_jump: None,
             settings_scroll: ScrollHandle::new(),
+            update_check: UpdateCheck::default(),
             shortcut_editor: None,
             panel_shortcut_dialog: None,
             shortcut_error: None,
@@ -1925,6 +1930,34 @@ impl WorkspaceView {
             self.cancel_theme_preview(cx);
         }
         cx.notify();
+    }
+
+    /// 手动检查更新：后台执行器跑网络请求，结果经实体更新回写
+    /// update_check 字段。收尾语义与 quake 泵一致（见 start_quake_pump）：
+    /// 「切走设置面板」只是 settings_open 布尔开关，本任务不取消——结果
+    /// 落实体字段等下次打开显示；实体/窗口已亡时 update 返回 Err 自然丢弃。
+    /// 8s 全局超时封顶（update_check.rs TIMEOUT），防按钮永久「检查中…」。
+    fn check_for_update(&mut self, cx: &mut Context<Self>) {
+        // 幂等门：检查中连点不再发请求（update_check.start 已兜底，这里
+        // 短路省一次 spawn）
+        if !self.update_check.start() {
+            return;
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            // 同步网络调用必须包进 async 块：直接传 query_latest() 的话，
+            // 求值发生在外层 spawn 所在的主线程，8s 超时内 UI 整体卡死
+            //（评审必改项；secrets 先例 workspace.rs delete_totp 同形态）。
+            let result = cx
+                .background_executor()
+                .spawn(async move { update_check::query_latest() })
+                .await;
+            let _ = this.update(cx, |workspace, cx| {
+                workspace.update_check.finish(result);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn change_setting(
@@ -9226,6 +9259,8 @@ mod settings_panel_tests {
             "settings-section-shortcuts",
             "settings-section-terminal",
             "settings-section-servers",
+            "settings-section-about",
+            "settings-section-update",
         ];
         let mut previous_top = content.top();
         for selector in selectors {
@@ -9238,6 +9273,76 @@ mod settings_panel_tests {
             );
             previous_top = bounds.top();
         }
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    /// 检查更新三态渲染（离线注入，零真实网络）：Idle 只报当前版本；
+    /// 注入 Newer 结果横幅与「去下载」按钮在场；注入 Err 出「未能确认」
+    /// 静默行且无任何弹窗元素——失败绝不呈现为「已是最新」（update_check.rs
+    /// 失败语义口径的结果侧回归钉）。
+    #[gpui::test]
+    fn update_check_states_render_offline(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_settings_panel(cx);
+        // Idle：检查按钮 + 「当前 v0.2.0」状态行在场
+        assert!(
+            cx.debug_bounds("update-check-btn").is_some(),
+            "检查按钮必须在场"
+        );
+        assert!(
+            cx.debug_bounds("update-status-idle").is_some(),
+            "Idle 态状态行必须在场"
+        );
+        // 注入 Newer：横幅 + 「去下载」按钮出现，Idle 状态行退场
+        workspace.update(cx, |view, cx| {
+            view.update_check
+                .finish(Ok(crate::update_check::Outcome::Newer("v99.0.0".into())));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("update-newer-banner").is_some(),
+            "新版本横幅必须紧贴按钮渲染"
+        );
+        assert!(
+            cx.debug_bounds("update-download-btn").is_some(),
+            "「去下载」按钮必须在场"
+        );
+        assert!(cx.debug_bounds("update-status-idle").is_none());
+        // 注入 Err：「未能确认」行在场，横幅退场，无弹窗元素（静默文案）
+        workspace.update(cx, |view, cx| {
+            view.update_check.finish(Err("GitHub 返回 403".into()));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("update-status-error").is_some(),
+            "失败状态行必须在场"
+        );
+        assert!(cx.debug_bounds("update-newer-banner").is_none());
+        workspace.read_with(cx, |view, _| {
+            assert!(
+                view.command_dialog.is_none()
+                    && view.totp_dialog.is_none()
+                    && view.server_dialog.is_none()
+                    && view.shortcut_editor.is_none(),
+                "失败走静默状态行，不得弹任何对话框"
+            );
+        });
+        // 清除（「知道了」同款路径）：回到 Idle 状态行
+        workspace.update(cx, |view, cx| {
+            view.update_check.clear();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("update-status-idle").is_some(),
+            "清除后回到 Idle 状态行"
+        );
+        assert!(cx.debug_bounds("update-status-error").is_none());
         workspace.read_with(cx, |view, _| {
             for pane in &view.panes {
                 pane.session.close();
@@ -9265,7 +9370,7 @@ mod settings_panel_tests {
         workspace.read_with(cx, |view, _| {
             assert_eq!(
                 view.settings_section,
-                SettingsSection::Servers,
+                SettingsSection::UpdateCheck,
                 "滚到底必须兜底选中末节"
             );
         });
@@ -9336,7 +9441,7 @@ mod settings_panel_tests {
         });
         cx.run_until_parked();
         workspace.read_with(cx, |view, _| {
-            assert_eq!(view.settings_section, SettingsSection::Servers);
+            assert_eq!(view.settings_section, SettingsSection::UpdateCheck);
         });
         // 关闭（复位逻辑只允许写在打开分支，关闭帧不丢高亮）
         workspace.update_in(cx, |view, window, cx| {
@@ -9378,7 +9483,12 @@ mod settings_panel_tests {
         });
         workspace.update_in(cx, |view, window, cx| {
             view.spawn_tab(window, cx);
-            view.preview_theme(&MouseDownEvent::default(), "gruvbox-dark".into(), window, cx);
+            view.preview_theme(
+                &MouseDownEvent::default(),
+                "gruvbox-dark".into(),
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
         // 色板预览卡常驻于「滚动与主题」分区块内部（六节对位约束）
@@ -9392,8 +9502,9 @@ mod settings_panel_tests {
                 view.settings.appearance.theme, "tokyo-night",
                 "预览不得改动已保存值"
             );
-            let expected =
-                gpui::Rgba::from(super::palette_for(view.themes.resolve("gruvbox-dark")).background());
+            let expected = gpui::Rgba::from(
+                super::palette_for(view.themes.resolve("gruvbox-dark")).background(),
+            );
             for pane in &view.panes {
                 assert_eq!(
                     gpui::Rgba::from(pane.terminal.read(cx).config().colors.background()),
@@ -9439,15 +9550,17 @@ mod settings_panel_tests {
         });
         // 必改1回归：预览期间点回已保存主题 = 放弃预览（委托 cancel take+apply）
         workspace.update_in(cx, |view, window, cx| {
-            view.preview_theme(&MouseDownEvent::default(), "gruvbox-dark".into(), window, cx);
+            view.preview_theme(
+                &MouseDownEvent::default(),
+                "gruvbox-dark".into(),
+                window,
+                cx,
+            );
             assert_eq!(view.theme_preview.as_deref(), Some("gruvbox-dark"));
             view.preview_theme(&MouseDownEvent::default(), "tokyo-night".into(), window, cx);
         });
         workspace.read_with(cx, |view, cx| {
-            assert!(
-                view.theme_preview.is_none(),
-                "点回已保存主题必须放弃预览"
-            );
+            assert!(view.theme_preview.is_none(), "点回已保存主题必须放弃预览");
             let expected = gpui::Rgba::from(
                 super::palette_for(view.themes.resolve("tokyo-night")).background(),
             );
@@ -9482,7 +9595,12 @@ mod settings_panel_tests {
             view.settings.appearance.theme = "tokyo-night".into();
             view.apply_appearance(cx);
             view.spawn_tab(window, cx);
-            view.preview_theme(&MouseDownEvent::default(), "gruvbox-dark".into(), window, cx);
+            view.preview_theme(
+                &MouseDownEvent::default(),
+                "gruvbox-dark".into(),
+                window,
+                cx,
+            );
             view.commit_theme_preview(&MouseDownEvent::default(), window, cx);
         });
         cx.run_until_parked();
@@ -9519,9 +9637,7 @@ mod settings_panel_tests {
     /// 预览不存在的主题名：resolve 静默回退默认主题（窗格仍是已保存主题色）；
     /// commit 被 themes.get 严格校验拦截——不落盘、不落内存、预览清空并恢复。
     #[gpui::test]
-    fn theme_preview_missing_theme_falls_back_and_commit_does_not_persist(
-        cx: &mut TestAppContext,
-    ) {
+    fn theme_preview_missing_theme_falls_back_and_commit_does_not_persist(cx: &mut TestAppContext) {
         let dir = std::env::temp_dir().join(format!(
             "laterterm-theme-missing-test-{}",
             std::process::id()
@@ -9534,7 +9650,12 @@ mod settings_panel_tests {
             view.settings.appearance.theme = "tokyo-night".into();
             view.apply_appearance(cx);
             view.spawn_tab(window, cx);
-            view.preview_theme(&MouseDownEvent::default(), "no-such-theme".into(), window, cx);
+            view.preview_theme(
+                &MouseDownEvent::default(),
+                "no-such-theme".into(),
+                window,
+                cx,
+            );
         });
         cx.run_until_parked();
         workspace.read_with(cx, |view, cx| {
@@ -9605,7 +9726,12 @@ mod settings_panel_tests {
             view.apply_appearance(cx);
         });
         workspace.update_in(cx, |view, window, cx| {
-            view.preview_theme(&MouseDownEvent::default(), "gruvbox-dark".into(), window, cx);
+            view.preview_theme(
+                &MouseDownEvent::default(),
+                "gruvbox-dark".into(),
+                window,
+                cx,
+            );
             assert_eq!(view.theme_preview.as_deref(), Some("gruvbox-dark"));
             view.reset_settings(&MouseDownEvent::default(), window, cx);
         });

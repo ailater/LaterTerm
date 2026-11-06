@@ -9,6 +9,7 @@ mod quake;
 mod server_connection;
 mod sftp_panel;
 mod shortcut_recorder;
+mod update_check;
 mod workspace;
 #[cfg(test)]
 mod workspace_tests;
