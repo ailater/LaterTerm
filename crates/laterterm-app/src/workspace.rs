@@ -36,16 +36,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// 设置面板 UI 子模块：迁移函数需访问 WorkspaceView 私有字段/方法，按 Rust
+// 可见性规则挂为 workspace 子模块（平级顶层模块不可见，见 settings_ui.rs 头注）。
+mod settings_ui;
+pub(crate) use self::settings_ui::{
+    SCROLL_SPY_EPSILON_PX, SCROLL_SPY_LEAD_PX, SettingsSection, setting_button, settings_content,
+    settings_navigation, settings_overlay, settings_scroll_spy,
+};
+
 const TITLEBAR_HEIGHT: f32 = 34.0;
 const PANEL_WIDTH: f32 = 240.0;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SettingsPage {
-    Appearance,
-    Shortcuts,
-    Terminal,
-    Servers,
-}
 
 /// 窗格（pane）ID：一个终端会话的最小分屏单元。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -687,7 +687,14 @@ pub struct WorkspaceView {
     onboarding_rx: flume::Receiver<ProbeResults>,
     broadcast_tx: flume::Sender<(PaneId, Vec<u8>)>,
     broadcast_rx: flume::Receiver<(PaneId, Vec<u8>)>,
-    settings_page: SettingsPage,
+    /// 当前高亮的设置分区（scroll-spy 写、导航点击写、绘制消费）。
+    settings_section: SettingsSection,
+    /// 待执行的导航跳转（Some = 本帧 prepaint 消费 scroll_to_top_of_item，
+    /// 且 spy 跳过一帧防旧 offset 拉回高亮）。
+    settings_jump: Option<SettingsSection>,
+    /// 设置内容单页滚动容器句柄（offset 存 handle 内的 Rc，跨面板开关持久，
+    /// 打开时必须复位——见 toggle_settings）。
+    settings_scroll: ScrollHandle,
     shortcut_editor: Option<ShortcutEditor>,
     panel_shortcut_dialog: Option<BindingOwner>,
     shortcut_error: Option<String>,
@@ -883,7 +890,9 @@ impl WorkspaceView {
             split_drag: None,
             terminal_menu: None,
             secret_store: default_store(),
-            settings_page: SettingsPage::Appearance,
+            settings_section: SettingsSection::Appearance,
+            settings_jump: None,
+            settings_scroll: ScrollHandle::new(),
             shortcut_editor: None,
             panel_shortcut_dialog: None,
             shortcut_error: None,
@@ -1889,6 +1898,16 @@ impl WorkspaceView {
     fn toggle_settings(&mut self, cx: &mut Context<Self>) {
         cx.stop_propagation();
         self.settings_open = !self.settings_open;
+        if self.settings_open {
+            // track_scroll 模式下 offset 真身存在 ScrollHandle（view 字段，gpui
+            // div.rs 的 Rc<RefCell<Point>>），跨面板开关持久——重开若不复位会
+            // 残留上次滚动位置，与复位的首节高亮脱节（评审硬伤2）。只写在
+            // 打开分支：关闭动画帧保留高亮。
+            self.settings_section = SettingsSection::default();
+            self.settings_jump = None;
+            self.settings_scroll
+                .set_offset(gpui::point(px(0.0), px(0.0)));
+        }
         cx.notify();
     }
 
@@ -2039,16 +2058,55 @@ impl WorkspaceView {
         window.zoom_window();
     }
 
-    fn select_settings_page(
+    /// 导航点击：立即高亮（不等滚动对位），并记跳转让下一帧 prepaint 消费
+    /// scroll_to_top_of_item 瞬时对齐分区起点（Top 策略）。
+    fn select_settings_section(
         &mut self,
-        page: SettingsPage,
+        section: SettingsSection,
         _event: &MouseDownEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        self.settings_page = page;
+        self.settings_section = section;
+        self.settings_jump = Some(section);
+        self.settings_scroll.scroll_to_top_of_item(section.index());
         cx.notify();
+    }
+
+    /// 设置面板 scroll-spy：滚动 → 导航高亮。在 render 期执行，读的是上一帧
+    /// 绘制记录的容器/子元素几何（滞后一帧无感，与 LaterScreen 参照一致），
+    /// 结果由本帧导航绘制直接消费。绝不调 cx.notify——滚动帧由滚动容器内部
+    /// 滚轮监听的 notify 驱动（gpui div.rs bubble 期），这里再通知就是
+    /// 「render→notify→render」自激死循环。
+    fn settings_scroll_spy_step(&mut self) {
+        // 导航点击 → 跳转帧：prepaint 才会消费 scroll_to_top_of_item，本帧
+        // offset 还是旧值，跳过侦测防高亮被拉回旧分区（一帧闪烁）。
+        if self.settings_jump.take().is_some() {
+            return;
+        }
+        // 内容不超高（max_offset≈0）：at_bottom 恒真会错拉到末节，保持现状。
+        if self.settings_scroll.max_offset().height <= px(SCROLL_SPY_EPSILON_PX) {
+            return;
+        }
+        let handle = &self.settings_scroll;
+        let container_top = handle.bounds().top();
+        // child_bounds 在首次绘制前为空（bounds_for_item 返回 None），跳过；
+        // tops 为各分区起点相对容器顶的内容坐标（child_bounds 记录时不带本
+        // 容器滚动变换，减容器顶即归一化，与 -offset.y + 判定线同坐标系）。
+        let tops: Vec<(SettingsSection, f32)> = SettingsSection::ALL
+            .iter()
+            .enumerate()
+            .filter_map(|(index, section)| {
+                handle
+                    .bounds_for_item(index)
+                    .map(|bounds| (*section, f32::from(bounds.top() - container_top)))
+            })
+            .collect();
+        let offset_y = handle.offset().y;
+        let line = f32::from(-offset_y) + SCROLL_SPY_LEAD_PX;
+        let at_bottom = offset_y <= -(handle.max_offset().height - px(SCROLL_SPY_EPSILON_PX));
+        self.settings_section = settings_scroll_spy(&tops, line, at_bottom);
     }
 
     fn close_settings(
@@ -4974,6 +5032,11 @@ impl Render for WorkspaceView {
         let left_panel = self.left_panel;
         let right_panel = self.right_panel;
         let settings_open = self.settings_open;
+        // 设置面板打开时先跑 scroll-spy（滚动 → 高亮联动），本帧导航绘制直接
+        // 消费结果；不 notify（防自激帧循环，见 settings_scroll_spy_step 注记）。
+        if settings_open {
+            self.settings_scroll_spy_step();
+        }
 
         div()
             .size_full()
@@ -5153,8 +5216,8 @@ impl Render for WorkspaceView {
                 root.child(settings_overlay(
                     cx.listener(Self::close_settings),
                     cx.listener(Self::close_settings),
-                    settings_navigation(self.settings_page, cx),
-                    settings_content(self.settings_page, self, cx),
+                    settings_navigation(self.settings_section, cx),
+                    settings_content(self, cx),
                 ))
             })
             // SFTP 双栏面板：窗口级大覆盖层（右面板 240px 放不下双栏）
@@ -7249,880 +7312,6 @@ fn server_entry_row(
         )
 }
 
-fn settings_overlay(
-    scrim_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-    close_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-    navigation: gpui::Div,
-    content: gpui::Stateful<gpui::Div>,
-) -> gpui::Div {
-    div()
-        .absolute()
-        .top_0()
-        .right_0()
-        .bottom_0()
-        .left_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(gpui::black().opacity(0.6))
-        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-        .on_mouse_down(MouseButton::Left, scrim_listener)
-        .child(
-            div()
-                .w(px(640.0))
-                .h(px(560.0))
-                .flex()
-                .flex_col()
-                .overflow_hidden()
-                .rounded_md()
-                .bg(rgb(0x1C1E2C))
-                .border_1()
-                .border_color(rgb(0x343A50))
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .h(px(52.0))
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .px_5()
-                        .border_b_1()
-                        .border_color(rgb(0x343750))
-                        .child(div().text_color(rgb(0xC0CAF5)).child("设置"))
-                        .child(
-                            div()
-                                .h(px(30.0))
-                                .w(px(30.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_color(rgb(0xF7768E))
-                                .on_mouse_down(MouseButton::Left, close_listener)
-                                .child("×"),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .flex()
-                        .child(navigation)
-                        .child(content),
-                )
-                .child(
-                    div()
-                        .h(px(44.0))
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .px_5()
-                        .border_t_1()
-                        .border_color(rgb(0x343750))
-                        .text_color(rgb(0x7D829F))
-                        .child("修改即时生效")
-                        .child("LaterTerm"),
-                ),
-        )
-}
-
-fn settings_navigation(page: SettingsPage, cx: &mut Context<WorkspaceView>) -> gpui::Div {
-    let entries = [
-        (SettingsPage::Appearance, "外观"),
-        (SettingsPage::Shortcuts, "快捷键"),
-        (SettingsPage::Terminal, "终端"),
-        (SettingsPage::Servers, "服务器"),
-    ];
-    div()
-        .w(px(150.0))
-        .h_full()
-        .p_3()
-        .bg(rgb(0x1B1C2A))
-        .flex()
-        .flex_col()
-        .gap_1()
-        .children(entries.into_iter().map(|(entry, label)| {
-            let selected = entry == page;
-            div()
-                .w_full()
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .bg(if selected {
-                    rgb(0x35415B)
-                } else {
-                    rgb(0x1B1C2A)
-                })
-                .text_color(if selected {
-                    rgb(0xD6E3FF)
-                } else {
-                    rgb(0xA9B1D6)
-                })
-                .hover(|style| {
-                    style.bg(if selected {
-                        rgb(0x35415B)
-                    } else {
-                        rgb(0x292D40)
-                    })
-                })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, event, window, cx| {
-                        this.select_settings_page(entry, event, window, cx)
-                    }),
-                )
-                .child(label)
-        }))
-}
-
-fn settings_content(
-    page: SettingsPage,
-    workspace: &mut WorkspaceView,
-    cx: &mut Context<WorkspaceView>,
-) -> gpui::Stateful<gpui::Div> {
-    let title = match page {
-        SettingsPage::Appearance => "外观",
-        SettingsPage::Shortcuts => "快捷键",
-        SettingsPage::Terminal => "终端",
-        SettingsPage::Servers => "服务器",
-    };
-    let body = match page {
-        SettingsPage::Appearance => settings_panel(workspace, cx),
-        SettingsPage::Shortcuts => shortcuts_page(workspace, cx),
-        SettingsPage::Terminal => div()
-            .pt_4()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(section_title("本地会话"))
-            .child(
-                setting_card()
-                    .child(info_row("Shell", "$SHELL / bash"))
-                    .child(info_row("TERM", "xterm-256color"))
-                    .child(info_row("COLORTERM", "truecolor"))
-                    .child(info_row("滚动", "自然滚动，支持历史回看")),
-            ),
-        SettingsPage::Servers => div()
-            .pt_4()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .child(section_title("连接"))
-            .child(
-                setting_card()
-                    .child(info_row("本地 Shell", "已内置"))
-                    .child(info_row("SSH", "远程模块接入后可用")),
-            ),
-    };
-    div()
-        .id(gpui::SharedString::from(format!(
-            "settings-content-{page:?}"
-        )))
-        .flex_1()
-        .min_w(px(0.0))
-        .min_h(px(0.0))
-        .h_full()
-        .overflow_y_scroll()
-        .p_5()
-        .text_color(rgb(0xC0CAF5))
-        .child(div().text_color(rgb(0xC0CAF5)).child(title))
-        .child(body)
-}
-
-/// 设置→快捷键：全量绑定总览（内置 + 命令 + 服务器 + 动态码），冲突标红。
-fn shortcuts_page(workspace: &WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
-    let bindings = workspace.all_shortcut_bindings();
-    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for binding in &bindings {
-        *counts.entry(binding.normalized.as_str()).or_default() += 1;
-    }
-    let row = |binding: &ShortcutBinding| {
-        let conflicted = counts
-            .get(binding.normalized.as_str())
-            .copied()
-            .unwrap_or(1)
-            > 1;
-        setting_card().child(shortcut_row(
-            &binding.label,
-            &binding.normalized,
-            conflicted,
-        ))
-    };
-    let mut page = div().pt_4().flex().flex_col().gap_3();
-    // 系统级热键（Quake）：仅 Linux 提供——portal GlobalShortcuts 是 Wayland 下
-    // 全局热键的唯一正道，其余平台无此卡片（cfg 隔离，AGENTS.md 平台差异约定）。
-    #[cfg(target_os = "linux")]
-    {
-        let quake = workspace.settings.quake.clone();
-        let status = workspace.quake_status.clone();
-        page = page.child(section_title("系统级热键（Quake）"));
-        page = page.child(
-            setting_card()
-                .child(setting_row(
-                    "全局呼出",
-                    div(),
-                    quake_toggle_controls(
-                        cx,
-                        ("开", true),
-                        ("关", false),
-                        quake.enabled,
-                        |settings, value| settings.enabled = value,
-                    ),
-                ))
-                .child(setting_row(
-                    "失焦收起",
-                    div(),
-                    quake_toggle_controls(
-                        cx,
-                        ("开", true),
-                        ("关", false),
-                        quake.auto_hide_on_blur,
-                        |settings, value| settings.auto_hide_on_blur = value,
-                    ),
-                ))
-                .child(
-                    div()
-                        .py_1()
-                        .text_color(gpui::rgb(status.text_color()))
-                        .child(status.text()),
-                )
-                .child(
-                    div()
-                        .pt_1()
-                        .text_size(px(11.0))
-                        .text_color(rgb(0x565A78))
-                        .child(
-                            "首次启用会弹出系统确认对话框，请在桌面环境快捷键设置中授权；\
-                             实际键位可在桌面快捷键设置中修改。窗口的 Quake 几何（全屏宽 × \
-                             50% 高、顶部居中）在下次启动时生效。",
-                        ),
-                ),
-        );
-    }
-    page = page.child(section_title("内置"));
-    for binding in bindings
-        .iter()
-        .filter(|b| matches!(b.owner, BindingOwner::Builtin))
-    {
-        page = page.child(row(binding));
-    }
-    page = page.child(section_title("面板"));
-    for (label, shortcut, owner) in [
-        (
-            "命令面板",
-            workspace.settings.shortcuts.commands_panel.as_deref(),
-            BindingOwner::CommandsPanel,
-        ),
-        (
-            "服务器面板",
-            workspace.settings.shortcuts.servers_panel.as_deref(),
-            BindingOwner::ServersPanel,
-        ),
-    ] {
-        let invalid = shortcut.is_some_and(|key| normalize_shortcut(key).is_err());
-        let conflicted = shortcut
-            .and_then(|key| normalize_shortcut(key).ok())
-            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
-        page = page.child(
-            setting_card()
-                .child(shortcut_row(
-                    label,
-                    shortcut.unwrap_or("未设置"),
-                    invalid || conflicted,
-                ))
-                .child(setting_button(
-                    "编辑快捷键",
-                    false,
-                    cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.edit_panel_shortcut(owner.clone(), window, cx);
-                    }),
-                )),
-        );
-    }
-    // 直接从配置渲染，保留未绑定和无效历史值的修复入口。
-    page = page.child(section_title("命令"));
-    for command in &workspace.settings.commands {
-        let command = command.clone();
-        let shortcut = command.shortcut.as_deref().unwrap_or("未绑定");
-        let invalid = command
-            .shortcut
-            .as_ref()
-            .is_some_and(|key| normalize_shortcut(key).is_err());
-        let conflicted = normalize_shortcut(shortcut)
-            .ok()
-            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
-        page = page.child(
-            setting_card()
-                .child(shortcut_row(&command.name, shortcut, invalid || conflicted))
-                .child(setting_button(
-                    "编辑快捷键",
-                    false,
-                    cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.edit_command(Some(command.clone()), window, cx);
-                        this.start_shortcut_recording(window, cx);
-                    }),
-                )),
-        );
-    }
-    page = page.child(section_title("服务器"));
-    for entry in &workspace.settings.servers {
-        let entry = entry.clone();
-        let shortcut = entry.shortcut.as_deref().unwrap_or("未绑定");
-        let invalid = entry
-            .shortcut
-            .as_ref()
-            .is_some_and(|key| normalize_shortcut(key).is_err());
-        let conflicted = normalize_shortcut(shortcut)
-            .ok()
-            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
-        page = page.child(
-            setting_card()
-                .child(shortcut_row(&entry.name, shortcut, invalid || conflicted))
-                .child(setting_button(
-                    "编辑快捷键",
-                    false,
-                    cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.edit_server(Some(&entry), window, cx);
-                        this.start_shortcut_recording(window, cx);
-                    }),
-                )),
-        );
-    }
-    page = page.child(section_title("动态码"));
-    for entry in &workspace.settings.totp {
-        let entry = entry.clone();
-        let shortcut = entry.shortcut.as_deref().unwrap_or("未绑定");
-        let invalid = entry
-            .shortcut
-            .as_ref()
-            .is_some_and(|key| normalize_shortcut(key).is_err());
-        let conflicted = normalize_shortcut(shortcut)
-            .ok()
-            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
-        page = page.child(
-            setting_card()
-                .child(shortcut_row(&entry.name, shortcut, invalid || conflicted))
-                .child(setting_button(
-                    "编辑快捷键",
-                    false,
-                    cx.listener(move |this, _, window, cx| {
-                        cx.stop_propagation();
-                        this.edit_totp(Some(&entry), window, cx);
-                        this.start_shortcut_recording(window, cx);
-                    }),
-                )),
-        );
-    }
-    let has_conflict = counts.values().any(|count| *count > 1);
-    let invalid = workspace
-        .settings
-        .commands
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .shortcut
-                .as_ref()
-                .map(|key| (format!("命令 {}", entry.name), key))
-        })
-        .chain(workspace.settings.servers.iter().filter_map(|entry| {
-            entry
-                .shortcut
-                .as_ref()
-                .map(|key| (format!("服务器 {}", entry.name), key))
-        }))
-        .chain(workspace.settings.totp.iter().filter_map(|entry| {
-            entry
-                .shortcut
-                .as_ref()
-                .map(|key| (format!("动态码 {}", entry.name), key))
-        }))
-        .chain(
-            workspace
-                .settings
-                .shortcuts
-                .commands_panel
-                .as_ref()
-                .map(|key| ("命令面板".to_string(), key)),
-        )
-        .chain(
-            workspace
-                .settings
-                .shortcuts
-                .servers_panel
-                .as_ref()
-                .map(|key| ("服务器面板".to_string(), key)),
-        )
-        .filter(|(_, key)| normalize_shortcut(key).is_err())
-        .collect::<Vec<_>>();
-    if !invalid.is_empty() {
-        page = page.child(section_title("无效快捷键"));
-        for (label, key) in &invalid {
-            page = page.child(setting_card().child(shortcut_row(label, key, true)));
-        }
-    }
-    page.child(
-        div()
-            .pt_2()
-            .text_color(if has_conflict || !invalid.is_empty() {
-                rgb(0xF7768E)
-            } else {
-                rgb(0x565A78)
-            })
-            .child(if has_conflict || !invalid.is_empty() {
-                "存在冲突或无效绑定：请在对应编辑弹窗里修改（方向切换优先）"
-            } else {
-                "绑定在命令 / 服务器 / 动态码的编辑弹窗里设置，保存时自动查重"
-            }),
-    )
-}
-
-fn settings_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
-    let settings = workspace.settings.appearance.clone();
-    div()
-        .pt_4()
-        .flex()
-        .flex_col()
-        .gap_3()
-        .child(section_title("终端外观"))
-        .child(
-            setting_card()
-                .child(setting_row(
-                    "字号",
-                    value_chip(&format!("{:.0} px", settings.font_size)),
-                    stepper_controls(
-                        cx,
-                        |s: &mut Appearance| s.font_size = (s.font_size - 1.0).max(8.0),
-                        |s: &mut Appearance| s.font_size = (s.font_size + 1.0).min(32.0),
-                    ),
-                ))
-                .child(setting_row(
-                    "行高",
-                    value_chip(&format!("{:.1}", settings.line_height)),
-                    stepper_controls(
-                        cx,
-                        |s: &mut Appearance| {
-                            s.line_height = ((s.line_height - 0.1) * 10.0).round() / 10.0;
-                            s.line_height = s.line_height.clamp(0.8, 2.0);
-                        },
-                        |s: &mut Appearance| {
-                            s.line_height = ((s.line_height + 0.1) * 10.0).round() / 10.0;
-                            s.line_height = s.line_height.clamp(0.8, 2.0);
-                        },
-                    ),
-                ))
-                .child(setting_row(
-                    "内边距",
-                    value_chip(&format!("{:.0} px", settings.padding)),
-                    stepper_controls(
-                        cx,
-                        |s: &mut Appearance| s.padding = (s.padding - 1.0).max(0.0),
-                        |s: &mut Appearance| s.padding = (s.padding + 1.0).min(24.0),
-                    ),
-                )),
-        )
-        .child(section_title("字体"))
-        .child(
-            setting_card()
-                .child(
-                    div()
-                        .flex()
-                        .items_start()
-                        .gap_2()
-                        .py_2()
-                        .child(
-                            div()
-                                .w(px(64.0))
-                                .pt_1()
-                                .text_color(rgb(0xA9B1D6))
-                                .child("字体"),
-                        )
-                        .child(font_family_controls(cx, &settings.font_family)),
-                )
-                .child(setting_row(
-                    "连字",
-                    div(),
-                    toggle_controls(
-                        cx,
-                        ("开", true),
-                        ("关", false),
-                        settings.ligatures,
-                        |s: &mut Appearance, value| s.ligatures = value,
-                    ),
-                ))
-                .child(setting_row(
-                    "光标闪烁",
-                    div(),
-                    toggle_controls(
-                        cx,
-                        ("开", true),
-                        ("关", false),
-                        settings.cursor_blink,
-                        |s: &mut Appearance, value| s.cursor_blink = value,
-                    ),
-                ))
-                .child(setting_row(
-                    "光标样式",
-                    div(),
-                    cursor_style_controls(cx, settings.cursor_style),
-                ))
-                .child(setting_row(
-                    "平滑滚动",
-                    div(),
-                    toggle_controls(
-                        cx,
-                        ("开", true),
-                        ("关", false),
-                        settings.smooth_scrolling,
-                        |s: &mut Appearance, value| s.smooth_scrolling = value,
-                    ),
-                ))
-                .child(setting_row(
-                    // 拖拽/双击/三击出选区松开即复制（Deepin 同款），不只限拖拽
-                    "选中即复制",
-                    div(),
-                    toggle_controls(
-                        cx,
-                        ("开", true),
-                        ("关", false),
-                        settings.copy_on_select,
-                        |s: &mut Appearance, value| s.copy_on_select = value,
-                    ),
-                ))
-                .child(
-                    div()
-                        .flex()
-                        .items_start()
-                        .gap_2()
-                        .py_2()
-                        .child(
-                            div()
-                                .w(px(64.0))
-                                .pt_1()
-                                .text_color(rgb(0xA9B1D6))
-                                .child("备选"),
-                        )
-                        .child(font_fallback_controls(cx, &settings.font_fallbacks)),
-                ),
-        )
-        .child(section_title("滚动与主题"))
-        .child(
-            setting_card()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .py_2()
-                        .child(div().w(px(64.0)).text_color(rgb(0xA9B1D6)).child("回滚"))
-                        .child(
-                            div()
-                                .flex()
-                                .gap_1()
-                                .child(scrollback_controls(cx, &settings)),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .py_2()
-                        .child(div().w(px(64.0)).text_color(rgb(0xA9B1D6)).child("主题"))
-                        .child(theme_controls(cx, &workspace.themes, &settings.theme)),
-                ),
-        )
-        .child(setting_button(
-            "恢复默认",
-            false,
-            cx.listener(WorkspaceView::reset_settings),
-        ))
-}
-
-fn stepper_controls(
-    cx: &mut Context<WorkspaceView>,
-    decrease: impl Fn(&mut Appearance) + Clone + 'static,
-    increase: impl Fn(&mut Appearance) + Clone + 'static,
-) -> gpui::Div {
-    div()
-        .flex()
-        .gap_1()
-        .child(setting_button(
-            "−",
-            false,
-            cx.listener(move |this, event, window, cx| {
-                this.change_setting(event, window, cx, decrease.clone());
-            }),
-        ))
-        .child(setting_button(
-            "+",
-            false,
-            cx.listener(move |this, event, window, cx| {
-                this.change_setting(event, window, cx, increase.clone());
-            }),
-        ))
-}
-
-fn scrollback_controls(cx: &mut Context<WorkspaceView>, settings: &Appearance) -> gpui::Div {
-    div().flex().gap_1().children(
-        [(10_000usize, "10k"), (50_000, "50k"), (100_000, "100k")]
-            .into_iter()
-            .map(|(value, label)| {
-                let selected = settings.scrollback == value;
-                setting_button(
-                    label,
-                    selected,
-                    cx.listener(move |this, event, window, cx| {
-                        this.change_setting(event, window, cx, move |s| s.scrollback = value);
-                    }),
-                )
-            }),
-    )
-}
-
-/// 常用 CJK 备选字体预设；空表表示交回系统默认回退。
-const FALLBACK_PRESETS: [&str; 3] = ["Sarasa Mono SC", "Noto Sans Mono CJK SC", "无"];
-
-fn font_family_controls(cx: &mut Context<WorkspaceView>, current: &str) -> gpui::Div {
-    div()
-        .flex()
-        .flex_wrap()
-        .gap_1()
-        .children(FONT_PRESETS.into_iter().map(|name| {
-            let selected = name == current;
-            setting_button(
-                name,
-                selected,
-                cx.listener(move |this, event, window, cx| {
-                    this.change_setting(event, window, cx, |s| s.font_family = name.to_string());
-                }),
-            )
-        }))
-}
-
-fn font_fallback_controls(cx: &mut Context<WorkspaceView>, current: &[String]) -> gpui::Div {
-    div()
-        .flex()
-        .flex_wrap()
-        .gap_1()
-        .children(FALLBACK_PRESETS.into_iter().map(|name| {
-            let selected = if name == "无" {
-                current.is_empty()
-            } else {
-                current.iter().any(|entry| entry == name)
-            };
-            setting_button(
-                name,
-                selected,
-                cx.listener(move |this, event, window, cx| {
-                    this.change_setting(event, window, cx, |s| {
-                        if name == "无" {
-                            s.font_fallbacks.clear();
-                        } else if let Some(position) =
-                            s.font_fallbacks.iter().position(|entry| entry == name)
-                        {
-                            s.font_fallbacks.remove(position);
-                        } else {
-                            s.font_fallbacks.push(name.to_string());
-                        }
-                    });
-                }),
-            )
-        }))
-}
-
-/// 二值开关控件（选中侧高亮），如连字开/关。
-fn toggle_controls(
-    cx: &mut Context<WorkspaceView>,
-    on: (&'static str, bool),
-    off: (&'static str, bool),
-    current: bool,
-    apply: impl Fn(&mut Appearance, bool) + Clone + 'static,
-) -> gpui::Div {
-    div()
-        .flex()
-        .gap_1()
-        .children(
-            [(on, true), (off, false)]
-                .into_iter()
-                .map(|((label, value), _)| {
-                    let selected = value == current;
-                    let apply = apply.clone();
-                    setting_button(
-                        label,
-                        selected,
-                        cx.listener(move |this, event, window, cx| {
-                            this.change_setting(event, window, cx, |s| apply(s, value));
-                        }),
-                    )
-                }),
-        )
-}
-
-/// Quake 设置的二值开关控件：与 `toggle_controls` 同形，但落点是
-/// `QuakeSettings` 并联动 worker 生命周期（change_quake_setting）。
-#[cfg(target_os = "linux")]
-fn quake_toggle_controls(
-    cx: &mut Context<WorkspaceView>,
-    on: (&'static str, bool),
-    off: (&'static str, bool),
-    current: bool,
-    apply: impl Fn(&mut laterterm_config::QuakeSettings, bool) + Clone + 'static,
-) -> gpui::Div {
-    div()
-        .flex()
-        .gap_1()
-        .children(
-            [(on, true), (off, false)]
-                .into_iter()
-                .map(|((label, value), _)| {
-                    let selected = value == current;
-                    let apply = apply.clone();
-                    setting_button(
-                        label,
-                        selected,
-                        cx.listener(move |this, event, window, cx| {
-                            this.change_quake_setting(event, window, cx, |s| apply(s, value));
-                        }),
-                    )
-                }),
-        )
-}
-
-fn theme_controls(
-    cx: &mut Context<WorkspaceView>,
-    themes: &ThemeRegistry,
-    current: &str,
-) -> gpui::Div {
-    div()
-        .flex()
-        .flex_wrap()
-        .gap_1()
-        .children(themes.names().into_iter().map(|name| {
-            let selected = name == current;
-            setting_button(
-                name.clone(),
-                selected,
-                cx.listener(move |this, event, window, cx| {
-                    this.change_setting(event, window, cx, |s| s.theme = name.clone());
-                }),
-            )
-        }))
-}
-
-/// 光标形状三选一（选中侧高亮）；点击经 change_setting 自动保存并热更新全部窗格。
-/// 光标样式枚举一律写全路径——顶部 `use gpui::CursorStyle` 是指针样式，不能裸名撞车。
-fn cursor_style_controls(
-    cx: &mut Context<WorkspaceView>,
-    current: laterterm_config::CursorStyle,
-) -> gpui::Div {
-    div().flex().gap_1().children(
-        [
-            ("方块", laterterm_config::CursorStyle::Block),
-            ("竖线", laterterm_config::CursorStyle::Bar),
-            ("下划线", laterterm_config::CursorStyle::Underline),
-        ]
-        .into_iter()
-        .map(|(label, style)| {
-            let selected = style == current;
-            setting_button(
-                label,
-                selected,
-                cx.listener(move |this, event, window, cx| {
-                    this.change_setting(event, window, cx, move |s| s.cursor_style = style);
-                }),
-            )
-        }),
-    )
-}
-
-fn shortcut_row(label: &str, keys: &str, conflicted: bool) -> gpui::Div {
-    div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .py_2()
-        .text_color(if conflicted {
-            rgb(0xF7768E)
-        } else {
-            rgb(0xA9B1D6)
-        })
-        .child(format!(
-            "{}{}",
-            label,
-            if conflicted { " ⚠ 冲突" } else { "" }
-        ))
-        .child(value_chip(keys))
-}
-
-fn info_row(label: &str, value: &str) -> gpui::Div {
-    div()
-        .flex()
-        .items_center()
-        .justify_between()
-        .py_2()
-        .text_color(rgb(0xA9B1D6))
-        .child(label.to_string())
-        .child(value.to_string())
-}
-
-fn section_title(text: &str) -> gpui::Div {
-    div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .child(div().w(px(3.0)).h(px(14.0)).bg(rgb(0x7AA2F7)).rounded_sm())
-        .child(div().text_color(rgb(0xC0CAF5)).child(text.to_string()))
-}
-
-fn setting_card() -> gpui::Div {
-    div()
-        .flex()
-        .flex_col()
-        .p_3()
-        .gap_1()
-        .bg(rgb(0x252939))
-        .border_1()
-        .border_color(rgb(0x303548))
-        .rounded_md()
-}
-
-fn setting_row(label: &str, chip: gpui::Div, controls: gpui::Div) -> gpui::Div {
-    div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .py_2()
-        .child(
-            div()
-                .w(px(64.0))
-                .text_color(rgb(0xA9B1D6))
-                .child(label.to_string()),
-        )
-        .child(chip)
-        .child(controls)
-}
-
-fn value_chip(text: &str) -> gpui::Div {
-    div()
-        .min_w(px(64.0))
-        .h(px(30.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .px_3()
-        .bg(rgb(0x1A1B26))
-        .border_1()
-        .border_color(rgb(0x343750))
-        .rounded_sm()
-        .text_color(rgb(0xC0CAF5))
-        .child(text.to_string())
-}
-
 /// 侧栏快捷键入口：保留点击设置，同时降低对主要内容的视觉干扰。
 fn sidebar_shortcut_chip(text: &str) -> gpui::Div {
     div()
@@ -8242,42 +7431,6 @@ fn panel_caption(text: &str) -> gpui::Div {
         .text_size(px(11.0))
         .text_color(rgb(0x9AA0A6))
         .child(text.to_string())
-}
-
-fn setting_button(
-    label: impl Into<gpui::SharedString>,
-    selected: bool,
-    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> gpui::Div {
-    let bg = if selected {
-        rgb(0x2E4A6B)
-    } else {
-        rgb(0x252637)
-    };
-    let text = if selected {
-        rgb(0x7DCEFF)
-    } else {
-        rgb(0xA9B1D6)
-    };
-    div()
-        .h(px(30.0))
-        .min_w(px(36.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .px_3()
-        .bg(bg)
-        .border_1()
-        .border_color(if selected {
-            rgb(0x7AA2F7)
-        } else {
-            rgb(0x343750)
-        })
-        .rounded_sm()
-        .text_color(text)
-        .hover(|this| this.bg(rgb(0x303150)))
-        .on_mouse_down(MouseButton::Left, listener)
-        .child(label.into())
 }
 
 fn button(
@@ -9916,6 +9069,192 @@ mod onboarding_tests {
                 2,
                 "保留的应是先到的 fake_probe（bash 当前 + sh 列表项）"
             );
+        });
+    }
+}
+
+#[cfg(test)]
+mod settings_panel_tests {
+    use super::{Entity, SettingsSection, WorkspaceView};
+    use gpui::{MouseDownEvent, TestAppContext, VisualTestContext, px};
+
+    /// 开窗 + 打开设置面板并跑至静止；把 VisualTestContext 一并交还，
+    /// 供 debug_bounds / update_in 使用（TestAppContext 本体无这些入口）。
+    fn open_settings_panel(
+        cx: &mut TestAppContext,
+    ) -> (Entity<WorkspaceView>, &mut VisualTestContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, _window, cx| {
+            view.welcome_visible = false;
+            view.toggle_settings(cx);
+        });
+        cx.run_until_parked();
+        (workspace, cx)
+    }
+
+    /// 单页化 + 打开默认态：高亮首节、导航/内容/六节锚点全部在场。
+    #[gpui::test]
+    fn settings_panel_defaults_to_first_section_with_nav_highlight(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_settings_panel(cx);
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(
+                view.settings_section,
+                SettingsSection::Appearance,
+                "打开默认高亮首节"
+            );
+        });
+        let active = cx
+            .debug_bounds("settings-nav-active")
+            .expect("选中导航项必须存在");
+        assert!(active.size.height > px(0.0), "选中导航项必须可见");
+        let content = cx
+            .debug_bounds("settings-content")
+            .expect("单页滚动容器必须存在");
+        // 六节锚点全部在场且纵向排布（单页非分页的直接证据）；视口外分区被
+        // 容器内容遮罩裁剪，只断言「存在 + 单调排布」，不断言落在可视带内
+        //（滚出视口的节本就应在容器带外）
+        let selectors = [
+            "settings-section-appearance",
+            "settings-section-font",
+            "settings-section-scrolling",
+            "settings-section-shortcuts",
+            "settings-section-terminal",
+            "settings-section-servers",
+        ];
+        let mut previous_top = content.top();
+        for selector in selectors {
+            let bounds = cx
+                .debug_bounds(selector)
+                .unwrap_or_else(|| panic!("{selector} 分区锚点必须存在"));
+            assert!(
+                bounds.top() >= previous_top,
+                "{selector} 应按导航顺序纵向排布"
+            );
+            previous_top = bounds.top();
+        }
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    /// 滚动 → 高亮：滚到底兜底选中末节（矮分区碰不到判定线）。
+    #[gpui::test]
+    fn settings_scroll_to_bottom_pins_last_section(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_settings_panel(cx);
+        workspace.update(cx, |view, cx| {
+            // 门控前提：内容必须超高，否则 spy 跳过侦测、断言失效
+            assert!(
+                view.settings_scroll.max_offset().height > px(2.0),
+                "六节内容在设置面板内应可滚动"
+            );
+            view.settings_scroll.set_offset(gpui::point(
+                px(0.0),
+                -view.settings_scroll.max_offset().height,
+            ));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(
+                view.settings_section,
+                SettingsSection::Servers,
+                "滚到底必须兜底选中末节"
+            );
+        });
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    /// 点击 → 跳转：立即高亮 + Top 策略把分区起点顶到容器口。
+    /// （jump-skip 防的一帧高亮闪烁属帧内瞬态，无观察点——跳过侦测的收敛
+    /// 行为由下面第二段断言覆盖：再跑一帧不改 offset，高亮仍钉在目标分区。）
+    #[gpui::test]
+    fn settings_nav_click_highlights_then_jumps_to_section_top(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_settings_panel(cx);
+        workspace.update_in(cx, |view, window, cx| {
+            view.select_settings_section(
+                SettingsSection::Shortcuts,
+                &MouseDownEvent::default(),
+                window,
+                cx,
+            );
+            assert_eq!(
+                view.settings_section,
+                SettingsSection::Shortcuts,
+                "点击立即更新高亮，不等滚动"
+            );
+        });
+        cx.run_until_parked();
+        let content = cx
+            .debug_bounds("settings-content")
+            .expect("滚动容器必须存在");
+        let section = cx
+            .debug_bounds("settings-section-shortcuts")
+            .expect("目标分区必须存在");
+        assert!(
+            (section.top() - content.top()).abs() < px(2.0),
+            "跳转帧 Top 策略应把分区起点对齐容器口：section={section:?} content={content:?}"
+        );
+        workspace.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(
+                view.settings_section,
+                SettingsSection::Shortcuts,
+                "后续帧收敛一致：高亮不被 spy 拉走"
+            );
+        });
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    /// 关闭再打开：滚动与高亮都复位到首节（ScrollHandle 跨开关持久，
+    /// 打开分支不复位 set_offset 就会残留上次位置——评审硬伤2 回归钉）。
+    #[gpui::test]
+    fn settings_reopen_resets_scroll_and_section(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_settings_panel(cx);
+        workspace.update(cx, |view, cx| {
+            view.settings_scroll.set_offset(gpui::point(
+                px(0.0),
+                -view.settings_scroll.max_offset().height,
+            ));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(view.settings_section, SettingsSection::Servers);
+        });
+        // 关闭（复位逻辑只允许写在打开分支，关闭帧不丢高亮）
+        workspace.update_in(cx, |view, window, cx| {
+            view.close_settings(&MouseDownEvent::default(), window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update(cx, |view, cx| view.toggle_settings(cx));
+        cx.run_until_parked();
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(
+                view.settings_section,
+                SettingsSection::Appearance,
+                "重开必须回首节"
+            );
+            assert_eq!(
+                view.settings_scroll.offset().y,
+                px(0.0),
+                "重开必须复位滚动（ScrollHandle 持久残留）"
+            );
+        });
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
         });
     }
 }

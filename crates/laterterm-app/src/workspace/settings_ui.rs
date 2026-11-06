@@ -1,0 +1,1172 @@
+//! 设置面板 UI：右内容区单页连续滚动 + 左导航 scroll-spy 双向联动。
+//!
+//! 由 workspace.rs 迁入（原 settings_overlay / settings_navigation /
+//! settings_content / shortcuts_page / settings_panel 与全部设置专用控件）。
+//! 挂为 workspace 的**子模块**是评审硬伤1 的可见性策略：迁移函数需要访问
+//! `WorkspaceView` 的私有字段与方法（settings / themes / quake_status /
+//! all_shortcut_bindings / change_setting 等），Rust 可见性规则允许子孙模块
+//! 看到祖先模块的私有项，`main.rs` 顶层平级模块做不到。
+//!
+//! 结构：右内容 = 单一滚动容器，直接子元素恰好等于 `SettingsSection::ALL`
+//! 六个分区块（gpui 把 child_bounds 按直接子元素记录，多包一层或多插尾部
+//! 元素都会让 scroll_to_top_of_item 与 scroll-spy 整体错位一节）。「恢复默认」
+//! 按钮挂在「滚动与主题」分区块内部（原外观页最后一个子元素），因此不会
+//! 成为第七个直接子元素。
+//!
+//! 快捷键录制链路不动：录制控件 shortcut_editor_row 只渲染于窗口级模态弹窗
+//! （面板/命令/服务器/动态码编辑），不在设置面板内；本模块里的「编辑快捷键」
+//! 按钮只是弹窗入口，原样平移。
+
+use super::{BindingOwner, ShortcutBinding, WorkspaceView};
+use crate::onboarding::FONT_PRESETS;
+use gpui::{
+    App, Context, Div, InteractiveElement, MouseButton, MouseDownEvent, ParentElement,
+    SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, px, rgb, rgba,
+};
+use laterterm_config::{Appearance, normalize_shortcut};
+
+// ---------------------------------------------------------------------------
+// Tokyo Night 色板收敛（评审硬伤5：逐处替换、只动本模块，不按色值全局替换
+// ——0x35415B/0x343750 等值横跨右侧面板与标题栏分隔线，全局替换必误伤）
+// ---------------------------------------------------------------------------
+
+/// 面板底 / 芯片内凹底。
+const COLOR_OVERLAY_BG: u32 = 0x1A1B26;
+/// 导航底（比面板深一档，融入页框）。
+const COLOR_NAV_BG: u32 = 0x16161E;
+/// 卡片底。
+const COLOR_CARD_BG: u32 = 0x24283B;
+/// 卡片描边 / 分隔线。
+const COLOR_STROKE: u32 = 0x2F334D;
+/// 强调色。
+const COLOR_ACCENT: u32 = 0x7AA2F7;
+/// 主文字。
+const COLOR_TEXT: u32 = 0xC0CAF5;
+/// 次级文字。
+const COLOR_TEXT_SECONDARY: u32 = 0xA9B1D6;
+/// 弱化文字。
+const COLOR_TEXT_MUTED: u32 = 0x565A78;
+/// 危险 / 冲突。
+const COLOR_DANGER: u32 = 0xF7768E;
+/// 选中态 accent 半透明 tint（gpui::rgba 低 8 位是 alpha，26/255 ≈ 10%）。
+/// 注：LaterScreen 暗色模式用「中性提亮」（压暗的红在暗底上发闷）；这里
+/// 有意保留品牌色选中态——Tokyo Night 的蓝在深底上不闷，红/蓝气质不同。
+/// 属与参照相反的决策，留 4K 实机走查复核。
+const COLOR_ACCENT_TINT: u32 = 0x7AA2F726;
+/// 选中态 hover：tint 加深一档。
+const COLOR_ACCENT_TINT_HOVER: u32 = 0x7AA2F733;
+/// 未选中 hover：中性提亮（半透明次级色，31/255 ≈ 12%）。
+const COLOR_HOVER_TINT: u32 = 0xA9B1D61F;
+
+/// scroll-spy 判定线：视口顶部下探 64px 落在哪个分区内就高亮哪个分区。
+pub(crate) const SCROLL_SPY_LEAD_PX: f32 = 64.0;
+/// 内容超出视口不足该值视为「不超高」，跳过侦测（max_offset≈0 时
+/// at_bottom 恒真会把高亮错拉到末节，见 LaterScreen settings_ui 同款门控）。
+pub(crate) const SCROLL_SPY_EPSILON_PX: f32 = 2.0;
+
+// ---------------------------------------------------------------------------
+// 分区模型与 scroll-spy 纯函数
+// ---------------------------------------------------------------------------
+
+/// 设置分区：左导航顺序即右内容排布顺序（单页滚动锚点，不再是独立页签）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SettingsSection {
+    /// 终端外观（原外观页「终端外观」组）。
+    #[default]
+    Appearance,
+    /// 字体。
+    Font,
+    /// 滚动与主题。
+    Scrolling,
+    /// 快捷键（含 Linux Quake 卡）。
+    Shortcuts,
+    /// 终端。
+    Terminal,
+    /// 服务器。
+    Servers,
+}
+
+impl SettingsSection {
+    /// 导航/内容顺序即滚动容器直接子元素顺序；label / anchor_title /
+    /// debug_key 的 match 均不带通配分支，新增变体漏加任一处都会编译失败。
+    pub(crate) const ALL: [Self; 6] = [
+        Self::Appearance,
+        Self::Font,
+        Self::Scrolling,
+        Self::Shortcuts,
+        Self::Terminal,
+        Self::Servers,
+    ];
+
+    /// 左导航短标签。
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Appearance => "外观",
+            Self::Font => "字体",
+            Self::Scrolling => "滚动",
+            Self::Shortcuts => "快捷键",
+            Self::Terminal => "终端",
+            Self::Servers => "服务器",
+        }
+    }
+
+    /// 内容区分区锚点标题（外观三节沿用原分组名，语义不变）。
+    fn anchor_title(self) -> &'static str {
+        match self {
+            Self::Appearance => "终端外观",
+            Self::Font => "字体",
+            Self::Scrolling => "滚动与主题",
+            Self::Shortcuts => "快捷键",
+            Self::Terminal => "终端",
+            Self::Servers => "服务器",
+        }
+    }
+
+    /// debug_selector 后缀（测试取界：`settings-section-<key>`）。
+    fn debug_key(self) -> &'static str {
+        match self {
+            Self::Appearance => "appearance",
+            Self::Font => "font",
+            Self::Scrolling => "scrolling",
+            Self::Shortcuts => "shortcuts",
+            Self::Terminal => "terminal",
+            Self::Servers => "servers",
+        }
+    }
+
+    /// 在 ALL 中的下标 = 滚动容器直接子元素下标（跳转对位用）。
+    pub(crate) fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|section| *section == self)
+            .unwrap_or(0)
+    }
+}
+
+/// 滚动侦测（scroll-spy）：视口顶部下探 `line` 像素的判定线落在哪个分区
+/// 区间内，就高亮哪个分区；滚到最底时强制选中最后一节——矮分区永远碰
+/// 不到判定线，不兜底的话末节永远高亮不了。`tops` 为各分区起点在内容
+/// 坐标系里的 y（同一空间内单调递增即可，与绝对原点无关）。
+/// 纯函数无 GPUI 运行时依赖，测试见 workspace_tests.rs。
+pub(crate) fn settings_scroll_spy(
+    tops: &[(SettingsSection, f32)],
+    line: f32,
+    at_bottom: bool,
+) -> SettingsSection {
+    let mut current = tops
+        .first()
+        .map_or(SettingsSection::default(), |&(section, _)| section);
+    for &(section, top) in tops {
+        if top <= line {
+            current = section;
+        }
+    }
+    if at_bottom && let Some(&(section, _)) = tops.last() {
+        current = section;
+    }
+    current
+}
+
+// ---------------------------------------------------------------------------
+// 覆盖层与导航
+// ---------------------------------------------------------------------------
+
+/// 设置覆盖层：遮罩 + 居中面板（头部 52 / 导航+内容 / 底部 44，几何不变只换令牌）。
+pub(crate) fn settings_overlay(
+    scrim_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    close_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    navigation: Div,
+    content: Stateful<Div>,
+) -> Div {
+    div()
+        .absolute()
+        .top_0()
+        .right_0()
+        .bottom_0()
+        .left_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(gpui::black().opacity(0.6))
+        .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .on_mouse_down(MouseButton::Left, scrim_listener)
+        .child(
+            div()
+                .w(px(640.0))
+                .h(px(560.0))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .rounded_md()
+                .bg(rgb(COLOR_OVERLAY_BG))
+                .border_1()
+                .border_color(rgb(COLOR_STROKE))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(
+                    div()
+                        .h(px(52.0))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_5()
+                        .border_b_1()
+                        .border_color(rgb(COLOR_STROKE))
+                        .child(div().text_color(rgb(COLOR_TEXT)).child("设置"))
+                        .child(
+                            div()
+                                .h(px(30.0))
+                                .w(px(30.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_color(rgb(COLOR_DANGER))
+                                .on_mouse_down(MouseButton::Left, close_listener)
+                                .child("×"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .flex()
+                        .child(navigation)
+                        .child(content),
+                )
+                .child(
+                    div()
+                        .h(px(44.0))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_5()
+                        .border_t_1()
+                        .border_color(rgb(COLOR_STROKE))
+                        .text_color(rgb(COLOR_TEXT_MUTED))
+                        .child("修改即时生效")
+                        .child("LaterTerm"),
+                ),
+        )
+}
+
+/// 左导航：当前分区指示 + 点击跳转（滚动跟随由 workspace 的 scroll-spy 驱动）。
+pub(crate) fn settings_navigation(active: SettingsSection, cx: &mut Context<WorkspaceView>) -> Div {
+    div()
+        .w(px(150.0))
+        .h_full()
+        .p_3()
+        .bg(rgb(COLOR_NAV_BG))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .children(
+            SettingsSection::ALL
+                .into_iter()
+                .map(|section| settings_nav_item(section, section == active, cx)),
+        )
+}
+
+/// 导航项：32px 行高 + 选中 accent tint 底 + 左侧 3px accent 指示条 +
+/// 主文字色，未选中悬停中性提亮。（行高有意比 LaterScreen 参照 34px 紧凑，
+/// 设置面板只有文字无图标，32px 足够点击目标。）
+fn settings_nav_item(
+    section: SettingsSection,
+    selected: bool,
+    cx: &mut Context<WorkspaceView>,
+) -> Div {
+    let (bg, hover_bg, text) = if selected {
+        (
+            rgba(COLOR_ACCENT_TINT),
+            rgba(COLOR_ACCENT_TINT_HOVER),
+            rgb(COLOR_TEXT),
+        )
+    } else {
+        (
+            rgba(COLOR_NAV_BG),
+            rgba(COLOR_HOVER_TINT),
+            rgb(COLOR_TEXT_SECONDARY),
+        )
+    };
+    div()
+        .debug_selector(move || {
+            if selected {
+                "settings-nav-active".into()
+            } else {
+                "settings-nav-item".into()
+            }
+        })
+        .w_full()
+        .h(px(32.0))
+        .relative()
+        .flex()
+        .items_center()
+        .px_3()
+        .rounded_sm()
+        .bg(bg)
+        .hover(move |style| style.bg(hover_bg))
+        .text_color(text)
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event, window, cx| {
+                this.select_settings_section(section, event, window, cx)
+            }),
+        )
+        // 左侧 accent 指示条：让「当前在哪一节」不依赖底色也能读出来
+        .when(selected, |item| {
+            item.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px(6.0))
+                    .bottom(px(6.0))
+                    .w(px(3.0))
+                    .rounded_full()
+                    .bg(rgb(COLOR_ACCENT)),
+            )
+        })
+        .child(section.label())
+}
+
+// ---------------------------------------------------------------------------
+// 单页滚动内容
+// ---------------------------------------------------------------------------
+
+/// 右内容：全部分区连续排布在同一滚动页里（VS Code 设置式）。children 恰好
+/// = `SettingsSection::ALL.len()` 个分区块——滚动容器的 child_bounds 按直接
+/// 子元素记录，索引对位是 scroll_to_top_of_item 与 scroll-spy 的硬约束。
+pub(crate) fn settings_content(
+    workspace: &mut WorkspaceView,
+    cx: &mut Context<WorkspaceView>,
+) -> Stateful<Div> {
+    let appearance = workspace.settings.appearance.clone();
+    let mut children = Vec::with_capacity(SettingsSection::ALL.len());
+    for section in SettingsSection::ALL {
+        let body: Vec<Div> = match section {
+            SettingsSection::Appearance => settings_appearance_body(&appearance, cx),
+            SettingsSection::Font => settings_font_body(&appearance, cx),
+            SettingsSection::Scrolling => settings_scrolling_body(workspace, &appearance, cx),
+            SettingsSection::Shortcuts => settings_shortcuts_body(workspace, cx),
+            SettingsSection::Terminal => settings_terminal_body(),
+            SettingsSection::Servers => settings_servers_body(),
+        };
+        let block = div()
+            .debug_selector(move || format!("settings-section-{}", section.debug_key()))
+            .pt_2()
+            .pb_5()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(section_title(section.anchor_title()))
+            .children(body);
+        children.push(block);
+    }
+    div()
+        .id("settings-content")
+        .debug_selector(|| "settings-content".into())
+        .flex_1()
+        .min_w(px(0.0))
+        .min_h(px(0.0))
+        .overflow_y_scroll()
+        .track_scroll(&workspace.settings_scroll)
+        .flex()
+        .flex_col()
+        .text_color(rgb(COLOR_TEXT))
+        .children(children)
+}
+
+/// 「终端外观」卡：字号 / 行高 / 内边距。
+fn settings_appearance_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) -> Vec<Div> {
+    vec![
+        setting_card()
+            .child(setting_row(
+                "字号",
+                value_chip(&format!("{:.0} px", appearance.font_size)),
+                stepper_controls(
+                    cx,
+                    |s: &mut Appearance| s.font_size = (s.font_size - 1.0).max(8.0),
+                    |s: &mut Appearance| s.font_size = (s.font_size + 1.0).min(32.0),
+                ),
+            ))
+            .child(setting_row(
+                "行高",
+                value_chip(&format!("{:.1}", appearance.line_height)),
+                stepper_controls(
+                    cx,
+                    |s: &mut Appearance| {
+                        s.line_height = ((s.line_height - 0.1) * 10.0).round() / 10.0;
+                        s.line_height = s.line_height.clamp(0.8, 2.0);
+                    },
+                    |s: &mut Appearance| {
+                        s.line_height = ((s.line_height + 0.1) * 10.0).round() / 10.0;
+                        s.line_height = s.line_height.clamp(0.8, 2.0);
+                    },
+                ),
+            ))
+            .child(setting_row(
+                "内边距",
+                value_chip(&format!("{:.0} px", appearance.padding)),
+                stepper_controls(
+                    cx,
+                    |s: &mut Appearance| s.padding = (s.padding - 1.0).max(0.0),
+                    |s: &mut Appearance| s.padding = (s.padding + 1.0).min(24.0),
+                ),
+            )),
+    ]
+}
+
+/// 「字体」卡：字体族 / 连字 / 光标闪烁 / 光标样式 / 平滑滚动 / 选中即复制 / 备选。
+fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) -> Vec<Div> {
+    vec![
+        setting_card()
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .py_2()
+                    .child(
+                        div()
+                            .w(px(64.0))
+                            .pt_1()
+                            .text_color(rgb(COLOR_TEXT_SECONDARY))
+                            .child("字体"),
+                    )
+                    .child(font_family_controls(cx, &appearance.font_family)),
+            )
+            .child(setting_row(
+                "连字",
+                div(),
+                toggle_controls(
+                    cx,
+                    ("开", true),
+                    ("关", false),
+                    appearance.ligatures,
+                    |s: &mut Appearance, value| s.ligatures = value,
+                ),
+            ))
+            .child(setting_row(
+                "光标闪烁",
+                div(),
+                toggle_controls(
+                    cx,
+                    ("开", true),
+                    ("关", false),
+                    appearance.cursor_blink,
+                    |s: &mut Appearance, value| s.cursor_blink = value,
+                ),
+            ))
+            .child(setting_row(
+                "光标样式",
+                div(),
+                cursor_style_controls(cx, appearance.cursor_style),
+            ))
+            .child(setting_row(
+                "平滑滚动",
+                div(),
+                toggle_controls(
+                    cx,
+                    ("开", true),
+                    ("关", false),
+                    appearance.smooth_scrolling,
+                    |s: &mut Appearance, value| s.smooth_scrolling = value,
+                ),
+            ))
+            .child(setting_row(
+                // 拖拽/双击/三击出选区松开即复制（Deepin 同款），不只限拖拽
+                "选中即复制",
+                div(),
+                toggle_controls(
+                    cx,
+                    ("开", true),
+                    ("关", false),
+                    appearance.copy_on_select,
+                    |s: &mut Appearance, value| s.copy_on_select = value,
+                ),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .py_2()
+                    .child(
+                        div()
+                            .w(px(64.0))
+                            .pt_1()
+                            .text_color(rgb(COLOR_TEXT_SECONDARY))
+                            .child("备选"),
+                    )
+                    .child(font_fallback_controls(cx, &appearance.font_fallbacks)),
+            ),
+    ]
+}
+
+/// 「滚动与主题」卡 + 恢复默认按钮。按钮原是外观页最后一个子元素，单页化
+/// 后挂在末个外观分区块内部——保持「恢复默认作用于外观设置」的语义与视觉
+/// 位置，同时不增加滚动容器直接子元素数（六节对位约束）。
+fn settings_scrolling_body(
+    workspace: &WorkspaceView,
+    appearance: &Appearance,
+    cx: &mut Context<WorkspaceView>,
+) -> Vec<Div> {
+    vec![
+        setting_card()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_2()
+                    .child(
+                        div()
+                            .w(px(64.0))
+                            .text_color(rgb(COLOR_TEXT_SECONDARY))
+                            .child("回滚"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(scrollback_controls(cx, appearance)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_2()
+                    .child(
+                        div()
+                            .w(px(64.0))
+                            .text_color(rgb(COLOR_TEXT_SECONDARY))
+                            .child("主题"),
+                    )
+                    .child(theme_controls(cx, &workspace.themes, &appearance.theme)),
+            ),
+        setting_button(
+            "恢复默认",
+            false,
+            cx.listener(WorkspaceView::reset_settings),
+        ),
+    ]
+}
+
+/// 「终端」节：只读信息卡（语义不变，随单页平移）。
+fn settings_terminal_body() -> Vec<Div> {
+    vec![
+        setting_card()
+            .child(info_row("Shell", "$SHELL / bash"))
+            .child(info_row("TERM", "xterm-256color"))
+            .child(info_row("COLORTERM", "truecolor"))
+            .child(info_row("滚动", "自然滚动，支持历史回看")),
+    ]
+}
+
+/// 「服务器」节：只读信息卡（语义不变，随单页平移）。
+fn settings_servers_body() -> Vec<Div> {
+    vec![
+        setting_card()
+            .child(info_row("本地 Shell", "已内置"))
+            .child(info_row("SSH", "远程模块接入后可用")),
+    ]
+}
+
+/// 「快捷键」节：全量绑定总览（内置 + 命令 + 服务器 + 动态码），冲突标红。
+fn settings_shortcuts_body(workspace: &WorkspaceView, cx: &mut Context<WorkspaceView>) -> Vec<Div> {
+    let bindings = workspace.all_shortcut_bindings();
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for binding in &bindings {
+        *counts.entry(binding.normalized.as_str()).or_default() += 1;
+    }
+    let row = |binding: &ShortcutBinding| {
+        let conflicted = counts
+            .get(binding.normalized.as_str())
+            .copied()
+            .unwrap_or(1)
+            > 1;
+        setting_card().child(shortcut_row(
+            &binding.label,
+            &binding.normalized,
+            conflicted,
+        ))
+    };
+    let mut body: Vec<Div> = Vec::new();
+    // 系统级热键（Quake）：仅 Linux 提供——portal GlobalShortcuts 是 Wayland 下
+    // 全局热键的唯一正道，其余平台无此卡片（cfg 隔离，AGENTS.md 平台差异约定）。
+    #[cfg(target_os = "linux")]
+    {
+        let quake = workspace.settings.quake.clone();
+        let status = workspace.quake_status.clone();
+        body.push(group_title("系统级热键（Quake）"));
+        body.push(
+            setting_card()
+                .child(setting_row(
+                    "全局呼出",
+                    div(),
+                    quake_toggle_controls(
+                        cx,
+                        ("开", true),
+                        ("关", false),
+                        quake.enabled,
+                        |settings, value| settings.enabled = value,
+                    ),
+                ))
+                .child(setting_row(
+                    "失焦收起",
+                    div(),
+                    quake_toggle_controls(
+                        cx,
+                        ("开", true),
+                        ("关", false),
+                        quake.auto_hide_on_blur,
+                        |settings, value| settings.auto_hide_on_blur = value,
+                    ),
+                ))
+                .child(
+                    div()
+                        .py_1()
+                        .text_color(rgb(status.text_color()))
+                        .child(status.text()),
+                )
+                .child(
+                    div()
+                        .pt_1()
+                        .text_size(px(11.0))
+                        .text_color(rgb(COLOR_TEXT_MUTED))
+                        .child(
+                            "首次启用会弹出系统确认对话框，请在桌面环境快捷键设置中授权；\
+                             实际键位可在桌面快捷键设置中修改。窗口的 Quake 几何（全屏宽 × \
+                             50% 高、顶部居中）在下次启动时生效。",
+                        ),
+                ),
+        );
+    }
+    body.push(group_title("内置"));
+    for binding in bindings
+        .iter()
+        .filter(|binding| matches!(binding.owner, BindingOwner::Builtin))
+    {
+        body.push(row(binding));
+    }
+    body.push(group_title("面板"));
+    for (label, shortcut, owner) in [
+        (
+            "命令面板",
+            workspace.settings.shortcuts.commands_panel.as_deref(),
+            BindingOwner::CommandsPanel,
+        ),
+        (
+            "服务器面板",
+            workspace.settings.shortcuts.servers_panel.as_deref(),
+            BindingOwner::ServersPanel,
+        ),
+    ] {
+        let invalid = shortcut.is_some_and(|key| normalize_shortcut(key).is_err());
+        let conflicted = shortcut
+            .and_then(|key| normalize_shortcut(key).ok())
+            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
+        body.push(
+            setting_card()
+                .child(shortcut_row(
+                    label,
+                    shortcut.unwrap_or("未设置"),
+                    invalid || conflicted,
+                ))
+                .child(setting_button(
+                    "编辑快捷键",
+                    false,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.edit_panel_shortcut(owner.clone(), window, cx);
+                    }),
+                )),
+        );
+    }
+    // 直接从配置渲染，保留未绑定和无效历史值的修复入口。
+    body.push(group_title("命令"));
+    for command in &workspace.settings.commands {
+        let command = command.clone();
+        let shortcut = command.shortcut.as_deref().unwrap_or("未绑定");
+        let invalid = command
+            .shortcut
+            .as_ref()
+            .is_some_and(|key| normalize_shortcut(key).is_err());
+        let conflicted = normalize_shortcut(shortcut)
+            .ok()
+            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
+        body.push(
+            setting_card()
+                .child(shortcut_row(&command.name, shortcut, invalid || conflicted))
+                .child(setting_button(
+                    "编辑快捷键",
+                    false,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.edit_command(Some(command.clone()), window, cx);
+                        this.start_shortcut_recording(window, cx);
+                    }),
+                )),
+        );
+    }
+    body.push(group_title("服务器"));
+    for entry in &workspace.settings.servers {
+        let entry = entry.clone();
+        let shortcut = entry.shortcut.as_deref().unwrap_or("未绑定");
+        let invalid = entry
+            .shortcut
+            .as_ref()
+            .is_some_and(|key| normalize_shortcut(key).is_err());
+        let conflicted = normalize_shortcut(shortcut)
+            .ok()
+            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
+        body.push(
+            setting_card()
+                .child(shortcut_row(&entry.name, shortcut, invalid || conflicted))
+                .child(setting_button(
+                    "编辑快捷键",
+                    false,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.edit_server(Some(&entry), window, cx);
+                        this.start_shortcut_recording(window, cx);
+                    }),
+                )),
+        );
+    }
+    body.push(group_title("动态码"));
+    for entry in &workspace.settings.totp {
+        let entry = entry.clone();
+        let shortcut = entry.shortcut.as_deref().unwrap_or("未绑定");
+        let invalid = entry
+            .shortcut
+            .as_ref()
+            .is_some_and(|key| normalize_shortcut(key).is_err());
+        let conflicted = normalize_shortcut(shortcut)
+            .ok()
+            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
+        body.push(
+            setting_card()
+                .child(shortcut_row(&entry.name, shortcut, invalid || conflicted))
+                .child(setting_button(
+                    "编辑快捷键",
+                    false,
+                    cx.listener(move |this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.edit_totp(Some(&entry), window, cx);
+                        this.start_shortcut_recording(window, cx);
+                    }),
+                )),
+        );
+    }
+    let has_conflict = counts.values().any(|count| *count > 1);
+    let invalid = workspace
+        .settings
+        .commands
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .shortcut
+                .as_ref()
+                .map(|key| (format!("命令 {}", entry.name), key))
+        })
+        .chain(workspace.settings.servers.iter().filter_map(|entry| {
+            entry
+                .shortcut
+                .as_ref()
+                .map(|key| (format!("服务器 {}", entry.name), key))
+        }))
+        .chain(workspace.settings.totp.iter().filter_map(|entry| {
+            entry
+                .shortcut
+                .as_ref()
+                .map(|key| (format!("动态码 {}", entry.name), key))
+        }))
+        .chain(
+            workspace
+                .settings
+                .shortcuts
+                .commands_panel
+                .as_ref()
+                .map(|key| ("命令面板".to_string(), key)),
+        )
+        .chain(
+            workspace
+                .settings
+                .shortcuts
+                .servers_panel
+                .as_ref()
+                .map(|key| ("服务器面板".to_string(), key)),
+        )
+        .filter(|(_, key)| normalize_shortcut(key).is_err())
+        .collect::<Vec<_>>();
+    if !invalid.is_empty() {
+        body.push(group_title("无效快捷键"));
+        for (label, key) in &invalid {
+            body.push(setting_card().child(shortcut_row(label, key, true)));
+        }
+    }
+    body.push(
+        div()
+            .pt_2()
+            .text_color(if has_conflict || !invalid.is_empty() {
+                rgb(COLOR_DANGER)
+            } else {
+                rgb(COLOR_TEXT_MUTED)
+            })
+            .child(if has_conflict || !invalid.is_empty() {
+                "存在冲突或无效绑定：请在对应编辑弹窗里修改（方向切换优先）"
+            } else {
+                "绑定在命令 / 服务器 / 动态码的编辑弹窗里设置，保存时自动查重"
+            }),
+    );
+    body
+}
+
+// ---------------------------------------------------------------------------
+// 设置专用控件（自 workspace.rs 原样平移，色值收敛为模块色板令牌）
+// ---------------------------------------------------------------------------
+
+fn stepper_controls(
+    cx: &mut Context<WorkspaceView>,
+    decrease: impl Fn(&mut Appearance) + Clone + 'static,
+    increase: impl Fn(&mut Appearance) + Clone + 'static,
+) -> Div {
+    div()
+        .flex()
+        .gap_1()
+        .child(setting_button(
+            "−",
+            false,
+            cx.listener(move |this, event, window, cx| {
+                this.change_setting(event, window, cx, decrease.clone());
+            }),
+        ))
+        .child(setting_button(
+            "+",
+            false,
+            cx.listener(move |this, event, window, cx| {
+                this.change_setting(event, window, cx, increase.clone());
+            }),
+        ))
+}
+
+fn scrollback_controls(cx: &mut Context<WorkspaceView>, settings: &Appearance) -> Div {
+    div().flex().gap_1().children(
+        [(10_000usize, "10k"), (50_000, "50k"), (100_000, "100k")]
+            .into_iter()
+            .map(|(value, label)| {
+                let selected = settings.scrollback == value;
+                setting_button(
+                    label,
+                    selected,
+                    cx.listener(move |this, event, window, cx| {
+                        this.change_setting(event, window, cx, move |s| s.scrollback = value);
+                    }),
+                )
+            }),
+    )
+}
+
+/// 常用 CJK 备选字体预设；空表表示交回系统默认回退。
+const FALLBACK_PRESETS: [&str; 3] = ["Sarasa Mono SC", "Noto Sans Mono CJK SC", "无"];
+
+fn font_family_controls(cx: &mut Context<WorkspaceView>, current: &str) -> Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_1()
+        .children(FONT_PRESETS.into_iter().map(|name| {
+            let selected = name == current;
+            setting_button(
+                name,
+                selected,
+                cx.listener(move |this, event, window, cx| {
+                    this.change_setting(event, window, cx, |s| s.font_family = name.to_string());
+                }),
+            )
+        }))
+}
+
+fn font_fallback_controls(cx: &mut Context<WorkspaceView>, current: &[String]) -> Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_1()
+        .children(FALLBACK_PRESETS.into_iter().map(|name| {
+            let selected = if name == "无" {
+                current.is_empty()
+            } else {
+                current.iter().any(|entry| entry == name)
+            };
+            setting_button(
+                name,
+                selected,
+                cx.listener(move |this, event, window, cx| {
+                    this.change_setting(event, window, cx, |s| {
+                        if name == "无" {
+                            s.font_fallbacks.clear();
+                        } else if let Some(position) =
+                            s.font_fallbacks.iter().position(|entry| entry == name)
+                        {
+                            s.font_fallbacks.remove(position);
+                        } else {
+                            s.font_fallbacks.push(name.to_string());
+                        }
+                    });
+                }),
+            )
+        }))
+}
+
+/// 二值开关控件（选中侧高亮），如连字开/关。
+fn toggle_controls(
+    cx: &mut Context<WorkspaceView>,
+    on: (&'static str, bool),
+    off: (&'static str, bool),
+    current: bool,
+    apply: impl Fn(&mut Appearance, bool) + Clone + 'static,
+) -> Div {
+    div()
+        .flex()
+        .gap_1()
+        .children(
+            [(on, true), (off, false)]
+                .into_iter()
+                .map(|((label, value), _)| {
+                    let selected = value == current;
+                    let apply = apply.clone();
+                    setting_button(
+                        label,
+                        selected,
+                        cx.listener(move |this, event, window, cx| {
+                            this.change_setting(event, window, cx, |s| apply(s, value));
+                        }),
+                    )
+                }),
+        )
+}
+
+/// Quake 设置的二值开关控件：与 `toggle_controls` 同形，但落点是
+/// `QuakeSettings` 并联动 worker 生命周期（change_quake_setting）。
+#[cfg(target_os = "linux")]
+fn quake_toggle_controls(
+    cx: &mut Context<WorkspaceView>,
+    on: (&'static str, bool),
+    off: (&'static str, bool),
+    current: bool,
+    apply: impl Fn(&mut laterterm_config::QuakeSettings, bool) + Clone + 'static,
+) -> Div {
+    div()
+        .flex()
+        .gap_1()
+        .children(
+            [(on, true), (off, false)]
+                .into_iter()
+                .map(|((label, value), _)| {
+                    let selected = value == current;
+                    let apply = apply.clone();
+                    setting_button(
+                        label,
+                        selected,
+                        cx.listener(move |this, event, window, cx| {
+                            this.change_quake_setting(event, window, cx, |s| apply(s, value));
+                        }),
+                    )
+                }),
+        )
+}
+
+fn theme_controls(
+    cx: &mut Context<WorkspaceView>,
+    themes: &laterterm_config::ThemeRegistry,
+    current: &str,
+) -> Div {
+    div()
+        .flex()
+        .flex_wrap()
+        .gap_1()
+        .children(themes.names().into_iter().map(|name| {
+            let selected = name == current;
+            setting_button(
+                name.clone(),
+                selected,
+                cx.listener(move |this, event, window, cx| {
+                    this.change_setting(event, window, cx, |s| s.theme = name.clone());
+                }),
+            )
+        }))
+}
+
+/// 光标形状三选一（选中侧高亮）；点击经 change_setting 自动保存并热更新全部窗格。
+/// 光标样式枚举一律写全路径——`use gpui::CursorStyle` 是指针样式，不能裸名撞车。
+fn cursor_style_controls(
+    cx: &mut Context<WorkspaceView>,
+    current: laterterm_config::CursorStyle,
+) -> Div {
+    div().flex().gap_1().children(
+        [
+            ("方块", laterterm_config::CursorStyle::Block),
+            ("竖线", laterterm_config::CursorStyle::Bar),
+            ("下划线", laterterm_config::CursorStyle::Underline),
+        ]
+        .into_iter()
+        .map(|(label, style)| {
+            let selected = style == current;
+            setting_button(
+                label,
+                selected,
+                cx.listener(move |this, event, window, cx| {
+                    this.change_setting(event, window, cx, move |s| s.cursor_style = style);
+                }),
+            )
+        }),
+    )
+}
+
+fn shortcut_row(label: &str, keys: &str, conflicted: bool) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .py_2()
+        .text_color(if conflicted {
+            rgb(COLOR_DANGER)
+        } else {
+            rgb(COLOR_TEXT_SECONDARY)
+        })
+        .child(format!(
+            "{}{}",
+            label,
+            if conflicted { " ⚠ 冲突" } else { "" }
+        ))
+        .child(value_chip(keys))
+}
+
+fn info_row(label: &str, value: &str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .py_2()
+        .text_color(rgb(COLOR_TEXT_SECONDARY))
+        .child(label.to_string())
+        .child(value.to_string())
+}
+
+/// 分区锚点标题：accent 竖条 + 14px 主文字（骨架沿用原 section_title）。
+fn section_title(text: &str) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .w(px(3.0))
+                .h(px(16.0))
+                .bg(rgb(COLOR_ACCENT))
+                .rounded_sm(),
+        )
+        .child(
+            div()
+                .text_size(px(14.0))
+                .text_color(rgb(COLOR_TEXT))
+                .child(text.to_string()),
+        )
+}
+
+/// 组内子标题：比分区锚点低一级（快捷键节的内置/面板/命令等分组）。
+fn group_title(text: &str) -> Div {
+    div()
+        .pt_1()
+        .text_size(px(12.0))
+        .text_color(rgb(COLOR_TEXT_MUTED))
+        .child(text.to_string())
+}
+
+fn setting_card() -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .p_3()
+        .gap_1()
+        .bg(rgb(COLOR_CARD_BG))
+        .border_1()
+        .border_color(rgb(COLOR_STROKE))
+        .rounded_md()
+}
+
+fn setting_row(label: &str, chip: Div, controls: Div) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .py_2()
+        .child(
+            div()
+                .w(px(64.0))
+                .text_color(rgb(COLOR_TEXT_SECONDARY))
+                .child(label.to_string()),
+        )
+        .child(chip)
+        .child(controls)
+}
+
+fn value_chip(text: &str) -> Div {
+    div()
+        .min_w(px(64.0))
+        .h(px(30.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .px_3()
+        .bg(rgb(COLOR_OVERLAY_BG))
+        .border_1()
+        .border_color(rgb(COLOR_STROKE))
+        .rounded_sm()
+        .text_color(rgb(COLOR_TEXT))
+        .child(text.to_string())
+}
+
+/// 面板/对话框共用的按钮芯片（对话框沿用同一观感，随本模块收敛为
+/// Tokyo Night——sftp_panel 的注释「对齐 setting_button 观感」即此约定）。
+/// 选中态 = accent tint 底 + accent 描边 + 主文字：主文字从 0x7DCEFF 收敛为
+/// 0xC0CAF5 后的辨识度损失由 accent 描边补偿（评审风险7）。
+pub(crate) fn setting_button(
+    label: impl Into<SharedString>,
+    selected: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    let (bg, border, text) = if selected {
+        (rgba(COLOR_ACCENT_TINT), rgb(COLOR_ACCENT), rgb(COLOR_TEXT))
+    } else {
+        (
+            rgb(COLOR_OVERLAY_BG),
+            rgb(COLOR_STROKE),
+            rgb(COLOR_TEXT_SECONDARY),
+        )
+    };
+    let hover_bg = if selected {
+        rgba(COLOR_ACCENT_TINT_HOVER)
+    } else {
+        rgb(COLOR_STROKE)
+    };
+    div()
+        .h(px(30.0))
+        .min_w(px(36.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .px_3()
+        .bg(bg)
+        .border_1()
+        .border_color(border)
+        .rounded_sm()
+        .text_color(text)
+        .hover(move |this| this.bg(hover_bg))
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(label.into())
+}

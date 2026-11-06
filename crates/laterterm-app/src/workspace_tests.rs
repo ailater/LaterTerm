@@ -172,3 +172,61 @@ fn unified_shortcut_conflicts_detect_cross_kind() {
     // 非法格式返回 None：格式校验由保存路径先行的 normalize 报错承担
     assert!(shortcut_conflict_with(&bindings, "ctrl", None).is_none());
 }
+
+#[test]
+fn settings_scroll_spy_follows_judge_line_and_pins_bottom() {
+    use super::workspace::{SettingsSection, settings_scroll_spy};
+
+    let tops = [
+        (SettingsSection::Appearance, 0.0),
+        (SettingsSection::Font, 300.0),
+        (SettingsSection::Scrolling, 500.0),
+        (SettingsSection::Shortcuts, 700.0),
+        (SettingsSection::Terminal, 900.0),
+        (SettingsSection::Servers, 1100.0),
+    ];
+    // 顶部：判定线在首分区内
+    assert_eq!(
+        settings_scroll_spy(&tops, 80.0, false),
+        SettingsSection::Appearance
+    );
+    // 判定线越过第二分区起点 → 高亮跟随
+    assert_eq!(
+        settings_scroll_spy(&tops, 310.0, false),
+        SettingsSection::Font
+    );
+    // 判定线正好落在分区起点上 → 该分区接管（边界含等号）
+    assert_eq!(
+        settings_scroll_spy(&tops, 500.0, false),
+        SettingsSection::Scrolling
+    );
+    // 矮分区（如「服务器」）起点永远够不到判定线，滚到底必须兜底选中
+    assert_eq!(
+        settings_scroll_spy(&tops, 950.0, true),
+        SettingsSection::Servers
+    );
+    // 空列表兜底默认分区
+    assert_eq!(
+        settings_scroll_spy(&[], 80.0, false),
+        SettingsSection::Appearance
+    );
+}
+
+#[test]
+fn settings_sections_have_unique_labels_and_anchor_order() {
+    use super::workspace::SettingsSection;
+
+    let labels: Vec<_> = SettingsSection::ALL.iter().map(|s| s.label()).collect();
+    let mut unique = labels.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(labels.len(), unique.len(), "导航标签必须互异（导航项可辨）");
+    // 分区下标 = 滚动容器直接子元素下标，跳转/侦测都按它对位
+    for (index, section) in SettingsSection::ALL.iter().enumerate() {
+        assert_eq!(
+            section.index(),
+            index,
+            "{section:?} 下标必须与 ALL 排布一致"
+        );
+    }
+}
