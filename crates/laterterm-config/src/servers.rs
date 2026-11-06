@@ -219,13 +219,16 @@ pub fn normalize_group(raw: Option<&str>) -> Option<String> {
 }
 
 /// 跳板链缺陷（内部结构化形态，供错误文案与清理共用）。
+///
+/// `referrer` 指向「实际断链那一跳的引用方」条目：清理时只断它，
+/// 链头等合法上游不被级联误清。
 enum JumpDefect {
     /// 环（含自引）：成员按环序排列（如 `["A", "B"]` 表示 A→B→A）。
     Cycle(Vec<String>),
-    /// 引用了不存在的跳板名。
-    Missing(String),
-    /// 超过 [`MAX_JUMP_DEPTH`] 跳。
-    TooDeep,
+    /// 引用了不存在的跳板名：`jump` 为幽灵名，`referrer` 为引用它的条目。
+    Missing { jump: String, referrer: String },
+    /// 超过 [`MAX_JUMP_DEPTH`] 跳：`referrer` 为令链路溢出的那一跳的引用方。
+    TooDeep { referrer: String },
 }
 
 /// 检查 `name` 的跳板链是否存在缺陷；无缺陷返回 `None`。
@@ -242,12 +245,21 @@ fn jump_defect(servers: &[ServerEntry], name: &str) -> Option<JumpDefect> {
         }
         let next = match find(jump_name) {
             Some(next) => next,
-            // `?` 会把「名字不存在」误判为「无缺陷」，必须显式报 Missing
-            None => return Some(JumpDefect::Missing(jump_name.to_string())),
+            // `?` 会把「名字不存在」误判为「无缺陷」，必须显式报 Missing；
+            // 此刻 current 尚未推进，正是引用幽灵名的那一跳
+            None => {
+                return Some(JumpDefect::Missing {
+                    jump: jump_name.to_string(),
+                    referrer: current.name.clone(),
+                });
+            }
         };
         path.push(next.name.clone());
         if path.len() > MAX_JUMP_DEPTH + 1 {
-            return Some(JumpDefect::TooDeep);
+            // current 尚未推进到 next：正是它引用的那一跳令链路溢出上限
+            return Some(JumpDefect::TooDeep {
+                referrer: current.name.clone(),
+            });
         }
         current = next;
     }
@@ -269,10 +281,10 @@ pub fn resolve_jump_chain<'a>(
     let find = |target: &str| servers.iter().find(|server| server.name == target);
     match jump_defect(servers, name) {
         Some(JumpDefect::Cycle(cycle)) => bail!("跳板链形成环: {}", cycle.join("→")),
-        Some(JumpDefect::Missing(jump_name)) => {
-            bail!("跳板机「{jump_name}」不存在");
+        Some(JumpDefect::Missing { jump, .. }) => {
+            bail!("跳板机「{jump}」不存在");
         }
-        Some(JumpDefect::TooDeep) => {
+        Some(JumpDefect::TooDeep { .. }) => {
             bail!("跳板链过长（最多 {MAX_JUMP_DEPTH} 跳）");
         }
         None => {}
@@ -300,11 +312,13 @@ pub fn servers_referencing_jump<'a>(servers: &'a [ServerEntry], name: &str) -> V
 }
 
 /// 清理全表跳板引用：格式非法、悬空、成环、超深的引用一律置 `None`——
-/// 宁断链不丢条目。返回被清理引用的条目名（供导入回报计数）。
+/// 宁断链不丢条目。返回被清理引用的条目名（供载入/导入回报计数）。
 ///
 /// 载入（`Settings::load`→`sanitize_servers`）与导入合并两条路径都要调用，
 /// 否则手改 TOML 的坏引用会一直存活到连接期才报错。
 /// 环只断环上成员：路过环的条目在下一轮复检后保留有效链路。
+/// 悬空/超深只断实际断链的那一跳（缺陷携带的 `referrer`）：
+/// 链头沿合法上游走到断点的链路不被级联误清。
 pub fn clear_broken_jump_refs(servers: &mut [ServerEntry]) -> Vec<String> {
     // 格式层：先记录格式非法条目，再统一 trim / 置 None
     let format_broken: Vec<String> = servers
@@ -323,24 +337,25 @@ pub fn clear_broken_jump_refs(servers: &mut [ServerEntry]) -> Vec<String> {
             .map(|name| name.trim().to_string())
             .filter(|name| !name.is_empty() && validate_ref_name(name).is_ok());
     }
-    // 链路层：循环到不动点。环清成员，悬空/超深清自身；
-    // 路过环的条目在环成员断链后复检通过，不会被误伤。
+    // 链路层：循环到不动点。环清环上成员，悬空/超深清各自缺陷携带的
+    // referrer（断链那一跳的引用方）；路过环的条目在环成员断链后复检通过，
+    // 合法上游也不因下游断链被级联误伤。
     let mut cleared = format_broken;
     loop {
-        let defects: Vec<(String, JumpDefect)> = servers
+        let defects: Vec<JumpDefect> = servers
             .iter()
-            .filter_map(|server| {
-                jump_defect(servers, &server.name).map(|defect| (server.name.clone(), defect))
-            })
+            .filter_map(|server| jump_defect(servers, &server.name))
             .collect();
         if defects.is_empty() {
             break;
         }
         let mut touched = false;
-        for (name, defect) in defects {
+        for defect in defects {
             let victims = match defect {
                 JumpDefect::Cycle(members) => members,
-                JumpDefect::Missing(_) | JumpDefect::TooDeep => vec![name],
+                JumpDefect::Missing { referrer, .. } | JumpDefect::TooDeep { referrer } => {
+                    vec![referrer]
+                }
             };
             for victim in victims {
                 if let Some(server) = servers.iter_mut().find(|server| server.name == victim)
@@ -918,6 +933,77 @@ group = "坏\n组"
         // （顺序敏感：断的是环上条目，旁观条目保持原引用，其链路下一轮载入会再查）
         assert_eq!(cleared.len(), 2);
         assert_eq!(servers[2].jump.as_deref(), Some("A"));
+    }
+
+    #[test]
+    fn clear_broken_jump_refs_only_cuts_the_broken_hop_not_legal_upstream() {
+        // 回归钉子（2026-11-06）：A→B 合法、B→幽灵 断链。旧实现 victims 取
+        // 链头 name，A 会被级联误清并静默降级直连；定点清理只断引用方 B。
+        let mut servers = vec![jump_entry("A", Some("B")), jump_entry("B", Some("幽灵"))];
+        let cleared = clear_broken_jump_refs(&mut servers);
+        assert_eq!(cleared, vec!["B"], "只断实际断链那一跳的引用方");
+        assert_eq!(
+            servers[0].jump.as_deref(),
+            Some("B"),
+            "合法上游 A 不被级联误清"
+        );
+        let chain: Vec<&str> = resolve_jump_chain(&servers, "A")
+            .unwrap()
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect();
+        assert_eq!(chain, vec!["B"], "A 经 B 的链路清理后仍可解析");
+    }
+
+    #[test]
+    fn clear_broken_jump_refs_trims_deep_chains_at_the_overflow_hop() {
+        // T→d1..d12 共 12 跳（d1..d11 各跳下一个、d12 直连），上限 8 跳。
+        // 各条目视角的溢出跳引用方不同：T 链裁 d8、d1 链裁 d9、d2 链裁 d10、
+        // d3 链裁 d11（单轮裁剪到位）；下一轮复检无缺陷即退出。
+        let mut servers = vec![jump_entry("T", Some("d1"))];
+        for hop in 1..=11 {
+            servers.push(jump_entry(
+                &format!("d{hop}"),
+                Some(&format!("d{}", hop + 1)),
+            ));
+        }
+        servers.push(jump_entry("d12", None));
+        let cleared = clear_broken_jump_refs(&mut servers);
+        let mut expected = vec!["d8", "d9", "d10", "d11"];
+        expected.sort_unstable();
+        let mut actual = cleared.clone();
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "每条各自溢出的链路各裁自己的引用方");
+        assert_eq!(
+            servers[0].jump.as_deref(),
+            Some("d1"),
+            "链头 T 不被级联误清"
+        );
+        // T 的链路裁剪后恰好收敛到上限：d1..d8 共 8 跳
+        assert_eq!(
+            resolve_jump_chain(&servers, "T").unwrap().len(),
+            MAX_JUMP_DEPTH
+        );
+        for name in ["T", "d1", "d7", "d8", "d9", "d10", "d11", "d12"] {
+            let hops = resolve_jump_chain(&servers, name).unwrap().len();
+            assert!(
+                hops <= MAX_JUMP_DEPTH,
+                "{name} 清理后应可解析且 ≤{MAX_JUMP_DEPTH} 跳，实际 {hops}"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_servers_returns_cleared_jump_refs_for_reporting() {
+        // 回报契约：sanitize_servers 返回被清条目名清单（Settings::load 据此
+        // eprintln 回报）；eprintln 传输本身不做 stdout 断言。
+        let mut settings = Settings {
+            servers: vec![jump_entry("内网机", Some("幽灵")), jump_entry("直连", None)],
+            ..Default::default()
+        };
+        assert_eq!(settings.sanitize_servers(), vec!["内网机"]);
+        assert_eq!(settings.servers[0].jump, None);
+        assert_eq!(settings.servers[1].jump, None, "正常条目不动");
     }
 
     #[test]

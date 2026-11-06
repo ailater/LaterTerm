@@ -272,6 +272,36 @@ pub(crate) fn spawn_portal_worker(event_tx: flume::Sender<QuakePortalEvent>) -> 
     QuakeWorkerHandle { stop_tx }
 }
 
+/// worker 事件循环退出原因：区分用户主动停止与 portal 会话断开。
+#[cfg(target_os = "linux")]
+enum WorkerExit {
+    /// 停止令牌到位（用户关闭开关/热加载禁用），正常退出。
+    NormalStop,
+    /// 信号流意外结束（portal 会话拆除/连接断开），需向状态行发 Failed。
+    PortalDisconnected,
+}
+
+/// 运行期断连提示文案：经 `QuakePortalEvent::Failed` 由状态行展示
+/// （enabled 门内可见）。措辞避开「portal」开头——Failed 状态行已有
+/// 「portal 不可用，已降级为仅应用内快捷键：」前缀，避免双 portal 冗余。
+#[cfg(target_os = "linux")]
+const PORTAL_DISCONNECT_REASON: &str =
+    "热键会话已断开（信号流结束）：请关闭后重新开启 Quake 开关恢复";
+
+/// 归类事件循环的流结束退出：停止未被请求 = portal 断连；已请求 = 正常退出。
+///
+/// 竞态窗口说明：停止令牌可能已被事件循环里 racing 的 `recv_async` 消费，
+/// 此处 `stop_requested` 落空会被误判为断连——由 workspace 侧 `Failed`
+/// 事件的 enabled 门兜底（禁用流程中的迟到 Failed 落入禁用分支被忽略）。
+#[cfg(target_os = "linux")]
+fn classify_stream_exit(stop_requested: bool) -> WorkerExit {
+    if stop_requested {
+        WorkerExit::NormalStop
+    } else {
+        WorkerExit::PortalDisconnected
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn portal_worker_main(event_tx: flume::Sender<QuakePortalEvent>, stop_rx: flume::Receiver<()>) {
     async_io::block_on(async move {
@@ -348,10 +378,12 @@ async fn register_and_run(
     let _ = event_tx.send(QuakePortalEvent::Ready { trigger });
 
     // 事件循环：Activated / ShortcutsChanged / 停止 三路赛跑，按设计长活。
+    // 流结束按 classify_stream_exit 分流：用户停止静默退出，portal 断连发
+    // Failed 让状态行可见（旧实现统一归 Stop 静默退出，热键无声失效）。
     enum WorkerStep {
         Activated,
         ShortcutsChanged(ashpd::desktop::global_shortcuts::ShortcutsChanged),
-        Stop,
+        Exit(WorkerExit),
     }
     loop {
         let step = futures_lite::future::race(
@@ -359,19 +391,20 @@ async fn register_and_run(
                 async {
                     match activated.as_mut().next().await {
                         Some(_) => WorkerStep::Activated,
-                        None => WorkerStep::Stop, // 信号流结束 = 会话/连接断开
+                        // 信号流结束 = 会话/连接断开或停止令牌已到位
+                        None => WorkerStep::Exit(classify_stream_exit(stop_requested(stop_rx))),
                     }
                 },
                 async {
                     let _ = stop_rx.recv_async().await;
-                    WorkerStep::Stop
+                    WorkerStep::Exit(WorkerExit::NormalStop)
                 },
             ),
             async {
                 match changed.as_mut() {
                     Some(stream) => match stream.as_mut().next().await {
                         Some(event) => WorkerStep::ShortcutsChanged(event),
-                        None => WorkerStep::Stop,
+                        None => WorkerStep::Exit(classify_stream_exit(stop_requested(stop_rx))),
                     },
                     None => std::future::pending().await,
                 }
@@ -395,7 +428,16 @@ async fn register_and_run(
                     });
                 }
             }
-            WorkerStep::Stop => return Ok(()),
+            WorkerStep::Exit(WorkerExit::NormalStop) => return Ok(()),
+            WorkerStep::Exit(WorkerExit::PortalDisconnected) => {
+                // 运行期断连不自动重试（注册期 1s 重试语义不适用于已建会话）；
+                // 发 Failed 让用户可见，恢复走既有开关重开路径——关：Drop 停止
+                // 句柄复位 Disabled；开：workspace 重新 spawn worker。
+                let _ = event_tx.send(QuakePortalEvent::Failed {
+                    reason: PORTAL_DISCONNECT_REASON.to_string(),
+                });
+                return Ok(());
+            }
         }
     }
 }
@@ -699,6 +741,35 @@ mod tests {
             QuakePortalStatus::Failed("x".into())
                 .text()
                 .contains("降级")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stream_exit_classifies_disconnect_vs_user_stop() {
+        // 回归背景（2026-11-06）：信号流结束曾统一归入通用 Stop 静默退出，
+        // portal 会话拆除后热键无声失效且状态行停留「已绑定」。现在按停止
+        // 令牌是否被请求分流：未被请求 = 断连（发 Failed），已请求 = 正常退出。
+        assert!(matches!(
+            classify_stream_exit(false),
+            WorkerExit::PortalDisconnected
+        ));
+        assert!(matches!(classify_stream_exit(true), WorkerExit::NormalStop));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn portal_disconnect_reason_feeds_failed_status_text() {
+        // 钉住断连文案能经既有 Failed 状态行（workspace enabled 门内）可见；
+        // 前缀已含「portal 不可用」，reason 本身不再重复 portal 字样。
+        let text = QuakePortalStatus::Failed(PORTAL_DISCONNECT_REASON.into()).text();
+        assert!(text.contains("断开"), "{text}");
+        assert!(text.contains("重新开启"), "{text}");
+        // 前缀已有「portal 不可用」，reason 不重复 portal 字样（全文恰 1 次）
+        assert_eq!(
+            text.matches("portal").count(),
+            1,
+            "仅前缀含 portal，reason 不得叠加: {text}"
         );
     }
 }

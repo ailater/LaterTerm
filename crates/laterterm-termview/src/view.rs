@@ -1202,12 +1202,16 @@ impl TerminalView {
     /// Handle mouse up events: 结束拖拽；未成形的单击选区直接清除。
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         // 上报期间的 release：与已上报的 press 配对发给应用。take() 立即清理
-        // 按下标记（含模式中途翻转——mouse_button_report 返回 None 时静默丢弃
-        // 不写字节，也绝无悬挂标记）；期间不存在本地选区，直接返回。
+        // 按下标记；期间不存在本地选区，直接返回。门控与 down/move/scroll
+        // 三入口同口径——模式中途翻转（按住期间应用单独发 ?1006l 退到
+        // 1000-only）时 release 被拦下，绝不以 SGR 字节发给旧编码应用，
+        // 静默丢弃、无悬挂标记、不落本地选区。
         if let Some(button) = self.mouse_down_reported.take() {
             self.last_motion_report = None;
             let mode = self.state.mode();
-            if let Some(point) = self.mouse_report_point(event.position) {
+            if crate::mouse::mouse_reporting_active(mode, event.modifiers.shift)
+                && let Some(point) = self.mouse_report_point(event.position)
+            {
                 let modifiers = crate::mouse::encode_modifiers(
                     false,
                     event.modifiers.alt,
@@ -2789,6 +2793,65 @@ mod tests {
             );
             assert!(view.mouse_down_reported.is_none(), "无悬挂按下标记");
             assert!(!view.has_selection(), "翻转路径不落本地选区");
+        });
+    }
+
+    #[gpui::test]
+    fn sgr_flip_mid_press_never_feeds_1000_only_app(cx: &mut TestAppContext) {
+        // 回归钉子（2026-11-06）：按住期间应用单独退订 SGR（?1006l，1000 保留）
+        // 时，release 旧实现只查 mouse_down_reported 就发 SGR 字节——违反
+        // mouse_reporting_active 门控不变量。up 分支补门控后零新字节。
+        use gpui::{Modifiers, MouseUpEvent};
+        use std::sync::Mutex;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let recorded = buffer.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let view = TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx);
+            *view.stdin_writer.lock() = Box::new(RecordingWriter(recorded));
+            view
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            enable_mouse_reporting(view, b"\x1b[?1000;1006h", &buffer);
+
+            let down = MouseDownEvent {
+                button: MouseButton::Left,
+                position: gpui::point(gpui::px(5.0), gpui::px(10.0)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            view.on_mouse_down(&down, window, cx);
+            assert_eq!(
+                *buffer.lock().unwrap(),
+                b"\x1b[<0;1;1M",
+                "按下上报 SGR press"
+            );
+
+            // 应用按住期间单独发 ?1006l（保留 1000）：模式仍含 CLICK 但已无 SGR
+            view.state.process_bytes(b"\x1b[?1006l");
+            let mode = view.state.mode();
+            assert!(
+                mode.contains(alacritty_terminal::term::TermMode::MOUSE_REPORT_CLICK)
+                    && !mode.contains(alacritty_terminal::term::TermMode::SGR_MOUSE),
+                "1006l 后应为 1000-only（CLICK 置位、SGR 清除）"
+            );
+
+            // release 被门控拦下：零新字节、无悬挂标记、无本地选区
+            let up = MouseUpEvent {
+                button: MouseButton::Left,
+                position: gpui::point(gpui::px(5.0), gpui::px(10.0)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+            view.on_mouse_up(&up, window, cx);
+            assert_eq!(
+                *buffer.lock().unwrap(),
+                b"\x1b[<0;1;1M",
+                "1000-only 下 release 绝不补发 SGR 字节"
+            );
+            assert!(view.mouse_down_reported.is_none(), "无悬挂按下标记");
+            assert!(!view.has_selection(), "门控路径不落本地选区");
         });
     }
 

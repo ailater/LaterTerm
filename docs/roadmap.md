@@ -130,6 +130,23 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 > 防逐像素刷 PTY。测试口径：mouse.rs 纯逻辑 + view.rs gpui::test（真实 process_bytes 置位后
 > 驱动事件断言写入字节与本地让位）。
 
+> 低危遗留清理（2026-11-06，评审四处逐项修复完毕）：① 跳板链定点清理——JumpDefect 的
+> Missing/TooDeep 改携带 referrer（实际断链那一跳的引用方），clear_broken_jump_refs 只断
+> 断链跳，链头合法上游不再被级联误清（旧实现 A→B、B→幽灵 会把 A 一并清掉静默降级直连；
+> 环臂语义不动，路过环的旁观条目仍保留）；载入期可见回报：sanitize_servers 返回被清条目
+> 清单，Settings::load 非空时 eprintln「无效跳板引用已清除 N（…）」与导入侧同口径。②
+> 鼠标上报 release 门控补齐——on_mouse_up 的 mouse_down_reported 分支补 mouse_reporting_active
+> （与 down/move/scroll 三入口同口径）：应用按住期间单独发 ?1006l 退到 1000-only 时 release
+> 绝不再补发 SGR 字节。③ Quake portal 断连分流——事件循环流结束按停止令牌分类
+> （WorkerExit::NormalStop/PortalDisconnected），断连发 Failed 让状态行红显「会话已断开…关闭
+> 后重新开启恢复」，不再静默归 Stop；不自动重试，恢复=关/开 Quake 开关重新拉起 worker；竞态
+> （禁用后快速重开时旧 worker 迟到 Failed 短暂覆盖 AwaitingConsent，新 worker Ready 自愈）
+> 为纯观感瞬态，由 enabled 门兜底。真机验收（启用 Quake 后重启 xdg-desktop-portal 应见红色
+> 断连提示、关开开关恢复热键）待实机。④ 首启引导 shell 坏值测试恒真修正——坏值从 [appearance]
+> 表内移到顶层键：from_str 钉解析落位（shell==Some(坏值)）+ Settings::load 钉 sanitize 生效
+> （shell==None 且 font_size 不受影响），测试与 sanitize 路径重新挂钩。门禁：config lib 82、
+> termview lib 108、app bins 125 通过 1 ignored（各含 3/1/2 个新增回归测试）。
+
 > 主机分组与命令迁移收尾（2026-11-05）：ServerEntry 新增扁平 `group` 分组字段（TOML 可选、
 > 允许 `/`、无父子指针类型层面不成环；validate 严格报错 / normalize_group 宽容降级 None 成对，
 > 坏分组绝不丢条目，不 bump CURRENT_VERSION 双向兼容）——服务器页签按组折叠展示（组头 ▸/▾+计数，

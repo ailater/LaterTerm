@@ -302,7 +302,8 @@ impl Settings {
     ///
     /// 跳板引用（jump）单独走全表清理：格式非法、悬空、成环、超深一律断链
     /// 保条目——这是载入期兜底，坏引用不会一直存活到连接期才暴露。
-    fn sanitize_servers(&mut self) {
+    /// 返回被清理引用的条目名清单（供 `Settings::load` 向用户回报）。
+    fn sanitize_servers(&mut self) -> Vec<String> {
         self.servers.retain_mut(|server| {
             server.name = server.name.trim().to_string();
             server.host = server.host.trim().to_string();
@@ -320,7 +321,7 @@ impl Settings {
             server.warn_invalid_shortcut();
             true
         });
-        servers::clear_broken_jump_refs(&mut self.servers);
+        servers::clear_broken_jump_refs(&mut self.servers)
     }
 
     /// 重命名服务器后改写所有指向旧名的跳板引用（按名引用随改名同步，
@@ -352,7 +353,17 @@ impl Settings {
         settings.appearance.sanitize();
         settings.quake.sanitize();
         settings.sanitize_totp();
-        settings.sanitize_servers();
+        let cleared_jumps = settings.sanitize_servers();
+        // 载入期可见回报：措辞与导入侧（workspace「无效跳板引用已清除 N（…）」）
+        // 一致。启动早于 UI、无通知通道，沿用 eprintln 先例（解析失败告警、
+        // 快捷键无效告警同款）。
+        if !cleared_jumps.is_empty() {
+            eprintln!(
+                "无效跳板引用已清除 {}（{}）",
+                cleared_jumps.len(),
+                cleared_jumps.join("、")
+            );
+        }
         settings.sanitize_shell();
         Ok(settings)
     }
@@ -754,20 +765,31 @@ shortcut = "  legacy shortcut  "
         // 原子写不应留下临时文件
         assert!(!path.with_extension("toml.tmp").exists());
 
-        // 手改坏值：载入期归 None，整份配置不解析失败
-        for raw in [
-            "shell = \"bash -l\"\n",     // 带参数——不是纯路径
-            "shell = \"\"\n",            // 空串
-            "shell = \"relative/sh\"\n", // 相对路径
-            "shell = \"/bin/sh' -x\"\n", // 引号注入
+        // 手改坏值：raw 写在 [appearance] 之前的顶层键（若拼进表内会被 serde
+        // 当未知字段忽略，断言恒真——2026-11-06 修正）。from_str 不跑 sanitize
+        // （只在 Settings::load 调用），故分两步：先钉坏值确实解析进顶层
+        // shell 字段（防测试与 sanitize 路径脱钩），再走完整 load 钉 sanitize 生效。
+        for (raw, value) in [
+            ("shell = \"bash -l\"\n", "bash -l"), // 带参数——不是纯路径
+            ("shell = \"\"\n", ""),               // 空串
+            ("shell = \"relative/sh\"\n", "relative/sh"), // 相对路径
+            ("shell = \"/bin/sh' -x\"\n", "/bin/sh' -x"), // 引号注入
         ] {
-            let patched: Settings =
-                toml::from_str(&format!("[appearance]\nfont_size = 14.0\n{raw}")).unwrap();
-            assert_eq!(patched.shell, None, "坏值应归 None: {raw}");
+            let body = format!("{raw}[appearance]\nfont_size = 14.0\n");
+            let parsed: Settings = toml::from_str(&body).unwrap();
+            assert_eq!(
+                parsed.shell.as_deref(),
+                Some(value),
+                "坏值应落在顶层 shell 键: {raw}"
+            );
+            std::fs::write(&path, &body).unwrap();
+            let loaded = Settings::load(&path).unwrap();
+            assert_eq!(loaded.shell, None, "载入期 sanitize 应归 None: {raw}");
+            assert_eq!(
+                loaded.appearance.font_size, 14.0,
+                "[appearance] 不受坏值影响"
+            );
         }
-        // 显式写坏值再走完整 load 路径同样归 None
-        std::fs::write(&path, "shell = \"bash -l\"\n").unwrap();
-        assert_eq!(Settings::load(&path).unwrap().shell, None);
         std::fs::remove_file(&path).unwrap();
     }
 
