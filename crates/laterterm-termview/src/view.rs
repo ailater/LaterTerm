@@ -92,6 +92,18 @@ fn font_trace_reason(
     }
 }
 
+/// 终端光标形状。与 laterterm-config 的同名枚举一一对应，由 app 层映射
+/// （两 crate 不互依，各自持一份定义）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorStyle {
+    /// 方块（默认，占满整格）。
+    Block,
+    /// 竖线（光标列左缘的细竖条）。
+    Bar,
+    /// 下划线（贴格底的横条）。
+    Underline,
+}
+
 /// Configuration for terminal creation and runtime updates.
 ///
 /// This struct defines the terminal's appearance and behavior, including
@@ -143,6 +155,7 @@ fn font_trace_reason(
 ///     terminal.update_config(config, cx);
 /// });
 /// ```
+
 #[derive(Clone, Debug)]
 pub struct TerminalConfig {
     /// Number of columns (character width) in the terminal
@@ -181,6 +194,9 @@ pub struct TerminalConfig {
     /// 光标闪烁。默认开启；关闭后光标常显。
     pub cursor_blink: bool,
 
+    /// 光标形状：方块 / 竖线 / 下划线。默认方块。
+    pub cursor_style: CursorStyle,
+
     /// 平滑滚动：滚轮/触控板按像素累积连续滚动，而不是一次跳一整行。
     /// 默认开启。
     pub smooth_scrolling: bool,
@@ -200,6 +216,7 @@ impl Default for TerminalConfig {
             ligatures: true,
             font_fallbacks: Vec::new(),
             cursor_blink: true,
+            cursor_style: CursorStyle::Block,
             smooth_scrolling: true,
         }
     }
@@ -612,6 +629,7 @@ impl TerminalView {
             config.colors.clone(),
             config.ligatures,
             config.font_fallbacks.clone(),
+            config.cursor_style,
         );
 
         // Create focus handle
@@ -1610,6 +1628,8 @@ impl TerminalView {
         // 连字不影响单元格度量，无需重新测量
         self.renderer.ligatures = config.ligatures;
         self.renderer.font_fallbacks = config.font_fallbacks.clone();
+        // 光标形状只改绘制几何，同样无需重新测量
+        self.renderer.cursor_style = config.cursor_style;
         if font_changed {
             self.renderer.invalidate_measurement();
             self.font_trace_changed = true;

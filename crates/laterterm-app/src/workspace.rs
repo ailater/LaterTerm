@@ -1607,6 +1607,7 @@ impl WorkspaceView {
                 config.colors = palette.clone();
                 config.ligatures = appearance.ligatures;
                 config.cursor_blink = appearance.cursor_blink;
+                config.cursor_style = cursor_style_for(appearance.cursor_style);
                 config.font_fallbacks = appearance.font_fallbacks.clone();
                 terminal.update_config(config, cx);
             });
@@ -7243,6 +7244,11 @@ fn settings_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>
                     ),
                 ))
                 .child(setting_row(
+                    "光标样式",
+                    div(),
+                    cursor_style_controls(cx, settings.cursor_style),
+                ))
+                .child(setting_row(
                     "平滑滚动",
                     div(),
                     toggle_controls(
@@ -7452,6 +7458,32 @@ fn theme_controls(
                 }),
             )
         }))
+}
+
+/// 光标形状三选一（选中侧高亮）；点击经 change_setting 自动保存并热更新全部窗格。
+/// 光标样式枚举一律写全路径——顶部 `use gpui::CursorStyle` 是指针样式，不能裸名撞车。
+fn cursor_style_controls(
+    cx: &mut Context<WorkspaceView>,
+    current: laterterm_config::CursorStyle,
+) -> gpui::Div {
+    div().flex().gap_1().children(
+        [
+            ("方块", laterterm_config::CursorStyle::Block),
+            ("竖线", laterterm_config::CursorStyle::Bar),
+            ("下划线", laterterm_config::CursorStyle::Underline),
+        ]
+        .into_iter()
+        .map(|(label, style)| {
+            let selected = style == current;
+            setting_button(
+                label,
+                selected,
+                cx.listener(move |this, event, window, cx| {
+                    this.change_setting(event, window, cx, move |s| s.cursor_style = style);
+                }),
+            )
+        }),
+    )
 }
 
 fn shortcut_row(label: &str, keys: &str, conflicted: bool) -> gpui::Div {
@@ -7877,6 +7909,7 @@ fn terminal_config_for(
         cols,
         rows,
         cursor_blink: settings.cursor_blink,
+        cursor_style: cursor_style_for(settings.cursor_style),
         smooth_scrolling: settings.smooth_scrolling,
         scrollback: settings.scrollback,
         line_height_multiplier: settings.line_height,
@@ -8029,11 +8062,24 @@ fn palette_for(theme: &Theme) -> ColorPalette {
     builder.build()
 }
 
+/// laterterm_config 光标样式 → termview 光标样式。
+///
+/// 两 crate 不互依，各自持一份枚举；match 穷尽映射，新增形状漏接时编译期报错。
+/// 注意：workspace.rs 顶部已 `use gpui::CursorStyle`（指针样式），此处的
+/// 光标形状枚举一律写全路径，避免裸名解析到 gpui 的同名枚举。
+fn cursor_style_for(style: laterterm_config::CursorStyle) -> laterterm_termview::CursorStyle {
+    match style {
+        laterterm_config::CursorStyle::Block => laterterm_termview::CursorStyle::Block,
+        laterterm_config::CursorStyle::Bar => laterterm_termview::CursorStyle::Bar,
+        laterterm_config::CursorStyle::Underline => laterterm_termview::CursorStyle::Underline,
+    }
+}
+
 #[cfg(test)]
 mod exit_regression_tests {
     use super::{
         PaneDirection, SplitDirection, WorkspaceView, config_event_requires_reload,
-        keystroke_matches_shortcut, pane_direction_for_keystroke,
+        cursor_style_for, keystroke_matches_shortcut, pane_direction_for_keystroke,
     };
     use gpui::{KeyDownEvent, Keystroke, MouseDownEvent, TestAppContext};
 
@@ -8165,6 +8211,30 @@ mod exit_regression_tests {
             view.apply_appearance(cx);
             for pane in &view.panes {
                 assert_eq!(pane.terminal.read(cx).config().cursor_blink, enabled);
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn cursor_style_setting_updates_existing_panes(cx: &mut TestAppContext) {
+        use laterterm_config::CursorStyle;
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            view.spawn_tab(window, cx);
+            // config() 返回 termview 侧 TerminalConfig，断言值须映射成 termview 枚举
+            for target in [CursorStyle::Bar, CursorStyle::Underline, CursorStyle::Block] {
+                view.settings.appearance.cursor_style = target;
+                view.apply_appearance(cx);
+                for pane in &view.panes {
+                    assert_eq!(
+                        pane.terminal.read(cx).config().cursor_style,
+                        cursor_style_for(target),
+                        "光标样式 {target:?} 应热更新到既有窗格"
+                    );
+                }
+            }
+            for pane in &view.panes {
                 pane.session.close();
             }
         });

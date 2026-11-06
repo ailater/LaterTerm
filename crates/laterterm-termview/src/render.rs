@@ -50,19 +50,23 @@
 //!
 //! ```ignore
 //! use gpui::px;
-//! use gpui_terminal::{ColorPalette, TerminalRenderer};
+//! use laterterm_termview::{ColorPalette, CursorStyle, TerminalRenderer};
 //!
 //! let renderer = TerminalRenderer::new(
 //!     "JetBrains Mono".to_string(),
 //!     px(14.0),
 //!     1.0,  // line height multiplier
 //!     ColorPalette::default(),
+//!     true,      // 连字
+//!     Vec::new(), // 备选字体链
+//!     CursorStyle::Block,
 //! );
 //! ```
 
 use crate::box_drawing;
 use crate::colors::ColorPalette;
 use crate::event::GpuiEventProxy;
+use crate::view::CursorStyle;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use alacritty_terminal::term::Term;
@@ -107,6 +111,58 @@ pub fn preedit_layout(text: &str, start_col: usize, columns: usize) -> Vec<(usiz
         col += width;
     }
     placed
+}
+
+/// 按光标样式计算光标矩形的几何（纯函数，无窗口依赖，可测）。
+///
+/// - Block：占满整格（历史行为不变，quad 盖字的现状保持）；
+/// - Bar：光标列左缘的竖条，高度为整格；
+/// - Underline：贴格底的横条，宽度为整格。
+///
+/// 细条厚度按单元格尺寸取比例（格宽 15% / 格高 10%）并用 `.max(px(1.0))`
+/// 兜底：纯几何随字体度量缩放，4K 缩放下按比例不失真，也不会薄到不可见。
+pub fn cursor_rect(
+    style: CursorStyle,
+    cursor_x: Pixels,
+    cursor_y: Pixels,
+    cell_width: Pixels,
+    cell_height: Pixels,
+) -> Bounds<Pixels> {
+    match style {
+        CursorStyle::Block => Bounds {
+            origin: Point {
+                x: cursor_x,
+                y: cursor_y,
+            },
+            size: Size {
+                width: cell_width,
+                height: cell_height,
+            },
+        },
+        CursorStyle::Bar => Bounds {
+            origin: Point {
+                x: cursor_x,
+                y: cursor_y,
+            },
+            size: Size {
+                width: (cell_width * 0.15).max(px(1.0)),
+                height: cell_height,
+            },
+        },
+        CursorStyle::Underline => {
+            let thickness = (cell_height * 0.1).max(px(1.0));
+            Bounds {
+                origin: Point {
+                    x: cursor_x,
+                    y: cursor_y + cell_height - thickness,
+                },
+                size: Size {
+                    width: cell_width,
+                    height: thickness,
+                },
+            }
+        }
+    }
 }
 
 /// A batched run of text with consistent styling.
@@ -227,6 +283,9 @@ pub struct TerminalRenderer {
     /// 备选字体链：主字体缺字时按序回退（如 CJK）；空表示系统默认回退
     pub font_fallbacks: Vec<String>,
 
+    /// 光标形状：方块 / 竖线 / 下划线；默认方块（历史行为）
+    pub cursor_style: CursorStyle,
+
     /// Color palette for resolving terminal colors
     pub palette: ColorPalette,
 
@@ -243,6 +302,9 @@ impl TerminalRenderer {
     /// * `font_size` - The font size in pixels
     /// * `line_height_multiplier` - Multiplier for line height (e.g., 1.2 for 20% extra)
     /// * `palette` - The color palette to use for terminal colors
+    /// * `ligatures` - Whether to enable ligatures (calt)
+    /// * `font_fallbacks` - Fallback fonts for missing glyphs (e.g., CJK)
+    /// * `cursor_style` - Cursor shape: block, bar, or underline
     ///
     /// # Returns
     ///
@@ -250,12 +312,20 @@ impl TerminalRenderer {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// use gpui::px;
-    /// use gpui_terminal::render::TerminalRenderer;
-    /// use gpui_terminal::ColorPalette;
+    /// use laterterm_termview::render::TerminalRenderer;
+    /// use laterterm_termview::{ColorPalette, CursorStyle};
     ///
-    /// let renderer = TerminalRenderer::new("Fira Code".to_string(), px(14.0), 1.0, ColorPalette::default(), true, Vec::new());
+    /// let renderer = TerminalRenderer::new(
+    ///     "Fira Code".to_string(),
+    ///     px(14.0),
+    ///     1.0,
+    ///     ColorPalette::default(),
+    ///     true,
+    ///     Vec::new(),
+    ///     CursorStyle::Block,
+    /// );
     /// ```
     pub fn new(
         font_family: String,
@@ -264,6 +334,7 @@ impl TerminalRenderer {
         palette: ColorPalette,
         ligatures: bool,
         font_fallbacks: Vec<String>,
+        cursor_style: CursorStyle,
     ) -> Self {
         // Default cell dimensions - will be measured on first paint
         // Using 0.6 as approximate em-width ratio for monospace fonts
@@ -278,6 +349,7 @@ impl TerminalRenderer {
             line_height_multiplier,
             ligatures,
             font_fallbacks,
+            cursor_style,
             palette,
             needs_measurement: true,
         }
@@ -812,16 +884,13 @@ impl TerminalRenderer {
             colors,
         );
 
-        let cursor_bounds = Bounds {
-            origin: Point {
-                x: cursor_x,
-                y: cursor_y,
-            },
-            size: Size {
-                width: self.cell_width,
-                height: self.cell_height,
-            },
-        };
+        let cursor_bounds = cursor_rect(
+            self.cursor_style,
+            cursor_x,
+            cursor_y,
+            self.cell_width,
+            self.cell_height,
+        );
 
         window.paint_quad(quad(
             cursor_bounds,
@@ -905,6 +974,7 @@ mod tests {
             ColorPalette::default(),
             true,
             Vec::new(),
+            CursorStyle::Block,
         );
         assert_eq!(renderer.font_family, "Fira Code");
         assert_eq!(renderer.font_size, px(14.0));
@@ -950,6 +1020,7 @@ mod tests {
             ColorPalette::default(),
             true,
             Vec::new(),
+            CursorStyle::Block,
         );
         let black = Hsla::black();
 
@@ -972,6 +1043,34 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].start_col, 0);
         assert_eq!(merged[0].end_col, 10);
+    }
+
+    #[test]
+    fn cursor_rect_shapes() {
+        let (cw, ch) = (px(8.0), px(20.0));
+
+        // 方块：占满整格（历史行为）
+        let block = cursor_rect(CursorStyle::Block, px(10.0), px(40.0), cw, ch);
+        assert_eq!((block.size.width, block.size.height), (cw, ch));
+
+        // 竖线：左缘对齐光标列，高度整格，宽度按比例且小于格宽
+        let bar = cursor_rect(CursorStyle::Bar, px(10.0), px(40.0), cw, ch);
+        assert_eq!(bar.origin.x, px(10.0));
+        assert_eq!(bar.size.height, ch);
+        assert!(bar.size.width < cw);
+        assert_eq!(bar.size.width, (cw * 0.15).max(px(1.0)));
+
+        // 下划线：宽度整格，贴格底，厚度按比例且小于格高
+        let under = cursor_rect(CursorStyle::Underline, px(10.0), px(40.0), cw, ch);
+        assert_eq!(under.size.width, cw);
+        assert_eq!(under.origin.y + under.size.height, px(60.0));
+        assert!(under.size.height < ch);
+
+        // 高 DPI 兜底：格尺寸极小时厚度不薄于 1px
+        let tiny_bar = cursor_rect(CursorStyle::Bar, px(0.0), px(0.0), px(2.0), px(3.0));
+        assert_eq!(tiny_bar.size.width, px(1.0));
+        let tiny_under = cursor_rect(CursorStyle::Underline, px(0.0), px(0.0), px(2.0), px(3.0));
+        assert_eq!(tiny_under.size.height, px(1.0));
     }
 }
 

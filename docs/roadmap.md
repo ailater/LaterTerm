@@ -195,7 +195,7 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 | 1 | 三平台打包矩阵：Linux（AppImage + deb）、Windows（msi）、macOS（dmg），CI 发版链照抄 LaterMD 经验（auto-tag + 版本注入 Release 正文） |
 | 2 | Quake 下拉模式（全局快捷键顶部滑出） |
 | 3 | 广播输入（多会话同步键入） |
-| 4 | 动效与无障碍打磨；首启动引导（默认 shell/字体探测）；终端光标样式可配置（方块/竖线/下划线 + 闪烁）；Quake 全局热键走 portal GlobalShortcuts（方案与 LaterScreen 四坑结论见 architecture.md） |
+| 4 | 动效与无障碍打磨；首启动引导（默认 shell/字体探测）；终端光标样式可配置（方块/竖线/下划线 + 闪烁）——2026-11-06 落地：闪烁随 M1 完成，形状三选一（设置面板 + apply_appearance 热更新 + serde 旧配置兼容）已实现；Quake 全局热键走 portal GlobalShortcuts（方案与 LaterScreen 四坑结论见 architecture.md） |
 
 **验收**：v0.1.0 发布，README 附真机截图（复用 LaterMD 的无头截图生成思路可选项）。
 

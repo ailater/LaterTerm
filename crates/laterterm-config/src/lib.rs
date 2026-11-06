@@ -76,6 +76,24 @@ impl PanelShortcuts {
     }
 }
 
+/// 终端光标形状。TOML 中以小写字符串存储（`cursor_style = "block"`）。
+///
+/// `Block` 上标 `#[serde(other)]`：手改出未知值时降级为方块，而不是让整份
+/// settings.toml 解析失败——否则 `load_or_default` 会静默回退全默认，下次
+/// 保存即覆盖用户整个配置文件。serde 要求 `other` 变体必须声明在末位，
+/// 故 Block 物理上排最后；逻辑默认仍为方块（见 `Appearance::default()`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorStyle {
+    /// 竖线（光标列左缘的细竖条）。
+    Bar,
+    /// 下划线（贴格底的横条）。
+    Underline,
+    /// 方块（默认，占满整格）。
+    #[serde(other)]
+    Block,
+}
+
 /// 外观项。数值范围与设置面板的步进按钮一致。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -96,6 +114,9 @@ pub struct Appearance {
     /// 光标闪烁。默认开启；关闭后光标常显。
     #[serde(default = "default_true")]
     pub cursor_blink: bool,
+
+    /// 光标形状：方块 / 竖线 / 下划线。默认方块；旧配置缺字段自动得方块。
+    pub cursor_style: CursorStyle,
 
     /// 平滑滚动：滚轮/触控板按像素累积连续滚动。默认开启。
     #[serde(default = "default_true")]
@@ -120,6 +141,7 @@ impl Default for Appearance {
             theme: DEFAULT_THEME.into(),
             ligatures: true,
             cursor_blink: true,
+            cursor_style: CursorStyle::Block,
             smooth_scrolling: true,
             font_fallbacks: Vec::new(),
             downloads_dir: String::new(),
@@ -603,6 +625,27 @@ shortcut = "  legacy shortcut  "
         let loaded = Settings::load(&path).unwrap();
         assert!(!loaded.appearance.cursor_blink);
         assert!(!loaded.appearance.smooth_scrolling);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn cursor_style_defaults_roundtrip_and_unknown_falls_back() {
+        // 旧文件缺 cursor_style 字段 → 容器级 serde(default) 得 Block
+        let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert_eq!(legacy.appearance.cursor_style, CursorStyle::Block);
+
+        // 合法值 roundtrip：TOML 输出 lowercase，保存/加载相等
+        let path = temp_settings_path("cursor-style");
+        let mut settings = Settings::default();
+        settings.appearance.cursor_style = CursorStyle::Underline;
+        settings.save_to(&path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("cursor_style = \"underline\""), "{body}");
+        assert_eq!(Settings::load(&path).unwrap(), settings);
+
+        // 手改坏值：serde(other) 兜底为 Block，整份配置不解析失败
+        let patched: Settings = toml::from_str("[appearance]\ncursor_style = \"wave\"\n").unwrap();
+        assert_eq!(patched.appearance.cursor_style, CursorStyle::Block);
         std::fs::remove_file(&path).unwrap();
     }
 
