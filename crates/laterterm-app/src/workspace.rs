@@ -1939,6 +1939,7 @@ impl WorkspaceView {
                 config.cursor_blink = appearance.cursor_blink;
                 config.cursor_style = cursor_style_for(appearance.cursor_style);
                 config.font_fallbacks = appearance.font_fallbacks.clone();
+                config.copy_on_select = appearance.copy_on_select;
                 terminal.update_config(config, cx);
             });
         }
@@ -7780,6 +7781,18 @@ fn settings_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>
                         |s: &mut Appearance, value| s.smooth_scrolling = value,
                     ),
                 ))
+                .child(setting_row(
+                    // 拖拽/双击/三击出选区松开即复制（Deepin 同款），不只限拖拽
+                    "选中即复制",
+                    div(),
+                    toggle_controls(
+                        cx,
+                        ("开", true),
+                        ("关", false),
+                        settings.copy_on_select,
+                        |s: &mut Appearance, value| s.copy_on_select = value,
+                    ),
+                ))
                 .child(
                     div()
                         .flex()
@@ -8463,6 +8476,7 @@ fn terminal_config_for(
         cursor_blink: settings.cursor_blink,
         cursor_style: cursor_style_for(settings.cursor_style),
         smooth_scrolling: settings.smooth_scrolling,
+        copy_on_select: settings.copy_on_select,
         scrollback: settings.scrollback,
         line_height_multiplier: settings.line_height,
         padding: Edges::all(px(settings.padding)),
@@ -8632,6 +8646,7 @@ mod exit_regression_tests {
     use super::{
         PaneDirection, SplitDirection, WorkspaceView, config_event_requires_reload,
         cursor_style_for, keystroke_matches_shortcut, pane_direction_for_keystroke,
+        terminal_config_for,
     };
     use gpui::{KeyDownEvent, Keystroke, MouseDownEvent, TestAppContext};
 
@@ -8763,6 +8778,29 @@ mod exit_regression_tests {
             view.apply_appearance(cx);
             for pane in &view.panes {
                 assert_eq!(pane.terminal.read(cx).config().cursor_blink, enabled);
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn copy_on_select_setting_updates_existing_panes(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            view.spawn_tab(window, cx);
+            let enabled = !view.panes[0].terminal.read(cx).config().copy_on_select;
+            view.settings.appearance.copy_on_select = enabled;
+            // 既有窗格链路：apply_appearance 逐窗格热更新
+            view.apply_appearance(cx);
+            for pane in &view.panes {
+                assert_eq!(pane.terminal.read(cx).config().copy_on_select, enabled);
+            }
+            // 新窗格链路：terminal_config_for 产出同值
+            let appearance = view.settings.appearance.clone();
+            let theme = view.themes.resolve(&appearance.theme);
+            let config = terminal_config_for(&appearance, theme, 80, 24);
+            assert_eq!(config.copy_on_select, enabled, "新建窗格应继承同值");
+            for pane in &view.panes {
                 pane.session.close();
             }
         });

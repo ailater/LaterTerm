@@ -200,6 +200,10 @@ pub struct TerminalConfig {
     /// 平滑滚动：滚轮/触控板按像素累积连续滚动，而不是一次跳一整行。
     /// 默认开启。
     pub smooth_scrolling: bool,
+
+    /// 选中即复制：左键拖拽/双击/三击出有效选区后松开，自动写入剪贴板
+    /// （Deepin 终端同款体验）。默认开启。
+    pub copy_on_select: bool,
 }
 
 impl Default for TerminalConfig {
@@ -218,6 +222,7 @@ impl Default for TerminalConfig {
             cursor_blink: true,
             cursor_style: CursorStyle::Block,
             smooth_scrolling: true,
+            copy_on_select: true,
         }
     }
 }
@@ -1239,6 +1244,12 @@ impl TerminalView {
             term.selection = finalized;
         });
         cx.notify();
+        // 选中即复制：只挂在有效选区支路（前两条支路已提前 return——上报接管
+        // 期间无本地选区、单击清选区路径无有效选区），finalize 后 has_selection
+        // 恰好等价于 to_range 非空；copy_selection 自带空文本保护。
+        if self.config.copy_on_select && self.has_selection() {
+            self.copy_selection(cx);
+        }
     }
 
     /// Handle mouse move events: 按住左键拖拽时更新选区终点。
@@ -2457,6 +2468,133 @@ mod tests {
             );
             view.on_mouse_up(&up(gpui::point(gpui::px(5.0), gpui::px(10.0))), window, cx);
             assert!(!view.has_selection(), "单击未拖拽不应留下选区");
+        });
+    }
+
+    #[gpui::test]
+    fn copy_on_select_auto_copies_valid_selection_on_mouse_up(cx: &mut TestAppContext) {
+        use gpui::{ClipboardItem, Modifiers, MouseMoveEvent, MouseUpEvent};
+
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            view.state.process_bytes(b"hello selection\r\n$ ");
+            view.last_content_origin = Some(gpui::Point {
+                x: gpui::px(0.0),
+                y: gpui::px(0.0),
+            });
+            view.renderer.cell_width = gpui::px(10.0);
+            view.renderer.cell_height = gpui::px(20.0);
+
+            let down = |position, click_count| MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count,
+                first_mouse: false,
+            };
+            let move_to = |position| MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            };
+            let up = |position| MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+
+            // 拖拽松开（默认开）→ 自动写入剪贴板
+            view.on_mouse_down(
+                &down(gpui::point(gpui::px(5.0), gpui::px(10.0)), 1),
+                window,
+                cx,
+            );
+            view.on_mouse_move(
+                &move_to(gpui::point(gpui::px(45.0), gpui::px(10.0))),
+                window,
+                cx,
+            );
+            view.on_mouse_up(&up(gpui::point(gpui::px(45.0), gpui::px(10.0))), window, cx);
+            assert!(view.has_selection(), "拖拽后应有选区");
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("hello".to_string()),
+                "拖拽松开应自动复制选中文本"
+            );
+
+            // 预写哨兵后单击清选区：不覆盖剪贴板
+            cx.write_to_clipboard(ClipboardItem::new_string("sentinel".to_string()));
+            view.on_mouse_down(
+                &down(gpui::point(gpui::px(5.0), gpui::px(10.0)), 1),
+                window,
+                cx,
+            );
+            view.on_mouse_up(&up(gpui::point(gpui::px(5.0), gpui::px(10.0))), window, cx);
+            assert!(!view.has_selection(), "单击未拖拽不应留下选区");
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("sentinel".to_string()),
+                "单击清选区路径不应覆盖剪贴板"
+            );
+        });
+
+        // 关闭开关：拖拽松开保留选区但不写剪贴板
+        let (terminal_off, cx) = cx.add_window_view(|_, cx| {
+            let config = TerminalConfig {
+                copy_on_select: false,
+                ..TerminalConfig::default()
+            };
+            TerminalView::new(Arc::new(FinishedSession), config, cx)
+        });
+        terminal_off.update_in(cx, |view, window, cx| {
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("sentinel".to_string()));
+            view.state.process_bytes(b"hello selection\r\n$ ");
+            view.last_content_origin = Some(gpui::Point {
+                x: gpui::px(0.0),
+                y: gpui::px(0.0),
+            });
+            view.renderer.cell_width = gpui::px(10.0);
+            view.renderer.cell_height = gpui::px(20.0);
+
+            let down = |position, click_count| MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count,
+                first_mouse: false,
+            };
+            let move_to = |position| MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            };
+            let up = |position| MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+
+            view.on_mouse_down(
+                &down(gpui::point(gpui::px(5.0), gpui::px(10.0)), 1),
+                window,
+                cx,
+            );
+            view.on_mouse_move(
+                &move_to(gpui::point(gpui::px(45.0), gpui::px(10.0))),
+                window,
+                cx,
+            );
+            view.on_mouse_up(&up(gpui::point(gpui::px(45.0), gpui::px(10.0))), window, cx);
+            assert!(view.has_selection(), "关闭开关仍应保留选区");
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some("sentinel".to_string()),
+                "开关关闭时拖拽松开不应写剪贴板"
+            );
         });
     }
 

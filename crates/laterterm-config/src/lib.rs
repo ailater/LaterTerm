@@ -154,6 +154,11 @@ pub struct Appearance {
     /// 平滑滚动：滚轮/触控板按像素累积连续滚动。默认开启。
     #[serde(default = "default_true")]
     pub smooth_scrolling: bool,
+
+    /// 选中即复制：拖拽/双击/三击松开自动写入剪贴板。默认开启；旧配置缺字段自动为 true。
+    #[serde(default = "default_true")]
+    pub copy_on_select: bool,
+
     /// 接收目录；空 = ~/Downloads。
     pub downloads_dir: String,
 }
@@ -176,6 +181,7 @@ impl Default for Appearance {
             cursor_blink: true,
             cursor_style: CursorStyle::Block,
             smooth_scrolling: true,
+            copy_on_select: true,
             font_fallbacks: Vec::new(),
             downloads_dir: String::new(),
         }
@@ -696,6 +702,22 @@ shortcut = "  legacy shortcut  "
         let loaded = Settings::load(&path).unwrap();
         assert!(!loaded.appearance.cursor_blink);
         assert!(!loaded.appearance.smooth_scrolling);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn copy_on_select_defaults_and_false_roundtrip() {
+        // 旧 settings.toml 缺 copy_on_select 字段 → serde 补默认 true
+        let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert!(legacy.appearance.copy_on_select);
+
+        // 显式关闭后 roundtrip 保持 false
+        let path = temp_settings_path("copy-on-select");
+        let mut settings = Settings::default();
+        settings.appearance.copy_on_select = false;
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert!(!loaded.appearance.copy_on_select);
         std::fs::remove_file(&path).unwrap();
     }
 

@@ -147,6 +147,17 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 > （shell==None 且 font_size 不受影响），测试与 sanitize 路径重新挂钩。门禁：config lib 82、
 > termview lib 108、app bins 125 通过 1 ignored（各含 3/1/2 个新增回归测试）。
 
+> 选中即复制（2026-11-06）：左键拖拽/双击选词/三击选行出有效选区后松开自动写入剪贴板
+> （Deepin 同款，不只限拖拽——习惯性双击也会覆盖剪贴板）；Appearance/TerminalConfig 增
+> copy_on_select 默认开，旧 settings.toml 缺字段 serde 补 true（default_true，sanitize 不钳 bool）；
+> 设置→外观「选中即复制」开关经 change_setting 落盘 + apply_appearance（既有窗格热更新）/
+> terminal_config_for（新建窗格，本地与 SSH 共用）双链路生效；触发点挂在 on_mouse_up 有效选区
+> 支路 finalize 之后（上报接管/无选区/单击清选区三条提前 return 支路天然不触发）——鼠标协议
+> 上报接管（vim/tmux）期间本地选区让位不自动复制，Shift 绕过走本地选区照常自动复制；右键
+> 菜单「复制」行为不变（开关关闭后仍是唯一复制入口）；PRIMARY 选择区不在本次范围（gpui 写
+> 的是 CLIPBOARD）。门禁：config lib 83、termview lib 109、app bins 126 通过 1 ignored（各 +1
+> 新增测试：false roundtrip / 拖拽复制+单击不覆盖+开关关闭 / 传播链含新窗格）。
+
 > 主机分组与命令迁移收尾（2026-11-05）：ServerEntry 新增扁平 `group` 分组字段（TOML 可选、
 > 允许 `/`、无父子指针类型层面不成环；validate 严格报错 / normalize_group 宽容降级 None 成对，
 > 坏分组绝不丢条目，不 bump CURRENT_VERSION 双向兼容）——服务器页签按组折叠展示（组头 ▸/▾+计数，
