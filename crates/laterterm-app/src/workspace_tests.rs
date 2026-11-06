@@ -230,3 +230,130 @@ fn settings_sections_have_unique_labels_and_anchor_order() {
         );
     }
 }
+
+/// 主题色板纯函数：ANSI 行序固定（normal 黑→白 / bright 亮黑→亮白）且逐值
+/// 拷贝——预览卡展示与真实窗格色板同源，行序串位会让预览与实际不一致。
+/// 三个实例分别钉：19 色各异（行序与逐值）、gruvbox_dark（background==black、
+/// cursor==foreground==bright_white 等重值不得互串）、缺省回退基准 tokyo_night
+/// （主题 TOML 缺键的回退值即此，theme.rs Deserialize 从它起底）。
+#[test]
+fn palette_preview_orders_ansi_rows_and_copies_values() {
+    use super::workspace::{PalettePreview, palette_preview};
+    use laterterm_config::theme::ThemeColors;
+
+    fn assert_rows(preview: &PalettePreview, expected_normal: [(&str, u32); 8], expected_bright: [(&str, u32); 8]) {
+        assert_eq!(preview.normal, expected_normal, "ANSI 普通行序或取值串位");
+        assert_eq!(preview.bright, expected_bright, "ANSI 亮色行序或取值串位");
+    }
+
+    // 19 色各异：行序与逐值拷贝一一对位
+    let distinct = ThemeColors {
+        background: 0x010001,
+        foreground: 0x010002,
+        cursor: 0x010003,
+        black: 0x010004,
+        red: 0x010005,
+        green: 0x010006,
+        yellow: 0x010007,
+        blue: 0x010008,
+        magenta: 0x010009,
+        cyan: 0x01000A,
+        white: 0x01000B,
+        bright_black: 0x01000C,
+        bright_red: 0x01000D,
+        bright_green: 0x01000E,
+        bright_yellow: 0x01000F,
+        bright_blue: 0x010010,
+        bright_magenta: 0x010011,
+        bright_cyan: 0x010012,
+        bright_white: 0x010013,
+    };
+    let preview = palette_preview(&distinct);
+    assert_eq!(preview.background, 0x010001);
+    assert_eq!(preview.foreground, 0x010002);
+    assert_eq!(preview.cursor, 0x010003);
+    assert_rows(
+        &preview,
+        [
+            ("黑", 0x010004),
+            ("红", 0x010005),
+            ("绿", 0x010006),
+            ("黄", 0x010007),
+            ("蓝", 0x010008),
+            ("紫", 0x010009),
+            ("青", 0x01000A),
+            ("白", 0x01000B),
+        ],
+        [
+            ("亮黑", 0x01000C),
+            ("亮红", 0x01000D),
+            ("亮绿", 0x01000E),
+            ("亮黄", 0x01000F),
+            ("亮蓝", 0x010010),
+            ("亮紫", 0x010011),
+            ("亮青", 0x010012),
+            ("亮白", 0x010013),
+        ],
+    );
+
+    // gruvbox_dark：background==black、foreground==cursor==bright_white，
+    // 重值字段（如把 background 的值串到 black 位）不会被发现——全数组兜底
+    let gruvbox = ThemeColors::gruvbox_dark();
+    let preview = palette_preview(&gruvbox);
+    assert_eq!(preview.background, 0x282828);
+    assert_eq!(preview.foreground, 0xEBDBB2);
+    assert_eq!(preview.cursor, 0xEBDBB2);
+    assert_rows(
+        &preview,
+        [
+            ("黑", gruvbox.black),
+            ("红", gruvbox.red),
+            ("绿", gruvbox.green),
+            ("黄", gruvbox.yellow),
+            ("蓝", gruvbox.blue),
+            ("紫", gruvbox.magenta),
+            ("青", gruvbox.cyan),
+            ("白", gruvbox.white),
+        ],
+        [
+            ("亮黑", gruvbox.bright_black),
+            ("亮红", gruvbox.bright_red),
+            ("亮绿", gruvbox.bright_green),
+            ("亮黄", gruvbox.bright_yellow),
+            ("亮蓝", gruvbox.bright_blue),
+            ("亮紫", gruvbox.bright_magenta),
+            ("亮青", gruvbox.bright_cyan),
+            ("亮白", gruvbox.bright_white),
+        ],
+    );
+
+    // 缺省回退基准 tokyo_night（主题缺键回退值），同样不许串位
+    let fallback = ThemeColors::tokyo_night();
+    let preview = palette_preview(&fallback);
+    assert_eq!(preview.background, 0x1A1B26);
+    assert_eq!(preview.foreground, 0xC0CAF5);
+    assert_eq!(preview.cursor, 0xC0CAF5);
+    assert_rows(
+        &preview,
+        [
+            ("黑", fallback.black),
+            ("红", fallback.red),
+            ("绿", fallback.green),
+            ("黄", fallback.yellow),
+            ("蓝", fallback.blue),
+            ("紫", fallback.magenta),
+            ("青", fallback.cyan),
+            ("白", fallback.white),
+        ],
+        [
+            ("亮黑", fallback.bright_black),
+            ("亮红", fallback.bright_red),
+            ("亮绿", fallback.bright_green),
+            ("亮黄", fallback.bright_yellow),
+            ("亮蓝", fallback.bright_blue),
+            ("亮紫", fallback.bright_magenta),
+            ("亮青", fallback.bright_cyan),
+            ("亮白", fallback.bright_white),
+        ],
+    );
+}

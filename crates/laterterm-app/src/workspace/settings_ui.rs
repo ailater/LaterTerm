@@ -25,6 +25,7 @@ use gpui::{
     prelude::FluentBuilder, px, rgb, rgba,
 };
 use laterterm_config::{Appearance, normalize_shortcut};
+use laterterm_config::theme::ThemeColors;
 
 // ---------------------------------------------------------------------------
 // Tokyo Night 色板收敛（评审硬伤5：逐处替换、只动本模块，不按色值全局替换
@@ -166,6 +167,55 @@ pub(crate) fn settings_scroll_spy(
         current = section;
     }
     current
+}
+
+// ---------------------------------------------------------------------------
+// 主题色板预览（纯函数 + 数据，无 GPUI 依赖；UI 卡见 theme_preview_card）
+// ---------------------------------------------------------------------------
+
+/// 主题色板预览数据：背景/前景/光标三基色 + ANSI 8×2（普通行/亮色行）。
+/// 纯数据无 GPUI 依赖，行序契约见 `palette_preview`，测试见 workspace_tests.rs。
+pub(crate) struct PalettePreview {
+    /// 主题背景色（示例终端区打底）。
+    pub(crate) background: u32,
+    /// 主题前景色（示例文字着色）。
+    pub(crate) foreground: u32,
+    /// 主题光标色（示例行内光标色块）。
+    pub(crate) cursor: u32,
+    /// ANSI 普通行：固定黑→白序（black/red/green/yellow/blue/magenta/cyan/white）。
+    pub(crate) normal: [(&'static str, u32); 8],
+    /// ANSI 亮色行：固定亮黑→亮白序（bright_black..bright_white）。
+    pub(crate) bright: [(&'static str, u32); 8],
+}
+
+/// 从 `ThemeColors` 抽取预览数据：ANSI 行序固定黑→白、亮黑→亮白，逐字段
+/// 拷贝不重排——映射只此一处，UI 与测试都以此为准，改行序必须连测试同改。
+pub(crate) fn palette_preview(colors: &ThemeColors) -> PalettePreview {
+    PalettePreview {
+        background: colors.background,
+        foreground: colors.foreground,
+        cursor: colors.cursor,
+        normal: [
+            ("黑", colors.black),
+            ("红", colors.red),
+            ("绿", colors.green),
+            ("黄", colors.yellow),
+            ("蓝", colors.blue),
+            ("紫", colors.magenta),
+            ("青", colors.cyan),
+            ("白", colors.white),
+        ],
+        bright: [
+            ("亮黑", colors.bright_black),
+            ("亮红", colors.bright_red),
+            ("亮绿", colors.bright_green),
+            ("亮黄", colors.bright_yellow),
+            ("亮蓝", colors.bright_blue),
+            ("亮紫", colors.bright_magenta),
+            ("亮青", colors.bright_cyan),
+            ("亮白", colors.bright_white),
+        ],
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -507,52 +557,182 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
 /// 「滚动与主题」卡 + 恢复默认按钮。按钮原是外观页最后一个子元素，单页化
 /// 后挂在末个外观分区块内部——保持「恢复默认作用于外观设置」的语义与视觉
 /// 位置，同时不增加滚动容器直接子元素数（六节对位约束）。
+///
+/// 主题行为预览语义：色板预览卡常驻（读生效主题），点芯片只改预览态；
+/// 预览激活时在卡内追加提示行与「保存主题 / 还原」按钮。底栏「修改即时
+/// 生效」对其余设置仍成立，主题的例外文案只出现在本卡内，不全局反复横跳。
 fn settings_scrolling_body(
     workspace: &WorkspaceView,
     appearance: &Appearance,
     cx: &mut Context<WorkspaceView>,
 ) -> Vec<Div> {
-    vec![
-        setting_card()
+    // 生效主题唯一读口（预览优先）：芯片选中态、色板卡、窗格颜色三处同源。
+    let effective = workspace.effective_theme_name().to_string();
+    let preview = palette_preview(&workspace.themes.resolve(&effective).colors);
+    let previewing = workspace.theme_preview.is_some();
+    let mut theme_card = setting_card()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .py_2()
+                .child(
+                    div()
+                        .w(px(64.0))
+                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .child("回滚"),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .child(scrollback_controls(cx, appearance)),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .py_2()
+                .child(
+                    div()
+                        .w(px(64.0))
+                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .child("主题"),
+                )
+                .child(theme_controls(cx, &workspace.themes, &effective)),
+        )
+        .child(theme_preview_card(&preview));
+    // 预览激活才出现的提交/放弃控件与提示行——全部塞进本分区块内部，
+    // 不得新增滚动容器直接子元素（settings_content 六节对位硬约束）。
+    if previewing {
+        theme_card = theme_card
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .py_2()
-                    .child(
-                        div()
-                            .w(px(64.0))
-                            .text_color(rgb(COLOR_TEXT_SECONDARY))
-                            .child("回滚"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_1()
-                            .child(scrollback_controls(cx, appearance)),
-                    ),
+                    .pt_1()
+                    .text_size(px(11.0))
+                    .text_color(rgb(COLOR_ACCENT))
+                    .child("预览中：保存后生效，关面板自动还原"),
             )
             .child(
                 div()
+                    .debug_selector(|| "theme-preview-actions".into())
                     .flex()
-                    .items_center()
-                    .gap_2()
-                    .py_2()
-                    .child(
-                        div()
-                            .w(px(64.0))
-                            .text_color(rgb(COLOR_TEXT_SECONDARY))
-                            .child("主题"),
-                    )
-                    .child(theme_controls(cx, &workspace.themes, &appearance.theme)),
-            ),
+                    .gap_1()
+                    .child(setting_button(
+                        "保存主题",
+                        true,
+                        cx.listener(|this, event, window, cx| {
+                            this.commit_theme_preview(event, window, cx)
+                        }),
+                    ))
+                    .child(setting_button(
+                        "还原",
+                        false,
+                        cx.listener(|this, _event, _window, cx| {
+                            cx.stop_propagation();
+                            this.cancel_theme_preview(cx);
+                        }),
+                    )),
+            );
+    }
+    vec![
+        theme_card,
         setting_button(
             "恢复默认",
             false,
             cx.listener(WorkspaceView::reset_settings),
         ),
     ]
+}
+
+/// 主题色板预览卡：背景/前景/光标三色块 + ANSI 8×2 网格 + 示例终端文本，
+/// 数据全部来自 `palette_preview`（生效主题；预览期间即预览主题）。中文名
+/// 以小字标签直接排在色块下——gpui tooltip 需要 AnyView 工厂无字符串糖
+/// （评审建议2），全仓尚无 .tooltip( 先例，不为此 UI 卡引入首例。
+fn theme_preview_card(preview: &PalettePreview) -> Div {
+    let color_chip = |name: &'static str, color: u32| {
+        div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .w(px(22.0))
+                    .h(px(14.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(COLOR_STROKE))
+                    .bg(rgb(color)),
+            )
+            .child(
+                div()
+                    .text_size(px(9.0))
+                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .child(name),
+            )
+    };
+    div()
+        .debug_selector(|| "theme-preview-card".into())
+        .mt_1()
+        .p_2()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .bg(rgb(COLOR_OVERLAY_BG))
+        .border_1()
+        .border_color(rgb(COLOR_STROKE))
+        .rounded_sm()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(color_chip("背景", preview.background))
+                .child(color_chip("前景", preview.foreground))
+                .child(color_chip("光标", preview.cursor))
+                .child(
+                    // 示例终端行：主题背景打底、前景着色、光标色块
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .overflow_hidden()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .bg(rgb(preview.background))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(rgb(preview.foreground))
+                                .child("user@laterterm:~$ ls"),
+                        )
+                        .child(
+                            div()
+                                .w(px(6.0))
+                                .h(px(12.0))
+                                .bg(rgb(preview.cursor)),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_1()
+                .children(preview.normal.iter().map(|(name, color)| color_chip(name, *color))),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_1()
+                .children(preview.bright.iter().map(|(name, color)| color_chip(name, *color))),
+        )
 }
 
 /// 「终端」节：只读信息卡（语义不变，随单页平移）。
@@ -980,6 +1160,10 @@ fn quake_toggle_controls(
         )
 }
 
+/// 主题芯片行：选中态读生效主题（预览期间高亮跟随预览，与色板卡/窗格
+/// 同源）；点击走预览语义（不落盘），保存/还原在预览卡下方的条件按钮。
+/// 芯片列表每次 render 从 `themes.names()` 现取——热加载删掉的自定义主题
+/// 自然不再渲染，预览态残留名字由 commit 的严格 get 校验兜底。
 fn theme_controls(
     cx: &mut Context<WorkspaceView>,
     themes: &laterterm_config::ThemeRegistry,
@@ -995,7 +1179,7 @@ fn theme_controls(
                 name.clone(),
                 selected,
                 cx.listener(move |this, event, window, cx| {
-                    this.change_setting(event, window, cx, |s| s.theme = name.clone());
+                    this.preview_theme(event, name.clone(), window, cx);
                 }),
             )
         }))
