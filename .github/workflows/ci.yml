@@ -45,9 +45,12 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: 安装图标检查工具
+      - name: 安装图标与打包检查工具
         run: |
-          python -m pip install Pillow==12.3.0
+          # pyyaml 是 test_workflows.py（yml 契约门禁）的依赖：setup-python
+          # 发行版不含它，缺装会在门禁首跑 ModuleNotFoundError，故钉版安装；
+          # test_workflows.py 由下方 unittest discover 自动纳入，无需单列执行行
+          python -m pip install Pillow==12.3.0 pyyaml==6.0.3
           sudo apt-get install -y --no-install-recommends desktop-file-utils
 
       - name: 图标与打包资源

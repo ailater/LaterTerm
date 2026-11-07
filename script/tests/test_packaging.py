@@ -2,8 +2,10 @@
 """Packaging contract tests; stdlib only."""
 from pathlib import Path
 import os
+import shutil
 import subprocess
 import tempfile
+import tomllib
 import unittest
 import plistlib
 
@@ -133,6 +135,84 @@ class PackagingTests(unittest.TestCase):
             text = plist.read_text()
             self.assertIn("io.github.crazykun.LaterTerm", text)
             self.assertIn("laterterm.icns", text)
+
+    def test_deb_staging_control_and_dpkg_build(self):
+        if shutil.which("dpkg-deb") is None:
+            self.skipTest("本机无 dpkg-deb")
+        script = ROOT / "script/package-deb.sh"
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            binary = td / "laterterm fixture"
+            binary.write_text("#!/bin/sh\n")
+            binary.chmod(0o755)
+            staging = td / "staging"
+            r = subprocess.run([script, "--binary", str(binary), "--output", str(staging)], text=True, capture_output=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            # control 字段与 workspace Cargo.toml 版本一致（tomllib 读取，不依赖行序）
+            version = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+            control = (staging / "DEBIAN/control").read_text()
+            self.assertIn("Package: laterterm\n", control)
+            self.assertIn(f"Version: {version}\n", control)
+            self.assertIn("Architecture: amd64\n", control)
+            self.assertIn("Depends:", control)
+            # 暂存树：usr/bin + desktop + hicolor + 随包文档
+            self.assertTrue((staging / "usr/bin/laterterm").exists())
+            desktop = staging / "usr/share/applications/laterterm.desktop"
+            self.assertIn('Exec="/usr/bin/laterterm"', desktop.read_text())
+            self.assertTrue((staging / "usr/share/icons/hicolor/256x256/apps/laterterm.png").exists())
+            for name in ("README.md", "CHANGELOG.md", "LICENSE"):
+                self.assertTrue((staging / f"usr/share/doc/laterterm/{name}").exists())
+            # 脚本内组包 + dpkg-deb --info 自校验；这里再独立解析一次
+            deb = td / f"laterterm_{version}_amd64.deb"
+            self.assertTrue(deb.is_file())
+            info = subprocess.run(["dpkg-deb", "--info", str(deb)], text=True, capture_output=True)
+            self.assertEqual(info.returncode, 0, info.stderr)
+            self.assertIn("Package: laterterm", info.stdout)
+            self.assertIn(f"Version: {version}", info.stdout)
+
+    def test_deb_refuses_existing_staging_and_deb(self):
+        if shutil.which("dpkg-deb") is None:
+            self.skipTest("本机无 dpkg-deb")
+        script = ROOT / "script/package-deb.sh"
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            binary = td / "laterterm"
+            binary.write_text("#!/bin/sh\n")
+            binary.chmod(0o755)
+            staging = td / "staging"
+            first = subprocess.run([script, "--binary", str(binary), "--output", str(staging)], text=True, capture_output=True)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            version = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
+            deb = td / f"laterterm_{version}_amd64.deb"
+            before_deb = deb.read_bytes()
+            # 暂存目录已存在 → 拒绝且不碰已有产物
+            second = subprocess.run([script, "--binary", str(binary), "--output", str(staging)], text=True, capture_output=True)
+            self.assertNotEqual(second.returncode, 0)
+            self.assertEqual(deb.read_bytes(), before_deb)
+            # 换新暂存目录但 .deb 已存在 → 同样拒绝
+            third = subprocess.run([script, "--binary", str(binary), "--output", str(td / "staging2")], text=True, capture_output=True)
+            self.assertNotEqual(third.returncode, 0)
+            self.assertEqual(deb.read_bytes(), before_deb)
+
+    def test_appimage_dry_run_stages_appdir_without_artifact(self):
+        script = ROOT / "script/package-appimage.sh"
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            binary = td / "laterterm"
+            binary.write_text("#!/bin/sh\n")
+            binary.chmod(0o755)
+            out = td / "out"
+            r = subprocess.run([script, "--binary", str(binary), "--output", str(out), "--dry-run"], text=True, capture_output=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            appdir = out / "LaterTerm.AppDir"
+            self.assertTrue((appdir / "usr/bin/laterterm").exists())
+            desktop = appdir / "usr/share/applications/laterterm.desktop"
+            text = desktop.read_text()
+            self.assertIn("Exec=laterterm", text)
+            self.assertIn("Icon=laterterm", text)
+            self.assertTrue((appdir / "usr/share/icons/hicolor/128x128/apps/laterterm.png").exists())
+            # 无 linuxdeploy（或 dry-run）时不产 .AppImage，只停在 AppDir + 元数据校验
+            self.assertEqual(list(out.glob("*.AppImage")), [])
 
 if __name__ == "__main__":
     unittest.main()

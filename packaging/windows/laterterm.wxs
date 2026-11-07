@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  LaterTerm Windows msi 清单（WiX v4+ 单命令语法：`wix build`）。
+
+  状态（2026-11-07，评审定级）：本清单暂未接入 release.yml。硬阻塞在源码层——
+  laterterm-ssh 在 Windows 下不可编译：crates/laterterm-ssh/src/lib.rs:841 的
+  russh AgentClient::connect_env() 仅 #[cfg(unix)]，本文件内无平台守卫，
+  MSVC 下 E0599（v0.2.0 release 的 build-windows 构建步已实跑失败被
+  continue-on-error 吞掉）；laterterm-app 对 laterterm-ssh 无条件依赖
+  （crates/laterterm-app/Cargo.toml:24）。前置条件 = Windows 下
+  laterterm-ssh 编过；届时接线步骤（本任务范围外；XML 注释禁双连字符，
+  长参数名在此改述）：
+    1. dotnet tool install（全局安装 wix 工具并锁定具体版本号；v4+ CLI，
+       .NET SDK runner 预装。runner 镜像仍预装 WiX 3.14 candle/light，
+       但按全新未验链处理、不依赖预装）
+    2. wix build -arch x64 -dLaterTermVersion=<tag 剥 v> \
+         -dLaterTermExe=<target/release/laterterm.exe 路径> \
+         -dLaterTermIco=assets/icons/laterterm.ico \
+         -o laterterm_<版本>_x64.msi packaging/windows/laterterm.wxs
+    3. build-windows 去掉 continue-on-error（msi 成为交付物后静默缺平台比挂链更糟）
+
+  已知边界：WiX v4 默认无完整安装向导 UI（需另挂 WixToolset.UI.wixext），
+  本清单不含 UI 序列——msiexec /i 静默安装与 /qn 可用，交互式只有最小 UI。
+
+  签名占位（不在本任务范围）：产物 msi 需 Authenticode 签名时在接线步加
+  signtool sign /fd SHA256 /tr <时间戳服务> /td SHA256（证书待定）。
+
+  UpgradeCode 固定约定：生成一次永不更改，否则升级链（MajorUpgrade 检测）断裂；
+  test_workflows.py 断言其为下述精确值，改动会红。
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="LaterTerm"
+    Manufacturer="crazykun"
+    Version="$(LaterTermVersion)"
+    UpgradeCode="064cb4a5-5d90-4cbf-80ae-4719ca4b47f0"
+    Scope="perMachine"
+    Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="已安装更新版本的 LaterTerm，请先卸载。" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="LaterTerm" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ProgramMenuDir" Name="LaterTerm" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="MainExecutable">
+        <File Id="LaterTermExe" Name="laterterm.exe" Source="$(LaterTermExe)" KeyPath="yes" />
+        <Shortcut
+          Id="StartMenuLaterTerm"
+          Directory="ProgramMenuDir"
+          Name="LaterTerm"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="LaterTermIcon.exe"
+          Advertise="yes" />
+      </Component>
+      <Component Id="AppIcon">
+        <File Id="LaterTermIco" Name="laterterm.ico" Source="$(LaterTermIco)" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Icon Id="LaterTermIcon.exe" SourceFile="$(LaterTermIco)" />
+    <Property Id="ARPPRODUCTICON" Value="LaterTermIcon.exe" />
+
+    <Feature Id="Main" Title="LaterTerm" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+  </Package>
+</Wix>

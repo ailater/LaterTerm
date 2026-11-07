@@ -27,6 +27,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # 钉 CI 验证过的提交（LaterMD auto-tag.yml:46 同款）：默认 checkout
+          # 取 main HEAD，并发合入时可能指向比 CI 验证更新的提交
+          ref: ${{ github.event.workflow_run.head_sha }}
           # 需要拉全部 tag 做比对
           fetch-depth: 0
 
@@ -34,7 +37,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          set -euo pipefail
+          # 版本读取不依赖字段行序 + SemVer 校验（照抄 LaterMD auto-tag.yml:53-57，
+          # 实跑验证过的模式；grep '^version' 在 workspace 字段重排时会静默拿错值。
+          # tomllib 需 python3.11+，本 job 跑 ubuntu-latest（3.12+），无 22.04 前提问题）
+          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['workspace']['package']['version'])")
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Cargo.toml 版本号 $VERSION 不是合法 SemVer,中止" >&2
+            exit 1
+          fi
           TAG="v${VERSION}"
           echo "Cargo.toml 版本: $VERSION → tag: $TAG"
 
@@ -44,7 +55,7 @@ jobs:
             exit 0
           fi
 
-          # tag 指向当前 main HEAD（CI 已绿）
+          # tag 指向 CI 验证过的提交（上方 head_sha 钉定）
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "$TAG" -m "LaterTerm $TAG"

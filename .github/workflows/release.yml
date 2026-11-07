@@ -1,7 +1,13 @@
 # LaterTerm release：tag → 三平台构建 → GitHub Release
 #
-# 由 auto-tag.yml 在版本号变化时自动 dispatch，也可手动 workflow_dispatch。
-# 产物：Linux x64 tar.xz + macOS 双架构 dmg（M4 首版；Windows 后续）。
+# 由 auto-tag.yml 在版本号变化时自动 dispatch，也可手动 workflow_dispatch / 推 tag 触发。
+# 产物：Linux x64 tar.xz + deb + AppImage、macOS 双架构 dmg、Windows zip。
+#
+# 预演口径（不要对旧 tag dispatch）：workflow_dispatch 按指定 ref 取该 ref 上的
+# workflow 文件——对 v0.1.0 这类旧 tag dispatch 只会跑旧 release.yml，验不到新文件；
+# 且旧 Release 已存在，末尾 gh release create（无 --clobber 语义）在跑完三平台
+# 构建后必失败。正确预演 = 合并后在 main 上推一次性 tag（push: tags 会在 tag ref
+# 上取到新文件）；预演重跑前先 `gh release delete <tag> --yes`。
 
 name: Release
 
@@ -18,10 +24,19 @@ env:
 
 jobs:
   build-linux:
-    name: Linux x64 构建
-    runs-on: ubuntu-latest
+    name: Linux x64 构建（tar.xz + deb + AppImage）
+    # 钉 ubuntu-22.04：glibc 下限跟随构建机（2.35），压低兼容线；
+    # LaterMD 发版链同口径（linux-deb.yml 钉 22.04）。
+    # 边界：GPUI vendor 依赖在 22.04 上的编译未经 CI 实跑裁决（ci.yml 门禁一直跑
+    # ubuntu-latest）；若首跑编不过，回退 ubuntu-24.04 并在 README/Release 正文声明 glibc 下限。
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      # 22.04 系统 python3 是 3.10，无 tomllib；版本步（tomllib 读版本）由这里提供 3.12
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - uses: dtolnay/rust-toolchain@master
         with:
@@ -32,31 +47,80 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev \
-            libxcb1-dev libasound2-dev libudev-dev libfontconfig1-dev pkg-config
+            libxcb1-dev libasound2-dev libudev-dev libfontconfig1-dev pkg-config \
+            desktop-file-utils
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-linux
+          # 镜像从 ubuntu-latest 钉到 22.04，换 key 防旧镜像缓存串味
+          key: release-linux-22.04
 
       - name: 构建
-        run: cargo build --release -p laterterm-app --bin laterterm
+        run: cargo build --release --locked -p laterterm-app --bin laterterm
+
+      - name: 读取版本号（tomllib + SemVer 校验）
+        # 不用 grep '^version'：它依赖字段行序，workspace 字段重排会静默拿错值；
+        # 本段照抄 LaterMD auto-tag.yml:53-57（实跑验证过的模式）
+        run: |
+          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['workspace']['package']['version'])")
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Cargo.toml 版本号 $VERSION 不是合法 SemVer，中止" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: 打包 tar.xz
         run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           mkdir -p laterterm-${VERSION}
           cp target/release/laterterm laterterm-${VERSION}/
           cp README.md laterterm-${VERSION}/
           tar -cJf laterterm-${VERSION}-x86_64-unknown-linux-gnu.tar.xz laterterm-${VERSION}/
           sha256sum laterterm-${VERSION}-x86_64-unknown-linux-gnu.tar.xz > laterterm-${VERSION}-x86_64-unknown-linux-gnu.tar.xz.sha256
 
+      - name: 打包 deb
+        # 打包脚本强制绝对路径（package-assets.py absolute_path 对相对路径直接拒绝），
+        # $PWD 即 runner 的仓库工作区根；mv 与 --output 父目录配套
+        run: |
+          python3 -I script/package-assets.py deb \
+            --binary "$PWD/target/release/laterterm" \
+            --output "$PWD/packaging-staging/deb"
+          mv packaging-staging/laterterm_${VERSION}_amd64.deb .
+          sha256sum laterterm_${VERSION}_amd64.deb > laterterm_${VERSION}_amd64.deb.sha256
+
+      - name: 打包 AppImage（钉版 linuxdeploy）
+        run: |
+          # 钉具体 release 版本号，追 latest 会在上游换行为时静默翻车；
+          # runner 无 FUSE，脚本内以 --appimage-extract-and-run 运行
+          # --binary/--output/--linuxdeploy 均传绝对路径（脚本强制，且脚本会 cd 进输出目录）
+          curl -fsSLo linuxdeploy.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20251107-1/linuxdeploy-x86_64.AppImage
+          bash script/package-appimage.sh \
+            --binary "$PWD/target/release/laterterm" \
+            --output "$PWD/packaging-staging/appimage" \
+            --linuxdeploy "$PWD/linuxdeploy.AppImage" \
+            --version "$VERSION"
+          mv packaging-staging/appimage/laterterm_${VERSION}_x86_64.AppImage .
+          sha256sum laterterm_${VERSION}_x86_64.AppImage > laterterm_${VERSION}_x86_64.AppImage.sha256
+
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64
           path: |
             *.tar.xz
+            *.deb
+            *.AppImage
             *.sha256
 
+  # Windows msi 拆为后续任务（评审定级，2026-11-07）：硬阻塞在源码层——
+  # laterterm-ssh 在 Windows 下不可编译（crates/laterterm-ssh/src/lib.rs:841
+  # AgentClient::connect_env 仅 #[cfg(unix)]，本文件无平台守卫，MSVC 下 E0599；
+  # v0.2.0 release 的本 job 构建步已实跑失败、被 continue-on-error 吞掉），
+  # laterterm-app 对 laterterm-ssh 无条件依赖（crates/laterterm-app/Cargo.toml:24）。
+  # 前置 = Windows 下 laterterm-ssh 编过；届时接线 packaging/windows/laterterm.wxs
+  # （dotnet tool wix v4 钉版 + msvc-dev-cmd/GPUI_FXC_PATH 配方，见 wxs 头注释）
+  # 并去掉 continue-on-error。
+  # 现阶段保留 continue-on-error：源码修好前去守卫只会把整条发版链打成必红，
+  # 静默缺 Windows 包优于用户下载到残缺 Release（临时降级出口，见 roadmap M4-1 注记）。
   build-windows:
     name: Windows x64 构建（尽力而为）
     runs-on: windows-latest
@@ -77,6 +141,8 @@ jobs:
 
       - name: 打包 zip
         shell: bash
+        # 版本读取沿用 grep：windows runner 的 python3 别名不保证存在（通常只有 python），
+        # tomllib 健壮化随 msi 后续任务一并做
         run: |
           VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           mkdir -p laterterm-${VERSION}
@@ -114,12 +180,13 @@ jobs:
 
       - name: lipo 合一
         run: |
+          # 产物落绝对路径：下游组装 .app 的脚本强制 --binary 绝对路径
           lipo -create \
-            -output laterterm-universal \
+            -output "$PWD/laterterm-universal" \
             target/x86_64-apple-darwin/release/laterterm \
             target/aarch64-apple-darwin/release/laterterm
-          lipo -archs laterterm-universal | tee /dev/stderr | grep -q x86_64
-          lipo -archs laterterm-universal | tee /dev/stderr | grep -q arm64
+          lipo -archs "$PWD/laterterm-universal" | tee /dev/stderr | grep -q x86_64
+          lipo -archs "$PWD/laterterm-universal" | tee /dev/stderr | grep -q arm64
 
       - name: 清理构建产物腾磁盘
         run: |
@@ -127,17 +194,36 @@ jobs:
           rm -rf target/x86_64-apple-darwin/release
           df -h /
 
-      - name: 组装 .app + dmg
+      - name: 组装 .app（Info.plist @VERSION@ 注入 + icns）
+        # script/package-macos.sh 是 packaging.yml 已验证的组装配方（plutil -lint 同款）；
+        # --binary 传绝对路径（package-assets.py 的 absolute_path 拒绝相对路径）
+        run: |
+          bash script/package-macos.sh --binary "$PWD/laterterm-universal" --output "$RUNNER_TEMP/bundle"
+          plutil -lint "$RUNNER_TEMP/bundle/LaterTerm.app/Contents/Info.plist"
+
+      - name: 分步组装 dmg
         env:
           VERSION: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           VERSION_NUM="${VERSION#v}"
-          # 最小 .app bundle（Info.plist 后续补齐）
-          mkdir -p LaterTerm.app/Contents/MacOS
-          cp laterterm-universal LaterTerm.app/Contents/MacOS/laterterm
-          DMG="laterterm-${VERSION_NUM}-universal2-apple-darwin.dmg"
-          hdiutil create -volname "LaterTerm" -srcfolder LaterTerm.app \
-            -ov -format UDZO "$DMG"
+          DMG="laterterm-v${VERSION_NUM}-universal2-apple-darwin.dmg"
+          # 分步 hdiutil 是防御性对齐 LaterMD macos-dmg.yml:113-128（2026-10-25 踩坑）：
+          # 一步式「create 直接挂源目录」按源目录估算镜像容量，xattr/资源叉不计入，
+          # LaterMD v0.0.11 两跑炸 No space left；LaterTerm v0.1.0/v0.2.0 一步式跑通属
+          # 容量余量运气，改分步消除隐患（非修已观察故障）。固定大小 → 挂载 → ditto
+          # 拷入 → 卸载 → convert，每一步可独立归因。
+          df -h /System/Volumes/Data || true
+          du -sh "$RUNNER_TEMP/bundle/LaterTerm.app" || true
+          hdiutil create -size 512m -fs "HFS+" -volname "LaterTerm" \
+            -attach -ov "${RUNNER_TEMP}/laterterm-staging.dmg"
+          ditto "$RUNNER_TEMP/bundle/LaterTerm.app" "/Volumes/LaterTerm/LaterTerm.app"
+          hdiutil detach "/Volumes/LaterTerm"
+          hdiutil convert "${RUNNER_TEMP}/laterterm-staging.dmg" \
+            -format UDZO -o "$DMG"
+          # 签名/公证占位（不在本任务范围）：接入 Apple Developer ID 后在组 .app 步后加
+          #   codesign --deep --force --options runtime -s "Developer ID Application: <ID>" <.app>
+          # 与 xcrun notarytool submit + stapler staple。
           shasum -a 256 "$DMG" > "$DMG.sha256"
 
       - uses: actions/upload-artifact@v4
@@ -161,8 +247,9 @@ jobs:
       - name: 收集产物
         run: |
           mkdir -p release-assets
-          find artifacts -type f \( -name "*.tar.xz" -o -name "*.dmg" -o -name "*.zip" -o -name "*.sha256" \) \
+          find artifacts -type f \( -name "*.tar.xz" -o -name "*.deb" -o -name "*.AppImage" -o -name "*.dmg" -o -name "*.zip" -o -name "*.msi" -o -name "*.sha256" \) \
             -exec cp {} release-assets/ \;
+          # *.msi 为后续任务预留（laterterm-ssh Windows 兼容修复后接线，当前无产物不会命中）
           ls -la release-assets/
 
       - name: 提取 CHANGELOG 小节作为 Release 正文
@@ -180,6 +267,8 @@ jobs:
             echo "LaterTerm ${TAG}" > release-notes.md
           fi
 
+      # gh release create 对已存在 tag 的 Release 会失败（无 --clobber 语义）：
+      # 预演/重跑前先 `gh release delete <tag> --yes`；头部注释有完整预演口径。
       - name: 创建 GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
