@@ -2067,8 +2067,10 @@ impl Render for TerminalView {
                         use alacritty_terminal::grid::Dimensions;
 
                         // 测量已在上面的实体 render 阶段完成；闭包是 move+FnOnce，
-                        // 直接使用 move 进来的 renderer（不再每帧每窗格克隆一遍：
-                        // font_family String + font_fallbacks Vec + palette 的白拷贝）。
+                        // 直接使用 move 进来的 renderer。注意：上方 `let renderer =
+                        // self.renderer.clone()`（font_family String + font_fallbacks
+                        // Vec + palette ~4.4KB 白拷贝）本体仍在每帧路径——量级 µs 级
+                        // 非瓶颈，独立复核 2026-11-07 确认；如需消除可改 Arc 共享。
 
                         // Calculate available space after padding, clamping tiny windows safely.
                         let available_width: f32 =

@@ -411,6 +411,36 @@ pub(crate) struct ShortcutBinding {
     pub(crate) label: String,
 }
 
+/// 快捷键绑定的派生缓存（设置面板 shortcuts 节专用）：GPUI 无视图缓存，
+/// 面板打开期间每帧都渲染；本缓存让 normalize 全表 / 逐条克隆 / 无效链
+/// format! 只在 settings 实际变化后的首次渲染发生一次。
+/// 硬约束：改动 commands/servers/totp/shortcuts 的路径必须经
+/// `persist_settings`（推进 settings_version），直接改字段会得到陈旧面板。
+/// 快捷键绑定的派生缓存（设置面板 shortcuts 节专用）：GPUI 无视图缓存，
+/// 面板打开期间每帧都渲染；本缓存让 normalize 全表 / 逐条克隆 / 无效链
+/// format! 只在 settings 实际变化后的首次渲染发生一次。
+/// 硬约束：改动 commands/servers/totp/shortcuts 的路径必须经
+/// `persist_settings`（推进 settings_version），直接改字段会得到陈旧面板。
+/// 按帧访问走 [`WorkspaceView::shortcut_bindings_cache`] 的快照克隆
+/// （全 Arc，零深拷贝），避免 `&mut self` 借用钉住整个 workspace。
+#[derive(Clone)]
+struct ShortcutBindingsCache {
+    version: u64,
+    /// 全量有效绑定（含内置），行渲染与冲突计数共用。
+    bindings: Arc<Vec<ShortcutBinding>>,
+    /// 归一化键 → 出现次数（>1 即冲突）。
+    counts: Arc<BTreeMap<String, usize>>,
+    /// 与 settings.commands / servers / totp **下标对位**的归一化结果
+    /// （None = 未绑定或格式非法），面板行免每帧再 normalize。
+    command_normalized: Arc<Vec<Option<String>>>,
+    server_normalized: Arc<Vec<Option<String>>>,
+    totp_normalized: Arc<Vec<Option<String>>>,
+    /// 面板快捷键归一化（[命令面板, 服务器面板]；None 同上）。
+    panel_normalized: [Option<String>; 2],
+    /// 无效快捷键展示行（类别标签, 原文），重算时一次 format!。
+    invalid_rows: Arc<Vec<(String, String)>>,
+}
+
 /// 候选快捷键与现有绑定的冲突查找；ignore_owner 用于编辑自身时豁免。
 pub(crate) fn shortcut_conflict_with(
     bindings: &[ShortcutBinding],
@@ -748,6 +778,11 @@ pub struct WorkspaceView {
     server_group_confirm: Option<String>,
     /// 设置落盘路径（None = 用户默认配置；测试注入临时路径避免污染真实配置）。
     settings_save_path: Option<PathBuf>,
+    /// 设置数据版本：persist_settings / reload_from_disk 统一推进，
+    /// 快捷键派生缓存（[`Self::shortcut_cache`]）据此判断是否重算。
+    settings_version: u64,
+    /// 快捷键绑定派生缓存（Some = 与 settings_version 对齐）。
+    shortcut_cache: Option<ShortcutBindingsCache>,
     /// 导入来源选择弹窗（Some(已选来源) = 打开中）。
     server_import_dialog: Option<ServerImportSource>,
     /// 正在连接中的服务器名（None 表示空闲；期间禁止并发连接）。
@@ -792,7 +827,14 @@ impl WorkspaceView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let weak_workspace = cx.weak_entity();
         let first_run = !Settings::default_path().is_some_and(|path| path.exists());
-        let mut settings = Settings::load_or_default();
+        // main 启动时已读一份 settings 共享在 App 全局（StartupSettings）：
+        // 取走即得（move，零拷贝），消掉启动路径的第二次读盘+TOML 解析；
+        // 测试等直连构造路径无此全局，回退自行加载（与此前行为一致）。
+        let mut settings = if cx.has_global::<crate::StartupSettings>() {
+            cx.remove_global::<crate::StartupSettings>().0
+        } else {
+            Settings::load_or_default()
+        };
         if !settings.legacy_servers_migrated
             && settings.migrate_legacy_servers(laterterm_config::servers::ServerStore::load())
         {
@@ -878,6 +920,8 @@ impl WorkspaceView {
             server_groups_collapsed: BTreeSet::new(),
             server_group_confirm: None,
             settings_save_path: None,
+            settings_version: 0,
+            shortcut_cache: None,
             server_import_dialog: None,
             ssh_connecting: None,
             ssh_request: None,
@@ -2102,6 +2146,8 @@ impl WorkspaceView {
         if settings != self.settings || themes != self.themes {
             let quake_changed = settings.quake != self.settings.quake;
             self.settings = settings;
+            // 热加载整份替换设置：同步推进版本（快捷键派生缓存失效）
+            self.settings_version += 1;
             self.themes = themes;
             // 外部改文件后旧预览作废：不清的话关面板时预览会覆盖用户在文件里
             // 选的主题（apply_appearance 在块尾统一执行，读已保存值天然正确）。
@@ -2262,7 +2308,11 @@ impl WorkspaceView {
 
     /// 设置落盘统一入口：默认写用户配置文件；测试可注入
     /// `settings_save_path`（临时目录），避免测试导入污染真实配置。
-    fn persist_settings(&self) -> anyhow::Result<()> {
+    /// 所有改动 commands/servers/totp/shortcuts 的路径都经此汇口：
+    /// 这里统一推进设置版本，令快捷键派生缓存失效重算（保存失败回滚
+    /// 只是多做一次重算，语义仍正确）。
+    fn persist_settings(&mut self) -> anyhow::Result<()> {
+        self.settings_version += 1;
         let path = self
             .settings_save_path
             .clone()
@@ -4136,12 +4186,12 @@ impl WorkspaceView {
         if double && is_dir {
             if is_local {
                 let dir = panel.local.dir.join(&name);
-                panel.local.selected.clear();
+                Arc::make_mut(&mut panel.local.selected).clear();
                 panel.refresh_local(&dir, &self.sftp_events_tx);
             } else {
                 match sftp_panel::remote_join(&panel.remote.dir, &name) {
                     Ok(dir) => {
-                        panel.remote.selected.clear();
+                        Arc::make_mut(&mut panel.remote.selected).clear();
                         panel.refresh_remote(&dir, &self.sftp_events_tx);
                     }
                     Err(message) => panel.error = Some(message),
@@ -4153,6 +4203,8 @@ impl WorkspaceView {
             } else {
                 &mut panel.remote.selected
             };
+            // Arc 独占于帧间（渲染闭包随帧释放），make_mut 原地改写不拷贝
+            let selected = Arc::make_mut(selected);
             if selected.contains(&name) {
                 selected.remove(&name);
             } else {
@@ -4172,13 +4224,13 @@ impl WorkspaceView {
         match side {
             PaneSide::Local => {
                 if let Some(parent) = sftp_panel::local_parent(Path::new(path)) {
-                    panel.local.selected.clear();
+                    Arc::make_mut(&mut panel.local.selected).clear();
                     panel.refresh_local(&parent, &self.sftp_events_tx);
                 }
             }
             PaneSide::Remote => {
                 if let Some(parent) = sftp_panel::remote_parent(path) {
-                    panel.remote.selected.clear();
+                    Arc::make_mut(&mut panel.remote.selected).clear();
                     panel.refresh_remote(&parent, &self.sftp_events_tx);
                 }
             }
@@ -4242,7 +4294,7 @@ impl WorkspaceView {
             Ok(None) => {}
             Ok(Some(paths)) => {
                 if let Some(dir) = paths.into_iter().next() {
-                    panel.local.selected.clear();
+                    Arc::make_mut(&mut panel.local.selected).clear();
                     panel.refresh_local(&dir, &self.sftp_events_tx);
                 }
             }
@@ -4273,7 +4325,7 @@ impl WorkspaceView {
         let is_upload = kind == TransferKind::Upload;
         let mut queued = 0usize;
         let mut skipped_dirs = 0usize;
-        for name in &source_selected {
+        for name in source_selected.iter() {
             let is_dir = if is_upload {
                 panel
                     .local
@@ -4308,7 +4360,7 @@ impl WorkspaceView {
             };
             let id = self.next_sftp_transfer_id;
             self.next_sftp_transfer_id += 1;
-            panel.transfers.push(SftpTransfer {
+            Arc::make_mut(&mut panel.transfers).push(SftpTransfer {
                 id,
                 kind,
                 file_name: name.clone(),
@@ -4420,9 +4472,9 @@ impl WorkspaceView {
         panel.error = None;
         panel.notice = Some("正在执行…".to_string());
         if is_local {
-            panel.local.selected.clear();
+            Arc::make_mut(&mut panel.local.selected).clear();
         } else {
-            panel.remote.selected.clear();
+            Arc::make_mut(&mut panel.remote.selected).clear();
         }
         let events = self.sftp_events_tx.clone();
         let browse = Arc::clone(&panel.browse);
@@ -4603,9 +4655,9 @@ impl WorkspaceView {
             })
             .ok();
         if is_local {
-            panel.local.selected.clear();
+            Arc::make_mut(&mut panel.local.selected).clear();
         } else {
-            panel.remote.selected.clear();
+            Arc::make_mut(&mut panel.remote.selected).clear();
         }
         cx.notify();
     }
@@ -4768,9 +4820,94 @@ impl WorkspaceView {
         }
     }
 
+    /// 快捷键派生缓存（设置面板 shortcuts 节渲染入口）：版本不匹配才重算
+    /// 一次；返回 Arc 快照克隆（每帧仅引用计数），不持有 workspace 借用。
+    /// 保存前冲突检查等事件路径仍走 [`Self::all_shortcut_bindings`]
+    /// 即时计算，语义不受缓存影响。
+    fn shortcut_bindings_cache(&mut self) -> ShortcutBindingsCache {
+        if self
+            .shortcut_cache
+            .as_ref()
+            .is_none_or(|cache| cache.version != self.settings_version)
+        {
+            let bindings = self.all_shortcut_bindings();
+            let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+            for binding in &bindings {
+                *counts.entry(binding.normalized.clone()).or_default() += 1;
+            }
+            let normalized = |shortcut: &Option<String>| -> Option<String> {
+                shortcut.as_ref().and_then(|key| normalize_shortcut(key).ok())
+            };
+            let command_normalized: Vec<Option<String>> = self
+                .settings
+                .commands
+                .iter()
+                .map(|command| normalized(&command.shortcut))
+                .collect();
+            let server_normalized: Vec<Option<String>> = self
+                .settings
+                .servers
+                .iter()
+                .map(|server| normalized(&server.shortcut))
+                .collect();
+            let totp_normalized: Vec<Option<String>> = self
+                .settings
+                .totp
+                .iter()
+                .map(|entry| normalized(&entry.shortcut))
+                .collect();
+            let panel_normalized = [
+                normalized(&self.settings.shortcuts.commands_panel),
+                normalized(&self.settings.shortcuts.servers_panel),
+            ];
+            // 无效快捷键展示行（原文保留修复入口），重算时一次 format!
+            let mut invalid_rows: Vec<(String, String)> = Vec::new();
+            let push_invalid =
+                |rows: &mut Vec<(String, String)>, label: &str, name: &str, shortcut: &Option<String>| {
+                    if let Some(key) = shortcut
+                        && normalize_shortcut(key).is_err()
+                    {
+                        rows.push((format!("{label} {name}"), key.clone()));
+                    }
+                };
+            for command in &self.settings.commands {
+                push_invalid(&mut invalid_rows, "命令", &command.name, &command.shortcut);
+            }
+            for server in &self.settings.servers {
+                push_invalid(&mut invalid_rows, "服务器", &server.name, &server.shortcut);
+            }
+            for entry in &self.settings.totp {
+                push_invalid(&mut invalid_rows, "动态码", &entry.name, &entry.shortcut);
+            }
+            for (label, shortcut) in [
+                ("命令面板", &self.settings.shortcuts.commands_panel),
+                ("服务器面板", &self.settings.shortcuts.servers_panel),
+            ] {
+                if let Some(key) = shortcut
+                    && normalize_shortcut(key).is_err()
+                {
+                    invalid_rows.push((label.to_string(), key.clone()));
+                }
+            }
+            self.shortcut_cache = Some(ShortcutBindingsCache {
+                version: self.settings_version,
+                bindings: Arc::new(bindings),
+                counts: Arc::new(counts),
+                command_normalized: Arc::new(command_normalized),
+                server_normalized: Arc::new(server_normalized),
+                totp_normalized: Arc::new(totp_normalized),
+                panel_normalized,
+                invalid_rows: Arc::new(invalid_rows),
+            });
+        }
+        self.shortcut_cache
+            .as_ref()
+            .expect("版本不匹配分支刚已填充")
+            .clone()
+    }
+
     /// 全量快捷键绑定：内置、面板与条目共用同一冲突注册表。
-    fn all_shortcut_bindings(&self) -> Vec<ShortcutBinding> {
-        let mut bindings = Vec::new();
+    fn all_shortcut_bindings(&self) -> Vec<ShortcutBinding> {        let mut bindings = Vec::new();
         for (keystroke, label) in BUILTIN_SHORTCUTS {
             if let Ok(normalized) = normalize_shortcut(keystroke) {
                 bindings.push(ShortcutBinding {
@@ -6019,13 +6156,14 @@ fn sidebar_shortcut_label(shortcut: Option<&str>) -> &str {
 }
 
 fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
-    let commands = workspace.settings.commands.clone();
+    // 条目行借用渲染 + 点击时查整条：GPUI 无视图缓存，面板每帧重渲染，
+    // 这里不得整表克隆 commands（此前每帧深拷贝全表 + 每行多次 clone）。
     let error = workspace.command_error.clone();
     let notice = workspace.command_notice.clone();
     let delete_confirm = workspace.command_delete_confirm.clone();
     let active_tab = workspace.right_panel_tab;
     let item_count = match active_tab {
-        RightPanelTab::Commands => commands.len(),
+        RightPanelTab::Commands => workspace.settings.commands.len(),
         RightPanelTab::Totp => workspace.settings.totp.len(),
         RightPanelTab::Servers => workspace.settings.servers.len(),
     };
@@ -6070,13 +6208,14 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
             .when_some(notice, |panel, notice| {
                 panel.child(div().pt_2().text_color(rgb(0x9ECE6A)).child(notice))
             })
-            .when(commands.is_empty(), |panel| {
+            .when(workspace.settings.commands.is_empty(), |panel| {
                 panel.child(sidebar_empty("还没有命令", "点击上方按钮新建常用命令"))
             })
-            .children(commands.into_iter().map(|command| {
+            .children(workspace.settings.commands.iter().map(|command| {
                 let has_separate_template = command.template != command.name;
                 let pending_delete = delete_confirm.as_deref() == Some(command.name.as_str());
-                let open_command = command.clone();
+                // 行内监听只持有名称（每帧唯一捕获），点击时再查整条
+                let name = command.name.clone();
                 entry_card()
                     .child(
                         div()
@@ -6086,8 +6225,19 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                             .gap_1()
                             .on_mouse_down(
                                 MouseButton::Left,
-                                cx.listener(move |this, _event, window, cx| {
-                                    this.open_command(&open_command, window, cx);
+                                cx.listener({
+                                    let name = name.clone();
+                                    move |this, _event, window, cx| {
+                                        if let Some(command) = this
+                                            .settings
+                                            .commands
+                                            .iter()
+                                            .find(|item| item.name == name)
+                                            .cloned()
+                                        {
+                                            this.open_command(&command, window, cx);
+                                        }
+                                    }
                                 }),
                             )
                             .child(
@@ -6121,11 +6271,19 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener({
-                                    let command = command.clone();
+                                    let name = name.clone();
                                     move |this, _, window, cx| {
                                         cx.stop_propagation();
-                                        this.edit_command(Some(command.clone()), window, cx);
-                                        this.start_shortcut_recording(window, cx);
+                                        if let Some(command) = this
+                                            .settings
+                                            .commands
+                                            .iter()
+                                            .find(|item| item.name == name)
+                                            .cloned()
+                                        {
+                                            this.edit_command(Some(command), window, cx);
+                                            this.start_shortcut_recording(window, cx);
+                                        }
                                     }
                                 }),
                             ),
@@ -6139,9 +6297,17 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                                 "编辑",
                                 false,
                                 cx.listener({
-                                    let command = command.clone();
+                                    let name = name.clone();
                                     move |this, _event, window, cx| {
-                                        this.edit_command(Some(command.clone()), window, cx)
+                                        if let Some(command) = this
+                                            .settings
+                                            .commands
+                                            .iter()
+                                            .find(|item| item.name == name)
+                                            .cloned()
+                                        {
+                                            this.edit_command(Some(command), window, cx);
+                                        }
                                     }
                                 }),
                             ))
@@ -6153,7 +6319,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                                 },
                                 pending_delete,
                                 cx.listener({
-                                    let name = command.name.clone();
+                                    let name = name.clone();
                                     move |this, _event, _window, cx| this.delete_command(&name, cx)
                                 }),
                             )),
@@ -6984,12 +7150,12 @@ fn totp_preview_remaining(generated_at: SystemTime, period: u64) -> u64 {
 }
 
 /// 右面板「动态码」区：条目列表（编辑/预览走窗口级模态弹窗）。
+/// 条目行借用渲染 + 点击时查整条，不整表克隆 totp。
 fn render_totp_section(
     workspace: &mut WorkspaceView,
     panel: gpui::Div,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
-    let entries = workspace.settings.totp.clone();
     let delete_confirm = workspace.totp_delete_confirm.clone();
     let error = workspace.totp_error.clone();
 
@@ -7003,10 +7169,11 @@ fn render_totp_section(
         .when_some(error, |panel, error| {
             panel.child(div().text_color(rgb(0xF7768E)).child(error))
         })
-        .when(entries.is_empty(), |panel| {
+        .when(workspace.settings.totp.is_empty(), |panel| {
             panel.child(sidebar_empty("还没有动态码", "支持粘贴密钥或 otpauth 链接"))
         })
-        .children(entries.iter().map(|entry| {
+        .children(workspace.settings.totp.iter().map(|entry| {
+            // 行内监听只持有名称（每帧唯一捕获），点击时再查整条
             let name = entry.name.clone();
             let remaining = totp_window_remaining(entry.period);
             let pending_delete = delete_confirm.as_deref() == Some(entry.name.as_str());
@@ -7020,8 +7187,18 @@ fn render_totp_section(
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener({
-                                let entry = entry.clone();
-                                move |this, _event, _window, cx| this.open_totp(&entry, cx)
+                                let name = name.clone();
+                                move |this, _event, _window, cx| {
+                                    if let Some(entry) = this
+                                        .settings
+                                        .totp
+                                        .iter()
+                                        .find(|item| item.name == name)
+                                        .cloned()
+                                    {
+                                        this.open_totp(&entry, cx)
+                                    }
+                                }
                             }),
                         )
                         .child(
@@ -7058,9 +7235,17 @@ fn render_totp_section(
                             "编辑",
                             false,
                             cx.listener({
-                                let entry = entry.clone();
+                                let name = name.clone();
                                 move |this, _event, window, cx| {
-                                    this.edit_totp(Some(&entry), window, cx)
+                                    if let Some(entry) = this
+                                        .settings
+                                        .totp
+                                        .iter()
+                                        .find(|item| item.name == name)
+                                        .cloned()
+                                    {
+                                        this.edit_totp(Some(&entry), window, cx)
+                                    }
                                 }
                             }),
                         ))
@@ -7081,12 +7266,13 @@ fn render_totp_section(
 
 /// 右面板「服务器」区：条目列表（编辑/连接凭据走窗口级模态弹窗）。
 /// 有分组时按组折叠展示（组名升序、未分组殿后）；纯未分组时与旧版平铺外观一致。
+/// 条目行借用渲染（不整表克隆 servers）；分组每帧从借用数据即时重建，
+/// 保证外部直改 settings（含测试注入）也零陈旧。
 fn render_server_section(
     workspace: &mut WorkspaceView,
     panel: gpui::Div,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
-    let servers = workspace.settings.servers.clone();
     let delete_confirm = workspace.server_delete_confirm.clone();
     let error = workspace.server_error.clone();
     let notice = workspace.server_notice.clone();
@@ -7129,7 +7315,7 @@ fn render_server_section(
                 ),
         )
         .child(panel_caption("凭据保存在系统密钥环中"))
-        .when(servers.is_empty(), |panel| {
+        .when(workspace.settings.servers.is_empty(), |panel| {
             panel.child(sidebar_empty(
                 "还没有服务器",
                 "新建连接，或导入已有的服务器列表",
@@ -7152,13 +7338,13 @@ fn render_server_section(
         // 分组渲染：组头（▸/▾ + 组名 + 计数）+ 成员条目；折叠的组不渲染成员行。
         // 硬约束：纯未分组（无任何命名组）时保持旧版平铺外观，一个组头都不渲染。
         .children({
-            let mut groups = server_groups(&servers);
+            let mut groups = server_groups(&workspace.settings.servers);
             if groups.len() == 1 && groups[0].0.is_none() {
                 let (_, indexes) = groups.swap_remove(0);
                 indexes
                     .into_iter()
                     .map(|index| {
-                        let entry = &servers[index];
+                        let entry = &workspace.settings.servers[index];
                         server_entry_row(
                             entry,
                             delete_confirm.as_deref() == Some(entry.name.as_str()),
@@ -7181,7 +7367,7 @@ fn render_server_section(
                         ));
                         if !is_collapsed {
                             rows.extend(indexes.into_iter().map(|index| {
-                                let entry = &servers[index];
+                                let entry = &workspace.settings.servers[index];
                                 server_entry_row(
                                     entry,
                                     delete_confirm.as_deref() == Some(entry.name.as_str()),
@@ -7421,9 +7607,18 @@ fn server_entry_row(
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener({
-                                let entry = entry.clone();
+                                // 每帧只持有名称：点击时再查整条，避免逐帧克隆
+                                let name = entry.name.clone();
                                 move |this, _event, window, cx| {
-                                    this.edit_server(Some(&entry), window, cx)
+                                    if let Some(entry) = this
+                                        .settings
+                                        .servers
+                                        .iter()
+                                        .find(|item| item.name == name)
+                                        .cloned()
+                                    {
+                                        this.edit_server(Some(&entry), window, cx)
+                                    }
                                 }
                             }),
                         )

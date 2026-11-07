@@ -26,7 +26,7 @@ use gpui::{
     prelude::FluentBuilder, px, rgb, rgba,
 };
 use laterterm_config::theme::ThemeColors;
-use laterterm_config::{Appearance, normalize_shortcut};
+use laterterm_config::Appearance;
 
 // ---------------------------------------------------------------------------
 // Tokyo Night 色板收敛（评审硬伤5：逐处替换、只动本模块，不按色值全局替换
@@ -944,14 +944,16 @@ fn settings_update_body(workspace: &WorkspaceView, cx: &mut Context<WorkspaceVie
 }
 
 /// 「快捷键」节：全量绑定总览（内置 + 命令 + 服务器 + 动态码），冲突标红。
-fn settings_shortcuts_body(workspace: &WorkspaceView, cx: &mut Context<WorkspaceView>) -> Vec<Div> {
-    let bindings = workspace.all_shortcut_bindings();
-    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for binding in &bindings {
-        *counts.entry(binding.normalized.as_str()).or_default() += 1;
-    }
+/// 绑定/计数/归一化均读 [`super::WorkspaceView::shortcut_bindings_cache`]
+/// 的派生缓存（settings 变化才重算），条目行按借用渲染、点击时才取整条。
+fn settings_shortcuts_body(
+    workspace: &mut WorkspaceView,
+    cx: &mut Context<WorkspaceView>,
+) -> Vec<Div> {
+    let cache = workspace.shortcut_bindings_cache();
     let row = |binding: &ShortcutBinding| {
-        let conflicted = counts
+        let conflicted = cache
+            .counts
             .get(binding.normalized.as_str())
             .copied()
             .unwrap_or(1)
@@ -1014,14 +1016,16 @@ fn settings_shortcuts_body(workspace: &WorkspaceView, cx: &mut Context<Workspace
         );
     }
     body.push(group_title("内置"));
-    for binding in bindings
+    for binding in cache
+        .bindings
         .iter()
         .filter(|binding| matches!(binding.owner, BindingOwner::Builtin))
     {
         body.push(row(binding));
     }
     body.push(group_title("面板"));
-    for (label, shortcut, owner) in [
+    // 归一化读缓存（下标与 panel_normalized 对位），不再每帧 normalize
+    for (index, (label, shortcut, owner)) in [
         (
             "命令面板",
             workspace.settings.shortcuts.commands_panel.as_deref(),
@@ -1032,11 +1036,15 @@ fn settings_shortcuts_body(workspace: &WorkspaceView, cx: &mut Context<Workspace
             workspace.settings.shortcuts.servers_panel.as_deref(),
             BindingOwner::ServersPanel,
         ),
-    ] {
-        let invalid = shortcut.is_some_and(|key| normalize_shortcut(key).is_err());
-        let conflicted = shortcut
-            .and_then(|key| normalize_shortcut(key).ok())
-            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let normalized = cache.panel_normalized.get(index).cloned().flatten();
+        let invalid = shortcut.is_some() && normalized.is_none();
+        let conflicted = normalized
+            .as_deref()
+            .is_some_and(|key| cache.counts.get(key).copied().unwrap_or(0) > 1);
         body.push(
             setting_card()
                 .child(shortcut_row(
@@ -1055,17 +1063,16 @@ fn settings_shortcuts_body(workspace: &WorkspaceView, cx: &mut Context<Workspace
         );
     }
     // 直接从配置渲染，保留未绑定和无效历史值的修复入口。
+    // 行内只借用渲染 + 持有名称，点击时才查整条（免每帧深拷贝全表）。
     body.push(group_title("命令"));
-    for command in &workspace.settings.commands {
-        let command = command.clone();
+    for (index, command) in workspace.settings.commands.iter().enumerate() {
+        let normalized = cache.command_normalized.get(index).cloned().flatten();
         let shortcut = command.shortcut.as_deref().unwrap_or("未绑定");
-        let invalid = command
-            .shortcut
-            .as_ref()
-            .is_some_and(|key| normalize_shortcut(key).is_err());
-        let conflicted = normalize_shortcut(shortcut)
-            .ok()
-            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
+        let invalid = command.shortcut.is_some() && normalized.is_none();
+        let conflicted = normalized
+            .as_deref()
+            .is_some_and(|key| cache.counts.get(key).copied().unwrap_or(0) > 1);
+        let name = command.name.clone();
         body.push(
             setting_card()
                 .child(shortcut_row(&command.name, shortcut, invalid || conflicted))
@@ -1074,23 +1081,29 @@ fn settings_shortcuts_body(workspace: &WorkspaceView, cx: &mut Context<Workspace
                     false,
                     cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.edit_command(Some(command.clone()), window, cx);
-                        this.start_shortcut_recording(window, cx);
+                        if let Some(command) = this
+                            .settings
+                            .commands
+                            .iter()
+                            .find(|item| item.name == name)
+                            .cloned()
+                        {
+                            this.edit_command(Some(command), window, cx);
+                            this.start_shortcut_recording(window, cx);
+                        }
                     }),
                 )),
         );
     }
     body.push(group_title("服务器"));
-    for entry in &workspace.settings.servers {
-        let entry = entry.clone();
+    for (index, entry) in workspace.settings.servers.iter().enumerate() {
+        let normalized = cache.server_normalized.get(index).cloned().flatten();
         let shortcut = entry.shortcut.as_deref().unwrap_or("未绑定");
-        let invalid = entry
-            .shortcut
-            .as_ref()
-            .is_some_and(|key| normalize_shortcut(key).is_err());
-        let conflicted = normalize_shortcut(shortcut)
-            .ok()
-            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
+        let invalid = entry.shortcut.is_some() && normalized.is_none();
+        let conflicted = normalized
+            .as_deref()
+            .is_some_and(|key| cache.counts.get(key).copied().unwrap_or(0) > 1);
+        let name = entry.name.clone();
         body.push(
             setting_card()
                 .child(shortcut_row(&entry.name, shortcut, invalid || conflicted))
@@ -1099,23 +1112,29 @@ fn settings_shortcuts_body(workspace: &WorkspaceView, cx: &mut Context<Workspace
                     false,
                     cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.edit_server(Some(&entry), window, cx);
-                        this.start_shortcut_recording(window, cx);
+                        if let Some(entry) = this
+                            .settings
+                            .servers
+                            .iter()
+                            .find(|item| item.name == name)
+                            .cloned()
+                        {
+                            this.edit_server(Some(&entry), window, cx);
+                            this.start_shortcut_recording(window, cx);
+                        }
                     }),
                 )),
         );
     }
     body.push(group_title("动态码"));
-    for entry in &workspace.settings.totp {
-        let entry = entry.clone();
+    for (index, entry) in workspace.settings.totp.iter().enumerate() {
+        let normalized = cache.totp_normalized.get(index).cloned().flatten();
         let shortcut = entry.shortcut.as_deref().unwrap_or("未绑定");
-        let invalid = entry
-            .shortcut
-            .as_ref()
-            .is_some_and(|key| normalize_shortcut(key).is_err());
-        let conflicted = normalize_shortcut(shortcut)
-            .ok()
-            .is_some_and(|key| counts.get(key.as_str()).copied().unwrap_or(0) > 1);
+        let invalid = entry.shortcut.is_some() && normalized.is_none();
+        let conflicted = normalized
+            .as_deref()
+            .is_some_and(|key| cache.counts.get(key).copied().unwrap_or(0) > 1);
+        let name = entry.name.clone();
         body.push(
             setting_card()
                 .child(shortcut_row(&entry.name, shortcut, invalid || conflicted))
@@ -1124,56 +1143,21 @@ fn settings_shortcuts_body(workspace: &WorkspaceView, cx: &mut Context<Workspace
                     false,
                     cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        this.edit_totp(Some(&entry), window, cx);
-                        this.start_shortcut_recording(window, cx);
+                        if let Some(entry) =
+                            this.settings.totp.iter().find(|item| item.name == name).cloned()
+                        {
+                            this.edit_totp(Some(&entry), window, cx);
+                            this.start_shortcut_recording(window, cx);
+                        }
                     }),
                 )),
         );
     }
-    let has_conflict = counts.values().any(|count| *count > 1);
-    let invalid = workspace
-        .settings
-        .commands
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .shortcut
-                .as_ref()
-                .map(|key| (format!("命令 {}", entry.name), key))
-        })
-        .chain(workspace.settings.servers.iter().filter_map(|entry| {
-            entry
-                .shortcut
-                .as_ref()
-                .map(|key| (format!("服务器 {}", entry.name), key))
-        }))
-        .chain(workspace.settings.totp.iter().filter_map(|entry| {
-            entry
-                .shortcut
-                .as_ref()
-                .map(|key| (format!("动态码 {}", entry.name), key))
-        }))
-        .chain(
-            workspace
-                .settings
-                .shortcuts
-                .commands_panel
-                .as_ref()
-                .map(|key| ("命令面板".to_string(), key)),
-        )
-        .chain(
-            workspace
-                .settings
-                .shortcuts
-                .servers_panel
-                .as_ref()
-                .map(|key| ("服务器面板".to_string(), key)),
-        )
-        .filter(|(_, key)| normalize_shortcut(key).is_err())
-        .collect::<Vec<_>>();
+    let has_conflict = cache.counts.values().any(|count| *count > 1);
+    let invalid = &cache.invalid_rows;
     if !invalid.is_empty() {
         body.push(group_title("无效快捷键"));
-        for (label, key) in &invalid {
+        for (label, key) in invalid.iter() {
             body.push(setting_card().child(shortcut_row(label, key, true)));
         }
     }

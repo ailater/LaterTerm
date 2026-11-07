@@ -16,9 +16,17 @@ mod workspace_tests;
 
 use anyhow::Result;
 use gpui::AppContext;
+use laterterm_config::Settings;
 use workspace::WorkspaceView;
 
-fn window_options(cx: &mut gpui::App) -> gpui::WindowOptions {
+/// 启动期共享设置：main 只读一次 settings.toml，窗口几何判断与
+/// WorkspaceView 共用，消掉启动路径的双读双解析。WorkspaceView::new
+/// 取走（move）；测试等直连构造路径无此全局，自行回退加载。
+struct StartupSettings(Settings);
+
+impl gpui::Global for StartupSettings {}
+
+fn window_options(cx: &mut gpui::App, settings: &Settings) -> gpui::WindowOptions {
     let mut options = gpui::WindowOptions {
         titlebar: Some(gpui::TitlebarOptions {
             title: Some("LaterTerm".into()),
@@ -35,7 +43,6 @@ fn window_options(cx: &mut gpui::App) -> gpui::WindowOptions {
     // Wayland xdg-shell 忽略 origin，由合成器摆位。
     #[cfg(target_os = "linux")]
     {
-        let settings = laterterm_config::Settings::load_or_default();
         if settings.quake.enabled
             && let Some(display) = cx.primary_display()
         {
@@ -50,6 +57,8 @@ fn window_options(cx: &mut gpui::App) -> gpui::WindowOptions {
     // 非 Linux 平台不读 quake 设置，参数仅为签名统一。
     #[cfg(not(target_os = "linux"))]
     let _ = cx;
+    #[cfg(not(target_os = "linux"))]
+    let _ = settings;
     #[cfg(target_os = "macos")]
     let options = {
         let mut options = options;
@@ -64,7 +73,11 @@ fn window_options(cx: &mut gpui::App) -> gpui::WindowOptions {
 fn main() -> Result<()> {
     let app = gpui::Application::new();
     app.run(|cx| {
-        let options = window_options(cx);
+        // 启动路径仅此一次读盘+解析 settings.toml：先算 Quake 窗口几何，
+        // 再把同一份设置共享给 WorkspaceView（new 里取走，避免二次加载）。
+        let settings = Settings::load_or_default();
+        let options = window_options(cx, &settings);
+        cx.set_global(StartupSettings(settings));
         cx.spawn(async move |cx| {
             cx.open_window(options, |window, cx| {
                 let workspace = cx.new(|cx| WorkspaceView::new(window, cx));

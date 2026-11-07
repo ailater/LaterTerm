@@ -48,6 +48,8 @@ pub(crate) struct LocalEntry {
 }
 
 /// 列表行的纯数据快照（渲染闭包捕获用，避免跨帧借用面板状态）。
+/// 由 [`RemoteListing::rows`]/[`LocalListing::rows`] 以 `Arc` 缓存，
+/// 仅在列表事件落地时重建，渲染帧只克隆 Arc。
 #[derive(Clone, Debug)]
 pub(crate) struct ListRow {
     pub(crate) name: String,
@@ -438,16 +440,20 @@ fn now_millis() -> u64 {
 pub(crate) const INITIAL_REMOTE_REQUEST: &str = ".";
 
 /// 远端栏列表状态：当前目录、加载中标签、条目与选中集。
-/// 列表用 `Arc<Vec<_>>`：渲染闭包每帧捕获，Arc 克隆避免逐帧深拷贝。
+/// `entries` 与 `rows`（渲染快照）成对更新：entries 只在
+/// [`Self::apply_listed`] 落地时重建，渲染帧仅克隆 Arc，避免 GPUI
+/// 无视图缓存（每帧重渲染）导致大目录逐帧深拷贝。
 #[derive(Default)]
 pub(crate) struct RemoteListing {
     pub(crate) dir: String,
     /// 正在加载的请求标签（过期列表事件按此丢弃）。
     pub(crate) pending: Option<String>,
     pub(crate) entries: Arc<Vec<RemoteEntry>>,
+    /// 与 `entries` 同步的渲染快照；不得绕过 apply_listed 单独改写 entries。
+    pub(crate) rows: Arc<Vec<ListRow>>,
     pub(crate) truncated: usize,
     pub(crate) error: Option<String>,
-    pub(crate) selected: BTreeSet<String>,
+    pub(crate) selected: Arc<BTreeSet<String>>,
 }
 
 impl RemoteListing {
@@ -472,10 +478,12 @@ impl RemoteListing {
         self.pending = None;
         self.dir = resolved.unwrap_or_else(|| requested.to_string());
         self.entries = Arc::new(entries);
+        // 渲染快照与 entries 同帧成对重建（唯一写点，保证缓存不滞后）
+        self.rows = Arc::new(self.entries.iter().map(ListRow::from_remote).collect());
         self.truncated = truncated;
         self.error = None;
         let names: BTreeSet<String> = self.entries.iter().map(|e| e.name.clone()).collect();
-        self.selected.retain(|name| names.contains(name));
+        Arc::make_mut(&mut self.selected).retain(|name| names.contains(name));
         true
     }
 
@@ -492,9 +500,11 @@ pub(crate) struct LocalListing {
     pub(crate) dir: PathBuf,
     pub(crate) pending: Option<PathBuf>,
     pub(crate) entries: Arc<Vec<LocalEntry>>,
+    /// 与 `entries` 同步的渲染快照；不得绕过 apply_listed 单独改写 entries。
+    pub(crate) rows: Arc<Vec<ListRow>>,
     pub(crate) truncated: usize,
     pub(crate) error: Option<String>,
-    pub(crate) selected: BTreeSet<String>,
+    pub(crate) selected: Arc<BTreeSet<String>>,
 }
 
 impl LocalListing {
@@ -514,10 +524,12 @@ impl LocalListing {
         self.pending = None;
         self.dir = requested;
         self.entries = Arc::new(entries);
+        // 渲染快照与 entries 同帧成对重建（唯一写点，保证缓存不滞后）
+        self.rows = Arc::new(self.entries.iter().map(ListRow::from_local).collect());
         self.truncated = truncated;
         self.error = None;
         let names: BTreeSet<String> = self.entries.iter().map(|e| e.name.clone()).collect();
-        self.selected.retain(|name| names.contains(name));
+        Arc::make_mut(&mut self.selected).retain(|name| names.contains(name));
         true
     }
 
@@ -538,7 +550,9 @@ pub(crate) struct SftpPanelState {
     pub(crate) hops: Vec<SshEndpoint>,
     pub(crate) remote: RemoteListing,
     pub(crate) local: LocalListing,
-    pub(crate) transfers: Vec<SftpTransfer>,
+    /// 渲染帧只克隆 Arc；事件落地时经 `Arc::make_mut` 原地更新（帧间
+    /// Arc 独占，无拷贝），避免每帧整队列深拷贝。
+    pub(crate) transfers: Arc<Vec<SftpTransfer>>,
     pub(crate) error: Option<String>,
     pub(crate) notice: Option<String>,
     /// 待二次确认的删除操作（对齐 sidebar 删除确认口径）。
@@ -563,7 +577,7 @@ impl SftpPanelState {
                 dir: local_dir,
                 ..LocalListing::default()
             },
-            transfers: Vec::new(),
+            transfers: Arc::new(Vec::new()),
             error: None,
             notice: None,
             delete_confirm: None,
@@ -702,7 +716,7 @@ impl SftpPanelState {
     }
 
     fn transfer_mut(&mut self, id: u64) -> Option<&mut SftpTransfer> {
-        self.transfers.iter_mut().find(|transfer| transfer.id == id)
+        Arc::make_mut(&mut self.transfers).iter_mut().find(|transfer| transfer.id == id)
     }
 
     /// 取消一条传输：置位标志；排队中的直接标 Cancelled（工作线程可能
@@ -724,7 +738,7 @@ impl SftpPanelState {
     /// Running 的传输快照（这些可能留有半成品，调用方按需清理）。
     pub(crate) fn cancel_all(&mut self) -> Vec<SftpTransfer> {
         let mut running = Vec::new();
-        for transfer in &mut self.transfers {
+        for transfer in Arc::make_mut(&mut self.transfers) {
             if transfer.is_active() {
                 transfer.cancel.store(true, Ordering::Relaxed);
                 if transfer.status == TransferStatus::Running {
@@ -754,7 +768,7 @@ impl SftpPanelState {
         else {
             return;
         };
-        let transfer = &mut self.transfers[index];
+        let transfer = &mut Arc::make_mut(&mut self.transfers)[index];
         transfer.status = TransferStatus::Running;
         spawn_transfer_worker(
             transfer.id,
@@ -1026,22 +1040,10 @@ pub(crate) fn sftp_overlay(
     let dismiss = close_listener(cx);
     let weak = cx.weak_entity();
 
-    let local_rows: Arc<Vec<ListRow>> = Arc::new(
-        panel
-            .local
-            .entries
-            .iter()
-            .map(ListRow::from_local)
-            .collect(),
-    );
-    let remote_rows: Arc<Vec<ListRow>> = Arc::new(
-        panel
-            .remote
-            .entries
-            .iter()
-            .map(ListRow::from_remote)
-            .collect(),
-    );
+    // 渲染快照均已在列表事件落地时缓存（rows/selected/transfers 均为
+    // Arc），本帧只克隆指针——GPUI 每帧重渲染，这里严禁逐条深拷贝。
+    let local_rows = Arc::clone(&panel.local.rows);
+    let remote_rows = Arc::clone(&panel.remote.rows);
     let local_selected = panel.local.selected.clone();
     let remote_selected = panel.remote.selected.clone();
     let local_dir_text = panel.local.dir.display().to_string();
@@ -1186,7 +1188,7 @@ pub(crate) fn sftp_overlay(
                         .gap_1()
                         .children(
                             transfers
-                                .into_iter()
+                                .iter()
                                 .map(|transfer| transfer_row(transfer, cx).into_any_element()),
                         )
                         .into_any_element()
@@ -1241,7 +1243,7 @@ pub(crate) fn sftp_overlay(
 fn file_pane(
     view: gpui::WeakEntity<WorkspaceView>,
     rows: Arc<Vec<ListRow>>,
-    selected: BTreeSet<String>,
+    selected: Arc<BTreeSet<String>>,
     path_text: String,
     side: PaneSide,
     loading: bool,
@@ -1475,7 +1477,8 @@ fn file_row(
 }
 
 /// 传输队列单行：方向 + 文件名 + 进度条 + 状态 + 取消。
-fn transfer_row(transfer: SftpTransfer, cx: &mut Context<WorkspaceView>) -> Div {
+/// 借用渲染（`&SftpTransfer`）：队列行不再逐帧克隆。
+fn transfer_row(transfer: &SftpTransfer, cx: &mut Context<WorkspaceView>) -> Div {
     let id = transfer.id;
     let active = transfer.is_active();
     let unknown_total = transfer.total == 0;
@@ -1622,6 +1625,11 @@ mod tests {
         );
         assert!(listing.pending.is_none(), "loading 态解除");
         assert_eq!(listing.entries.len(), 1);
+        assert_eq!(
+            listing.rows.len(),
+            listing.entries.len(),
+            "渲染快照必须与 entries 成对重建"
+        );
         assert!(listing.error.is_none());
         assert!(listing.selected.is_empty());
     }
@@ -1675,7 +1683,7 @@ mod tests {
     fn local_listing_applies_requested_dir_and_prunes_selection() {
         let mut listing = LocalListing::default();
         listing.mark_loading(PathBuf::from("/home/u"));
-        listing.selected.insert("gone.txt".into());
+        Arc::make_mut(&mut listing.selected).insert("gone.txt".into());
         let applied = listing.apply_listed(
             PathBuf::from("/home/u"),
             vec![LocalEntry {
@@ -1690,6 +1698,11 @@ mod tests {
         assert_eq!(listing.dir, PathBuf::from("/home/u"));
         assert!(listing.pending.is_none());
         assert!(listing.selected.is_empty(), "刷新后已消失的选中项应被修剪");
+        assert_eq!(
+            listing.rows.len(),
+            listing.entries.len(),
+            "渲染快照必须与 entries 成对重建"
+        );
         // 过期事件不落地
         assert!(
             !listing.apply_listed(PathBuf::from("/other"), vec![], 0),
