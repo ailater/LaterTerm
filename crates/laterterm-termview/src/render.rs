@@ -69,7 +69,9 @@ use crate::event::GpuiEventProxy;
 use crate::view::CursorStyle;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+use alacritty_terminal::selection::SelectionRange;
 use alacritty_terminal::term::Term;
+use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::Color;
@@ -77,6 +79,190 @@ use gpui::{
     App, Bounds, Edges, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Hsla, Pixels,
     Point, SharedString, Size, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
 };
+
+/// 一次绘制期的可见网格快照。
+///
+/// [`FrameSnapshot::capture`] 在锁内只做可见区逐格复制与字段读取（含选区换算），
+/// 调用方拿到返回值即可释放锁；网格绘制与搜索/选区/预编辑覆盖层全部以本快照为
+/// 数据源，保证 cells 与 selection/display_offset/cursor 天然同帧（无撕裂）。
+///
+/// 复制成本 ≈ `size_of::<Cell>() × 可见格数`（约 24B/格；120×40 ≈ 115KB，
+/// 4K 满屏 ≈ 1.8MB）。实测（release、228×98=22344 格、隔离测试窗口）锁内
+/// 复制中位 0.114ms，为快照前整段持锁绘制（0.531ms）的 21.5%。已知代价：
+/// 两阶段「先全网格复制、再逐行消费」的工作集（≈2×快照体积）大于快照前
+/// 「收集一行→立刻消费一行」的行热模式，隔离基准整帧 +12%（约 +65µs，
+/// 〈1% vsync 帧预算）；备选的「锁内布局、锁外整形」形态实测锁窗口 0.29ms
+/// （复制之外 layout 本身约 0.17ms）而整帧无统计显著改善，故保留本形态。
+/// 详见 docs/roadmap.md M1 注记（2026-11-07，非基准承诺）。
+#[derive(Clone)]
+pub struct FrameSnapshot {
+    /// 可见区逐格副本：`cells[视口行][列]`。
+    pub cells: Vec<Vec<Cell>>,
+    /// 网格列数。
+    pub columns: usize,
+    /// 可见行数。
+    pub screen_lines: usize,
+    /// 总行数（含回滚历史）。
+    pub total_lines: usize,
+    /// 显示偏移（向上回滚的行数）。
+    pub display_offset: usize,
+    /// 动态颜色覆盖（OSC 4/10/11 等写入的调色板快照）。
+    pub colors: Colors,
+    /// 终端模式位（光标可见性等）。
+    pub mode: TermMode,
+    /// 光标位置（网格坐标）。
+    pub cursor: AlacPoint,
+    /// 选区范围（与 cells 同一次持锁内换算，同帧一致）。
+    pub selection: Option<SelectionRange>,
+}
+
+impl Default for FrameSnapshot {
+    fn default() -> Self {
+        Self {
+            cells: Vec::new(),
+            columns: 0,
+            screen_lines: 0,
+            total_lines: 0,
+            display_offset: 0,
+            colors: Colors::default(),
+            mode: TermMode::NONE,
+            cursor: AlacPoint::new(Line(0), Column(0)),
+            selection: None,
+        }
+    }
+}
+
+impl FrameSnapshot {
+    /// 在**持有终端锁**期间捕获可见网格快照；拿到返回值后调用方应尽快释放锁。
+    ///
+    /// 行坐标公式与既有绘制路径逐字一致：可见行 `line_idx` →
+    /// `Line(line_idx - display_offset)`。
+    pub fn capture(term: &Term<GpuiEventProxy>) -> Self {
+        let mut out = Self::default();
+        Self::capture_into(term, &mut out);
+        out
+    }
+
+    /// 把可见网格快照写入 `out`，**复用其已有 rows/row 容量**（稳态帧零分配）。
+    ///
+    /// 与 [`Self::capture`] 等价；区别仅在于复用调用方提供的缓冲（缓冲池模式：
+    /// 帧尾归还、下帧取用）。网格 resize 导致行/列数变化时，多出的行缓冲被
+    /// 截断、不足的部分重新分配——resize 是低频事件，稳态帧全部命中复用路径。
+    pub fn capture_into(term: &Term<GpuiEventProxy>, out: &mut Self) {
+        let grid = term.grid();
+        let columns = grid.columns();
+        let screen_lines = grid.screen_lines();
+        let total_lines = grid.total_lines();
+        let display_offset = grid.display_offset();
+        if out.cells.len() > screen_lines {
+            out.cells.truncate(screen_lines);
+        }
+        for line_idx in 0..screen_lines {
+            let line = Line(line_idx as i32 - display_offset as i32);
+            match out.cells.get_mut(line_idx) {
+                Some(row) => {
+                    row.clear();
+                    if row.capacity() < columns {
+                        row.reserve(columns);
+                    }
+                    for col_idx in 0..columns {
+                        row.push(grid[AlacPoint::new(line, Column(col_idx))].clone());
+                    }
+                }
+                None => {
+                    let mut row = Vec::with_capacity(columns);
+                    for col_idx in 0..columns {
+                        row.push(grid[AlacPoint::new(line, Column(col_idx))].clone());
+                    }
+                    out.cells.push(row);
+                }
+            }
+        }
+        out.columns = columns;
+        out.screen_lines = screen_lines;
+        out.total_lines = total_lines;
+        out.display_offset = display_offset;
+        // 选区必须在同一次持锁内对同一份 Term 换算：cells 与 selection 同帧，
+        // 与快照前「锁贯穿 paint+overlay」的一致性等价。
+        out.selection = term.selection.as_ref().and_then(|sel| sel.to_range(term));
+        out.colors = *term.colors();
+        out.mode = *term.mode();
+        out.cursor = grid.cursor.point;
+    }
+}
+
+/// 搜索命中高亮矩形：把回滚搜索命中换算为视口内像素矩形（纯函数，可测）。
+///
+/// `match_line` 是「历史+屏幕」自顶向下的绝对行号（0 = 最老历史行，同
+/// [`crate::terminal::SearchMatch::line`]）；命中滚出视口（上方或下方）返回
+/// `None`。数据源必须来自与网格同帧的快照字段，滚动到历史中部时命中框才不错行。
+#[allow(clippy::too_many_arguments)] // 纯函数逐项传参，与调用点公式一一对应
+pub fn search_match_rect(
+    match_line: usize,
+    match_column: usize,
+    match_len: usize,
+    display_offset: usize,
+    history_lines: usize,
+    screen_lines: usize,
+    content_origin: Point<Pixels>,
+    cell_width: Pixels,
+    cell_height: Pixels,
+) -> Option<Bounds<Pixels>> {
+    let row = match_line as i64 + display_offset as i64 - history_lines as i64;
+    if row < 0 || row as usize >= screen_lines {
+        return None;
+    }
+    let x = content_origin.x + cell_width * match_column as f32;
+    let y = content_origin.y + cell_height * row as f32;
+    Some(Bounds {
+        origin: Point { x, y },
+        size: Size {
+            width: cell_width * match_len as f32,
+            height: cell_height,
+        },
+    })
+}
+
+/// 选区高亮的逐行区间 `(视口行, 起始列, 结束列[不含])`（纯函数，可测）。
+///
+/// 只返回落在视口内的行；首末行按选区端点裁剪列，中间行整行覆盖。
+/// `display_offset`/`columns`/`screen_lines` 应取自与网格同帧的快照字段。
+pub fn selection_row_spans(
+    selection: SelectionRange,
+    display_offset: usize,
+    columns: usize,
+    screen_lines: usize,
+) -> Vec<(usize, usize, usize)> {
+    let mut spans = Vec::new();
+    for screen_row in 0..screen_lines as i64 {
+        let line = screen_row - display_offset as i64;
+        if line < selection.start.line.0 as i64 || line > selection.end.line.0 as i64 {
+            continue;
+        }
+        let start_col = if line == selection.start.line.0 as i64 {
+            selection.start.column.0
+        } else {
+            0
+        };
+        let end_col = if line == selection.end.line.0 as i64 {
+            (selection.end.column.0 + 1).min(columns)
+        } else {
+            columns
+        };
+        if end_col <= start_col {
+            continue;
+        }
+        spans.push((screen_row as usize, start_col, end_col));
+    }
+    spans
+}
+
+/// 预编辑行的视口换算：光标行按显示偏移平移并钳进视口（纯函数，可测）。
+///
+/// 滚离屏幕时光标不可见，锚到最近的可见行，预编辑浮层与候选框不出屏。
+pub fn preedit_row(cursor_line: i32, display_offset: i32, screen_lines: usize) -> usize {
+    (cursor_line + display_offset).clamp(0, screen_lines as i32 - 1) as usize
+}
 
 /// 单个字符在终端网格中占用的列数（东亚宽字符 2 列）。
 ///
@@ -169,7 +355,7 @@ pub fn cursor_rect(
 ///
 /// This struct groups adjacent terminal cells with identical visual attributes
 /// to reduce the number of text rendering calls.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BatchedTextRun {
     /// The text content to render
     pub text: String,
@@ -202,7 +388,7 @@ pub struct BatchedTextRun {
 /// Background rectangle to paint.
 ///
 /// Represents a rectangular region with a solid color background.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct BackgroundRect {
     /// Starting column position
     pub start_col: usize,
@@ -445,7 +631,10 @@ impl TerminalRenderer {
     /// # Arguments
     ///
     /// * `row` - The row number
-    /// * `cells` - Iterator over (column, Cell) pairs
+    /// * `cells` - Iterator over (column, &Cell) pairs（借用版：直接引用
+    ///   [`FrameSnapshot`] 快照行，消除旧值迭代对每格的第二次 clone；
+    ///   签名自快照改造起由 `(usize, Cell)` 有意变更为 `(usize, &Cell)`，
+    ///   工作区内唯一调用方为 [`Self::paint_frame`]）
     /// * `colors` - Terminal color configuration
     ///
     /// # Returns
@@ -453,10 +642,10 @@ impl TerminalRenderer {
     /// A tuple of `(backgrounds, text_runs)` where:
     /// - `backgrounds` is a vector of merged background rectangles
     /// - `text_runs` is a vector of batched text runs
-    pub fn layout_row(
+    pub fn layout_row<'a>(
         &self,
         row: usize,
-        cells: impl Iterator<Item = (usize, Cell)>,
+        cells: impl Iterator<Item = (usize, &'a Cell)>,
         colors: &Colors,
         default_bg: Hsla,
     ) -> (Vec<BackgroundRect>, Vec<BatchedTextRun>) {
@@ -624,6 +813,10 @@ impl TerminalRenderer {
     /// This is the main rendering method that draws the terminal grid,
     /// including backgrounds, text, and cursor.
     ///
+    /// 薄包装（公共 API 保持不变）：锁内一次 [`FrameSnapshot::capture`] 随即
+    /// 释放，绘制本体走 [`Self::paint_frame`]——调用方持有 `&Term` 的时间从
+    /// 「整段绘制」缩到「快照复制」。
+    ///
     /// # Arguments
     ///
     /// * `bounds` - The bounding box to render within
@@ -642,11 +835,29 @@ impl TerminalRenderer {
         cursor_visible: bool,
         scroll_offset: f32,
     ) {
-        // Get terminal dimensions
-        let grid = term.grid();
-        let num_lines = grid.screen_lines();
-        let num_cols = grid.columns();
-        let colors = term.colors();
+        let frame = FrameSnapshot::capture(term);
+        self.paint_frame(bounds, padding, &frame, window, _cx, cursor_visible, scroll_offset);
+    }
+
+    /// 按既有快照绘制网格：数据源全部来自 [`FrameSnapshot`]（与覆盖层同帧）。
+    ///
+    /// 与快照前 `paint(&Term)` 的绘制逐行等价：三段顺序（背景→行内容
+    /// 横线→竖线→文本→光标）与全部坐标公式保持不动，仅把数据源从
+    /// `term.grid()` 直读换成同帧快照字段。
+    #[allow(clippy::too_many_arguments)] // 绘制入口：逐项传参比打包结构更直观
+    pub fn paint_frame(
+        &self,
+        bounds: Bounds<Pixels>,
+        padding: Edges<Pixels>,
+        frame: &FrameSnapshot,
+        window: &mut Window,
+        _cx: &mut App,
+        cursor_visible: bool,
+        scroll_offset: f32,
+    ) {
+        // Get terminal dimensions（数据源：同帧快照）
+        let num_lines = frame.screen_lines;
+        let colors = &frame.colors;
 
         // Calculate default background color
         let default_bg = self.palette.resolve(
@@ -671,23 +882,19 @@ impl TerminalRenderer {
         };
 
         // Iterate over visible lines
-        let display_offset = grid.display_offset() as i32;
+        let display_offset = frame.display_offset as i32;
         for line_idx in 0..num_lines {
-            let line = Line(line_idx as i32 - display_offset);
-
-            // Collect cells for this line
-            let cells: Vec<(usize, Cell)> = (0..num_cols)
-                .map(|col_idx| {
-                    let col = Column(col_idx);
-                    let point = AlacPoint::new(line, col);
-                    let cell = grid[point].clone();
-                    (col_idx, cell)
-                })
-                .collect();
+            // 本行快照（锁内已复制，这里只借引用，不再逐格 clone）
+            let row_cells = &frame.cells[line_idx];
 
             // Layout the row once; text runs are shaped in batches below.
-            let (backgrounds, text_runs) =
-                self.layout_row(line_idx, cells.iter().cloned(), colors, default_bg);
+            // 借用迭代：消除快照前「进 cells Vec 一次 + 值迭代再 clone 一次」的第二遍复制。
+            let (backgrounds, text_runs) = self.layout_row(
+                line_idx,
+                row_cells.iter().enumerate(),
+                colors,
+                default_bg,
+            );
 
             // Paint backgrounds
             for bg_rect in backgrounds {
@@ -724,17 +931,15 @@ impl TerminalRenderer {
             let y_base = origin.y + self.cell_height * (line_idx as f32 + scroll_offset);
             let cy = y_base + self.cell_height / 2.0;
 
-            // Use cells vec for multiple passes (already collected above)
-            let cells_vec = &cells;
-
             // First pass: find and draw horizontal spans of box-drawing characters
             // This draws continuous lines across multiple cells to avoid gaps
             let mut processed_horizontal: std::collections::HashSet<usize> =
                 std::collections::HashSet::new();
 
             let mut i = 0;
-            while i < cells_vec.len() {
-                let (col_idx, ref cell) = cells_vec[i];
+            while i < row_cells.len() {
+                let cell = &row_cells[i];
+                let col_idx = i;
                 let ch = cell.c;
 
                 // Check if this starts a horizontal span
@@ -745,8 +950,9 @@ impl TerminalRenderer {
 
                     // Look ahead for consecutive cells with same horizontal weight
                     let mut j = i + 1;
-                    while j < cells_vec.len() {
-                        let (next_col, ref next_cell) = cells_vec[j];
+                    while j < row_cells.len() {
+                        let next_cell = &row_cells[j];
+                        let next_col = j;
                         // Must be adjacent
                         if next_col != end_col + 1 {
                             break;
@@ -790,14 +996,14 @@ impl TerminalRenderer {
             }
 
             // Second pass: draw vertical components and non-horizontal box chars
-            for (col_idx, cell) in cells_vec.iter() {
+            for (col_idx, cell) in row_cells.iter().enumerate() {
                 let ch = cell.c;
 
                 if ch == ' ' || ch == '\0' {
                     continue;
                 }
 
-                let x = origin.x + self.cell_width * (*col_idx as f32);
+                let x = origin.x + self.cell_width * (col_idx as f32);
                 let fg_color = self.palette.resolve(cell.fg, colors);
 
                 if box_drawing::is_box_drawing_char(ch) {
@@ -809,7 +1015,7 @@ impl TerminalRenderer {
                         },
                     };
 
-                    if processed_horizontal.contains(col_idx) {
+                    if processed_horizontal.contains(&col_idx) {
                         // Horizontal already drawn, just draw vertical components
                         box_drawing::draw_vertical_components(
                             ch,
@@ -863,15 +1069,11 @@ impl TerminalRenderer {
             }
         }
 
-        if !term
-            .mode()
-            .contains(alacritty_terminal::term::TermMode::SHOW_CURSOR)
-            || !cursor_visible
-        {
+        if !frame.mode.contains(TermMode::SHOW_CURSOR) || !cursor_visible {
             return;
         }
 
-        let cursor_point = grid.cursor.point;
+        let cursor_point = frame.cursor;
         let cursor_line = cursor_point.line.0 + display_offset;
         if cursor_line < 0 || cursor_line >= num_lines as i32 {
             return;
@@ -907,6 +1109,7 @@ impl TerminalRenderer {
     /// 预编辑文本不属于 VT 流（shell 看不见它），只在提交时写入 PTY；
     /// 因此这里按覆盖层画在网格之上，「不破坏网格」是硬约束。
     /// 行尾放不下的部分截断（布局见 [`preedit_layout`]）。
+    /// 公共 API 保持不变；快照调用方请用 [`Self::paint_preedit_frame`]。
     pub fn paint_preedit(
         &self,
         term: &Term<GpuiEventProxy>,
@@ -922,20 +1125,77 @@ impl TerminalRenderer {
         let grid = term.grid();
         let display_offset = grid.display_offset() as i32;
         let cursor = grid.cursor.point;
-        let row =
-            (cursor.line.0 + display_offset).clamp(0, grid.screen_lines() as i32 - 1) as usize;
-
+        let row = preedit_row(cursor.line.0, display_offset, grid.screen_lines());
         let fg_color = self.palette.resolve(
             Color::Named(alacritty_terminal::vte::ansi::NamedColor::Foreground),
             term.colors(),
         );
+        self.paint_preedit_at(
+            origin,
+            window,
+            cx,
+            text,
+            scroll_offset,
+            cursor.column.0,
+            row,
+            grid.columns(),
+            fg_color,
+        );
+    }
+
+    /// 快照版预编辑浮层：数据源为同帧 [`FrameSnapshot`]（与网格绘制同帧，无撕裂）。
+    pub fn paint_preedit_frame(
+        &self,
+        frame: &FrameSnapshot,
+        origin: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        text: &str,
+        scroll_offset: f32,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        let row = preedit_row(frame.cursor.line.0, frame.display_offset as i32, frame.screen_lines);
+        let fg_color = self.palette.resolve(
+            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Foreground),
+            &frame.colors,
+        );
+        self.paint_preedit_at(
+            origin,
+            window,
+            cx,
+            text,
+            scroll_offset,
+            frame.cursor.column.0,
+            row,
+            frame.columns,
+            fg_color,
+        );
+    }
+
+    /// 预编辑绘制本体：`(起始列, 视口行, 列数, 前景色)` 直读版与快照版共用，
+    /// 公式唯一（行换算见 [`preedit_row`]，布局见 [`preedit_layout`]）。
+    #[allow(clippy::too_many_arguments)] // 内部共用体：逐项传参与两版调用方对齐
+    fn paint_preedit_at(
+        &self,
+        origin: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut App,
+        text: &str,
+        scroll_offset: f32,
+        start_col: usize,
+        row: usize,
+        columns: usize,
+        fg_color: Hsla,
+    ) {
         let font = self.font_for(false, false);
         // 与网格文字相同的垂直居中口径
         let base_height = self.cell_height / self.line_height_multiplier;
         let vertical_offset = (self.cell_height - base_height) / 2.0;
         let y = origin.y + self.cell_height * (row as f32 + scroll_offset) + vertical_offset;
 
-        for (col, ch, _) in preedit_layout(text, cursor.column.0, grid.columns()) {
+        for (col, ch, _) in preedit_layout(text, start_col, columns) {
             let char_str = ch.to_string();
             let run = TextRun {
                 len: char_str.len(),
@@ -964,6 +1224,233 @@ impl TerminalRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_snapshot_captures_visible_grid_and_overlays() {
+        use crate::event::GpuiEventProxy;
+        use crate::terminal::TerminalState;
+        use alacritty_terminal::grid::Scroll;
+        use alacritty_terminal::index::Side;
+        use alacritty_terminal::selection::{
+            Selection as AlacSelection, SelectionType as AlacSelectionType,
+        };
+        use alacritty_terminal::term::color::COUNT;
+        use alacritty_terminal::vte::ansi::NamedColor;
+        use std::sync::mpsc::channel;
+
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(20, 4, 32, GpuiEventProxy::new(tx));
+        // OSC 4 调色板覆盖（colors 非默认）+ 宽字符行 + SGR 加粗红样式行
+        terminal.process_bytes(b"\x1b]4;1;rgb:ff/00/00\x1b\\");
+        terminal.process_bytes("首行中文\r\n".as_bytes());
+        for i in 0..12 {
+            terminal.process_bytes(format!("\x1b[1;31mR{i}\x1b[0m中文\r\n").as_bytes());
+        }
+        // 选区：网格第 2 行 0..5 列；再上滚 2 行制造 display_offset
+        terminal.with_term_mut(|term| {
+            let mut selection = AlacSelection::new(
+                AlacSelectionType::Simple,
+                AlacPoint::new(Line(2), Column(0)),
+                Side::Left,
+            );
+            selection.update(AlacPoint::new(Line(2), Column(4)), Side::Right);
+            term.selection = Some(selection);
+        });
+        terminal.with_term_mut(|term| term.scroll_display(Scroll::Delta(2)));
+
+        let (snapshot, expected) = terminal.with_term(|term| {
+            let snap = FrameSnapshot::capture(term);
+            // 同一次持锁内对同一份 Term 现读，逐字段对账
+            let grid = term.grid();
+            let cells: Vec<Vec<Cell>> = (0..grid.screen_lines())
+                .map(|row| {
+                    let line = Line(row as i32 - grid.display_offset() as i32);
+                    (0..grid.columns())
+                        .map(|col| grid[AlacPoint::new(line, Column(col))].clone())
+                        .collect()
+                })
+                .collect();
+            let expected = (
+                cells,
+                grid.columns(),
+                grid.screen_lines(),
+                grid.total_lines(),
+                grid.display_offset(),
+                grid.cursor.point,
+                *term.mode(),
+                term.selection.as_ref().and_then(|sel| sel.to_range(term)),
+                *term.colors(),
+            );
+            (snap, expected)
+        });
+
+        let (
+            cells,
+            columns,
+            screen_lines,
+            total_lines,
+            display_offset,
+            cursor,
+            mode,
+            selection,
+            colors,
+        ) = expected;
+
+        // 前置条件自证：滚动/选区/调色板/可见区样式确实生效，对账不是空转
+        assert_eq!(snapshot.display_offset, 2, "前置条件：上滚两行");
+        assert!(snapshot.selection.is_some(), "前置条件：选区已建立");
+        assert!(snapshot.colors[1].is_some(), "前置条件：OSC 4 覆盖红色");
+        assert!(
+            snapshot
+                .cells
+                .iter()
+                .flatten()
+                .any(|cell| cell.flags.contains(Flags::WIDE_CHAR)),
+            "前置条件：宽字符在可见区"
+        );
+        assert!(
+            snapshot
+                .cells
+                .iter()
+                .flatten()
+                .any(|cell| cell.flags.contains(Flags::BOLD)
+                    && cell.fg == Color::Named(NamedColor::Red)),
+            "前置条件：SGR 样式在可见区"
+        );
+
+        assert_eq!(snapshot.cells, cells, "可见区逐格对账（SGR/宽字符/滚动）");
+        assert_eq!(snapshot.columns, columns);
+        assert_eq!(snapshot.screen_lines, screen_lines);
+        assert_eq!(snapshot.total_lines, total_lines);
+        assert_eq!(snapshot.display_offset, display_offset);
+        assert_eq!(snapshot.cursor, cursor);
+        assert_eq!(snapshot.mode, mode);
+        assert_eq!(snapshot.selection, selection, "选区与锁内 to_range 一致");
+        // Colors 未实现 PartialEq，逐槽对账
+        for index in 0..COUNT {
+            assert_eq!(snapshot.colors[index], colors[index], "颜色槽 {index}");
+        }
+
+        // 缓冲池复用路径：同一缓冲二次 capture_into（行容量已预扩），结果必须
+        // 与首捕逐格一致——稳态帧全部走这条复用路径
+        let mut reused = snapshot.clone();
+        terminal.with_term(|term| FrameSnapshot::capture_into(term, &mut reused));
+        assert_eq!(reused.cells, snapshot.cells, "复用缓冲逐格一致");
+        assert_eq!(reused.display_offset, snapshot.display_offset);
+        assert_eq!(reused.selection, snapshot.selection);
+    }
+
+    #[test]
+    fn layout_row_borrowed_matches_owned_value_iteration() {
+        let renderer = TerminalRenderer::new(
+            "monospace".to_string(),
+            px(14.0),
+            1.0,
+            ColorPalette::default(),
+            true,
+            Vec::new(),
+            CursorStyle::Block,
+        );
+        let colors = Colors::default();
+        let default_bg = renderer.palette.resolve(
+            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background),
+            &colors,
+        );
+
+        // 行形态覆盖：普通字符 / 空格 / 宽字符对 / box-drawing / 可合并样式段
+        let mut cells = vec![Cell::default(); 10];
+        cells[0].c = 'a';
+        cells[1].c = 'b';
+        cells[2].c = 'c';
+        cells[3].c = ' ';
+        cells[4].c = '中';
+        cells[4].flags = Flags::WIDE_CHAR;
+        cells[5].c = ' ';
+        cells[5].flags = Flags::WIDE_CHAR_SPACER;
+        cells[6].c = '─';
+        for (col, ch) in [(7usize, 'X'), (8usize, 'Y')] {
+            cells[col].c = ch;
+            cells[col].fg = Color::Named(alacritty_terminal::vte::ansi::NamedColor::Red);
+            cells[col].bg = Color::Named(alacritty_terminal::vte::ansi::NamedColor::Blue);
+            cells[col].flags = Flags::BOLD;
+        }
+        cells[9].c = 'z';
+
+        // 新借用迭代（快照行直引）
+        let (bg_borrowed, runs_borrowed) =
+            renderer.layout_row(0, cells.iter().enumerate(), &colors, default_bg);
+        // 旧值迭代语义：先克隆成拥有值再借引用迭代 —— 输出必须一致
+        let owned: Vec<(usize, Cell)> = cells.iter().cloned().enumerate().collect();
+        let (bg_owned, runs_owned) =
+            renderer.layout_row(0, owned.iter().map(|(col, cell)| (*col, cell)), &colors, default_bg);
+        assert_eq!(bg_borrowed, bg_owned, "背景与旧值迭代一致");
+        assert_eq!(runs_borrowed, runs_owned, "文本 run 与旧值迭代一致");
+
+        // 字面期望：abc 单 run；空格切断；「中」占两列；box-drawing 不进 run；
+        // X/Y 同样式合并；z 样式不同自成 run
+        let runs: Vec<(usize, usize, &str)> = runs_borrowed
+            .iter()
+            .map(|run| (run.start_col, run.end_col, run.text.as_str()))
+            .collect();
+        assert_eq!(
+            runs,
+            vec![(0, 3, "abc"), (4, 6, "中"), (7, 9, "XY"), (9, 10, "z")]
+        );
+        // 背景合并：col7-8 蓝底合并为单矩形
+        assert_eq!(bg_borrowed.len(), 1);
+        assert_eq!((bg_borrowed[0].start_col, bg_borrowed[0].end_col), (7, 9));
+    }
+
+    #[test]
+    fn search_match_rect_maps_history_row_and_rejects_offscreen() {
+        let origin = gpui::point(px(10.0), px(20.0));
+        // 命中在视口内：row = line + display_offset - history = 38 + 2 - 36 = 4
+        let rect = search_match_rect(38, 4, 6, 2, 36, 40, origin, px(8.0), px(20.0))
+            .expect("视口内命中应有矩形");
+        assert_eq!(rect.origin.x, px(10.0 + 8.0 * 4.0));
+        assert_eq!(rect.origin.y, px(20.0 + 20.0 * 4.0));
+        assert_eq!(rect.size.width, px(8.0 * 6.0));
+        assert_eq!(rect.size.height, px(20.0));
+        // 滚出视口上方（row<0）/下方（row>=screen_lines）→ None
+        assert!(search_match_rect(10, 0, 3, 2, 36, 40, origin, px(8.0), px(20.0)).is_none());
+        assert!(search_match_rect(80, 0, 3, 2, 36, 40, origin, px(8.0), px(20.0)).is_none());
+    }
+
+    #[test]
+    fn selection_row_spans_clamp_to_viewport_and_columns() {
+        // 选区跨网格行 -2..=1（端点列 3 与 9），display_offset=2，视口 6 行 10 列
+        let selection = SelectionRange::new(
+            AlacPoint::new(Line(-2), Column(3)),
+            AlacPoint::new(Line(1), Column(9)),
+            false,
+        );
+        assert_eq!(
+            selection_row_spans(selection, 2, 10, 6),
+            vec![(0, 3, 10), (1, 0, 10), (2, 0, 10), (3, 0, 10)],
+            "首行从端点列起，中间行整行，末行裁到端点列+1"
+        );
+        // 选区整体滚出视口上方 → 空扇区
+        let above = SelectionRange::new(
+            AlacPoint::new(Line(-9), Column(0)),
+            AlacPoint::new(Line(-8), Column(5)),
+            false,
+        );
+        assert!(selection_row_spans(above, 2, 10, 6).is_empty());
+        // 末列越界钳到 columns
+        let wide = SelectionRange::new(
+            AlacPoint::new(Line(0), Column(8)),
+            AlacPoint::new(Line(0), Column(20)),
+            false,
+        );
+        assert_eq!(selection_row_spans(wide, 0, 10, 6), vec![(0, 8, 10)]);
+    }
+
+    #[test]
+    fn preedit_row_clamps_into_viewport() {
+        assert_eq!(preedit_row(3, 0, 4), 3);
+        assert_eq!(preedit_row(-5, 2, 4), 0, "滚出视口钳到顶行");
+        assert_eq!(preedit_row(10, 0, 4), 3, "越底钳到底行");
+    }
 
     #[test]
     fn test_renderer_creation() {

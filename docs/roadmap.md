@@ -65,7 +65,40 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 > 与 LaterScreen 暗色「中性提亮」系有意偏离，留 4K 实机走查）。设置语义与持久化
 > 路径不变；迁移函数挂为 workspace 子模块（需访问 WorkspaceView 私有项，顶层
 > 平级模块不可见）。门禁：app bins 新增 scroll-spy 纯函数与导航联动 gpui::test。
-> 已知体验债：终端锁覆盖 paint（可做可见网格 snapshot）；渲染器克隆/测量可再省。
+> 已知体验债「终端锁覆盖 paint；渲染器克隆/测量可再省」处置（2026-11-07）：绘制期
+> 改为「可见网格快照短锁」——canvas 每帧唯一一次持锁做 FrameSnapshot::capture
+> （可见区逐格复制 + selection.to_range + dims/cursor/display_offset/colors/mode 读取），
+> 锁外 paint_frame 与搜索/选区/preedit 覆盖层全部消费同帧快照；快照缓冲每窗格持池
+> （帧尾归还、capture_into 复用行容量，稳态帧零行分配）；last_content_origin 的
+> entity.update 移出锁窗口；paint 闭包内 renderer.clone() 删除（闭包 move+FnOnce 直接
+> 用，省每帧每窗格 font_family String + font_fallbacks Vec + palette 白拷贝）。新增
+> LATERTERM_RENDER_TRACE=1 每帧稳态观测（font_trace 只打重测量帧，采不到稳态），
+> 字段口径钉死、前后对照只认 paint_lock_hold_ms（锁获取成功→guard 释放：快照前=历史
+> 读取+实体写+绘制+三段覆盖层全程，快照后=仅快照复制，另有 snapshot_ms 同值标注）。
+> 对照数据（release、隔离测试窗口逐帧 window.draw、228×98=22344 格、交替 4 轮×207
+> 稳态帧取中位；**非基准承诺**，非真机 4 窗格协议，debug 构建渲染失真前提见 M3
+> 2026-11-04 注记）：锁持有时长 0.531ms→0.114ms（-78.5%）；锁等待双方均 0（主线程
+> 串行模型本无竞争）；整帧 paint_closure_ms 0.532→0.597ms（+12.3%，约 +65µs，<1%
+> vsync 帧预算）。方案「after≤before×10%」参考线未达：纯 cell 复制本身实测即
+> 0.114ms（=21.5%），任何全网格遍历不低于此——该线前提（复制≈50µs）被实测否定，
+> 非机制失效。+5% 帧回归线超出：两阶段「先复制后消费」的整网格工作集（≈2×快照
+> 体积）相比旧「收集一行→立刻消费一行」的行热模式有固有缓存代价，缓冲池/行解析
+> 外提/scratch+swap 三变体实测无改善；方案 risk-1 预案的「锁内布局、锁外整形」形态
+> 实测锁窗口 0.29-0.31ms（layout 本身约 0.17ms，比快照差 2.5×）而整帧差异在批次
+> 漂移 ±5-6% 内统计不可区分——回退不划算，保留快照形态并把代价如实入账。收益定位
+> （诚实口径）：主线程串行与帧调度不变，用户可感知收益为零；真实收益=锁窗口记账
+> -78.5% + 为未来第二线程消费者（后台快照/诊断抓帧）留路。API 口径：paint 保持签名
+> （薄包装=capture+paint_frame）；layout_row 迭代项有意由 (usize,Cell) 改
+> (usize,&Cell)（工作区无其它调用方，本 crate 已内化随本仓库演进）；paint_preedit
+> 原签名保留、新增 paint_preedit_frame 快照变体。覆盖层防错行：搜索命中/选区/预编辑
+> 坐标换算抽为纯函数 search_match_rect / selection_row_spans / preedit_row 并单测
+> （历史行换算/视口外 None/端点裁剪/钳位）；既有 mouse/搜索 gpui::test 只覆盖状态侧
+> 不进 paint 路径，paint 侧防护=快照对账单测（OSC 颜色覆盖/SGR/宽字符/滚动/选区/
+> 缓冲池复用逐字段与锁内现读对账 + layout 借用版与旧值迭代产出相等）+ 待实机走查
+> （滚动中段命中框、拖拽选区逐行高亮、IME 下划线候选框跟随、光标三形状闪烁、
+> htop/vim 连笔、4K 缩放）。真机 4 窗格同负载对照（如 seq 负载 20s、≥200 稳态帧）
+> 待实机。门禁：workspace lib/bins 407 通过 4 ignored（termview +5 测试：快照对账/
+> 池复用/layout 等价/三覆盖层纯函数，+1 bench ignored；clippy 零告警）。
 > 主题预览（2026-11-07）：设置→滚动与主题新增色板预览卡（背景/前景/光标三色块 +
 > ANSI 8×2 中文名小字标签 + 示例终端行，数据经 palette_preview 纯函数与真实窗格色板
 > 同源）；点主题芯片改为「预览未落盘」语义——选中即全部窗格真实换色

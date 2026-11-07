@@ -48,7 +48,9 @@
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
-use crate::render::TerminalRenderer;
+use crate::render::{
+    FrameSnapshot, TerminalRenderer, search_match_rect, selection_row_spans,
+};
 use crate::terminal::TerminalState;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
@@ -90,6 +92,31 @@ fn font_trace_reason(
     } else {
         None
     }
+}
+
+/// 绘制期性能观测：`LATERTERM_RENDER_TRACE=1` 时每帧输出一行锁窗口与绘制耗时。
+/// 与 font_trace 的分工：font_trace 只在重测量帧打印，采不到稳态帧；本通道专供
+/// 「锁持有时长」前后对照采集（快照优化前=整段持锁绘制，优化后=仅快照复制）。
+/// 字段口径钉死（改造前后同名同义，对照只认 paint_lock_hold_ms）：
+/// - paint_lock_wait_ms  等待 paint 锁的时长
+/// - paint_lock_hold_ms  锁持有时长＝锁获取成功→guard 释放的完整窗口
+///   （快照前＝历史行读取+实体写+网格绘制+三段覆盖层全程；
+///   快照后＝仅可见网格快照复制）
+/// - snapshot_ms         快照复制本体时长（快照后恒等于 paint_lock_hold_ms；
+///   快照前的代码无此字段）
+/// - paint_ms            渲染器 paint(_frame) 本体时长（不含覆盖层）
+/// - overlay_ms          搜索/选区/预编辑三段覆盖层时长
+/// - paint_closure_ms    canvas paint 闭包整段时长
+/// - cells               本帧绘制覆盖的可见格数（行×列）
+fn render_trace_requested(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+fn render_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        render_trace_requested(std::env::var_os("LATERTERM_RENDER_TRACE").as_deref())
+    })
 }
 
 /// 终端光标形状。与 laterterm-config 的同名枚举一一对应，由 app 层映射
@@ -474,6 +501,11 @@ pub struct TerminalView {
     /// 平滑滚动残差：不足一行的像素滚动累积于此（单位：行，可为小数）。
     scroll_residual: f32,
 
+    /// 绘制期快照缓冲池：帧尾归还 [`FrameSnapshot`]，下帧 canvas 闭包取出并用
+    /// [`FrameSnapshot::capture_into`] 复用 rows/row 容量（稳态帧零行分配）。
+    /// 只有主线程 canvas 闭包经此互斥体取还，实际无竞争。
+    snapshot_cache: Arc<parking_lot::Mutex<Option<FrameSnapshot>>>,
+
     /// Callback to notify the PTY about size changes
     resize_callback: Option<Arc<ResizeCallback>>,
     /// 已同步到会话的首帧尺寸；会话初始尺寸不一定等于网格配置。
@@ -789,6 +821,7 @@ impl TerminalView {
             _blink_task: blink_task,
             _sync_task: sync_task,
             scroll_residual: 0.0,
+            snapshot_cache: Arc::new(parking_lot::Mutex::new(None)),
             rendered_epoch: 0,
             blink_on: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             // 默认 resize 回调转发给会话；with_resize_callback 可整体覆盖
@@ -1958,6 +1991,8 @@ impl Render for TerminalView {
         let renderer = self.renderer.clone();
         let resize_callback = self.resize_callback.clone();
         let session_size = self.session_size.clone();
+        // 快照缓冲池句柄：canvas 闭包帧尾归还、下帧复用（见 snapshot_cache 字段注记）
+        let snapshot_cache = self.snapshot_cache.clone();
         let focus_handle = self.focus_handle.clone();
         // 光标可见性快照：canvas 闭包在绘制阶段读取（闪烁相位由 blink 任务驱动）
         let cursor_visible =
@@ -2022,6 +2057,8 @@ impl Render for TerminalView {
                 canvas(
                     move |bounds, _window, _cx| bounds,
                     move |bounds, _, window, cx| {
+                        let rt = render_trace_enabled();
+                        let rt_closure_started = rt.then(Instant::now);
                         window.handle_input(
                             &focus_handle,
                             ElementInputHandler::new(bounds, entity.clone()),
@@ -2029,17 +2066,17 @@ impl Render for TerminalView {
                         );
                         use alacritty_terminal::grid::Dimensions;
 
-                        // 测量已在上面的实体 render 阶段完成；这里直接使用快照，
-                        // 不在 canvas 闭包中重复字体整形。
-                        let measured_renderer = renderer.clone();
+                        // 测量已在上面的实体 render 阶段完成；闭包是 move+FnOnce，
+                        // 直接使用 move 进来的 renderer（不再每帧每窗格克隆一遍：
+                        // font_family String + font_fallbacks Vec + palette 的白拷贝）。
 
                         // Calculate available space after padding, clamping tiny windows safely.
                         let available_width: f32 =
                             (bounds.size.width - padding.left - padding.right).into();
                         let available_height: f32 =
                             (bounds.size.height - padding.top - padding.bottom).into();
-                        let cell_width_f32: f32 = measured_renderer.cell_width.into();
-                        let cell_height_f32: f32 = measured_renderer.cell_height.into();
+                        let cell_width_f32: f32 = renderer.cell_width.into();
+                        let cell_height_f32: f32 = renderer.cell_height.into();
 
                         let cols =
                             ((available_width.max(0.0) / cell_width_f32.max(1.0)) as usize).max(1);
@@ -2107,101 +2144,107 @@ impl Render for TerminalView {
                             None
                         };
 
+                        // 唯一一次持锁：捕获同帧可见网格快照（cells/selection/cursor/
+                        // display_offset 同帧一致），随取随放——锁窗口从「整段绘制」缩到
+                        // 「快照复制」，为未来的第二线程消费者（后台快照/诊断抓帧）留路。
+                        // 快照缓冲自缓冲池取用（复用行容量，稳态帧零分配），帧尾归还。
+                        let mut frame = snapshot_cache.lock().take().unwrap_or_default();
                         let paint_lock_started = trace.map(|_| Instant::now());
-                        let term = state_arc.lock();
-                        let paint_lock_wait = paint_lock_started.map(|started| started.elapsed());
-                        let history_lines = trace.map(|_| term.grid().total_lines() - term.screen_lines());
+                        let rt_lock_started = rt.then(Instant::now);
+                        let paint_lock_wait;
+                        let rt_lock_wait;
+                        let rt_lock_hold;
+                        let rt_snapshot;
+                        let history_lines;
+                        let rt_cells;
+                        {
+                            let term = state_arc.lock();
+                            paint_lock_wait = paint_lock_started.map(|started| started.elapsed());
+                            rt_lock_wait = rt_lock_started.map(|started| started.elapsed());
+                            // 锁获取成功：paint_lock_hold 计时起点（口径见 render_trace_enabled 注记）
+                            let rt_hold_started = rt.then(Instant::now);
+                            let rt_capture_started = rt.then(Instant::now);
+                            FrameSnapshot::capture_into(&term, &mut frame);
+                            // guard 释放前一刻：hold 终点（本实现锁窗口＝快照复制本体）
+                            rt_lock_hold = rt_hold_started.map(|started| started.elapsed());
+                            rt_snapshot = rt_capture_started.map(|started| started.elapsed());
+                            history_lines = trace.map(|_| frame.total_lines - frame.screen_lines);
+                            rt_cells = rt.then(|| frame.screen_lines * frame.columns);
+                        }
 
-                        // Paint the terminal with measured dimensions
+                        // Paint the terminal with measured dimensions（锁外：数据源=快照）
                         let paint_started = trace.map(|_| Instant::now());
-                        // 记录内容原点（URL 点击检测用：padding 内侧的字符区起点）
+                        let rt_paint_started = rt.then(Instant::now);
+                        // 记录内容原点（URL 点击检测用：padding 内侧的字符区起点；无需锁）
                         entity.update(cx, |view: &mut Self, _| {
                             view.last_content_origin = Some(Point {
                                 x: bounds.origin.x + padding.left,
                                 y: bounds.origin.y + padding.top,
                             });
                         });
-                        measured_renderer.paint(
+                        renderer.paint_frame(
                             bounds,
                             padding,
-                            &term,
+                            &frame,
                             window,
                             cx,
                             cursor_visible,
                             scroll_offset,
                         );
                         let paint_elapsed = paint_started.map(|started| started.elapsed());
+                        let rt_paint_elapsed = rt_paint_started.map(|started| started.elapsed());
+                        let rt_overlay_started = rt.then(Instant::now);
 
                         let trace_report = trace.map(|(reason, started, entity_id, scale, measure_elapsed)| {
                             (reason, entity_id, scale, measure_elapsed, started.elapsed())
                         });
 
-                        // 当前搜索命中的高亮覆盖层（网格坐标锚定，随滚动移动）
-                        if search_open && let Some(match_) = current_match {
-                            let grid = term.grid();
-                            let history = grid.total_lines() - grid.screen_lines();
-                            let display_offset = grid.display_offset() as i64;
-                            let row = match_.line as i64 + display_offset - history as i64;
-                            if row >= 0 && (row as usize) < grid.screen_lines() {
-                                let origin_x = bounds.origin.x + padding.left;
-                                let origin_y = bounds.origin.y + padding.top;
-                                let x =
-                                    origin_x + measured_renderer.cell_width * match_.column as f32;
-                                let y = origin_y + measured_renderer.cell_height * row as f32;
-                                window.paint_quad(gpui::quad(
-                                    Bounds {
-                                        origin: Point { x, y },
-                                        size: Size {
-                                            width: measured_renderer.cell_width * match_.len as f32,
-                                            height: measured_renderer.cell_height,
-                                        },
-                                    },
-                                    px(0.0),
-                                    gpui::Hsla::from(gpui::rgb(0xE0AF68)).opacity(0.35),
-                                    Edges::<Pixels>::default(),
-                                    gpui::transparent_black(),
-                                    gpui::BorderStyle::default(),
-                                ));
-                            }
-                        }
-                        // 文本选区高亮：逐行画选区段覆盖（网格坐标锚定，随滚动移动）
-                        if let Some(selection) =
-                            term.selection.as_ref().and_then(|sel| sel.to_range(&term))
+                        // 当前搜索命中的高亮覆盖层（网格坐标锚定，随滚动移动；数据源=快照）
+                        if search_open
+                            && let Some(match_) = current_match
+                            && let Some(rect) = search_match_rect(
+                                match_.line,
+                                match_.column,
+                                match_.len,
+                                frame.display_offset,
+                                frame.total_lines - frame.screen_lines,
+                                frame.screen_lines,
+                                Point {
+                                    x: bounds.origin.x + padding.left,
+                                    y: bounds.origin.y + padding.top,
+                                },
+                                renderer.cell_width,
+                                renderer.cell_height,
+                            )
                         {
-                            let grid = term.grid();
-                            let display_offset = grid.display_offset() as i64;
-                            let columns = grid.columns();
+                            window.paint_quad(gpui::quad(
+                                rect,
+                                px(0.0),
+                                gpui::Hsla::from(gpui::rgb(0xE0AF68)).opacity(0.35),
+                                Edges::<Pixels>::default(),
+                                gpui::transparent_black(),
+                                gpui::BorderStyle::default(),
+                            ));
+                        }
+                        // 文本选区高亮：逐行画选区段覆盖（数据源=快照，与 cells 同帧）
+                        if let Some(selection) = frame.selection {
                             let origin_x = bounds.origin.x + padding.left;
                             let origin_y = bounds.origin.y + padding.top;
-                            for screen_row in 0..grid.screen_lines() as i64 {
-                                let line = screen_row - display_offset;
-                                if line < selection.start.line.0 as i64
-                                    || line > selection.end.line.0 as i64
-                                {
-                                    continue;
-                                }
-                                let start_col = if line == selection.start.line.0 as i64 {
-                                    selection.start.column.0
-                                } else {
-                                    0
-                                };
-                                let end_col = if line == selection.end.line.0 as i64 {
-                                    (selection.end.column.0 + 1).min(columns)
-                                } else {
-                                    columns
-                                };
-                                if end_col <= start_col {
-                                    continue;
-                                }
-                                let x = origin_x + measured_renderer.cell_width * start_col as f32;
-                                let y = origin_y + measured_renderer.cell_height * screen_row as f32;
+                            for (screen_row, start_col, end_col) in selection_row_spans(
+                                selection,
+                                frame.display_offset,
+                                frame.columns,
+                                frame.screen_lines,
+                            ) {
+                                let x = origin_x + renderer.cell_width * start_col as f32;
+                                let y = origin_y + renderer.cell_height * screen_row as f32;
                                 window.paint_quad(gpui::quad(
                                     Bounds {
                                         origin: Point { x, y },
                                         size: Size {
-                                            width: measured_renderer.cell_width
+                                            width: renderer.cell_width
                                                 * (end_col - start_col) as f32,
-                                            height: measured_renderer.cell_height,
+                                            height: renderer.cell_height,
                                         },
                                     },
                                     px(0.0),
@@ -2218,8 +2261,8 @@ impl Render for TerminalView {
                                 x: bounds.origin.x + padding.left,
                                 y: bounds.origin.y + padding.top,
                             };
-                            measured_renderer.paint_preedit(
-                                &term,
+                            renderer.paint_preedit_frame(
+                                &frame,
                                 origin,
                                 window,
                                 cx,
@@ -2227,8 +2270,29 @@ impl Render for TerminalView {
                                 scroll_offset,
                             );
                         }
-                        // 持锁完成后再输出，避免诊断 I/O 阻塞 PTY 读线程。
-                        drop(term);
+                        let rt_overlay_elapsed = rt_overlay_started.map(|started| started.elapsed());
+                        // 快照块内 guard 已释放；帧尾把快照归还缓冲池（下帧复用行容量），
+                        // 诊断 I/O 不占任何锁、也不持快照。
+                        *snapshot_cache.lock() = Some(frame);
+                        if rt {
+                            // 诊断输出在锁与快照释放之后：I/O 不进锁窗口（口径见 render_trace_enabled 注记）
+                            let as_ms = |duration: Option<Duration>| {
+                                duration.map_or(f64::NAN, |value| value.as_secs_f64() * 1000.0)
+                            };
+                            let closure_ms = rt_closure_started
+                                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                                .unwrap_or(f64::NAN);
+                            eprintln!(
+                                "[render-trace] grid={cols}x{rows} cells={} paint_lock_wait_ms={:.3} paint_lock_hold_ms={:.3} snapshot_ms={:.3} paint_ms={:.3} overlay_ms={:.3} paint_closure_ms={:.3}",
+                                rt_cells.unwrap_or_default(),
+                                as_ms(rt_lock_wait),
+                                as_ms(rt_lock_hold),
+                                as_ms(rt_snapshot),
+                                as_ms(rt_paint_elapsed),
+                                as_ms(rt_overlay_elapsed),
+                                closure_ms,
+                            );
+                        }
                         if let Some((reason, entity_id, scale, measure_elapsed, total_elapsed)) = trace_report {
                             let as_ms = |duration: Option<Duration>| {
                                 duration.map(|value| value.as_secs_f64() * 1000.0)
@@ -3354,5 +3418,41 @@ mod tests {
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         drop(terminal);
+    }
+
+    /// 手动基准（默认 `#[ignore]`）：采集 `LATERTERM_RENDER_TRACE` 的锁窗口对照数据。
+    ///
+    /// ```text
+    /// LATERTERM_RENDER_TRACE=1 cargo test --release -p laterterm-termview --lib \
+    ///     render_trace_lock_window_benchmark -- --ignored --nocapture
+    /// ```
+    ///
+    /// 隔离测试窗口逐帧 `window.draw`（不经真实 GPU/合成器，文本整形走同一文本系统），
+    /// stderr 的 `[render-trace]` 行即为样本。对照口径只认 `paint_lock_hold_ms`
+    /// （快照前=整段持锁绘制，快照后=仅快照复制，见 `render_trace_enabled` 注记）；
+    /// 该数据只作锁窗口对照，非真机帧率基准（真机口径见 roadmap M1 注记）。
+    #[gpui::test]
+    #[ignore]
+    fn render_trace_lock_window_benchmark(cx: &mut TestAppContext) {
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        // 灌入近似持续输出的网格：大量行 + 少量 SGR 着色/加粗，制造真实负载形态
+        terminal.update(cx, |view, _| {
+            for i in 0..2000 {
+                let line = format!(
+                    "\x1b[1;34mrow {i:06}\x1b[0m 0123456789abcdefghijklmnopqrstuvwxyz\r\n"
+                );
+                view.state.process_bytes(line.as_bytes());
+            }
+        });
+        // 预热：首帧含字体测量与网格 resize，不计入样本
+        for _ in 0..5 {
+            cx.update(|window, cx| window.draw(cx).clear());
+        }
+        let frames = 200;
+        for _ in 0..frames {
+            cx.update(|window, cx| window.draw(cx).clear());
+        }
     }
 }
