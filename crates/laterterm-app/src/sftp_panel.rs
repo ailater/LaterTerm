@@ -716,7 +716,9 @@ impl SftpPanelState {
     }
 
     fn transfer_mut(&mut self, id: u64) -> Option<&mut SftpTransfer> {
-        Arc::make_mut(&mut self.transfers).iter_mut().find(|transfer| transfer.id == id)
+        Arc::make_mut(&mut self.transfers)
+            .iter_mut()
+            .find(|transfer| transfer.id == id)
     }
 
     /// 取消一条传输：置位标志；排队中的直接标 Cancelled（工作线程可能

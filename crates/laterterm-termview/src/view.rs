@@ -48,9 +48,7 @@
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
-use crate::render::{
-    FrameSnapshot, TerminalRenderer, search_match_rect, selection_row_spans,
-};
+use crate::render::{FrameSnapshot, TerminalRenderer, search_match_rect, selection_row_spans};
 use crate::terminal::TerminalState;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
@@ -1375,6 +1373,30 @@ impl TerminalView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Ctrl+滚轮：字号缩放（终端标配）——不进滚动逻辑
+        if event.modifiers.control {
+            let delta: f32 = match event.delta {
+                ScrollDelta::Lines(point) => point.y,
+                ScrollDelta::Pixels(point) => {
+                    let py: f32 = point.y.into();
+                    py * 0.01
+                }
+            };
+            if delta.abs() < 0.1 {
+                return;
+            }
+            let step = if delta > 0.0 { 1.0 } else { -1.0 };
+            let current: f32 = self.config.font_size.into();
+            let new_size = (current + step).clamp(8.0, 40.0);
+            if (new_size - current).abs() > f32::EPSILON {
+                self.config.font_size = gpui::px(new_size);
+                self.renderer.font_size = self.config.font_size;
+                self.renderer.invalidate_measurement();
+                cx.notify();
+            }
+            return;
+        }
+
         let cell_height: f32 = self.renderer.cell_height.into();
         let delta_y: f32 = match event.delta {
             ScrollDelta::Lines(point) => point.y,
@@ -1472,11 +1494,23 @@ impl TerminalView {
                 TerminalEvent::ClipboardStore(text) => {
                     if let Some(ref callback) = self.clipboard_store_callback {
                         callback(window, cx, &text);
+                    } else {
+                        // OSC 52 默认行为：无回调时直接写系统剪贴板
+                        let _ = crate::clipboard::Clipboard::new()
+                            .and_then(|mut clipboard| clipboard.copy(&text));
                     }
                 }
                 TerminalEvent::ClipboardLoad => {
-                    // Terminal wants to load data from clipboard
-                    // TODO: Implement clipboard integration
+                    // OSC 52 读：把系统剪贴板内容写入终端输入（等价粘贴）
+                    if let Ok(text) = crate::clipboard::Clipboard::new()
+                        .and_then(|mut clipboard| clipboard.paste())
+                        && !text.is_empty()
+                    {
+                        let mut writer = self.stdin_writer.lock();
+                        let _ = writer
+                            .write_all(text.as_bytes())
+                            .and_then(|_| writer.flush());
+                    }
                 }
                 TerminalEvent::Exit => {
                     if let Some(callback) = self.exit_callback.take() {
@@ -3442,9 +3476,8 @@ mod tests {
         // 灌入近似持续输出的网格：大量行 + 少量 SGR 着色/加粗，制造真实负载形态
         terminal.update(cx, |view, _| {
             for i in 0..2000 {
-                let line = format!(
-                    "\x1b[1;34mrow {i:06}\x1b[0m 0123456789abcdefghijklmnopqrstuvwxyz\r\n"
-                );
+                let line =
+                    format!("\x1b[1;34mrow {i:06}\x1b[0m 0123456789abcdefghijklmnopqrstuvwxyz\r\n");
                 view.state.process_bytes(line.as_bytes());
             }
         });

@@ -25,8 +25,8 @@ use gpui::{
     SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px, rgb, rgba,
 };
-use laterterm_config::theme::ThemeColors;
 use laterterm_config::Appearance;
+use laterterm_config::theme::ThemeColors;
 
 // ---------------------------------------------------------------------------
 // Tokyo Night 色板收敛（评审硬伤5：逐处替换、只动本模块，不按色值全局替换
@@ -1143,8 +1143,12 @@ fn settings_shortcuts_body(
                     false,
                     cx.listener(move |this, _, window, cx| {
                         cx.stop_propagation();
-                        if let Some(entry) =
-                            this.settings.totp.iter().find(|item| item.name == name).cloned()
+                        if let Some(entry) = this
+                            .settings
+                            .totp
+                            .iter()
+                            .find(|item| item.name == name)
+                            .cloned()
                         {
                             this.edit_totp(Some(&entry), window, cx);
                             this.start_shortcut_recording(window, cx);

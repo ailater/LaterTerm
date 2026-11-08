@@ -836,7 +836,15 @@ impl TerminalRenderer {
         scroll_offset: f32,
     ) {
         let frame = FrameSnapshot::capture(term);
-        self.paint_frame(bounds, padding, &frame, window, _cx, cursor_visible, scroll_offset);
+        self.paint_frame(
+            bounds,
+            padding,
+            &frame,
+            window,
+            _cx,
+            cursor_visible,
+            scroll_offset,
+        );
     }
 
     /// 按既有快照绘制网格：数据源全部来自 [`FrameSnapshot`]（与覆盖层同帧）。
@@ -889,12 +897,8 @@ impl TerminalRenderer {
 
             // Layout the row once; text runs are shaped in batches below.
             // 借用迭代：消除快照前「进 cells Vec 一次 + 值迭代再 clone 一次」的第二遍复制。
-            let (backgrounds, text_runs) = self.layout_row(
-                line_idx,
-                row_cells.iter().enumerate(),
-                colors,
-                default_bg,
-            );
+            let (backgrounds, text_runs) =
+                self.layout_row(line_idx, row_cells.iter().enumerate(), colors, default_bg);
 
             // Paint backgrounds
             for bg_rect in backgrounds {
@@ -1156,7 +1160,11 @@ impl TerminalRenderer {
         if text.is_empty() {
             return;
         }
-        let row = preedit_row(frame.cursor.line.0, frame.display_offset as i32, frame.screen_lines);
+        let row = preedit_row(
+            frame.cursor.line.0,
+            frame.display_offset as i32,
+            frame.screen_lines,
+        );
         let fg_color = self.palette.resolve(
             Color::Named(alacritty_terminal::vte::ansi::NamedColor::Foreground),
             &frame.colors,
@@ -1381,8 +1389,12 @@ mod tests {
             renderer.layout_row(0, cells.iter().enumerate(), &colors, default_bg);
         // 旧值迭代语义：先克隆成拥有值再借引用迭代 —— 输出必须一致
         let owned: Vec<(usize, Cell)> = cells.iter().cloned().enumerate().collect();
-        let (bg_owned, runs_owned) =
-            renderer.layout_row(0, owned.iter().map(|(col, cell)| (*col, cell)), &colors, default_bg);
+        let (bg_owned, runs_owned) = renderer.layout_row(
+            0,
+            owned.iter().map(|(col, cell)| (*col, cell)),
+            &colors,
+            default_bg,
+        );
         assert_eq!(bg_borrowed, bg_owned, "背景与旧值迭代一致");
         assert_eq!(runs_borrowed, runs_owned, "文本 run 与旧值迭代一致");
 

@@ -58,7 +58,7 @@ const PANEL_WIDTH: f32 = 240.0;
 pub(crate) struct PaneId(pub(crate) u64);
 
 /// 标签 ID：一组窗格（含其分屏树）的容器。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct TabId(pub(crate) u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -774,6 +774,10 @@ pub struct WorkspaceView {
     server_notice: Option<String>,
     /// 分组折叠态（键 = 组名，None = 未分组桶；会话级，不持久化）。
     server_groups_collapsed: BTreeSet<Option<String>>,
+    /// 用户自定义标签标题（双击重命名）；优先于 OSC/窗格计算标题。
+    custom_tab_titles: BTreeMap<TabId, String>,
+    /// 标签重命名输入框（双击标签时弹出）。
+    tab_rename_field: Option<(TabId, Entity<CommandTextField>)>,
     /// 待二次确认解散的分组名。
     server_group_confirm: Option<String>,
     /// 设置落盘路径（None = 用户默认配置；测试注入临时路径避免污染真实配置）。
@@ -918,6 +922,8 @@ impl WorkspaceView {
             server_error: None,
             server_notice: None,
             server_groups_collapsed: BTreeSet::new(),
+            custom_tab_titles: BTreeMap::new(),
+            tab_rename_field: None,
             server_group_confirm: None,
             settings_save_path: None,
             settings_version: 0,
@@ -1290,7 +1296,40 @@ impl WorkspaceView {
         }
     }
 
-    /// 关闭欢迎覆盖层。
+    // ───────────────────── 标签重命名 ─────────────────────
+
+    /// 双击标签打开重命名输入框。
+    fn start_tab_rename(&mut self, id: TabId, cx: &mut Context<Self>) {
+        let current = self.custom_tab_titles.get(&id).cloned().unwrap_or_else(|| {
+            self.tabs
+                .iter()
+                .find(|tab| tab.id == id)
+                .map(|tab| tab.tab_title(&self.panes))
+                .unwrap_or_default()
+        });
+        let field = cx.new(|cx| CommandTextField::new(current, "标签名", cx));
+        self.tab_rename_field = Some((id, field));
+        cx.notify();
+    }
+
+    /// 确认重命名：空 = 恢复自动标题。
+    fn commit_tab_rename(&mut self, cx: &mut Context<Self>) {
+        if let Some((id, field)) = self.tab_rename_field.take() {
+            let title = field.read(cx).value().trim().to_string();
+            if title.is_empty() {
+                self.custom_tab_titles.remove(&id);
+            } else {
+                self.custom_tab_titles.insert(id, title);
+            }
+        }
+        cx.notify();
+    }
+
+    fn cancel_tab_rename(&mut self, cx: &mut Context<Self>) {
+        self.tab_rename_field = None;
+        cx.notify();
+    }
+
     fn dismiss_welcome(
         &mut self,
         _event: &MouseDownEvent,
@@ -4836,7 +4875,9 @@ impl WorkspaceView {
                 *counts.entry(binding.normalized.clone()).or_default() += 1;
             }
             let normalized = |shortcut: &Option<String>| -> Option<String> {
-                shortcut.as_ref().and_then(|key| normalize_shortcut(key).ok())
+                shortcut
+                    .as_ref()
+                    .and_then(|key| normalize_shortcut(key).ok())
             };
             let command_normalized: Vec<Option<String>> = self
                 .settings
@@ -4862,14 +4903,16 @@ impl WorkspaceView {
             ];
             // 无效快捷键展示行（原文保留修复入口），重算时一次 format!
             let mut invalid_rows: Vec<(String, String)> = Vec::new();
-            let push_invalid =
-                |rows: &mut Vec<(String, String)>, label: &str, name: &str, shortcut: &Option<String>| {
-                    if let Some(key) = shortcut
-                        && normalize_shortcut(key).is_err()
-                    {
-                        rows.push((format!("{label} {name}"), key.clone()));
-                    }
-                };
+            let push_invalid = |rows: &mut Vec<(String, String)>,
+                                label: &str,
+                                name: &str,
+                                shortcut: &Option<String>| {
+                if let Some(key) = shortcut
+                    && normalize_shortcut(key).is_err()
+                {
+                    rows.push((format!("{label} {name}"), key.clone()));
+                }
+            };
             for command in &self.settings.commands {
                 push_invalid(&mut invalid_rows, "命令", &command.name, &command.shortcut);
             }
@@ -4907,7 +4950,8 @@ impl WorkspaceView {
     }
 
     /// 全量快捷键绑定：内置、面板与条目共用同一冲突注册表。
-    fn all_shortcut_bindings(&self) -> Vec<ShortcutBinding> {        let mut bindings = Vec::new();
+    fn all_shortcut_bindings(&self) -> Vec<ShortcutBinding> {
+        let mut bindings = Vec::new();
         for (keystroke, label) in BUILTIN_SHORTCUTS {
             if let Ok(normalized) = normalize_shortcut(keystroke) {
                 bindings.push(ShortcutBinding {
@@ -5295,13 +5339,17 @@ impl Render for WorkspaceView {
         let geometry_layout = active_layout.clone();
         let geometry_rects = pane_rects.clone();
         let focused_pane = self.active_tab().focused_pane;
-        // 每个标签的标题 = 其焦点窗格标题；多窗格时附带窗格数
+        // 每个标签的标题 = 用户自定义 > 焦点窗格标题；多窗格时附带窗格数
         let tab_labels = self
             .tabs
             .iter()
             .map(|tab| {
                 let count = tab.layout.leaf_count();
-                let title = tab.tab_title(&self.panes);
+                let title = self
+                    .custom_tab_titles
+                    .get(&tab.id)
+                    .cloned()
+                    .unwrap_or_else(|| tab.tab_title(&self.panes));
                 (tab.id, title, count)
             })
             .collect::<Vec<_>>();
@@ -5500,6 +5548,58 @@ impl Render for WorkspaceView {
             .when_some(sftp_overlay(self, cx), |root, overlay| root.child(overlay))
             .when(self.welcome_visible, |root| {
                 root.child(self.welcome_overlay(cx))
+            })
+            // 标签重命名浮层（双击标签触发）
+            .when_some(self.tab_rename_field.clone(), |root, (_id, field)| {
+                root.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .left_0()
+                        .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.85))
+                        .flex()
+                        .items_start()
+                        .justify_center()
+                        .pt(px(120.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.cancel_tab_rename(cx)),
+                        )
+                        .child(
+                            div()
+                                .w(px(360.0))
+                                .p_4()
+                                .bg(rgb(0x1A1B26))
+                                .rounded_md()
+                                .flex()
+                                .flex_col()
+                                .gap_3()
+                                .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                                .child(div().text_color(rgb(0x7DCFFF)).child("重命名标签"))
+                                .child(field)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(setting_button(
+                                            "保存",
+                                            true,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.commit_tab_rename(cx)
+                                            }),
+                                        ))
+                                        .child(setting_button(
+                                            "取消",
+                                            false,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.cancel_tab_rename(cx)
+                                            }),
+                                        )),
+                                ),
+                        ),
+                )
             })
             // 命令/动态码/服务器对话框：窗口级模态弹窗（最上层）
             .when_some(render_active_dialog(self, cx), |root, overlay| {
@@ -6101,8 +6201,12 @@ fn left_sidebar(
                         })
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, event, window, cx| {
-                                this.activate_tab(id, event, window, cx)
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                if event.click_count >= 2 {
+                                    this.start_tab_rename(id, cx);
+                                } else {
+                                    this.activate_tab(id, event, window, cx);
+                                }
                             }),
                         )
                         .child(div().w(px(2.0)).h(px(18.0)).rounded_full().bg(if selected {
