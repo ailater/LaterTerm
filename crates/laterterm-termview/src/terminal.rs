@@ -118,6 +118,64 @@ fn extract_url_containing(text: &str, cells: &[(usize, char)], click_col: usize)
     None
 }
 
+/// 大小写敏感可切换的行搜索（大小写不敏感时与 search_grid 同口径）。
+fn search_grid_sensitivity(
+    grid: &Grid<Cell>,
+    needle: &[char],
+    case_sensitive: bool,
+) -> Vec<SearchMatch> {
+    if case_sensitive {
+        search_grid_exact(grid, needle)
+    } else {
+        search_grid(grid, needle)
+    }
+}
+
+/// 大小写敏感的行搜索（不 lowercase）。
+fn search_grid_exact(grid: &Grid<Cell>, needle: &[char]) -> Vec<SearchMatch> {
+    let total_lines = grid.total_lines();
+    let history = total_lines - grid.screen_lines();
+    let columns = grid.columns();
+    let mut matches = Vec::new();
+    for absolute in 0..total_lines {
+        let line = Line(absolute as i32 - history as i32);
+        let mut text: Vec<char> = Vec::with_capacity(columns);
+        let mut char_columns: Vec<usize> = Vec::with_capacity(columns);
+        for column in 0..columns {
+            let cell = &grid[AlacPoint::new(line, Column(column))];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            text.push(cell.c);
+            char_columns.push(column);
+        }
+        let mut start = 0;
+        while start + needle.len() <= text.len() {
+            if text[start..start + needle.len()] == *needle {
+                let first = char_columns[start];
+                let last = char_columns[start + needle.len() - 1];
+                let last_width = if grid[AlacPoint::new(line, Column(last))]
+                    .flags
+                    .contains(Flags::WIDE_CHAR)
+                {
+                    2
+                } else {
+                    1
+                };
+                matches.push(SearchMatch {
+                    line: absolute,
+                    column: first,
+                    len: last + last_width - first,
+                });
+                start += needle.len();
+            } else {
+                start += 1;
+            }
+        }
+    }
+    matches
+}
+
 fn search_grid(grid: &Grid<Cell>, needle: &[char]) -> Vec<SearchMatch> {
     let total_lines = grid.total_lines();
     let history = total_lines - grid.screen_lines();
@@ -454,11 +512,20 @@ impl TerminalState {
     /// assert_eq!(matches[0].column, 6);
     /// ```
     pub fn search(&self, query: &str) -> Vec<SearchMatch> {
-        let needle: Vec<char> = query.to_lowercase().chars().collect();
+        self.search_with(query, false)
+    }
+
+    /// 大小写敏感可切换的搜索（`case_sensitive=false` 与 [`Self::search`] 同口径）。
+    pub fn search_with(&self, query: &str, case_sensitive: bool) -> Vec<SearchMatch> {
+        let needle: Vec<char> = if case_sensitive {
+            query.chars().collect()
+        } else {
+            query.to_lowercase().chars().collect()
+        };
         if needle.is_empty() {
             return Vec::new();
         }
-        self.with_term(|term| search_grid(term.grid(), &needle))
+        self.with_term(|term| search_grid_sensitivity(term.grid(), &needle, case_sensitive))
     }
 
     /// 从网格中提取点击位置处的 URL。

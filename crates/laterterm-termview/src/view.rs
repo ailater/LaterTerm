@@ -563,6 +563,8 @@ struct SearchState {
     matches: Vec<crate::terminal::SearchMatch>,
     /// 当前命中的下标（在 matches 中循环移动）。
     current: usize,
+    /// 大小写敏感（搜索栏 Aa 按钮切换）。
+    case_sensitive: bool,
 }
 
 /// 会话退出事件；不依赖终端是否可见。
@@ -1073,6 +1075,13 @@ impl TerminalView {
                 "backspace" => self.search_backspace(cx),
                 "up" => self.search_select_prev(cx),
                 "down" => self.search_select_next(cx),
+                "c" if keystroke.modifiers.alt => {
+                    // Alt+C 切换大小写敏感
+                    if let Some(search) = &mut self.search {
+                        search.case_sensitive = !search.case_sensitive;
+                    }
+                    self.refresh_search(cx);
+                }
                 _ => {
                     // 可打印字符走 InputHandler 提交路径追加查询；
                     // 其余组合键（Ctrl+C 等）在搜索态直接吞掉。
@@ -1645,6 +1654,7 @@ impl TerminalView {
                 query: String::new(),
                 matches: Vec::new(),
                 current: 0,
+                case_sensitive: false,
             });
             cx.notify();
         }
@@ -1736,7 +1746,9 @@ impl TerminalView {
     /// 查询变化后重新执行搜索并跳到首个命中。
     fn refresh_search(&mut self, cx: &mut Context<Self>) {
         if let Some(search) = &mut self.search {
-            let matches = self.state.search(&search.query);
+            let query = search.query.clone();
+            let case = search.case_sensitive;
+            let matches = self.state.search_with(&query, case);
             search.matches = matches;
             search.current = 0;
             self.scroll_to_current_match();
@@ -2069,11 +2081,20 @@ impl Render for TerminalView {
                 .text_color(rgb(0xC0CAF5))
                 .child(div().text_color(rgb(0x7DCFFF)).child("搜索"))
                 .child(div().child(format!("{}▏", search.query)))
+                .child(
+                    div()
+                        .text_color(if search.case_sensitive {
+                            rgb(0xE0AF68)
+                        } else {
+                            rgb(0x565A78)
+                        })
+                        .child("Aa"),
+                )
                 .child(div().ml_auto().text_color(rgb(0xE0AF68)).child(counter))
                 .child(
                     div()
                         .text_color(rgb(0x565A78))
-                        .child("Enter↓ Shift+Enter↑ Esc 关闭"),
+                        .child("Enter↓ Shift+Enter↑ Alt+C 大小写 Esc 关闭"),
                 )
         });
 
