@@ -189,6 +189,69 @@ fn mix(color: u32, base: u32, weight: f32) -> u32 {
     r << 16 | g << 8 | b
 }
 
+// ───────────────────── 统一按钮风格 ─────────────────────
+
+/// 按钮语义（全应用统一）：主操作 / 次操作 / 图标钮。
+/// 主操作 = accent 实心 + 反色文字（LaterMD primary_button 同款语义）；
+/// 次操作 = 中性描边 + 主文字；图标钮 = 透明底 + hover 提亮。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ButtonKind {
+    /// 主操作（保存/连接/发送/去下载）：accent 实心 + 反色文字。
+    Primary,
+    /// 次操作（取消/普通项）：中性描边 + 主文字。
+    Secondary,
+    /// 图标钮（标题栏/步进/行内图标）：透明底 + hover 提亮。
+    Ghost,
+}
+
+/// 统一按钮工厂：按语义给出底色/边框/文字/hover，集中管控风格。
+/// `ui` 为主题派生色（UiColors）；Ghost 的静止底/边透明（标题栏等纯图标场景）。
+fn ui_button(
+    label: impl Into<gpui::SharedString>,
+    kind: ButtonKind,
+    ui: UiColors,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Div {
+    let (bg, border, text, hover_bg, hover_text): (Option<u32>, Option<u32>, u32, u32, u32) =
+        match kind {
+            ButtonKind::Primary => (
+                Some(ui.accent),
+                Some(ui.accent),
+                ui.base_bg, // 反色文字：accent 底上用最深的底色保证对比度
+                lighten(ui.accent, 0.10),
+                ui.base_bg,
+            ),
+            ButtonKind::Secondary => (
+                Some(ui.card_bg),
+                Some(ui.border),
+                ui.text,
+                ui.hover_bg,
+                ui.text,
+            ),
+            // 透明底无边框：hover 才浮现底色（标题栏/步进图标钮）
+            ButtonKind::Ghost => (None, None, ui.text_secondary, ui.hover_bg, ui.text),
+        };
+    let base = div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .text_color(rgb(text))
+        .on_mouse_down(MouseButton::Left, listener);
+    let base = match (bg, border) {
+        (Some(bg), Some(border)) => base.bg(rgb(bg)).border_1().border_color(rgb(border)),
+        _ => base,
+    };
+    let base = base.child(label.into());
+    // 图标钮更紧凑；主/次操作有内边距与最小高度。统一固定高度：
+    // h_full 在无固定高容器（如设置行）里会塌陷，h30 与 value_chip 对齐。
+    let base = match kind {
+        ButtonKind::Ghost => base.h(px(30.0)).min_w(px(32.0)).px_2(),
+        _ => base.h(px(30.0)).min_w(px(36.0)).px_3(),
+    };
+    base.hover(move |style| style.bg(rgb(hover_bg)).text_color(rgb(hover_text)))
+}
+
 /// 窗格（pane）ID：一个终端会话的最小分屏单元。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PaneId(pub(crate) u64);
@@ -5632,7 +5695,7 @@ impl Render for WorkspaceView {
                             .gap_1()
                             .px_2()
                             .when(cfg!(target_os = "macos"), |brand| brand.pl(px(82.0)))
-                            .child(button("☰", cx.listener(Self::toggle_left_panel)))
+                            .child(button("☰", ui, cx.listener(Self::toggle_left_panel)))
                             .child(titlebar_logo())
                             .child(div().text_color(rgb(ui.text)).child(if self.broadcast {
                                 "LaterTerm · 广播中"
@@ -5711,11 +5774,12 @@ impl Render for WorkspaceView {
                                         )
                                 }))
                             })
-                            .child(button("+", cx.listener(Self::new_tab)))
+                            .child(button("+", ui, cx.listener(Self::new_tab)))
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::start_move)),
                     )
                     .child(button(
                         "⇔",
+                        ui,
                         cx.listener(|this, _event, window, cx| {
                             cx.stop_propagation();
                             this.split_focused(SplitDirection::Horizontal, window, cx);
@@ -5723,23 +5787,26 @@ impl Render for WorkspaceView {
                     ))
                     .child(button(
                         "⇕",
+                        ui,
                         cx.listener(|this, _event, window, cx| {
                             cx.stop_propagation();
                             this.split_focused(SplitDirection::Vertical, window, cx);
                         }),
                     ))
-                    .child(button("▣", cx.listener(Self::toggle_right_panel)))
+                    .child(button("▣", ui, cx.listener(Self::toggle_right_panel)))
                     .child(button(
                         "⚙",
+                        ui,
                         cx.listener(|this, _, _, cx| this.toggle_settings(cx)),
                     ))
                     .when(!cfg!(target_os = "macos"), |titlebar| {
                         titlebar
-                            .child(button("—", cx.listener(Self::minimize)))
-                            .child(button("□", cx.listener(Self::zoom)))
+                            .child(button("—", ui, cx.listener(Self::minimize)))
+                            .child(button("□", ui, cx.listener(Self::zoom)))
                             .child(button_with_color(
                                 "×",
                                 0xF7768E,
+                                ui,
                                 cx.listener(Self::close_window),
                             ))
                     }),
@@ -6399,7 +6466,7 @@ fn left_sidebar(
                             .child(tab_labels.len().to_string()),
                     ),
                 )
-                .child(button("+", cx.listener(WorkspaceView::new_tab))),
+                .child(button("+", ui, cx.listener(WorkspaceView::new_tab))),
         )
         .child(
             div()
@@ -8153,28 +8220,20 @@ fn panel_caption(text: &str, ui: UiColors) -> gpui::Div {
 
 fn button(
     label: &'static str,
+    ui: UiColors,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    button_with_color(label, 0xA9B1D6, listener)
+    ui_button(label, ButtonKind::Ghost, ui, listener)
 }
 
+/// 指定文字色的图标钮（如标题栏红 ×）；底色/hover 仍走统一 Ghost 规格。
 fn button_with_color(
     label: &'static str,
     color: u32,
+    ui: UiColors,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    div()
-        .h_full()
-        .min_w(px(32.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .px_2()
-        .rounded_sm()
-        .text_color(rgb(color))
-        .hover(|style| style.bg(rgb(0x292D40)).text_color(rgb(0xD7DEF7)))
-        .on_mouse_down(MouseButton::Left, listener)
-        .child(label)
+    ui_button(label, ButtonKind::Ghost, ui, listener).text_color(rgb(color))
 }
 
 struct TransferWrappedSession {

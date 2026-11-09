@@ -17,7 +17,7 @@
 //! （面板/命令/服务器/动态码编辑），不在设置面板内；本模块里的「编辑快捷键」
 //! 按钮只是弹窗入口，原样平移。
 
-use super::{BindingOwner, ShortcutBinding, WorkspaceView};
+use super::{BindingOwner, ButtonKind, ShortcutBinding, UiColors, WorkspaceView, ui_button};
 use crate::onboarding::FONT_PRESETS;
 use crate::update_check::{self, Outcome};
 use gpui::{
@@ -60,12 +60,6 @@ const COLOR_ACCENT_TINT: u32 = 0x7AA2F726;
 const COLOR_ACCENT_TINT_HOVER: u32 = 0x7AA2F733;
 /// 未选中 hover：中性提亮（半透明次级色，31/255 ≈ 12%）。
 const COLOR_HOVER_TINT: u32 = 0xA9B1D61F;
-/// 实心 accent 选中态的 hover：比 0x7AA2F7 亮一档。
-const COLOR_ACCENT_HOVER: u32 = 0x92B4F9;
-/// 多选芯片选中态：中性提亮底（无 accent 描边，避免误读成单选高亮）。
-const COLOR_MULTI_SELECTED_BG: u32 = 0x343A55;
-/// 多选芯片选中态 hover。
-const COLOR_MULTI_SELECTED_HOVER: u32 = 0x3B4261;
 /// 字体 / 备选芯片固定宽度：内容区两列对齐，避免按文字长短流式换行参差。
 const FONT_CHIP_WIDTH: f32 = 184.0;
 
@@ -1214,19 +1208,22 @@ fn stepper_controls(
     decrease: impl Fn(&mut Appearance) + Clone + 'static,
     increase: impl Fn(&mut Appearance) + Clone + 'static,
 ) -> Div {
+    // −/+ 是图标钮：走 Ghost 语义（透明底 hover 浮现），不再与单选芯片同款
     div()
         .flex()
         .gap_1()
-        .child(setting_button(
+        .child(ui_button(
             "−",
-            false,
+            ButtonKind::Ghost,
+            panel_ui(),
             cx.listener(move |this, event, window, cx| {
                 this.change_setting(event, window, cx, decrease.clone());
             }),
         ))
-        .child(setting_button(
+        .child(ui_button(
             "+",
-            false,
+            ButtonKind::Ghost,
+            panel_ui(),
             cx.listener(move |this, event, window, cx| {
                 this.change_setting(event, window, cx, increase.clone());
             }),
@@ -1520,46 +1517,30 @@ fn value_chip(text: &str) -> Div {
         .child(text.to_string())
 }
 
+/// 设置面板/对话框按钮的统一色系：面板是固定深色 overlay（不随终端主题
+/// 换肤），按钮色固定由内置 Tokyo Night 派生，与面板底色自洽；几何与语义
+/// 则全部走 workspace 的 ui_button 工厂（标题栏/边栏按钮同源）。
+fn panel_ui() -> UiColors {
+    UiColors::from_theme(&ThemeColors::tokyo_night())
+}
+
 /// 面板/对话框共用的按钮芯片（对话框沿用同一观感，随本模块收敛为
 /// Tokyo Night——sftp_panel 的注释「对齐 setting_button 观感」即此约定）。
-/// 选中态 = 实心 accent + 深色文字：单选组里只应有一个实心块，与未选中的
-/// 中性描边一眼可分；对话框的主按钮（保存主题 / 去下载 / 保存）复用同一语义。
-/// 多选语义走 `multi_select_button`，不要复用本控件——否则「多个蓝框」会被
-/// 误读成多个单选同时高亮。
+/// 选中态 = 主操作（实心 accent + 反色文字）：单选组里只应有一个实心块，
+/// 与未选中的中性描边一眼可分；对话框的主按钮（保存主题 / 去下载 / 保存）
+/// 复用同一语义。多选语义走 `multi_select_button`，不要复用本控件——
+/// 否则「多个蓝框」会被误读成多个单选同时高亮。
 pub(crate) fn setting_button(
     label: impl Into<SharedString>,
     selected: bool,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    let (bg, border, text) = if selected {
-        (rgb(COLOR_ACCENT), rgb(COLOR_ACCENT), rgb(COLOR_OVERLAY_BG))
+    let kind = if selected {
+        ButtonKind::Primary
     } else {
-        (
-            rgb(COLOR_OVERLAY_BG),
-            rgb(COLOR_STROKE),
-            rgb(COLOR_TEXT_SECONDARY),
-        )
+        ButtonKind::Secondary
     };
-    let hover_bg = if selected {
-        rgb(COLOR_ACCENT_HOVER)
-    } else {
-        rgb(COLOR_STROKE)
-    };
-    div()
-        .h(px(30.0))
-        .min_w(px(36.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .px_3()
-        .bg(bg)
-        .border_1()
-        .border_color(border)
-        .rounded_sm()
-        .text_color(text)
-        .hover(move |this| this.bg(hover_bg))
-        .on_mouse_down(MouseButton::Left, listener)
-        .child(label.into())
+    ui_button(label, kind, panel_ui(), listener)
 }
 
 /// 多选芯片：选中 = 中性提亮底 + ✓ + 主文字，描边始终中性，不带 accent。
@@ -1569,31 +1550,12 @@ fn multi_select_button(
     selected: bool,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    let (bg, text) = if selected {
-        (rgb(COLOR_MULTI_SELECTED_BG), rgb(COLOR_TEXT))
+    let label: SharedString = label.into();
+    // ✓ 直接并入文字（前缀），保持「先勾后名」的阅读顺序
+    let label: SharedString = if selected {
+        format!("✓ {label}").into()
     } else {
-        (rgb(COLOR_OVERLAY_BG), rgb(COLOR_TEXT_SECONDARY))
+        label
     };
-    let hover_bg = if selected {
-        rgb(COLOR_MULTI_SELECTED_HOVER)
-    } else {
-        rgb(COLOR_STROKE)
-    };
-    div()
-        .h(px(30.0))
-        .min_w(px(36.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .gap_1()
-        .px_3()
-        .bg(bg)
-        .border_1()
-        .border_color(rgb(COLOR_STROKE))
-        .rounded_sm()
-        .text_color(text)
-        .hover(move |this| this.bg(hover_bg))
-        .on_mouse_down(MouseButton::Left, listener)
-        .when(selected, |chip| chip.child("✓"))
-        .child(label.into())
+    ui_button(label, ButtonKind::Secondary, panel_ui(), listener)
 }
