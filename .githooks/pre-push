@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# 推送前本地门禁：与 CI 同口径（fmt / clippy / test），把红灯拦在推送之前。
+# CI 红两次都栽在 fmt 缺跑（2190671 / 455c0c5），故推送即全量校验。
+#
+# 紧急绕过：git push --no-verify（CI 仍会拦截，绕过 = 接受 CI 红）。
+set -euo pipefail
+exec "$(git rev-parse --show-toplevel)/script/gate.sh"

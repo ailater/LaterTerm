@@ -20,9 +20,15 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# 同分支新推送取消进行中的旧运行，避免过期红淹没最新结论
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  gate:
-    name: 门禁 (fmt / clippy / test)
+  # fmt 单独前置快速失败：格式问题 30 秒内出结果，不再拖 2 分钟编译才暴露
+  fmt:
+    name: fmt --check（快速失败）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,7 +36,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
-          components: rustfmt, clippy
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-fmt
+
+      - run: cargo fmt --all --check
+
+  gate:
+    name: 门禁 (clippy / test / 资源)
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94"
+          components: clippy
 
       - name: 安装 GPUI 系统依赖
         run: |
@@ -64,9 +88,6 @@ jobs:
         run: |
           rustc --edition 2024 --test crates/laterterm-app/build.rs -o "$RUNNER_TEMP/laterterm-build-tests"
           "$RUNNER_TEMP/laterterm-build-tests"
-
-      - name: fmt
-        run: cargo fmt --all --check
 
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
