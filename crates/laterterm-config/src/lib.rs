@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 pub mod commands;
 pub mod importers;
 pub mod servers;
+pub mod session;
 pub mod theme;
 pub mod totp;
 
@@ -52,6 +53,9 @@ pub struct Settings {
     /// 应用侧不持有键位文本，避免与桌面端真实绑定漂移。
     #[serde(default)]
     pub quake: QuakeSettings,
+    /// 启动时恢复上次会话的标签列表（默认关——避免测试环境误触发）。
+    #[serde(default)]
+    pub restore_session: bool,
     /// 旧主线 servers.toml 只迁移一次，避免已删除条目重启后复活。
     #[serde(default)]
     pub legacy_servers_migrated: bool,

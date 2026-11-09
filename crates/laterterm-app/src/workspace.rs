@@ -778,6 +778,8 @@ pub struct WorkspaceView {
     custom_tab_titles: BTreeMap<TabId, String>,
     /// 标签重命名输入框（双击标签时弹出）。
     tab_rename_field: Option<(TabId, Entity<CommandTextField>)>,
+    /// 会话恢复是否已执行（首帧 render 时跑一次）。
+    session_restored: bool,
     /// 待二次确认解散的分组名。
     server_group_confirm: Option<String>,
     /// 设置落盘路径（None = 用户默认配置；测试注入临时路径避免污染真实配置）。
@@ -924,6 +926,7 @@ impl WorkspaceView {
             server_groups_collapsed: BTreeSet::new(),
             custom_tab_titles: BTreeMap::new(),
             tab_rename_field: None,
+            session_restored: false,
             server_group_confirm: None,
             settings_save_path: None,
             settings_version: 0,
@@ -1296,6 +1299,93 @@ impl WorkspaceView {
         }
     }
 
+    // ───────────────────── 会话恢复 ─────────────────────
+
+    /// 捕获当前标签状态为会话快照（退出/变更时调用）。
+    fn snapshot_session(&self) -> laterterm_config::session::SessionSnapshot {
+        laterterm_config::session::SessionSnapshot {
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| {
+                    let custom_title = self.custom_tab_titles.get(&tab.id).cloned();
+                    // 窗格标题匹配服务器端点 → 还原时能重连
+                    let title = tab.tab_title(&self.panes);
+                    let server_name = self
+                        .settings
+                        .servers
+                        .iter()
+                        .find(|s| {
+                            let endpoint = if s.port == 22 {
+                                format!("{}@{}", s.username, s.host)
+                            } else {
+                                format!("{}@{}:{}", s.username, s.host, s.port)
+                            };
+                            title == endpoint
+                        })
+                        .map(|s| s.name.clone());
+                    laterterm_config::session::SessionTab {
+                        custom_title,
+                        server_name,
+                    }
+                })
+                .collect(),
+            active_tab: self.active_tab_index(),
+        }
+    }
+
+    /// 保存会话快照（标签增删/切换/重命名后调用）。
+    fn save_session_snapshot(&self) {
+        // 只在开关开启时保存；测试环境开关默认关，不污染共享配置。
+        if !self.settings.restore_session {
+            return;
+        }
+        let snapshot = self.snapshot_session();
+        if let Some(dir) = &self.settings_save_path {
+            snapshot.save_to(&dir.join("session.json"));
+        } else {
+            snapshot.save();
+        }
+    }
+
+    /// 恢复上次会话：对快照中每个额外标签，本地开终端或连服务器。
+    fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 开关关闭 = 不恢复（测试默认关，避免把真实用户配置拉进测试）。
+        if !self.settings.restore_session {
+            return;
+        }
+        let snapshot = if let Some(dir) = &self.settings_save_path {
+            laterterm_config::session::SessionSnapshot::load_from(&dir.join("session.json"))
+        } else {
+            laterterm_config::session::SessionSnapshot::load()
+        };
+        let extra = snapshot.tabs.len().saturating_sub(1); // 第一个标签已默认创建
+        for tab in snapshot.tabs.iter().skip(1).take(extra) {
+            if let Some(name) = &tab.server_name
+                && let Some(entry) = self
+                    .settings
+                    .servers
+                    .iter()
+                    .find(|s| s.name == *name)
+                    .cloned()
+            {
+                self.connect_server(&entry.name, cx);
+            } else {
+                self.new_tab(&MouseDownEvent::default(), window, cx);
+            }
+            // 还原自定义标题
+            if let Some(tab_ref) = self.tabs.last()
+                && let Some(title) = &tab.custom_title
+            {
+                self.custom_tab_titles.insert(tab_ref.id, title.clone());
+            }
+        }
+        // 恢复激活标签索引
+        if !snapshot.tabs.is_empty() && snapshot.active_tab < self.tabs.len() {
+            self.active_tab = self.tabs[snapshot.active_tab].id;
+        }
+    }
+
     // ───────────────────── 标签重命名 ─────────────────────
 
     /// 双击标签打开重命名输入框。
@@ -1322,6 +1412,7 @@ impl WorkspaceView {
                 self.custom_tab_titles.insert(id, title);
             }
         }
+        self.save_session_snapshot();
         cx.notify();
     }
 
@@ -1562,6 +1653,7 @@ impl WorkspaceView {
             focused_pane: pane_id,
         });
         self.focus_pane(pane_id, window, cx);
+        self.save_session_snapshot();
     }
 
     /// 在当前焦点窗格处创建分屏，新窗格获得焦点。
@@ -5325,6 +5417,11 @@ impl WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 会话恢复：首帧跑一次（构造函数里 window/cx 不完整）
+        if !self.session_restored {
+            self.session_restored = true;
+            self.restore_session(window, cx);
+        }
         self.process_shortcuts(window, cx);
         self.process_ssh_results(window, cx);
         self.process_sftp_results(window, cx);
