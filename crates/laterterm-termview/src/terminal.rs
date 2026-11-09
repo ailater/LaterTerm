@@ -80,7 +80,13 @@ fn is_url_end_char(ch: char) -> bool {
 
 /// 从行文本中提取包含指定列的 URL。
 /// `cells` 是 (列号, 字符) 的映射，用于把字符串索引换算回网格列。
-fn extract_url_containing(text: &str, cells: &[(usize, char)], click_col: usize) -> Option<String> {
+/// 从行文本中提取包含指定列的 URL，返回 `(url, 起始列, 结束列)`（结束列开区间）。
+/// `cells` 是 (列号, 字符) 的映射，用于把字符串索引换算回网格列。
+fn extract_url_span_containing(
+    text: &str,
+    cells: &[(usize, char)],
+    click_col: usize,
+) -> Option<(String, usize, usize)> {
     let lower: Vec<char> = text.to_lowercase().chars().collect();
     let raw: Vec<char> = text.chars().collect();
 
@@ -104,10 +110,12 @@ fn extract_url_containing(text: &str, cells: &[(usize, char)], click_col: usize)
                     .unwrap_or(0);
                 if click_col >= start_col && click_col < end_col {
                     let url: String = raw[start..end].iter().collect();
-                    if scheme == "www." {
-                        return Some(format!("https://{url}"));
-                    }
-                    return Some(url);
+                    let url = if scheme == "www." {
+                        format!("https://{url}")
+                    } else {
+                        url
+                    };
+                    return Some((url, start_col, end_col));
                 }
                 i = end;
             } else {
@@ -530,9 +538,9 @@ impl TerminalState {
 
     /// 从网格中提取点击位置处的 URL。
     ///
-    /// `row` 是屏幕行（0 = 视口顶行），`col` 是网格列。
-    /// 检测整个行文本中的 http/https/ftp/www 前缀，返回包含点击列的完整 URL。
-    pub fn extract_url_at(&self, row: usize, col: usize) -> Option<String> {
+    /// 提取指定网格位置命中的 URL 及其列范围（悬停下划线用）。
+    /// 返回 `(url, 起始列, 结束列)`；无命中为 None。结束列为开区间。
+    pub fn extract_url_span_at(&self, row: usize, col: usize) -> Option<(String, usize, usize)> {
         self.with_term(|term| {
             let grid = term.grid();
             let history = (grid.total_lines() - grid.screen_lines()) as i32;
@@ -551,8 +559,14 @@ impl TerminalState {
                 cells.push((c, cell.c));
             }
             let text: String = cells.iter().map(|(_, ch)| *ch).collect();
-            extract_url_containing(&text, &cells, col)
+            extract_url_span_containing(&text, &cells, col)
         })
+    }
+
+    /// `row` 是屏幕行（0 = 视口顶行），`col` 是网格列。
+    /// 检测整个行文本中的 http/https/ftp/www 前缀，返回包含点击列的完整 URL。
+    pub fn extract_url_at(&self, row: usize, col: usize) -> Option<String> {
+        self.extract_url_span_at(row, col).map(|(url, _, _)| url)
     }
 
     /// Execute a function with read access to the terminal.

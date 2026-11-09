@@ -56,7 +56,9 @@ use alacritty_terminal::selection::{
     Selection as AlacSelection, SelectionType as AlacSelectionType,
 };
 use alacritty_terminal::vte::ansi::{ClearMode, Handler as AnsiHandler};
-use gpui::{Edges, ElementInputHandler, EntityInputHandler, UTF16Selection, *};
+use gpui::{
+    Edges, ElementInputHandler, EntityInputHandler, UTF16Selection, prelude::FluentBuilder, *,
+};
 use laterterm_core::TerminalSession;
 use std::io::{Read, Write};
 use std::ops::Range;
@@ -525,6 +527,10 @@ pub struct TerminalView {
     /// 最近一次绘制的内容原点（padding 内侧）；URL 点击检测用
     pub(crate) last_content_origin: Option<Point<Pixels>>,
 
+    /// 鼠标悬停命中的 URL：`(url, 屏幕行, 起始列, 结束列)`（结束列开区间）。
+    /// 悬停显示下划线 + 小手光标；Ctrl+左键才跳转。
+    url_hover: Option<(String, usize, usize, usize)>,
+
     /// Callback for terminal title changes
     title_callback: Option<TitleCallback>,
 
@@ -842,6 +848,7 @@ impl TerminalView {
             input_callback: None,
             bell_callback: None,
             last_content_origin: None,
+            url_hover: None,
             title_callback: None,
             clipboard_store_callback: None,
             exit_callback: None,
@@ -1217,8 +1224,11 @@ impl TerminalView {
         }
         // 网格点不可得（首帧渲染前）：回落本地路径。
 
-        // URL 点击：把像素坐标换算为网格单元，提取 URL 并用系统浏览器打开
-        if let Some(origin) = self.last_content_origin {
+        // URL 点击：仅 Ctrl+左键才用系统浏览器打开（悬停仅下划线 + 小手光标，
+        // 不直接跳，避免误触跳转）。Ctrl+点击命中 URL 时不建立选区。
+        if event.modifiers.control
+            && let Some(origin) = self.last_content_origin
+        {
             let cell = crate::mouse::pixel_to_cell(
                 event.position,
                 origin,
@@ -1229,6 +1239,7 @@ impl TerminalView {
             let col = cell.column.0;
             if let Some(url) = self.state.extract_url_at(row, col) {
                 open_url(&url);
+                return;
             }
         }
 
@@ -1307,6 +1318,10 @@ impl TerminalView {
         // 否则移动上报是死路。
         let mode = self.state.mode();
         if !crate::mouse::mouse_reporting_active(mode, event.modifiers.shift) {
+            // URL 悬停探测（本地路径）：无按键悬停时更新下划线与小手光标。
+            if event.pressed_button.is_none() {
+                self.update_url_hover(event.position, cx);
+            }
             if event.pressed_button != Some(MouseButton::Left) {
                 return;
             }
@@ -1349,6 +1364,32 @@ impl TerminalView {
         if let Some(bytes) = crate::mouse::mouse_motion_report(pressed, point, modifiers, mode) {
             self.write_input(&bytes);
             self.last_motion_report = Some(dedupe_key);
+        }
+    }
+
+    /// 更新 URL 悬停状态：命中时记录范围并切小手光标 + 重绘下划线；离开清空。
+    fn update_url_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let span = self.last_content_origin.and_then(|origin| {
+            let cell = crate::mouse::pixel_to_cell(
+                position,
+                origin,
+                self.renderer.cell_width,
+                self.renderer.cell_height,
+            );
+            let row = cell.line.0.max(0) as usize;
+            self.state
+                .extract_url_span_at(row, cell.column.0)
+                .map(|(url, start, end)| (url, row, start, end))
+        });
+        // 比较位置元组（String 不参与比较）；同格重复 move 不重绘
+        let changed = match (&span, &self.url_hover) {
+            (None, None) => false,
+            (Some(a), Some(b)) => a.1 != b.1 || a.2 != b.2 || a.3 != b.3,
+            _ => true,
+        };
+        if changed {
+            self.url_hover = span;
+            cx.notify();
         }
     }
 
@@ -2068,6 +2109,8 @@ impl Render for TerminalView {
             .and_then(|search| search.matches.get(search.current).copied());
         // IME 预编辑快照（同上，绘制阶段读取）
         let marked_text = self.marked_text.clone();
+        // URL 悬停快照（canvas 闭包绘制下划线用）
+        let url_hover = self.url_hover.clone();
         let search_bar = self.search.as_ref().map(|search| {
             let counter = if search.query.is_empty() {
                 "0/0".to_string()
@@ -2112,6 +2155,10 @@ impl Render for TerminalView {
             .size_full()
             .bg(rgb(0x1e1e1e))
             .track_focus(&self.focus_handle)
+            // 悬停 URL 时小手光标（命中才有下划线与跳转语义，否则保持箭头）
+            .when(url_hover.is_some(), |root| {
+                root.cursor(gpui::CursorStyle::PointingHand)
+            })
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -2261,6 +2308,31 @@ impl Render for TerminalView {
                         let paint_elapsed = paint_started.map(|started| started.elapsed());
                         let rt_paint_elapsed = rt_paint_started.map(|started| started.elapsed());
                         let rt_overlay_started = rt.then(Instant::now);
+
+                        // URL 悬停下划线：网格行/列范围 → 格底 1px 线（accent 色），随滚动移动
+                        if let Some((_, row, start_col, end_col)) = &url_hover {
+                            let origin_x = bounds.origin.x + padding.left;
+                            let origin_y = bounds.origin.y + padding.top;
+                            let x = origin_x + renderer.cell_width * (*start_col as f32);
+                            let y = origin_y
+                                + renderer.cell_height * (*row as f32 + 1.0)
+                                - px(1.0);
+                            let width = renderer.cell_width * ((end_col - start_col) as f32);
+                            window.paint_quad(gpui::quad(
+                                Bounds {
+                                    origin: Point { x, y },
+                                    size: Size {
+                                        width,
+                                        height: px(1.0),
+                                    },
+                                },
+                                px(0.0),
+                                gpui::Hsla::from(gpui::rgb(0x7AA2F7)).opacity(0.9),
+                                Edges::<Pixels>::default(),
+                                gpui::transparent_black(),
+                                gpui::BorderStyle::default(),
+                            ));
+                        }
 
                         let trace_report = trace.map(|(reason, started, entity_id, scale, measure_elapsed)| {
                             (reason, entity_id, scale, measure_elapsed, started.elapsed())
