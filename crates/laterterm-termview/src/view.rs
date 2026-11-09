@@ -1493,6 +1493,9 @@ impl TerminalView {
                 TerminalEvent::Bell => {
                     if let Some(ref callback) = self.bell_callback {
                         callback(window, cx);
+                    } else {
+                        // 默认行为：系统通知（notify-send / osascript / toast）
+                        send_desktop_notification("LaterTerm", "终端 bell 响铃");
                     }
                 }
                 TerminalEvent::Title(title) => {
@@ -2389,6 +2392,38 @@ pub fn open_url(url: &str) {
         ("cmd", vec!["/c", "start", url])
     } else {
         ("xdg-open", vec![url])
+    };
+    let _ = std::process::Command::new(program).args(args).spawn();
+}
+
+/// 发送系统桌面通知（终端 bell → 通知，长命令跑完提醒）。
+fn send_desktop_notification(title: &str, body: &str) {
+    let (program, args): (&str, Vec<String>) = if cfg!(target_os = "macos") {
+        (
+            "osascript",
+            vec![
+                "-e".to_string(),
+                format!("display notification \"{body}\" with title \"{title}\""),
+            ],
+        )
+    } else if cfg!(target_os = "windows") {
+        (
+            "powershell",
+            vec![
+                "-c".to_string(),
+                format!("New-BurnToastNotification -Text '{title}','{body}' 2>$null"),
+            ],
+        )
+    } else {
+        (
+            "notify-send",
+            vec![
+                "-a".to_string(),
+                title.to_string(),
+                title.to_string(),
+                body.to_string(),
+            ],
+        )
     };
     let _ = std::process::Command::new(program).args(args).spawn();
 }
