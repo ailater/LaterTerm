@@ -456,6 +456,7 @@ fn settings_appearance_body(appearance: &Appearance, cx: &mut Context<WorkspaceV
                 value_chip(&format!("{:.0} px", appearance.font_size)),
                 stepper_controls(
                     cx,
+                    "font-size",
                     |s: &mut Appearance| s.font_size = (s.font_size - 1.0).max(8.0),
                     |s: &mut Appearance| s.font_size = (s.font_size + 1.0).min(32.0),
                 ),
@@ -465,6 +466,7 @@ fn settings_appearance_body(appearance: &Appearance, cx: &mut Context<WorkspaceV
                 value_chip(&format!("{:.1}", appearance.line_height)),
                 stepper_controls(
                     cx,
+                    "line-height",
                     |s: &mut Appearance| {
                         s.line_height = ((s.line_height - 0.1) * 10.0).round() / 10.0;
                         s.line_height = s.line_height.clamp(0.8, 2.0);
@@ -480,6 +482,7 @@ fn settings_appearance_body(appearance: &Appearance, cx: &mut Context<WorkspaceV
                 value_chip(&format!("{:.0} px", appearance.padding)),
                 stepper_controls(
                     cx,
+                    "padding",
                     |s: &mut Appearance| s.padding = (s.padding - 1.0).max(0.0),
                     |s: &mut Appearance| s.padding = (s.padding + 1.0).min(24.0),
                 ),
@@ -1203,26 +1206,29 @@ fn settings_shortcuts_body(
 // 设置专用控件（自 workspace.rs 原样平移，色值收敛为模块色板令牌）
 // ---------------------------------------------------------------------------
 
+/// 步进控件（−/+）：SVG 线性图标钮，与标题栏同规格（icon_button）。
+/// `group` 为实例前缀：三个步进行（字号/行高/内边距）各自唯一，
+/// group 名窗口级解析，同名会互相覆盖 hover。
 fn stepper_controls(
     cx: &mut Context<WorkspaceView>,
+    group: &'static str,
     decrease: impl Fn(&mut Appearance) + Clone + 'static,
     increase: impl Fn(&mut Appearance) + Clone + 'static,
 ) -> Div {
-    // −/+ 是图标钮：走 Ghost 语义（透明底 hover 浮现），不再与单选芯片同款
     div()
         .flex()
         .gap_1()
-        .child(ui_button(
-            "−",
-            ButtonKind::Ghost,
+        .child(super::icon_button(
+            format!("{group}-decrease"),
+            "icons/minus.svg",
             panel_ui(),
             cx.listener(move |this, event, window, cx| {
                 this.change_setting(event, window, cx, decrease.clone());
             }),
         ))
-        .child(ui_button(
-            "+",
-            ButtonKind::Ghost,
+        .child(super::icon_button(
+            format!("{group}-increase"),
+            "icons/plus.svg",
             panel_ui(),
             cx.listener(move |this, event, window, cx| {
                 this.change_setting(event, window, cx, increase.clone());

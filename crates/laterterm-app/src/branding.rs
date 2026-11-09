@@ -1,10 +1,84 @@
 //! 品牌资源与窗口身份：编译期嵌入，不依赖当前工作目录。
 
-use gpui::{Image, ImageFormat, IntoElement, ParentElement, Styled, StyledImage, div, img, px};
+use gpui::{
+    AssetSource, Image, ImageFormat, IntoElement, ParentElement, SharedString, Styled, StyledImage,
+    div, img, px,
+};
+use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 pub(crate) const APP_ID: &str = "laterterm";
 const LOGO_BYTES: &[u8] = include_bytes!("../../../assets/icons/png/laterterm-128.png");
+
+/// 图标资源表：`icon_button` 通过 `svg().path("icons/xxx.svg")` 引用，
+/// 路径须与本表键一致。全部为 Lucide 线性风（24 网格 / stroke 2 / 圆端点），
+/// 渲染色由 `svg().text_color()` 统一染（文件内 stroke 颜色仅占位）。
+const ICONS: &[(&str, &[u8])] = &[
+    (
+        "icons/close.svg",
+        include_bytes!("../../../assets/icons/svg/close.svg"),
+    ),
+    (
+        "icons/maximize.svg",
+        include_bytes!("../../../assets/icons/svg/maximize.svg"),
+    ),
+    (
+        "icons/menu.svg",
+        include_bytes!("../../../assets/icons/svg/menu.svg"),
+    ),
+    (
+        "icons/minus.svg",
+        include_bytes!("../../../assets/icons/svg/minus.svg"),
+    ),
+    (
+        "icons/panel-right.svg",
+        include_bytes!("../../../assets/icons/svg/panel-right.svg"),
+    ),
+    (
+        "icons/pen.svg",
+        include_bytes!("../../../assets/icons/svg/pen.svg"),
+    ),
+    (
+        "icons/plus.svg",
+        include_bytes!("../../../assets/icons/svg/plus.svg"),
+    ),
+    (
+        "icons/settings.svg",
+        include_bytes!("../../../assets/icons/svg/settings.svg"),
+    ),
+    (
+        "icons/split-h.svg",
+        include_bytes!("../../../assets/icons/svg/split-h.svg"),
+    ),
+    (
+        "icons/split-v.svg",
+        include_bytes!("../../../assets/icons/svg/split-v.svg"),
+    ),
+    (
+        "icons/trash.svg",
+        include_bytes!("../../../assets/icons/svg/trash.svg"),
+    ),
+];
+
+/// 应用级资源源：挂到 `Application::with_assets`，为 SVG 图标提供字节。
+pub(crate) struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> anyhow::Result<Option<Cow<'static, [u8]>>> {
+        Ok(ICONS
+            .iter()
+            .find(|(name, _)| *name == path)
+            .map(|(_, bytes)| Cow::Borrowed(*bytes)))
+    }
+
+    fn list(&self, path: &str) -> anyhow::Result<Vec<SharedString>> {
+        Ok(ICONS
+            .iter()
+            .map(|(name, _)| SharedString::from(*name))
+            .filter(|name| name.starts_with(path))
+            .collect())
+    }
+}
 
 pub(crate) fn logo_image() -> Arc<Image> {
     static LOGO: OnceLock<Arc<Image>> = OnceLock::new();

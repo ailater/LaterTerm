@@ -71,7 +71,7 @@ fn window_options(cx: &mut gpui::App, settings: &Settings) -> gpui::WindowOption
 }
 
 fn main() -> Result<()> {
-    let app = gpui::Application::new();
+    let app = gpui::Application::new().with_assets(branding::Assets);
     app.run(|cx| {
         // 启动路径仅此一次读盘+解析 settings.toml：先算 Quake 窗口几何，
         // 再把同一份设置共享给 WorkspaceView（new 里取走，避免二次加载）。

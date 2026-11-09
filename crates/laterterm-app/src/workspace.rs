@@ -15,7 +15,7 @@ use gpui::{
     FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render,
     ScrollHandle, StatefulInteractiveElement, Styled, WeakEntity, Window, anchored, canvas,
-    deferred, div, prelude::FluentBuilder, px, relative, rgb,
+    deferred, div, prelude::FluentBuilder, px, relative, rgb, svg,
 };
 use laterterm_config::{
     Appearance, CommandTemplate, ServerAuthKind, ServerEntry, ServersFile, Settings, Theme,
@@ -191,65 +191,82 @@ fn mix(color: u32, base: u32, weight: f32) -> u32 {
 
 // ───────────────────── 统一按钮风格 ─────────────────────
 
-/// 按钮语义（全应用统一）：主操作 / 次操作 / 图标钮。
+/// 按钮语义（全应用统一）：主操作 / 次操作。
 /// 主操作 = accent 实心 + 反色文字（LaterMD primary_button 同款语义）；
-/// 次操作 = 中性描边 + 主文字；图标钮 = 透明底 + hover 提亮。
+/// 次操作 = 中性描边 + 主文字。图标类按钮一律走 [`icon_button`]（SVG 线性图标）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ButtonKind {
     /// 主操作（保存/连接/发送/去下载）：accent 实心 + 反色文字。
     Primary,
     /// 次操作（取消/普通项）：中性描边 + 主文字。
     Secondary,
-    /// 图标钮（标题栏/步进/行内图标）：透明底 + hover 提亮。
-    Ghost,
 }
 
 /// 统一按钮工厂：按语义给出底色/边框/文字/hover，集中管控风格。
-/// `ui` 为主题派生色（UiColors）；Ghost 的静止底/边透明（标题栏等纯图标场景）。
+/// `ui` 为主题派生色（UiColors）。
 fn ui_button(
     label: impl Into<gpui::SharedString>,
     kind: ButtonKind,
     ui: UiColors,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Div {
-    let (bg, border, text, hover_bg, hover_text): (Option<u32>, Option<u32>, u32, u32, u32) =
-        match kind {
-            ButtonKind::Primary => (
-                Some(ui.accent),
-                Some(ui.accent),
-                ui.base_bg, // 反色文字：accent 底上用最深的底色保证对比度
-                lighten(ui.accent, 0.10),
-                ui.base_bg,
-            ),
-            ButtonKind::Secondary => (
-                Some(ui.card_bg),
-                Some(ui.border),
-                ui.text,
-                ui.hover_bg,
-                ui.text,
-            ),
-            // 透明底无边框：hover 才浮现底色（标题栏/步进图标钮）
-            ButtonKind::Ghost => (None, None, ui.text_secondary, ui.hover_bg, ui.text),
-        };
-    let base = div()
+    let (bg, border, text, hover_bg, hover_text) = match kind {
+        ButtonKind::Primary => (
+            ui.accent,
+            ui.accent,
+            ui.base_bg, // 反色文字：accent 底上用最深的底色保证对比度
+            lighten(ui.accent, 0.10),
+            ui.base_bg,
+        ),
+        ButtonKind::Secondary => (ui.card_bg, ui.border, ui.text, ui.hover_bg, ui.text),
+    };
+    div()
+        .h(px(30.0))
+        .min_w(px(36.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .px_3()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(border))
+        .bg(rgb(bg))
+        .text_color(rgb(text))
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(label.into())
+        .hover(move |style| style.bg(rgb(hover_bg)).text_color(rgb(hover_text)))
+}
+
+/// 图标钮统一工厂（对标 LaterMD 自绘线性图标体系）：
+/// 固定方形 30×30 + 16px SVG 线性图标（Lucide 24 网格 / stroke 2 / 圆端点），
+/// 静止透明、hover 浮现底色并提亮图标。Unicode 字符（☰ ⚙ ✎ 🗑）跨字体
+/// 大小不一、基线不齐，是「按钮大小不一形状各异」的根因，禁再新增。
+///
+/// `id` 须窗口内唯一：用作 group 名（hover 时容器与 SVG 联动变色，
+/// GroupHitboxes 按名全局解析，同名会互相覆盖）。
+fn icon_button(
+    id: impl Into<gpui::SharedString>,
+    icon: &'static str,
+    ui: UiColors,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Div {
+    let id = id.into();
+    div()
+        .group(id.clone())
+        .size(px(30.0))
         .flex()
         .items_center()
         .justify_center()
         .rounded_sm()
-        .text_color(rgb(text))
-        .on_mouse_down(MouseButton::Left, listener);
-    let base = match (bg, border) {
-        (Some(bg), Some(border)) => base.bg(rgb(bg)).border_1().border_color(rgb(border)),
-        _ => base,
-    };
-    let base = base.child(label.into());
-    // 图标钮更紧凑；主/次操作有内边距与最小高度。统一固定高度：
-    // h_full 在无固定高容器（如设置行）里会塌陷，h30 与 value_chip 对齐。
-    let base = match kind {
-        ButtonKind::Ghost => base.h(px(30.0)).min_w(px(32.0)).px_2(),
-        _ => base.h(px(30.0)).min_w(px(36.0)).px_3(),
-    };
-    base.hover(move |style| style.bg(rgb(hover_bg)).text_color(rgb(hover_text)))
+        .hover(move |style| style.bg(rgb(ui.hover_bg)))
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(
+            svg()
+                .path(icon)
+                .size(px(16.0))
+                .text_color(rgb(ui.text_secondary))
+                .group_hover(id, move |style| style.text_color(rgb(ui.text))),
+        )
 }
 
 /// 窗格（pane）ID：一个终端会话的最小分屏单元。
@@ -5695,7 +5712,12 @@ impl Render for WorkspaceView {
                             .gap_1()
                             .px_2()
                             .when(cfg!(target_os = "macos"), |brand| brand.pl(px(82.0)))
-                            .child(button("☰", ui, cx.listener(Self::toggle_left_panel)))
+                            .child(icon_button(
+                                "tb-menu",
+                                "icons/menu.svg",
+                                ui,
+                                cx.listener(Self::toggle_left_panel),
+                            ))
                             .child(titlebar_logo())
                             .child(div().text_color(rgb(ui.text)).child(if self.broadcast {
                                 "LaterTerm · 广播中"
@@ -5774,38 +5796,61 @@ impl Render for WorkspaceView {
                                         )
                                 }))
                             })
-                            .child(button("+", ui, cx.listener(Self::new_tab)))
+                            .child(icon_button(
+                                "tb-new-tab",
+                                "icons/plus.svg",
+                                ui,
+                                cx.listener(Self::new_tab),
+                            ))
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::start_move)),
                     )
-                    .child(button(
-                        "⇔",
+                    .child(icon_button(
+                        "tb-split-h",
+                        "icons/split-h.svg",
                         ui,
                         cx.listener(|this, _event, window, cx| {
                             cx.stop_propagation();
                             this.split_focused(SplitDirection::Horizontal, window, cx);
                         }),
                     ))
-                    .child(button(
-                        "⇕",
+                    .child(icon_button(
+                        "tb-split-v",
+                        "icons/split-v.svg",
                         ui,
                         cx.listener(|this, _event, window, cx| {
                             cx.stop_propagation();
                             this.split_focused(SplitDirection::Vertical, window, cx);
                         }),
                     ))
-                    .child(button("▣", ui, cx.listener(Self::toggle_right_panel)))
-                    .child(button(
-                        "⚙",
+                    .child(icon_button(
+                        "tb-panel-right",
+                        "icons/panel-right.svg",
+                        ui,
+                        cx.listener(Self::toggle_right_panel),
+                    ))
+                    .child(icon_button(
+                        "tb-settings",
+                        "icons/settings.svg",
                         ui,
                         cx.listener(|this, _, _, cx| this.toggle_settings(cx)),
                     ))
                     .when(!cfg!(target_os = "macos"), |titlebar| {
                         titlebar
-                            .child(button("—", ui, cx.listener(Self::minimize)))
-                            .child(button("□", ui, cx.listener(Self::zoom)))
-                            .child(button_with_color(
-                                "×",
-                                0xF7768E,
+                            .child(icon_button(
+                                "tb-minimize",
+                                "icons/minus.svg",
+                                ui,
+                                cx.listener(Self::minimize),
+                            ))
+                            .child(icon_button(
+                                "tb-zoom",
+                                "icons/maximize.svg",
+                                ui,
+                                cx.listener(Self::zoom),
+                            ))
+                            .child(icon_button(
+                                "tb-close",
+                                "icons/close.svg",
                                 ui,
                                 cx.listener(Self::close_window),
                             ))
@@ -6466,7 +6511,12 @@ fn left_sidebar(
                             .child(tab_labels.len().to_string()),
                     ),
                 )
-                .child(button("+", ui, cx.listener(WorkspaceView::new_tab))),
+                .child(icon_button(
+                    "sb-new-tab",
+                    "icons/plus.svg",
+                    ui,
+                    cx.listener(WorkspaceView::new_tab),
+                )),
         )
         .child(
             div()
@@ -6688,23 +6738,32 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                                 row.child(sidebar_shortcut_chip(shortcut, ui))
                             })
                             .child(div().flex_1().min_w(px(0.0)))
-                            .child(sidebar_icon_button("✎", ui.accent, None, ui).on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener({
-                                    let name = name.clone();
-                                    move |this, _event, window, cx| {
-                                        if let Some(command) = this
-                                            .settings
-                                            .commands
-                                            .iter()
-                                            .find(|item| item.name == name)
-                                            .cloned()
-                                        {
-                                            this.edit_command(Some(command), window, cx);
+                            .child(
+                                sidebar_icon_button(
+                                    format!("cmd-edit-{name}"),
+                                    "icons/pen.svg",
+                                    ui.accent,
+                                    None,
+                                    ui,
+                                )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener({
+                                        let name = name.clone();
+                                        move |this, _event, window, cx| {
+                                            if let Some(command) = this
+                                                .settings
+                                                .commands
+                                                .iter()
+                                                .find(|item| item.name == name)
+                                                .cloned()
+                                            {
+                                                this.edit_command(Some(command), window, cx);
+                                            }
                                         }
-                                    }
-                                }),
-                            ))
+                                    }),
+                                ),
+                            )
                             .child(if pending_delete {
                                 div()
                                     .px_1()
@@ -6725,7 +6784,14 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                                     )
                                     .child("确认删除")
                             } else {
-                                sidebar_icon_button("🗑", ui.danger, None, ui).on_mouse_down(
+                                sidebar_icon_button(
+                                    format!("cmd-delete-{name}"),
+                                    "icons/trash.svg",
+                                    ui.danger,
+                                    None,
+                                    ui,
+                                )
+                                .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener({
                                         let name = name.clone();
@@ -8018,7 +8084,14 @@ fn server_entry_row(
                 })
                 .child(div().flex_1().min_w(px(0.0)))
                 .child(
-                    sidebar_icon_button("✎", ui.accent, Some("server-edit"), ui).on_mouse_down(
+                    sidebar_icon_button(
+                        format!("server-edit-{}", entry.name),
+                        "icons/pen.svg",
+                        ui.accent,
+                        Some("server-edit"),
+                        ui,
+                    )
+                    .on_mouse_down(
                         MouseButton::Left,
                         cx.listener({
                             // 每帧只持有名称：点击时再查整条，避免逐帧克隆
@@ -8056,7 +8129,14 @@ fn server_entry_row(
                         )
                         .child("确认删除")
                 } else {
-                    sidebar_icon_button("🗑", ui.danger, Some("server-delete"), ui).on_mouse_down(
+                    sidebar_icon_button(
+                        format!("server-delete-{}", entry.name),
+                        "icons/trash.svg",
+                        ui.danger,
+                        Some("server-delete"),
+                        ui,
+                    )
+                    .on_mouse_down(
                         MouseButton::Left,
                         cx.listener({
                             let name = entry.name.clone();
@@ -8081,23 +8161,34 @@ fn sidebar_shortcut_chip(text: &str, ui: UiColors) -> gpui::Div {
 
 /// 侧栏条目图标按钮（编辑/删除）：22px 方形字形钮，hover 提亮。
 /// selector 供测试 debug_bounds 定位；字形用系统字体已覆盖的 ✎/🗑。
+/// 侧栏行内小图标钮（编辑/删除）：与 [`icon_button`] 同构（SVG 线性图标 +
+/// 唯一 group hover），仅尺寸缩小到 22×22 / 12px 适配行内密度。
+/// `id` 为动态字符串：列表循环内须带条目名（如 `format!("server-edit-{name}")`），
+/// group 名是窗口级全局解析，静态同名会让非末条目的 hover 失效。
 fn sidebar_icon_button(
-    glyph: &'static str,
+    id: impl Into<gpui::SharedString>,
+    icon: &'static str,
     hover_color: u32,
     selector: Option<&'static str>,
     ui: UiColors,
 ) -> gpui::Div {
+    let id = id.into();
     let button = div()
+        .group(id.clone())
         .h(px(22.0))
         .w(px(22.0))
         .flex()
         .items_center()
         .justify_center()
         .rounded_sm()
-        .text_size(px(12.0))
-        .text_color(rgb(ui.text_secondary))
-        .hover(move |style| style.text_color(rgb(hover_color)).bg(rgb(ui.hover_bg)))
-        .child(glyph);
+        .hover(move |style| style.bg(rgb(ui.hover_bg)))
+        .child(
+            svg()
+                .path(icon)
+                .size(px(12.0))
+                .text_color(rgb(ui.text_secondary))
+                .group_hover(id, move |style| style.text_color(rgb(hover_color))),
+        );
     if let Some(selector) = selector {
         button.debug_selector(move || selector.to_string())
     } else {
@@ -8216,24 +8307,6 @@ fn panel_caption(text: &str, ui: UiColors) -> gpui::Div {
         .text_size(px(11.0))
         .text_color(rgb(ui.text_muted))
         .child(text.to_string())
-}
-
-fn button(
-    label: &'static str,
-    ui: UiColors,
-    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    ui_button(label, ButtonKind::Ghost, ui, listener)
-}
-
-/// 指定文字色的图标钮（如标题栏红 ×）；底色/hover 仍走统一 Ghost 规格。
-fn button_with_color(
-    label: &'static str,
-    color: u32,
-    ui: UiColors,
-    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    ui_button(label, ButtonKind::Ghost, ui, listener).text_color(rgb(color))
 }
 
 struct TransferWrappedSession {
