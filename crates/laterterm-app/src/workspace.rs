@@ -2260,6 +2260,7 @@ impl WorkspaceView {
                 config.cursor_style = cursor_style_for(appearance.cursor_style);
                 config.font_fallbacks = appearance.font_fallbacks.clone();
                 config.copy_on_select = appearance.copy_on_select;
+                config.bell_notification = appearance.bell_notification;
                 terminal.update_config(config, cx);
             });
         }
@@ -8174,6 +8175,7 @@ fn terminal_config_for(
         cursor_style: cursor_style_for(settings.cursor_style),
         smooth_scrolling: settings.smooth_scrolling,
         copy_on_select: settings.copy_on_select,
+        bell_notification: settings.bell_notification,
         scrollback: settings.scrollback,
         line_height_multiplier: settings.line_height,
         padding: Edges::all(px(settings.padding)),
@@ -9736,7 +9738,7 @@ mod settings_panel_tests {
             "Idle 态状态行必须在场"
         );
         // 注入 Newer：横幅 + 「去下载」按钮出现，Idle 状态行退场
-        workspace.update(cx, |view, cx| {
+        workspace.update_in(cx, |view, _window, cx| {
             view.update_check
                 .finish(Ok(crate::update_check::Outcome::Newer("v99.0.0".into())));
             cx.notify();
@@ -9752,7 +9754,7 @@ mod settings_panel_tests {
         );
         assert!(cx.debug_bounds("update-status-idle").is_none());
         // 注入 Err：「未能确认」行在场，横幅退场，无弹窗元素（静默文案）
-        workspace.update(cx, |view, cx| {
+        workspace.update_in(cx, |view, _window, cx| {
             view.update_check.finish(Err("GitHub 返回 403".into()));
             cx.notify();
         });
@@ -9772,7 +9774,7 @@ mod settings_panel_tests {
             );
         });
         // 清除（「知道了」同款路径）：回到 Idle 状态行
-        workspace.update(cx, |view, cx| {
+        workspace.update_in(cx, |view, _window, cx| {
             view.update_check.clear();
             cx.notify();
         });

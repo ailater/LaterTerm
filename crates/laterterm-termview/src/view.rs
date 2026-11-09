@@ -229,6 +229,9 @@ pub struct TerminalConfig {
     /// 选中即复制：左键拖拽/双击/三击出有效选区后松开，自动写入剪贴板
     /// （Deepin 终端同款体验）。默认开启。
     pub copy_on_select: bool,
+
+    /// 终端 bell 时发送系统桌面通知。默认关闭（bell 走视觉提示，测试环境不外发）。
+    pub bell_notification: bool,
 }
 
 impl Default for TerminalConfig {
@@ -248,6 +251,7 @@ impl Default for TerminalConfig {
             cursor_style: CursorStyle::Block,
             smooth_scrolling: true,
             copy_on_select: true,
+            bell_notification: false,
         }
     }
 }
@@ -1493,9 +1497,12 @@ impl TerminalView {
                 TerminalEvent::Bell => {
                     if let Some(ref callback) = self.bell_callback {
                         callback(window, cx);
-                    } else {
-                        // 默认行为：系统通知（notify-send / osascript / toast）
+                    } else if self.config.bell_notification {
+                        // 显式开启才发系统通知（长命令跑完提醒）
                         send_desktop_notification("LaterTerm", "终端 bell 响铃");
+                    } else {
+                        // 默认视觉提示：请求一帧重绘（闪烁指示由宿主自行强化），不外发系统通知。
+                        cx.notify();
                     }
                 }
                 TerminalEvent::Title(title) => {

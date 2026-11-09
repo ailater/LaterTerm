@@ -163,6 +163,10 @@ pub struct Appearance {
     #[serde(default = "default_true")]
     pub copy_on_select: bool,
 
+    /// 终端 bell 时发送系统桌面通知。默认关闭（bell 走视觉提示，测试环境也不外发）。
+    #[serde(default)]
+    pub bell_notification: bool,
+
     /// 接收目录；空 = ~/Downloads。
     pub downloads_dir: String,
 }
@@ -186,6 +190,7 @@ impl Default for Appearance {
             cursor_style: CursorStyle::Block,
             smooth_scrolling: true,
             copy_on_select: true,
+            bell_notification: false,
             font_fallbacks: Vec::new(),
             downloads_dir: String::new(),
         }

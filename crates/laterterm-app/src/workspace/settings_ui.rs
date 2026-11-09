@@ -562,6 +562,18 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
                     |s: &mut Appearance, value| s.copy_on_select = value,
                 ),
             ))
+            .child(setting_row(
+                // 终端 bell 响铃时弹系统桌面通知；默认关（只视觉提示，测试不外发）
+                "响铃系统通知",
+                div(),
+                toggle_controls(
+                    cx,
+                    ("开", true),
+                    ("关", false),
+                    appearance.bell_notification,
+                    |s: &mut Appearance, value| s.bell_notification = value,
+                ),
+            ))
             .child(
                 div()
                     .flex()
