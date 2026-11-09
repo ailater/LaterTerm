@@ -15,7 +15,7 @@ use gpui::{
     FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render,
     ScrollHandle, StatefulInteractiveElement, Styled, WeakEntity, Window, anchored, canvas,
-    deferred, div, prelude::FluentBuilder, px, relative, rgb, svg,
+    deferred, div, prelude::FluentBuilder, px, relative, rgb, rgba, svg,
 };
 use laterterm_config::{
     Appearance, CommandTemplate, ServerAuthKind, ServerEntry, ServersFile, Settings, Theme,
@@ -2063,6 +2063,11 @@ impl WorkspaceView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.apply_toggle_left_panel(cx);
+    }
+
+    /// Ctrl+B 与标题栏按钮共用的左栏切换本体。
+    fn apply_toggle_left_panel(&mut self, cx: &mut Context<Self>) {
         cx.stop_propagation();
         self.left_panel = !self.left_panel;
         if self.left_panel {
@@ -5482,6 +5487,15 @@ impl WorkspaceView {
         if self.settings_open {
             return;
         }
+        // Ctrl+B：切换左侧导航（标签竖排/横排二态的总开关，VS Code 同款惯例）。
+        // 全局拦截含终端焦点——注意与 tmux prefix（C-b）冲突，tmux 用户需自行换 prefix。
+        if keystroke_matches_shortcut(event, "ctrl+b") {
+            if !event.is_held {
+                self.apply_toggle_left_panel(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         if keystroke_matches_shortcut(event, "ctrl+shift+b") {
             if !event.is_held {
                 self.toggle_broadcast(cx);
@@ -5712,18 +5726,27 @@ impl Render for WorkspaceView {
                             .gap_1()
                             .px_2()
                             .when(cfg!(target_os = "macos"), |brand| brand.pl(px(82.0)))
+                            // 品牌位：logo 最左，导航开关紧随其后（Ctrl+B 同此功能）
+                            .child(titlebar_logo())
                             .child(icon_button(
                                 "tb-menu",
                                 "icons/menu.svg",
                                 ui,
                                 cx.listener(Self::toggle_left_panel),
                             ))
-                            .child(titlebar_logo())
-                            .child(div().text_color(rgb(ui.text)).child(if self.broadcast {
-                                "LaterTerm · 广播中"
-                            } else {
-                                "LaterTerm"
-                            })),
+                            // 广播是全局状态，必须有可见提示；平时不留品牌文字
+                            .when(self.broadcast, |brand| {
+                                brand.child(
+                                    div()
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .text_size(px(11.0))
+                                        .bg(rgba((ui.accent << 8) | 0x26))
+                                        .text_color(rgb(ui.accent))
+                                        .child("广播中"),
+                                )
+                            }),
                     )
                     .child(
                         div()
