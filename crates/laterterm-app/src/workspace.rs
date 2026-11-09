@@ -6255,10 +6255,6 @@ fn left_sidebar(
         )
 }
 
-fn sidebar_shortcut_label(shortcut: Option<&str>) -> &str {
-    shortcut.unwrap_or("设置快捷键")
-}
-
 fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
     // 条目行借用渲染 + 点击时查整条：GPUI 无视图缓存，面板每帧重渲染，
     // 这里不得整表克隆 commands（此前每帧深拷贝全表 + 每行多次 clone）。
@@ -6369,64 +6365,60 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                             .flex()
                             .items_center()
                             .gap_1()
-                            .child(sidebar_shortcut_chip(sidebar_shortcut_label(
-                                command.shortcut.as_deref(),
-                            )))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener({
-                                    let name = name.clone();
-                                    move |this, _, window, cx| {
-                                        cx.stop_propagation();
-                                        if let Some(command) = this
-                                            .settings
-                                            .commands
-                                            .iter()
-                                            .find(|item| item.name == name)
-                                            .cloned()
-                                        {
-                                            this.edit_command(Some(command), window, cx);
-                                            this.start_shortcut_recording(window, cx);
+                            // 快捷键仅展示；修改入口统一在编辑弹窗里。
+                            .when_some(command.shortcut.as_deref(), |row, shortcut| {
+                                row.child(sidebar_shortcut_chip(shortcut))
+                            })
+                            .child(div().flex_1().min_w(px(0.0)))
+                            .child(
+                                sidebar_icon_button("✎", 0xC0D6FF, None).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener({
+                                        let name = name.clone();
+                                        move |this, _event, window, cx| {
+                                            if let Some(command) = this
+                                                .settings
+                                                .commands
+                                                .iter()
+                                                .find(|item| item.name == name)
+                                                .cloned()
+                                            {
+                                                this.edit_command(Some(command), window, cx);
+                                            }
                                         }
-                                    }
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .pt_1()
-                            .flex()
-                            .gap_1()
-                            .child(setting_button(
-                                "编辑",
-                                false,
-                                cx.listener({
-                                    let name = name.clone();
-                                    move |this, _event, window, cx| {
-                                        if let Some(command) = this
-                                            .settings
-                                            .commands
-                                            .iter()
-                                            .find(|item| item.name == name)
-                                            .cloned()
-                                        {
-                                            this.edit_command(Some(command), window, cx);
+                                    }),
+                                ),
+                            )
+                            .child(if pending_delete {
+                                div()
+                                    .px_1()
+                                    .h(px(22.0))
+                                    .flex()
+                                    .items_center()
+                                    .rounded_sm()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(0xF7768E))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener({
+                                            let name = name.clone();
+                                            move |this, _event, _window, cx| {
+                                                this.delete_command(&name, cx)
+                                            }
+                                        }),
+                                    )
+                                    .child("确认删除")
+                            } else {
+                                sidebar_icon_button("🗑", 0xF7768E, None).on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener({
+                                        let name = name.clone();
+                                        move |this, _event, _window, cx| {
+                                            this.delete_command(&name, cx)
                                         }
-                                    }
-                                }),
-                            ))
-                            .child(setting_button(
-                                if pending_delete {
-                                    "确认删除"
-                                } else {
-                                    "删除"
-                                },
-                                pending_delete,
-                                cx.listener({
-                                    let name = name.clone();
-                                    move |this, _event, _window, cx| this.delete_command(&name, cx)
-                                }),
-                            )),
+                                    }),
+                                )
+                            }),
                     )
             })),
         RightPanelTab::Totp => render_totp_section(workspace, panel, cx),
@@ -7679,61 +7671,52 @@ fn server_entry_row(
                 .pt_2()
                 .flex()
                 .items_center()
-                .gap_2()
+                .gap_1()
+                // 快捷键仅展示；修改入口统一在编辑弹窗里。
+                .when_some(entry.shortcut.as_deref(), |row, shortcut| {
+                    row.child(
+                        div()
+                            .debug_selector(|| "server-shortcut".into())
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .text_size(px(11.0))
+                            .text_color(rgb(0xA9B1D6))
+                            .bg(rgb(0x30364A))
+                            .child(shortcut.to_string()),
+                    )
+                })
+                .child(div().flex_1().min_w(px(0.0)))
                 .child(
-                    div()
-                        .debug_selector(|| "server-shortcut".into())
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .truncate()
-                        .text_size(px(11.0))
-                        .text_color(rgb(0xA9B1D6))
-                        .hover(|style| style.text_color(rgb(0xC0D6FF)))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener({
-                                let entry = entry.clone();
-                                move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.edit_server(Some(&entry), window, cx);
-                                    this.start_shortcut_recording(window, cx);
+                    sidebar_icon_button("✎", 0xC0D6FF, Some("server-edit")).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener({
+                            // 每帧只持有名称：点击时再查整条，避免逐帧克隆
+                            let name = entry.name.clone();
+                            move |this, _event, window, cx| {
+                                if let Some(entry) = this
+                                    .settings
+                                    .servers
+                                    .iter()
+                                    .find(|item| item.name == name)
+                                    .cloned()
+                                {
+                                    this.edit_server(Some(&entry), window, cx)
                                 }
-                            }),
-                        )
-                        .child(sidebar_shortcut_label(entry.shortcut.as_deref()).to_string()),
+                            }
+                        }),
+                    ),
                 )
-                .child(
-                    div()
-                        .debug_selector(|| "server-edit".into())
-                        .text_size(px(11.0))
-                        .text_color(rgb(0xA9B1D6))
-                        .hover(|style| style.text_color(rgb(0xC0D6FF)))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener({
-                                // 每帧只持有名称：点击时再查整条，避免逐帧克隆
-                                let name = entry.name.clone();
-                                move |this, _event, window, cx| {
-                                    if let Some(entry) = this
-                                        .settings
-                                        .servers
-                                        .iter()
-                                        .find(|item| item.name == name)
-                                        .cloned()
-                                    {
-                                        this.edit_server(Some(&entry), window, cx)
-                                    }
-                                }
-                            }),
-                        )
-                        .child("编辑"),
-                )
-                .child(
+                .child(if pending_delete {
                     div()
                         .debug_selector(|| "server-delete".into())
+                        .px_1()
+                        .h(px(22.0))
+                        .flex()
+                        .items_center()
+                        .rounded_sm()
                         .text_size(px(11.0))
-                        .text_color(rgb(if pending_delete { 0xF7768E } else { 0xA9B1D6 }))
-                        .hover(|style| style.text_color(rgb(0xF7768E)))
+                        .text_color(rgb(0xF7768E))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener({
@@ -7741,16 +7724,20 @@ fn server_entry_row(
                                 move |this, _event, _window, cx| this.delete_server(&name, cx)
                             }),
                         )
-                        .child(if pending_delete {
-                            "确认删除"
-                        } else {
-                            "删除"
+                        .child("确认删除")
+                } else {
+                    sidebar_icon_button("🗑", 0xF7768E, Some("server-delete")).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener({
+                            let name = entry.name.clone();
+                            move |this, _event, _window, cx| this.delete_server(&name, cx)
                         }),
-                ),
+                    )
+                }),
         )
 }
 
-/// 侧栏快捷键入口：保留点击设置，同时降低对主要内容的视觉干扰。
+/// 侧栏快捷键展示键帽：纯展示（修改入口统一在编辑弹窗），不承担点击行为。
 fn sidebar_shortcut_chip(text: &str) -> gpui::Div {
     div()
         .px_2()
@@ -7759,8 +7746,32 @@ fn sidebar_shortcut_chip(text: &str) -> gpui::Div {
         .text_size(px(11.0))
         .text_color(rgb(0xA9B1D6))
         .bg(rgb(0x30364A))
-        .hover(|style| style.bg(rgb(0x3B4561)).text_color(rgb(0xD6DFF8)))
         .child(text.to_string())
+}
+
+/// 侧栏条目图标按钮（编辑/删除）：22px 方形字形钮，hover 提亮。
+/// selector 供测试 debug_bounds 定位；字形用系统字体已覆盖的 ✎/🗑。
+fn sidebar_icon_button(
+    glyph: &'static str,
+    hover_color: u32,
+    selector: Option<&'static str>,
+) -> gpui::Div {
+    let button = div()
+        .h(px(22.0))
+        .w(px(22.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .text_size(px(12.0))
+        .text_color(rgb(0xA9B1D6))
+        .hover(move |style| style.text_color(rgb(hover_color)).bg(rgb(0x2A3048)))
+        .child(glyph);
+    if let Some(selector) = selector {
+        button.debug_selector(move || selector.to_string())
+    } else {
+        button
+    }
 }
 
 /// 服务器采用列表而非重卡片，减少视觉噪声和垂直占用。
@@ -8456,6 +8467,7 @@ mod exit_regression_tests {
                 name: "测试服务器".into(),
                 host: "example.com".into(),
                 username: "user".into(),
+                shortcut: Some("ctrl+shift+k".into()),
                 ..Default::default()
             }];
             cx.notify();
@@ -8481,8 +8493,12 @@ mod exit_regression_tests {
         );
         let edit = cx.debug_bounds("server-edit").expect("编辑按钮应可见");
         let delete = cx.debug_bounds("server-delete").expect("删除按钮应可见");
-        assert_eq!(shortcut.top(), edit.top(), "次要操作应在同一行");
-        assert_eq!(edit.top(), delete.top(), "编辑和删除应在同一行");
+        // 键帽（带内边距）与 22px 图标钮高度不同：一行内的判定用垂直中心而非顶边
+        let same_row = |a: gpui::Bounds<gpui::Pixels>, b: gpui::Bounds<gpui::Pixels>| {
+            (a.center().y - b.center().y).abs() < gpui::px(2.0)
+        };
+        assert!(same_row(shortcut, edit), "次要操作应在同一行");
+        assert!(same_row(edit, delete), "编辑和删除应在同一行");
         workspace.read_with(cx, |view, _| {
             for pane in &view.panes {
                 pane.session.close();
@@ -8619,13 +8635,39 @@ mod exit_regression_tests {
         });
     }
 
-    #[test]
-    fn sidebar_shortcut_label_remains_concise_and_identifiable() {
-        assert_eq!(super::sidebar_shortcut_label(None), "设置快捷键");
-        assert_eq!(
-            super::sidebar_shortcut_label(Some("ctrl+shift+k")),
-            "ctrl+shift+k"
+    #[gpui::test]
+    fn server_shortcut_chip_only_renders_when_bound(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, _, cx| {
+            view.welcome_visible = false;
+            view.right_panel = true;
+            view.right_panel_tab = super::RightPanelTab::Servers;
+            // 未绑定快捷键：键帽不渲染（修改入口统一在编辑弹窗）
+            view.settings.servers = vec![laterterm_config::ServerEntry {
+                name: "无快捷键".into(),
+                host: "example.com".into(),
+                username: "user".into(),
+                ..Default::default()
+            }];
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("server-shortcut").is_none(),
+            "未绑定快捷键不应渲染键帽"
         );
+        assert!(cx.debug_bounds("server-edit").is_some(), "编辑图标应可见");
+        workspace.update_in(cx, |view, _, cx| {
+            view.settings.servers[0].shortcut = Some("ctrl+shift+k".into());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("server-shortcut").is_some(), "绑定后键帽应可见");
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
     }
 
     #[test]
