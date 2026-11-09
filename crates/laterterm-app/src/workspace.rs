@@ -6370,25 +6370,23 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                                 row.child(sidebar_shortcut_chip(shortcut))
                             })
                             .child(div().flex_1().min_w(px(0.0)))
-                            .child(
-                                sidebar_icon_button("✎", 0xC0D6FF, None).on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener({
-                                        let name = name.clone();
-                                        move |this, _event, window, cx| {
-                                            if let Some(command) = this
-                                                .settings
-                                                .commands
-                                                .iter()
-                                                .find(|item| item.name == name)
-                                                .cloned()
-                                            {
-                                                this.edit_command(Some(command), window, cx);
-                                            }
+                            .child(sidebar_icon_button("✎", 0xC0D6FF, None).on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let name = name.clone();
+                                    move |this, _event, window, cx| {
+                                        if let Some(command) = this
+                                            .settings
+                                            .commands
+                                            .iter()
+                                            .find(|item| item.name == name)
+                                            .cloned()
+                                        {
+                                            this.edit_command(Some(command), window, cx);
                                         }
-                                    }),
-                                ),
-                            )
+                                    }
+                                }),
+                            ))
                             .child(if pending_delete {
                                 div()
                                     .px_1()
@@ -8662,7 +8660,10 @@ mod exit_regression_tests {
             cx.notify();
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("server-shortcut").is_some(), "绑定后键帽应可见");
+        assert!(
+            cx.debug_bounds("server-shortcut").is_some(),
+            "绑定后键帽应可见"
+        );
         workspace.read_with(cx, |view, _| {
             for pane in &view.panes {
                 pane.session.close();
