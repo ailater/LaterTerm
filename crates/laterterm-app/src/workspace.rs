@@ -1336,12 +1336,29 @@ impl WorkspaceView {
 
     /// 保存会话快照（标签增删/切换/重命名后调用）。
     fn save_session_snapshot(&self) {
-        self.snapshot_session().save();
+        // 只在开关开启时保存；测试环境开关默认关，不污染共享配置。
+        if !self.settings.restore_session {
+            return;
+        }
+        let snapshot = self.snapshot_session();
+        if let Some(dir) = &self.settings_save_path {
+            snapshot.save_to(&dir.join("session.json"));
+        } else {
+            snapshot.save();
+        }
     }
 
     /// 恢复上次会话：对快照中每个额外标签，本地开终端或连服务器。
     fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let snapshot = laterterm_config::session::SessionSnapshot::load();
+        // 开关关闭 = 不恢复（测试默认关，避免把真实用户配置拉进测试）。
+        if !self.settings.restore_session {
+            return;
+        }
+        let snapshot = if let Some(dir) = &self.settings_save_path {
+            laterterm_config::session::SessionSnapshot::load_from(&dir.join("session.json"))
+        } else {
+            laterterm_config::session::SessionSnapshot::load()
+        };
         let extra = snapshot.tabs.len().saturating_sub(1); // 第一个标签已默认创建
         for tab in snapshot.tabs.iter().skip(1).take(extra) {
             if let Some(name) = &tab.server_name

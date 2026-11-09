@@ -1,7 +1,7 @@
 //! 会话恢复（M4 基础功能）：退出时保存标签列表，重启后还原。
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// 一个被恢复的标签。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,15 +27,26 @@ impl SessionSnapshot {
         crate::app_config_dir().map(|dir| dir.join("session.json"))
     }
 
-    /// 读上次会话（文件缺失/损坏回落空 = 全新启动）。
-    pub fn load() -> Self {
-        let Some(path) = Self::path() else {
-            return Self::default();
-        };
-        std::fs::read_to_string(&path)
+    /// 从指定路径读（测试注入）；文件缺失/损坏回落空 = 全新启动。
+    pub fn load_from(path: &Path) -> Self {
+        std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default()
+    }
+
+    /// 读上次会话（默认配置路径）。
+    pub fn load() -> Self {
+        Self::path()
+            .map(|path| Self::load_from(&path))
+            .unwrap_or_default()
+    }
+
+    /// 写入指定路径（测试注入，目录须已存在）。
+    pub fn save_to(&self, path: &Path) {
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(path, json);
+        }
     }
 
     /// 落盘（退出或标签变更时调用；失败静默——恢复是增强不是保证）。
@@ -43,9 +54,7 @@ impl SessionSnapshot {
         let Some(path) = Self::path() else {
             return;
         };
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(&path, json);
-        }
+        self.save_to(&path);
     }
 
     /// 清除（用户关闭所有标签 = 下次全新启动）。
