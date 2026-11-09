@@ -60,6 +60,8 @@ const PANEL_WIDTH: f32 = 240.0;
 /// 不再写死十六进制。
 #[derive(Clone, Copy)]
 struct UiColors {
+    /// 根容器/标题栏底色（background 原色，最深）。
+    base_bg: u32,
     /// 边栏底色（background 提亮 4%）。
     panel_bg: u32,
     /// 卡片底色（background 提亮 8%）。
@@ -88,6 +90,7 @@ impl UiColors {
     /// 从主题颜色派生边栏语义色。亮度缩放走 HSL（保证任意主题下可读性）。
     fn from_theme(colors: &laterterm_config::theme::ThemeColors) -> Self {
         Self {
+            base_bg: colors.background,
             panel_bg: lighten(colors.background, 0.04),
             card_bg: lighten(colors.background, 0.08),
             hover_bg: lighten(colors.background, 0.12),
@@ -5599,11 +5602,12 @@ impl Render for WorkspaceView {
             self.settings_scroll_spy_step();
         }
 
+        let ui = self.ui_colors();
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x1A1B26))
+            .bg(rgb(ui.base_bg))
             .capture_key_down(cx.listener(WorkspaceView::on_key_down))
             .child({
                 let pane_rects = pane_rects.clone();
@@ -5618,7 +5622,7 @@ impl Render for WorkspaceView {
                     .w_full()
                     .flex()
                     .items_center()
-                    .bg(rgb(0x161722))
+                    .bg(rgb(ui.base_bg))
                     .child(
                         div()
                             .h_full()
@@ -5630,7 +5634,7 @@ impl Render for WorkspaceView {
                             .when(cfg!(target_os = "macos"), |brand| brand.pl(px(82.0)))
                             .child(button("☰", cx.listener(Self::toggle_left_panel)))
                             .child(titlebar_logo())
-                            .child(div().text_color(rgb(0xC0CAF5)).child(if self.broadcast {
+                            .child(div().text_color(rgb(ui.text)).child(if self.broadcast {
                                 "LaterTerm · 广播中"
                             } else {
                                 "LaterTerm"
@@ -5662,14 +5666,14 @@ impl Render for WorkspaceView {
                                         .gap_1()
                                         .px_3()
                                         .bg(if is_active {
-                                            rgb(0x292B3D)
+                                            rgb(ui.hover_bg)
                                         } else {
-                                            rgb(0x161722)
+                                            rgb(ui.panel_bg)
                                         })
                                         .text_color(if is_active {
-                                            rgb(0xC0CAF5)
+                                            rgb(ui.text)
                                         } else {
-                                            rgb(0xA9B1D6)
+                                            rgb(ui.text_secondary)
                                         })
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -5687,16 +5691,16 @@ impl Render for WorkspaceView {
                                                     .left_0()
                                                     .right_0()
                                                     .h(px(2.0))
-                                                    .bg(rgb(0x7AA2F7)),
+                                                    .bg(rgb(ui.accent)),
                                             )
                                         })
                                         .child(
                                             div()
                                                 .px_1()
-                                                .text_color(rgb(0x7D829F))
+                                                .text_color(rgb(ui.text_muted))
                                                 .opacity(0.55)
                                                 .group_hover("tab", |style| style.opacity(1.0))
-                                                .hover(|style| style.text_color(rgb(0xF7768E)))
+                                                .hover(|style| style.text_color(rgb(ui.danger)))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(move |this, _, window, cx| {
