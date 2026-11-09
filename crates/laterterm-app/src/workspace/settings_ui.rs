@@ -60,6 +60,14 @@ const COLOR_ACCENT_TINT: u32 = 0x7AA2F726;
 const COLOR_ACCENT_TINT_HOVER: u32 = 0x7AA2F733;
 /// 未选中 hover：中性提亮（半透明次级色，31/255 ≈ 12%）。
 const COLOR_HOVER_TINT: u32 = 0xA9B1D61F;
+/// 实心 accent 选中态的 hover：比 0x7AA2F7 亮一档。
+const COLOR_ACCENT_HOVER: u32 = 0x92B4F9;
+/// 多选芯片选中态：中性提亮底（无 accent 描边，避免误读成单选高亮）。
+const COLOR_MULTI_SELECTED_BG: u32 = 0x343A55;
+/// 多选芯片选中态 hover。
+const COLOR_MULTI_SELECTED_HOVER: u32 = 0x3B4261;
+/// 字体 / 备选芯片固定宽度：内容区两列对齐，避免按文字长短流式换行参差。
+const FONT_CHIP_WIDTH: f32 = 184.0;
 
 /// scroll-spy 判定线：视口顶部下探 64px 落在哪个分区内就高亮哪个分区。
 pub(crate) const SCROLL_SPY_LEAD_PX: f32 = 64.0;
@@ -308,8 +316,11 @@ pub(crate) fn settings_overlay(
                         .px_5()
                         .border_t_1()
                         .border_color(rgb(COLOR_STROKE))
-                        .text_color(rgb(COLOR_TEXT_MUTED))
-                        .child("修改即时生效")
+                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .child(format!(
+                            "修改即时生效 · 共 {} 节，上下滚动查看全部设置",
+                            SettingsSection::ALL.len()
+                        ))
                         .child("LaterTerm"),
                 ),
         )
@@ -1230,6 +1241,8 @@ fn scrollback_controls(cx: &mut Context<WorkspaceView>, settings: &Appearance) -
 /// 常用 CJK 备选字体预设；空表表示交回系统默认回退。
 const FALLBACK_PRESETS: [&str; 3] = ["Sarasa Mono SC", "Noto Sans Mono CJK SC", "无"];
 
+/// 字体族芯片：固定等宽 + flex_wrap，按内容区自然排成整齐两列。
+/// 原实现芯片宽度随字长变化，6 个预设换行成 1/2/2/1，视觉上参差。
 fn font_family_controls(cx: &mut Context<WorkspaceView>, current: &str) -> Div {
     div()
         .flex()
@@ -1244,9 +1257,12 @@ fn font_family_controls(cx: &mut Context<WorkspaceView>, current: &str) -> Div {
                     this.change_setting(event, window, cx, |s| s.font_family = name.to_string());
                 }),
             )
+            .w(px(FONT_CHIP_WIDTH))
         }))
 }
 
+/// 备选字体是多选（可同时启用多个回退），用 `multi_select_button` 的
+/// 勾选语义，不再复用单选芯片——避免两个蓝框看起来像「两个单选都选中」。
 fn font_fallback_controls(cx: &mut Context<WorkspaceView>, current: &[String]) -> Div {
     div()
         .flex()
@@ -1258,7 +1274,7 @@ fn font_fallback_controls(cx: &mut Context<WorkspaceView>, current: &[String]) -
             } else {
                 current.iter().any(|entry| entry == name)
             };
-            setting_button(
+            multi_select_button(
                 name,
                 selected,
                 cx.listener(move |this, event, window, cx| {
@@ -1275,6 +1291,7 @@ fn font_fallback_controls(cx: &mut Context<WorkspaceView>, current: &[String]) -
                     });
                 }),
             )
+            .w(px(FONT_CHIP_WIDTH))
         }))
 }
 
@@ -1493,15 +1510,21 @@ fn value_chip(text: &str) -> Div {
 
 /// 面板/对话框共用的按钮芯片（对话框沿用同一观感，随本模块收敛为
 /// Tokyo Night——sftp_panel 的注释「对齐 setting_button 观感」即此约定）。
-/// 选中态 = accent tint 底 + accent 描边 + 主文字：主文字从 0x7DCEFF 收敛为
-/// 0xC0CAF5 后的辨识度损失由 accent 描边补偿（评审风险7）。
+/// 选中态 = 实心 accent + 深色文字：单选组里只应有一个实心块，与未选中的
+/// 中性描边一眼可分；对话框的主按钮（保存主题 / 去下载 / 保存）复用同一语义。
+/// 多选语义走 `multi_select_button`，不要复用本控件——否则「多个蓝框」会被
+/// 误读成多个单选同时高亮。
 pub(crate) fn setting_button(
     label: impl Into<SharedString>,
     selected: bool,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
     let (bg, border, text) = if selected {
-        (rgba(COLOR_ACCENT_TINT), rgb(COLOR_ACCENT), rgb(COLOR_TEXT))
+        (
+            rgb(COLOR_ACCENT),
+            rgb(COLOR_ACCENT),
+            rgb(COLOR_OVERLAY_BG),
+        )
     } else {
         (
             rgb(COLOR_OVERLAY_BG),
@@ -1510,7 +1533,7 @@ pub(crate) fn setting_button(
         )
     };
     let hover_bg = if selected {
-        rgba(COLOR_ACCENT_TINT_HOVER)
+        rgb(COLOR_ACCENT_HOVER)
     } else {
         rgb(COLOR_STROKE)
     };
@@ -1528,5 +1551,41 @@ pub(crate) fn setting_button(
         .text_color(text)
         .hover(move |this| this.bg(hover_bg))
         .on_mouse_down(MouseButton::Left, listener)
+        .child(label.into())
+}
+
+/// 多选芯片：选中 = 中性提亮底 + ✓ + 主文字，描边始终中性，不带 accent。
+/// 用于「备选字体」这类可同时选中多项的组，与单选的实心 accent 明确区分。
+fn multi_select_button(
+    label: impl Into<SharedString>,
+    selected: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    let (bg, text) = if selected {
+        (rgb(COLOR_MULTI_SELECTED_BG), rgb(COLOR_TEXT))
+    } else {
+        (rgb(COLOR_OVERLAY_BG), rgb(COLOR_TEXT_SECONDARY))
+    };
+    let hover_bg = if selected {
+        rgb(COLOR_MULTI_SELECTED_HOVER)
+    } else {
+        rgb(COLOR_STROKE)
+    };
+    div()
+        .h(px(30.0))
+        .min_w(px(36.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .px_3()
+        .bg(bg)
+        .border_1()
+        .border_color(rgb(COLOR_STROKE))
+        .rounded_sm()
+        .text_color(text)
+        .hover(move |this| this.bg(hover_bg))
+        .on_mouse_down(MouseButton::Left, listener)
+        .when(selected, |chip| chip.child("✓"))
         .child(label.into())
 }
