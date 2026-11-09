@@ -53,6 +53,139 @@ pub(crate) use self::settings_ui::{PalettePreview, palette_preview};
 const TITLEBAR_HEIGHT: f32 = 34.0;
 const PANEL_WIDTH: f32 = 240.0;
 
+/// 边栏语义色：从当前主题 [`laterterm_config::theme::ThemeColors`] 派生，
+/// 替代边栏写死的 Tokyo Night 色值（主题切换时边栏同步换肤）。
+/// 派生原则：底 = background 的亮度变体；正文 = foreground；强调 = blue；
+/// 危险 = red；次要文字/边框 = bright_black。提亮/压暗用 HSL 亮度缩放，
+/// 不再写死十六进制。
+#[derive(Clone, Copy)]
+struct UiColors {
+    /// 边栏底色（background 提亮 4%）。
+    panel_bg: u32,
+    /// 卡片底色（background 提亮 8%）。
+    card_bg: u32,
+    /// 行 hover 底（background 提亮 12%）。
+    hover_bg: u32,
+    /// 选中行底（blue 低透明度压入 background 的混合，这里用 blue 暗化版）。
+    selected_bg: u32,
+    /// 边框/分隔线（bright_black 压暗 20%）。
+    border: u32,
+    /// 正文（foreground）。
+    text: u32,
+    /// 次要文字（bright_black 提亮 25%）。
+    text_secondary: u32,
+    /// 弱化文字（bright_black 原色）。
+    text_muted: u32,
+    /// 强调色（blue）。
+    accent: u32,
+    /// 危险/删除（red）。
+    danger: u32,
+    /// 成功提示（green）。
+    success: u32,
+}
+
+impl UiColors {
+    /// 从主题颜色派生边栏语义色。亮度缩放走 HSL（保证任意主题下可读性）。
+    fn from_theme(colors: &laterterm_config::theme::ThemeColors) -> Self {
+        Self {
+            panel_bg: lighten(colors.background, 0.04),
+            card_bg: lighten(colors.background, 0.08),
+            hover_bg: lighten(colors.background, 0.12),
+            selected_bg: mix(colors.blue, colors.background, 0.28),
+            border: darken(colors.bright_black, 0.20),
+            text: colors.foreground,
+            text_secondary: lighten(colors.bright_black, 0.25),
+            text_muted: colors.bright_black,
+            accent: colors.blue,
+            danger: colors.red,
+            success: colors.green,
+        }
+    }
+}
+
+/// HSL 提亮：把 u32 RGB 转 HSL，L 通道加 `amount`，再转回 u32。
+fn lighten(rgb: u32, amount: f32) -> u32 {
+    adjust_lightness(rgb, amount)
+}
+
+/// HSL 压暗。
+fn darken(rgb: u32, amount: f32) -> u32 {
+    adjust_lightness(rgb, -amount)
+}
+
+/// 亮度调整实现（amount 正提亮负压暗，L 钳制 0..1）。
+fn adjust_lightness(rgb: u32, amount: f32) -> u32 {
+    let (r, g, b) = (rgb >> 16 & 0xFF, rgb >> 8 & 0xFF, rgb & 0xFF);
+    let (rf, gf, bf) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
+    let l = (max + min) / 2.0;
+    let l = (l + amount).clamp(0.0, 1.0);
+    let s = if (max - min).abs() < f32::EPSILON {
+        0.0
+    } else if l <= 0.5 {
+        (max - min) / (max + min)
+    } else {
+        (max - min) / (2.0 - max - min)
+    };
+    let hue = |p: f32, q: f32, mut t: f32| {
+        if t < 0.0 {
+            t += 1.0;
+        }
+        if t > 1.0 {
+            t -= 1.0;
+        }
+        if t < 1.0 / 6.0 {
+            return p + (q - p) * 6.0 * t;
+        }
+        if t < 1.0 / 2.0 {
+            return q;
+        }
+        if t < 2.0 / 3.0 {
+            return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
+        }
+        p
+    };
+    let (nr, ng, nb) = if s.abs() < f32::EPSILON {
+        (l, l, l)
+    } else {
+        let q = if l < 0.5 {
+            l * (1.0 + s)
+        } else {
+            l + s - l * s
+        };
+        let p = 2.0 * l - q;
+        let h = if (max - min).abs() < f32::EPSILON {
+            0.0
+        } else if (max - rf).abs() < f32::EPSILON {
+            ((gf - bf) / (max - min) % 6.0) / 6.0
+        } else if (max - gf).abs() < f32::EPSILON {
+            ((bf - rf) / (max - min) + 2.0) / 6.0
+        } else {
+            ((rf - gf) / (max - min) + 4.0) / 6.0
+        };
+        (
+            hue(p, q, h + 1.0 / 3.0),
+            hue(p, q, h),
+            hue(p, q, h - 1.0 / 3.0),
+        )
+    };
+    ((nr * 255.0).round() as u32) << 16
+        | ((ng * 255.0).round() as u32) << 8
+        | (nb * 255.0).round() as u32
+}
+
+/// 两色按权重混合（weight 为 color 的占比，1-weight 为 base 的占比）。
+fn mix(color: u32, base: u32, weight: f32) -> u32 {
+    let (r1, g1, b1) = (color >> 16 & 0xFF, color >> 8 & 0xFF, color & 0xFF);
+    let (r2, g2, b2) = (base >> 16 & 0xFF, base >> 8 & 0xFF, base & 0xFF);
+    let w = weight.clamp(0.0, 1.0);
+    let r = (r1 as f32 * w + r2 as f32 * (1.0 - w)).round() as u32;
+    let g = (g1 as f32 * w + g2 as f32 * (1.0 - w)).round() as u32;
+    let b = (b1 as f32 * w + b2 as f32 * (1.0 - w)).round() as u32;
+    r << 16 | g << 8 | b
+}
+
 /// 窗格（pane）ID：一个终端会话的最小分屏单元。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct PaneId(pub(crate) u64);
@@ -2173,6 +2306,12 @@ impl WorkspaceView {
         self.theme_preview
             .as_deref()
             .unwrap_or(&self.settings.appearance.theme)
+    }
+
+    /// 当前生效主题派生的边栏语义色（预览态用预览主题，与终端窗格同口径）。
+    fn ui_colors(&self) -> UiColors {
+        let theme = self.themes.resolve(self.effective_theme_name());
+        UiColors::from_theme(&theme.colors)
     }
 
     /// 设置面板点选主题芯片：只进预览态，不落盘（落盘走 commit_theme_preview）。
@@ -5607,7 +5746,13 @@ impl Render for WorkspaceView {
                     .min_h(px(0.0))
                     .flex()
                     .child(if left_panel {
-                        left_sidebar(&tab_labels, active_tab_id, &self.tab_scroll, cx)
+                        left_sidebar(
+                            &tab_labels,
+                            active_tab_id,
+                            &self.tab_scroll,
+                            self.ui_colors(),
+                            cx,
+                        )
                     } else {
                         div()
                     })
@@ -5700,9 +5845,10 @@ impl Render for WorkspaceView {
                 )
             })
             // 命令/动态码/服务器对话框：窗口级模态弹窗（最上层）
-            .when_some(render_active_dialog(self, cx), |root, overlay| {
-                root.child(overlay)
-            })
+            .when_some(
+                render_active_dialog(self, self.ui_colors(), cx),
+                |root, overlay| root.child(overlay),
+            )
             // 终端右键菜单：anchored 浮层，最顶层
             .when_some(
                 self.terminal_menu
@@ -6212,10 +6358,12 @@ fn render_layout(
 }
 
 /// 标签列表采用固定标题和独立滚动区域，长标题不挤占关闭按钮。
+/// 颜色全部走 `ui`（主题派生），不再写死 Tokyo Night 色值。
 fn left_sidebar(
     tab_labels: &[(TabId, String, usize)],
     active_tab_id: TabId,
     scroll: &ScrollHandle,
+    ui: UiColors,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
     div()
@@ -6224,9 +6372,9 @@ fn left_sidebar(
         .flex_shrink_0()
         .flex()
         .flex_col()
-        .bg(rgb(0x1C1E2C))
+        .bg(rgb(ui.panel_bg))
         .border_r_1()
-        .border_color(rgb(0x292D40))
+        .border_color(rgb(ui.border))
         .child(
             div()
                 .h(px(52.0))
@@ -6236,14 +6384,14 @@ fn left_sidebar(
                 .items_center()
                 .justify_between()
                 .text_size(px(12.0))
-                .text_color(rgb(0xA9B1D6))
+                .text_color(rgb(ui.text_secondary))
                 .child(
                     div().flex().items_center().gap_2().child("会话").child(
                         div()
                             .px_1()
                             .rounded_sm()
-                            .bg(rgb(0x303548))
-                            .text_color(rgb(0xC0CAF5))
+                            .bg(rgb(ui.card_bg))
+                            .text_color(rgb(ui.text))
                             .child(tab_labels.len().to_string()),
                     ),
                 )
@@ -6281,20 +6429,20 @@ fn left_sidebar(
                         .gap_2()
                         .rounded_md()
                         .bg(if selected {
-                            rgb(0x303A52)
+                            rgb(ui.selected_bg)
                         } else {
-                            rgb(0x1C1E2C)
+                            rgb(ui.panel_bg)
                         })
                         .text_color(if selected {
-                            rgb(0xC0D6FF)
+                            rgb(ui.text)
                         } else {
-                            rgb(0xA9B1D6)
+                            rgb(ui.text_secondary)
                         })
                         .hover(|style| {
                             style.bg(if selected {
-                                rgb(0x35415B)
+                                rgb(ui.hover_bg)
                             } else {
-                                rgb(0x292D40)
+                                rgb(ui.border)
                             })
                         })
                         .on_mouse_down(
@@ -6308,14 +6456,14 @@ fn left_sidebar(
                             }),
                         )
                         .child(div().w(px(2.0)).h(px(18.0)).rounded_full().bg(if selected {
-                            rgb(0x7AA2F7)
+                            rgb(ui.accent)
                         } else {
-                            rgb(0x1C1E2C)
+                            rgb(ui.panel_bg)
                         }))
                         .child(
                             div()
                                 .text_size(px(13.0))
-                                .text_color(rgb(0x7AA2F7))
+                                .text_color(rgb(ui.accent))
                                 .child("›_"),
                         )
                         .child(
@@ -6330,7 +6478,7 @@ fn left_sidebar(
                             row.child(
                                 div()
                                     .text_size(px(11.0))
-                                    .text_color(rgb(0xA9B1D6))
+                                    .text_color(rgb(ui.text_secondary))
                                     .child(count.to_string()),
                             )
                         })
@@ -6339,8 +6487,8 @@ fn left_sidebar(
                                 .px_1()
                                 .opacity(0.0)
                                 .group_hover("session-row", |style| style.opacity(1.0))
-                                .text_color(rgb(0xA9B1D6))
-                                .hover(|style| style.text_color(rgb(0xF7768E)))
+                                .text_color(rgb(ui.text_secondary))
+                                .hover(|style| style.text_color(rgb(ui.danger)))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, window, cx| {
@@ -6356,6 +6504,7 @@ fn left_sidebar(
 fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
     // 条目行借用渲染 + 点击时查整条：GPUI 无视图缓存，面板每帧重渲染，
     // 这里不得整表克隆 commands（此前每帧深拷贝全表 + 每行多次 clone）。
+    let ui = workspace.ui_colors();
     let error = workspace.command_error.clone();
     let notice = workspace.command_notice.clone();
     let delete_confirm = workspace.command_delete_confirm.clone();
@@ -6371,7 +6520,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
         RightPanelTab::Servers => "sidebar-servers",
     };
 
-    let panel = div().w_full().text_color(rgb(0xC0CAF5));
+    let panel = div().w_full().text_color(rgb(ui.text));
     let panel = match active_tab {
         RightPanelTab::Commands => panel
             .child(
@@ -6398,23 +6547,23 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                         cx.listener(|this, _event, _window, cx| this.import_commands_deepin(cx)),
                     )),
             )
-            .child(panel_caption("命令模板与快捷键"))
+            .child(panel_caption("命令模板与快捷键", ui))
             .when_some(error, |panel, error| {
-                panel.child(div().text_color(rgb(0xF7768E)).child(error))
+                panel.child(div().text_color(rgb(ui.danger)).child(error))
             })
             // 导入/批量操作的一次性计数提示（同 server_notice 的绿色口径）
             .when_some(notice, |panel, notice| {
-                panel.child(div().pt_2().text_color(rgb(0x9ECE6A)).child(notice))
+                panel.child(div().pt_2().text_color(rgb(ui.success)).child(notice))
             })
             .when(workspace.settings.commands.is_empty(), |panel| {
-                panel.child(sidebar_empty("还没有命令", "点击上方按钮新建常用命令"))
+                panel.child(sidebar_empty("还没有命令", "点击上方按钮新建常用命令", ui))
             })
             .children(workspace.settings.commands.iter().map(|command| {
                 let has_separate_template = command.template != command.name;
                 let pending_delete = delete_confirm.as_deref() == Some(command.name.as_str());
                 // 行内监听只持有名称（每帧唯一捕获），点击时再查整条
                 let name = command.name.clone();
-                entry_card()
+                entry_card(ui)
                     .child(
                         div()
                             .flex()
@@ -6443,7 +6592,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                                     .flex_1()
                                     .min_w(px(0.0))
                                     .truncate()
-                                    .text_color(rgb(0xC0CAF5))
+                                    .text_color(rgb(ui.text))
                                     .child(command.name.clone()),
                             ),
                     )
@@ -6453,7 +6602,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                                 .pt_1()
                                 .truncate()
                                 .text_size(px(12.0))
-                                .text_color(rgb(0xA9B1D6))
+                                .text_color(rgb(ui.text_secondary))
                                 .child(command.template.clone()),
                         )
                     })
@@ -6465,10 +6614,10 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                             .gap_1()
                             // 快捷键仅展示；修改入口统一在编辑弹窗里。
                             .when_some(command.shortcut.as_deref(), |row, shortcut| {
-                                row.child(sidebar_shortcut_chip(shortcut))
+                                row.child(sidebar_shortcut_chip(shortcut, ui))
                             })
                             .child(div().flex_1().min_w(px(0.0)))
-                            .child(sidebar_icon_button("✎", 0xC0D6FF, None).on_mouse_down(
+                            .child(sidebar_icon_button("✎", ui.accent, None, ui).on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener({
                                     let name = name.clone();
@@ -6493,7 +6642,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                                     .items_center()
                                     .rounded_sm()
                                     .text_size(px(11.0))
-                                    .text_color(rgb(0xF7768E))
+                                    .text_color(rgb(ui.danger))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener({
@@ -6505,7 +6654,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                                     )
                                     .child("确认删除")
                             } else {
-                                sidebar_icon_button("🗑", 0xF7768E, None).on_mouse_down(
+                                sidebar_icon_button("🗑", ui.danger, None, ui).on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener({
                                         let name = name.clone();
@@ -6517,8 +6666,8 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                             }),
                     )
             })),
-        RightPanelTab::Totp => render_totp_section(workspace, panel, cx),
-        RightPanelTab::Servers => render_server_section(workspace, panel, cx),
+        RightPanelTab::Totp => render_totp_section(workspace, panel, ui, cx),
+        RightPanelTab::Servers => render_server_section(workspace, panel, ui, cx),
     };
 
     div()
@@ -6527,17 +6676,17 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
         .flex_shrink_0()
         .flex()
         .flex_col()
-        .bg(rgb(0x1C1E2C))
+        .bg(rgb(ui.panel_bg))
         .border_l_1()
-        .border_color(rgb(0x292D40))
-        .child(sidebar_header("工具", item_count))
+        .border_color(rgb(ui.border))
+        .child(sidebar_header("工具", item_count, ui))
         .child(
             div()
                 .mx_2()
                 .mb_2()
                 .p_1()
                 .rounded_md()
-                .bg(rgb(0x161824))
+                .bg(rgb(ui.panel_bg))
                 .flex()
                 .gap_1()
                 .children(RightPanelTab::ALL.map(|tab| {
@@ -6551,6 +6700,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                             this.server_delete_confirm = None;
                             cx.notify();
                         }),
+                        ui,
                     )
                 })),
         )
@@ -6572,6 +6722,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
 /// （原为右面板内覆盖层，现统一为居中弹窗；错误提示随之移入弹窗内部。）
 fn render_active_dialog(
     workspace: &mut WorkspaceView,
+    ui: UiColors,
     cx: &mut Context<WorkspaceView>,
 ) -> Option<gpui::Div> {
     // SFTP 栏内操作弹窗（新建目录/重命名）：窗口级模态，与其它弹窗同骨架
@@ -6671,7 +6822,7 @@ fn render_active_dialog(
             .child(
                 div()
                     .pt_2()
-                    .text_color(rgb(0x7D829F))
+                    .text_color(rgb(ui.text_muted))
                     .child("可取消后续操作；已经进入系统密钥环的写入无法撤回。"),
             )
             .child(dialog_footer(vec![setting_button(
@@ -6746,9 +6897,9 @@ fn modal_dialog(
                 .flex()
                 .flex_col()
                 .overflow_hidden()
-                .bg(rgb(0x202132))
+                .bg(rgb(0x252939))
                 .border_1()
-                .border_color(rgb(0x3B3F5C))
+                .border_color(rgb(0x292D40))
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(
                     div()
@@ -6760,7 +6911,7 @@ fn modal_dialog(
                         .justify_between()
                         .px_4()
                         .border_b_1()
-                        .border_color(rgb(0x343750))
+                        .border_color(rgb(0x292D40))
                         .child(div().text_color(rgb(0xC0CAF5)).child(title.into()))
                         .child(
                             div()
@@ -7003,7 +7154,7 @@ fn totp_edit_modal(
                 }))
                 .child(
                     div()
-                        .text_color(rgb(0x565A78))
+                        .text_color(rgb(0x7D829F))
                         .child(format!("周期 {} 秒", meta.period)),
                 ),
         )
@@ -7228,7 +7379,7 @@ fn server_connect_modal(
                         cx.notify();
                     }),
                 ))
-                .child(div().text_color(rgb(0x565A78)).child("连接成功后才保存；不勾选则仅本次使用")),
+                .child(div().text_color(rgb(0x7D829F)).child("连接成功后才保存；不勾选则仅本次使用")),
         )
         .when(busy, |body| body.child(div().pt_2().child("正在连接，可取消…")))
         .child(dialog_footer(vec![
@@ -7303,7 +7454,7 @@ fn server_import_modal(source: ServerImportSource, cx: &mut Context<WorkspaceVie
         .child(
             div()
                 .pt_3()
-                .text_color(rgb(0x565A78))
+                .text_color(rgb(0x7D829F))
                 .child("任何来源都不迁移凭据：首次连接补输一次即可（可记住入密钥环）"),
         )
         .child(dialog_footer(vec![
@@ -7346,6 +7497,7 @@ fn totp_preview_remaining(generated_at: SystemTime, period: u64) -> u64 {
 fn render_totp_section(
     workspace: &mut WorkspaceView,
     panel: gpui::Div,
+    ui: UiColors,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
     let delete_confirm = workspace.totp_delete_confirm.clone();
@@ -7357,19 +7509,23 @@ fn render_totp_section(
             true,
             cx.listener(|this, _event, window, cx| this.edit_totp(None, window, cx)),
         ))
-        .child(panel_caption("密钥保存在系统密钥环中"))
+        .child(panel_caption("密钥保存在系统密钥环中", ui))
         .when_some(error, |panel, error| {
-            panel.child(div().text_color(rgb(0xF7768E)).child(error))
+            panel.child(div().text_color(rgb(ui.danger)).child(error))
         })
         .when(workspace.settings.totp.is_empty(), |panel| {
-            panel.child(sidebar_empty("还没有动态码", "支持粘贴密钥或 otpauth 链接"))
+            panel.child(sidebar_empty(
+                "还没有动态码",
+                "支持粘贴密钥或 otpauth 链接",
+                ui,
+            ))
         })
         .children(workspace.settings.totp.iter().map(|entry| {
             // 行内监听只持有名称（每帧唯一捕获），点击时再查整条
             let name = entry.name.clone();
             let remaining = totp_window_remaining(entry.period);
             let pending_delete = delete_confirm.as_deref() == Some(entry.name.as_str());
-            entry_card()
+            entry_card(ui)
                 .child(
                     div()
                         .w_full()
@@ -7398,13 +7554,13 @@ fn render_totp_section(
                                 .flex_1()
                                 .min_w(px(0.0))
                                 .truncate()
-                                .text_color(rgb(0xC0CAF5))
+                                .text_color(rgb(ui.text))
                                 .child(entry.name.clone()),
                         )
                         .child(
                             div()
                                 .text_size(px(11.0))
-                                .text_color(rgb(0x7D829F))
+                                .text_color(rgb(ui.text_muted))
                                 .child(format!("{remaining}s")),
                         ),
                 )
@@ -7414,7 +7570,7 @@ fn render_totp_section(
                             .pt_1()
                             .truncate()
                             .text_size(px(11.0))
-                            .text_color(rgb(0x7D829F))
+                            .text_color(rgb(ui.text_muted))
                             .child(shortcut),
                     )
                 })
@@ -7463,6 +7619,7 @@ fn render_totp_section(
 fn render_server_section(
     workspace: &mut WorkspaceView,
     panel: gpui::Div,
+    ui: UiColors,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
     let delete_confirm = workspace.server_delete_confirm.clone();
@@ -7506,26 +7663,27 @@ fn render_server_section(
                         )),
                 ),
         )
-        .child(panel_caption("凭据保存在系统密钥环中"))
+        .child(panel_caption("凭据保存在系统密钥环中", ui))
         .when(workspace.settings.servers.is_empty(), |panel| {
             panel.child(sidebar_empty(
                 "还没有服务器",
                 "新建连接，或导入已有的服务器列表",
+                ui,
             ))
         })
         .when_some(notice, |panel, notice| {
-            panel.child(div().pt_2().text_color(rgb(0x9ECE6A)).child(notice))
+            panel.child(div().pt_2().text_color(rgb(ui.success)).child(notice))
         })
         .when_some(connecting, |panel, connecting| {
             panel.child(
                 div()
                     .pt_2()
-                    .text_color(rgb(0xBB9AF7))
+                    .text_color(rgb(ui.accent))
                     .child(format!("正在连接 {connecting} …（最长 15s）")),
             )
         })
         .when_some(error, |panel, error| {
-            panel.child(div().text_color(rgb(0xF7768E)).child(error))
+            panel.child(div().text_color(rgb(ui.danger)).child(error))
         })
         // 分组渲染：组头（▸/▾ + 组名 + 计数）+ 成员条目；折叠的组不渲染成员行。
         // 硬约束：纯未分组（无任何命名组）时保持旧版平铺外观，一个组头都不渲染。
@@ -7540,6 +7698,7 @@ fn render_server_section(
                         server_entry_row(
                             entry,
                             delete_confirm.as_deref() == Some(entry.name.as_str()),
+                            ui,
                             cx,
                         )
                     })
@@ -7555,6 +7714,7 @@ fn render_server_section(
                             indexes.len(),
                             is_collapsed,
                             disband_confirm.as_deref(),
+                            ui,
                             cx,
                         ));
                         if !is_collapsed {
@@ -7563,6 +7723,7 @@ fn render_server_section(
                                 server_entry_row(
                                     entry,
                                     delete_confirm.as_deref() == Some(entry.name.as_str()),
+                                    ui,
                                     cx,
                                 )
                             }));
@@ -7581,6 +7742,7 @@ fn server_group_header(
     count: usize,
     is_collapsed: bool,
     disband_confirm: Option<&str>,
+    ui: UiColors,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
     let label = group.clone().unwrap_or_else(|| "未分组".into());
@@ -7595,8 +7757,8 @@ fn server_group_header(
         .items_center()
         .gap_1()
         .text_size(px(12.0))
-        .text_color(rgb(0x7D829F))
-        .hover(|style| style.text_color(rgb(0xA9B1D6)))
+        .text_color(rgb(ui.text_muted))
+        .hover(|style| style.text_color(rgb(ui.text_secondary)))
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
@@ -7615,16 +7777,16 @@ fn server_group_header(
                 .flex_1()
                 .min_w(px(0.0))
                 .truncate()
-                .text_color(rgb(0xA9B1D6))
+                .text_color(rgb(ui.text_secondary))
                 .child(label),
         )
         .child(
             div()
                 .px_1()
                 .rounded_sm()
-                .bg(rgb(0x303548))
+                .bg(rgb(ui.card_bg))
                 .text_size(px(11.0))
-                .text_color(rgb(0xC0CAF5))
+                .text_color(rgb(ui.text))
                 .child(count.to_string()),
         );
     // 未分组桶没有组级操作（成员各自在编辑弹窗里进组）
@@ -7636,8 +7798,8 @@ fn server_group_header(
             div()
                 .debug_selector(|| "server-group-rename".into())
                 .text_size(px(11.0))
-                .text_color(rgb(0xA9B1D6))
-                .hover(|style| style.text_color(rgb(0xC0D6FF)))
+                .text_color(rgb(ui.text_secondary))
+                .hover(|style| style.text_color(rgb(ui.text)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener({
@@ -7656,7 +7818,7 @@ fn server_group_header(
                 .debug_selector(|| "server-group-disband".into())
                 .text_size(px(11.0))
                 .text_color(rgb(if disbanding { 0xF7768E } else { 0xA9B1D6 }))
-                .hover(|style| style.text_color(rgb(0xF7768E)))
+                .hover(|style| style.text_color(rgb(ui.danger)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _, _, cx| {
@@ -7678,6 +7840,7 @@ fn server_group_header(
 fn server_entry_row(
     entry: &ServerEntry,
     pending_delete: bool,
+    ui: UiColors,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
     let auth_label = match entry.auth {
@@ -7687,7 +7850,7 @@ fn server_entry_row(
         ServerAuthKind::Agent => "Agent",
     };
     let name = entry.name.clone();
-    server_list_item()
+    server_list_item(ui)
         .debug_selector(move || format!("server-card-{name}"))
         // 第一行：名称 + 连接
         .child(
@@ -7700,7 +7863,7 @@ fn server_entry_row(
                         .flex_1()
                         .min_w(px(0.0))
                         .truncate()
-                        .text_color(rgb(0xC0CAF5))
+                        .text_color(rgb(ui.text))
                         .child(entry.name.clone()),
                 )
                 .child(
@@ -7709,9 +7872,9 @@ fn server_entry_row(
                         .py_1()
                         .rounded_sm()
                         .text_size(px(12.0))
-                        .text_color(rgb(0xB7CEFF))
-                        .bg(rgb(0x303E58))
-                        .hover(|style| style.bg(rgb(0x405578)))
+                        .text_color(rgb(ui.text))
+                        .bg(rgb(ui.selected_bg))
+                        .hover(|style| style.bg(rgb(ui.hover_bg)))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener({
@@ -7728,9 +7891,9 @@ fn server_entry_row(
                         .py_1()
                         .rounded_sm()
                         .text_size(px(12.0))
-                        .text_color(rgb(0x7DCFFF))
-                        .bg(rgb(0x2A3450))
-                        .hover(|style| style.bg(rgb(0x364468)))
+                        .text_color(rgb(ui.accent))
+                        .bg(rgb(ui.card_bg))
+                        .hover(|style| style.bg(rgb(ui.hover_bg)))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener({
@@ -7749,7 +7912,7 @@ fn server_entry_row(
                 .pt_1()
                 .truncate()
                 .text_size(px(12.0))
-                .text_color(rgb(0xA9B1D6))
+                .text_color(rgb(ui.text_secondary))
                 .child({
                     // 跳板引用一眼可见：走哪条链直连/穿透不分家
                     let mut line = format!(
@@ -7777,14 +7940,14 @@ fn server_entry_row(
                             .py_1()
                             .rounded_sm()
                             .text_size(px(11.0))
-                            .text_color(rgb(0xA9B1D6))
-                            .bg(rgb(0x30364A))
+                            .text_color(rgb(ui.text_secondary))
+                            .bg(rgb(ui.card_bg))
                             .child(shortcut.to_string()),
                     )
                 })
                 .child(div().flex_1().min_w(px(0.0)))
                 .child(
-                    sidebar_icon_button("✎", 0xC0D6FF, Some("server-edit")).on_mouse_down(
+                    sidebar_icon_button("✎", ui.accent, Some("server-edit"), ui).on_mouse_down(
                         MouseButton::Left,
                         cx.listener({
                             // 每帧只持有名称：点击时再查整条，避免逐帧克隆
@@ -7812,7 +7975,7 @@ fn server_entry_row(
                         .items_center()
                         .rounded_sm()
                         .text_size(px(11.0))
-                        .text_color(rgb(0xF7768E))
+                        .text_color(rgb(ui.danger))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener({
@@ -7822,7 +7985,7 @@ fn server_entry_row(
                         )
                         .child("确认删除")
                 } else {
-                    sidebar_icon_button("🗑", 0xF7768E, Some("server-delete")).on_mouse_down(
+                    sidebar_icon_button("🗑", ui.danger, Some("server-delete"), ui).on_mouse_down(
                         MouseButton::Left,
                         cx.listener({
                             let name = entry.name.clone();
@@ -7834,14 +7997,14 @@ fn server_entry_row(
 }
 
 /// 侧栏快捷键展示键帽：纯展示（修改入口统一在编辑弹窗），不承担点击行为。
-fn sidebar_shortcut_chip(text: &str) -> gpui::Div {
+fn sidebar_shortcut_chip(text: &str, ui: UiColors) -> gpui::Div {
     div()
         .px_2()
         .py_1()
         .rounded_sm()
         .text_size(px(11.0))
-        .text_color(rgb(0xA9B1D6))
-        .bg(rgb(0x30364A))
+        .text_color(rgb(ui.text_secondary))
+        .bg(rgb(ui.card_bg))
         .child(text.to_string())
 }
 
@@ -7851,6 +8014,7 @@ fn sidebar_icon_button(
     glyph: &'static str,
     hover_color: u32,
     selector: Option<&'static str>,
+    ui: UiColors,
 ) -> gpui::Div {
     let button = div()
         .h(px(22.0))
@@ -7860,8 +8024,8 @@ fn sidebar_icon_button(
         .justify_center()
         .rounded_sm()
         .text_size(px(12.0))
-        .text_color(rgb(0xA9B1D6))
-        .hover(move |style| style.text_color(rgb(hover_color)).bg(rgb(0x2A3048)))
+        .text_color(rgb(ui.text_secondary))
+        .hover(move |style| style.text_color(rgb(hover_color)).bg(rgb(ui.hover_bg)))
         .child(glyph);
     if let Some(selector) = selector {
         button.debug_selector(move || selector.to_string())
@@ -7871,7 +8035,7 @@ fn sidebar_icon_button(
 }
 
 /// 服务器采用列表而非重卡片，减少视觉噪声和垂直占用。
-fn server_list_item() -> gpui::Div {
+fn server_list_item(ui: UiColors) -> gpui::Div {
     div()
         .pt_3()
         .pb_3()
@@ -7879,26 +8043,26 @@ fn server_list_item() -> gpui::Div {
         .flex()
         .flex_col()
         .border_b_1()
-        .border_color(rgb(0x303548))
-        .hover(|style| style.bg(rgb(0x242838)))
+        .border_color(rgb(ui.card_bg))
+        .hover(|style| style.bg(rgb(ui.hover_bg)))
 }
 
 /// 侧栏列表项使用低对比度背景，强调色留给选中项和主要操作。
-fn entry_card() -> gpui::Div {
+fn entry_card(ui: UiColors) -> gpui::Div {
     div()
         .mt_2()
         .p_3()
         .flex()
         .flex_col()
         .rounded_md()
-        .bg(rgb(0x252939))
+        .bg(rgb(ui.card_bg))
         .border_1()
-        .border_color(rgb(0x303548))
-        .hover(|style| style.bg(rgb(0x2B3042)))
+        .border_color(rgb(ui.card_bg))
+        .hover(|style| style.bg(rgb(ui.hover_bg)))
 }
 
 /// 侧栏的固定标题与条目数量。
-fn sidebar_header(title: &str, count: usize) -> gpui::Div {
+fn sidebar_header(title: &str, count: usize, ui: UiColors) -> gpui::Div {
     div()
         .h(px(52.0))
         .px_3()
@@ -7907,15 +8071,15 @@ fn sidebar_header(title: &str, count: usize) -> gpui::Div {
         .items_center()
         .gap_2()
         .text_size(px(12.0))
-        .text_color(rgb(0xA9B1D6))
+        .text_color(rgb(ui.text_secondary))
         .child(title.to_string())
         .child(
             div()
                 .px_1()
                 .rounded_sm()
-                .bg(rgb(0x303548))
+                .bg(rgb(ui.card_bg))
                 .text_size(px(11.0))
-                .text_color(rgb(0xC0CAF5))
+                .text_color(rgb(ui.text))
                 .child(count.to_string()),
         )
 }
@@ -7924,6 +8088,7 @@ fn sidebar_tab_button(
     label: &'static str,
     selected: bool,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ui: UiColors,
 ) -> gpui::Div {
     div()
         .flex_1()
@@ -7934,33 +8099,37 @@ fn sidebar_tab_button(
         .rounded_sm()
         .text_size(px(12.0))
         .bg(if selected {
-            rgb(0x35415B)
+            rgb(ui.hover_bg)
         } else {
-            rgb(0x161824)
+            rgb(ui.panel_bg)
         })
         .text_color(if selected {
-            rgb(0xD6E3FF)
+            rgb(ui.text)
         } else {
-            rgb(0xA9B1D6)
+            rgb(ui.text_secondary)
         })
         .hover(|style| {
             style.bg(if selected {
-                rgb(0x35415B)
+                rgb(ui.hover_bg)
             } else {
-                rgb(0x292D40)
+                rgb(ui.border)
             })
         })
         .on_mouse_down(MouseButton::Left, listener)
         .child(label)
 }
 
-fn sidebar_empty(title: &str, description: &str) -> gpui::Div {
+fn sidebar_empty(title: &str, description: &str, ui: UiColors) -> gpui::Div {
     div()
         .pt_4()
         .flex()
         .flex_col()
         .gap_1()
-        .child(div().text_color(rgb(0xA9B1D6)).child(title.to_string()))
+        .child(
+            div()
+                .text_color(rgb(ui.text_secondary))
+                .child(title.to_string()),
+        )
         .child(
             div()
                 .text_size(px(12.0))
@@ -7970,11 +8139,11 @@ fn sidebar_empty(title: &str, description: &str) -> gpui::Div {
 }
 
 /// 侧栏操作下方的辅助说明。
-fn panel_caption(text: &str) -> gpui::Div {
+fn panel_caption(text: &str, ui: UiColors) -> gpui::Div {
     div()
         .pt_2()
         .text_size(px(11.0))
-        .text_color(rgb(0x9AA0A6))
+        .text_color(rgb(ui.text_muted))
         .child(text.to_string())
 }
 
