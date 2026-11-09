@@ -60,7 +60,7 @@ const PANEL_WIDTH: f32 = 240.0;
 /// 不再写死十六进制。
 #[derive(Clone, Copy)]
 struct UiColors {
-    /// 根容器/标题栏底色（background 原色，最深）。
+    /// 根容器/标题栏底色（background 压暗 6%，比边栏更深，拉开层次）。
     base_bg: u32,
     /// 边栏底色（background 提亮 4%）。
     panel_bg: u32,
@@ -90,7 +90,7 @@ impl UiColors {
     /// 从主题颜色派生边栏语义色。亮度缩放走 HSL（保证任意主题下可读性）。
     fn from_theme(colors: &laterterm_config::theme::ThemeColors) -> Self {
         Self {
-            base_bg: colors.background,
+            base_bg: darken(colors.background, 0.06),
             panel_bg: lighten(colors.background, 0.04),
             card_bg: lighten(colors.background, 0.08),
             hover_bg: lighten(colors.background, 0.12),
