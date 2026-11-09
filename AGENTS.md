@@ -13,6 +13,7 @@
 ## 命令
 
 ```bash
+script/gate.sh       # 本地门禁 = CI 三件套（fmt/clippy/test），推送前必跑（pre-push 钩子已强制）
 cargo check          # 快速校验
 cargo run --release  # 运行（需要桌面环境）
 cargo clippy --fix   # lint
