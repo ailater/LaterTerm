@@ -1520,11 +1520,7 @@ pub(crate) fn setting_button(
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
     let (bg, border, text) = if selected {
-        (
-            rgb(COLOR_ACCENT),
-            rgb(COLOR_ACCENT),
-            rgb(COLOR_OVERLAY_BG),
-        )
+        (rgb(COLOR_ACCENT), rgb(COLOR_ACCENT), rgb(COLOR_OVERLAY_BG))
     } else {
         (
             rgb(COLOR_OVERLAY_BG),
