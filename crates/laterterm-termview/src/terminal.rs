@@ -538,18 +538,23 @@ impl TerminalState {
 
     /// 从网格中提取点击位置处的 URL。
     ///
-    /// 提取指定网格位置命中的 URL 及其列范围（悬停下划线用）。
+    /// `row` 是视口行（0 = 视口顶行，回滚时随视口上移），`col` 是网格列。
+    /// 行换算与渲染快照同口径：`Line(row - display_offset)`（负行进历史区）。
+    /// 越界坐标（鼠标滑出网格边缘）返回 None 而非索引网格——pixel_to_cell
+    /// 只钳下限，这里的防御是 URL 悬停/右键/Ctrl+点击三条路径的唯一护栏，
+    /// 缺了会在 `grid[Line]` 的 debug_assert 上 panic（storage.rs compute_index）。
     /// 返回 `(url, 起始列, 结束列)`；无命中为 None。结束列为开区间。
     pub fn extract_url_span_at(&self, row: usize, col: usize) -> Option<(String, usize, usize)> {
         self.with_term(|term| {
             let grid = term.grid();
-            let history = (grid.total_lines() - grid.screen_lines()) as i32;
-            let display_offset = grid.display_offset() as i32;
-            // 屏幕行 → grid 行：与 search_grid 同口径
-            let absolute = history + row as i32 + display_offset;
-            let line = Line(absolute - history);
-
+            let screen_lines = grid.screen_lines();
             let columns = grid.columns();
+            if row >= screen_lines || col >= columns {
+                return None;
+            }
+            let display_offset = grid.display_offset() as i32;
+            let line = Line(row as i32 - display_offset);
+
             let mut cells: Vec<(usize, char)> = Vec::with_capacity(columns);
             for c in 0..columns {
                 let cell = &grid[AlacPoint::new(line, Column(c))];
@@ -867,6 +872,34 @@ mod tests {
             term.scroll_display(alacritty_terminal::grid::Scroll::Bottom);
         });
         terminal.with_term(|term| assert_eq!(term.grid().display_offset(), 0));
+    }
+
+    /// URL 坐标护栏：`pixel_to_cell` 只钳下限，鼠标滑出网格底/右缘或回滚
+    /// 后悬停都会送进越界 row/col——必须返回 None 而非在 `grid[Line]` 的
+    /// debug_assert 上 panic（storage.rs compute_index）。
+    #[test]
+    fn extract_url_span_at_rejects_out_of_bounds_coordinates() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(80, 4, 100, GpuiEventProxy::new(tx));
+        terminal.process_bytes(b"$ curl https://example.com\r\n");
+
+        // 鼠标滑出网格底缘/右缘：越界一律 None。
+        // 注意 screen_lines 须先取出再调用——with_term 持锁期间重入
+        // extract_url_span_at（内部再 with_term）会自死锁。
+        let screen_lines = terminal.with_term(|term| term.grid().screen_lines());
+        assert_eq!(terminal.extract_url_span_at(screen_lines + 3, 10), None);
+        assert_eq!(terminal.extract_url_span_at(0, 999), None);
+
+        // 回滚后（display_offset > 0）视口行换算进历史区：合法行不 panic、越界仍 None
+        for line in 0..20 {
+            terminal.process_bytes(format!("history-{line}\r\n").as_bytes());
+        }
+        terminal.with_term_mut(|term| {
+            term.scroll_display(alacritty_terminal::grid::Scroll::Delta(2));
+        });
+        assert!(terminal.with_term(|term| term.grid().display_offset()) > 0);
+        assert_eq!(terminal.extract_url_span_at(screen_lines - 1, 0), None);
+        assert_eq!(terminal.extract_url_span_at(screen_lines + 1, 0), None);
     }
 
     #[test]
