@@ -894,6 +894,26 @@ struct TerminalMenuState {
 /// 右键菜单动作：拿到工作区、窗口与上下文执行具体操作。
 type TerminalMenuAction = Box<dyn Fn(&mut WorkspaceView, &mut Window, &mut Context<WorkspaceView>)>;
 
+/// 标签右键菜单的打开状态与来源标签。
+#[derive(Clone)]
+struct TabMenuState {
+    tab_id: TabId,
+    /// 菜单锚点（窗口坐标）。
+    position: Point<Pixels>,
+}
+
+/// 标签右键菜单的快捷色板（dbx 式环境区分用色，属用户数据而非主题语义）。
+const TAB_COLOR_SWATCHES: [u32; 8] = [
+    0xF7768E, // 红
+    0xFF9E64, // 橙
+    0xE0AF68, // 黄
+    0x9ECE6A, // 绿
+    0x7DCFFF, // 青
+    0x7AA2F7, // 蓝
+    0xBB9AF7, // 紫
+    0xA9B1D6, // 灰
+];
+
 /// 标签：持有自己的分屏树与窗格焦点。
 struct WorkspaceTab {
     id: TabId,
@@ -946,6 +966,8 @@ pub struct WorkspaceView {
     split_drag: Option<SplitDrag>,
     /// 终端右键菜单状态（None = 关闭）。
     terminal_menu: Option<TerminalMenuState>,
+    /// 标签右键菜单状态（None = 关闭）。
+    tab_menu: Option<TabMenuState>,
     left_panel: bool,
     tab_scroll: ScrollHandle,
     right_panel: bool,
@@ -1191,6 +1213,7 @@ impl WorkspaceView {
             pane_geometry: Rc::new(RefCell::new(None)),
             split_drag: None,
             terminal_menu: None,
+            tab_menu: None,
             secret_store: default_store(),
             settings_section: SettingsSection::Appearance,
             settings_jump: None,
@@ -2037,6 +2060,54 @@ impl WorkspaceView {
         }
     }
 
+    /// 打开标签右键菜单（同一时刻只保留一个浮层菜单，互斥终端菜单）。
+    fn open_tab_menu(&mut self, tab_id: TabId, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.terminal_menu = None;
+        self.tab_menu = Some(TabMenuState { tab_id, position });
+        cx.notify();
+    }
+
+    /// 设置标签色（菜单色块/无色项共用）；None = 清除自定义色。
+    fn set_tab_color(&mut self, id: TabId, color: Option<u32>, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            if tab.color == color {
+                return;
+            }
+            tab.color = color;
+            self.save_session_snapshot();
+            cx.notify();
+        }
+    }
+
+    /// 关闭其他标签：保留目标标签，其余全部走 Closing 生命周期。
+    /// 不复用 close_tab 逐个关——末标签关闭会触发补位 spawn_tab，语义不符。
+    fn close_other_tabs(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        cx.stop_propagation();
+        if self.tabs.len() <= 1 || !self.tabs.iter().any(|tab| tab.id == id) {
+            return;
+        }
+        let mut leaves = Vec::new();
+        for tab in &self.tabs {
+            if tab.id != id {
+                tab.layout.leaves(&mut leaves);
+            }
+        }
+        for pane_id in leaves {
+            if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id)
+                && pane.status.mark_closing()
+            {
+                pane.session.close();
+            }
+        }
+        self.tabs.retain(|tab| tab.id == id);
+        cx.notify();
+        if self.active_tab != id {
+            let pane_id = self.tabs[0].focused_pane;
+            self.focus_pane(pane_id, window, cx);
+        }
+        self.save_session_snapshot();
+    }
+
     fn remove_pane_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         let removed = self.panes.remove(index);
         // 从所在标签的布局树修剪；若该窗格是标签内最后一个（根叶子无法自删），
@@ -2326,6 +2397,164 @@ impl WorkspaceView {
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                     .children(items),
+            ),
+        )
+        .with_priority(1)
+    }
+
+    /// 标签右键菜单浮层：复用终端菜单的 anchored/snap_to_window/外点关闭
+    /// 基建，但属 UI chrome 菜单，配色走 UiColors（终端菜单为 Tokyo Night 定值）。
+    fn tab_context_menu(&self, menu: TabMenuState, cx: &mut Context<Self>) -> impl IntoElement {
+        let ui = self.ui_colors();
+        let tab_id = menu.tab_id;
+        let current_color = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .and_then(|tab| tab.color);
+        let has_others = self.tabs.len() > 1;
+
+        // 菜单项工厂：行高/字号口径同终端菜单（26px / 12px），禁用置灰；
+        // 动作执行后统一收起标签菜单。嵌套 fn 需显式传 ui（不能捕获外层）。
+        fn item(
+            ui: UiColors,
+            cx: &mut Context<WorkspaceView>,
+            label: &'static str,
+            enabled: bool,
+            action: TerminalMenuAction,
+        ) -> Div {
+            let base = div()
+                .h(px(26.0))
+                .px_2()
+                .flex()
+                .items_center()
+                .text_size(px(12.0));
+            if enabled {
+                base.text_color(rgb(ui.text))
+                    .hover(|style| style.bg(rgb(ui.hover_bg)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            action(this, window, cx);
+                            this.tab_menu = None;
+                            cx.notify();
+                        }),
+                    )
+            } else {
+                base.text_color(rgb(ui.text_muted))
+            }
+            .child(label)
+        }
+        let separator = || div().mx_2().my_1().h(px(1.0)).bg(rgb(ui.border));
+
+        // 快捷色板行：点色块即设色并收起；当前色加选中描边（用户数据，不随主题）
+        let swatches: Vec<Div> = TAB_COLOR_SWATCHES
+            .iter()
+            .map(|swatch| {
+                let swatch = *swatch;
+                div()
+                    .size(px(14.0))
+                    .rounded_sm()
+                    .bg(rgb(swatch))
+                    .when(current_color == Some(swatch), |color_box| {
+                        color_box.border_1().border_color(rgb(ui.text))
+                    })
+                    .hover(|style| style.opacity(0.75))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.set_tab_color(tab_id, Some(swatch), cx);
+                            this.tab_menu = None;
+                            cx.notify();
+                        }),
+                    )
+            })
+            .collect();
+        // 无色项：清除自定义色（回落主题口径），无色时文字提亮示意选中
+        let no_color_row = div()
+            .h(px(26.0))
+            .px_2()
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(px(12.0))
+            .text_color(if current_color.is_none() {
+                rgb(ui.text)
+            } else {
+                rgb(ui.text_secondary)
+            })
+            .hover(|style| style.bg(rgb(ui.hover_bg)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.set_tab_color(tab_id, None, cx);
+                    this.tab_menu = None;
+                    cx.notify();
+                }),
+            )
+            .child(div().size(px(10.0)).rounded_sm().border_1().border_color(
+                if current_color.is_none() {
+                    rgb(ui.accent)
+                } else {
+                    rgb(ui.border)
+                },
+            ))
+            .child("无色");
+
+        deferred(
+            anchored().position(menu.position).snap_to_window().child(
+                div()
+                    .w(px(176.0))
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .bg(rgb(ui.card_bg))
+                    .border_1()
+                    .border_color(rgb(ui.border))
+                    .rounded_md()
+                    // 点击菜单外任意处关闭
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.tab_menu = None;
+                        cx.notify();
+                    }))
+                    // 菜单内的点击不穿透，避免误触标签/终端
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                    // 重命名占位：本任务只留入口，交互在任务 3 接（点了仅收起菜单）
+                    .child(item(ui, cx, "重命名", true, Box::new(|_, _, _| {})))
+                    .child(separator())
+                    .child(
+                        div()
+                            .px_2()
+                            .py_1()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .children(swatches),
+                    )
+                    .child(no_color_row)
+                    .child(separator())
+                    .child(item(
+                        ui,
+                        cx,
+                        "关闭标签",
+                        true,
+                        Box::new(move |this, window, cx| {
+                            this.close_tab(tab_id, window, cx);
+                        }),
+                    ))
+                    .child(item(
+                        ui,
+                        cx,
+                        "关闭其他标签",
+                        has_others,
+                        Box::new(move |this, window, cx| {
+                            this.close_other_tabs(tab_id, window, cx);
+                        }),
+                    )),
             ),
         )
         .with_priority(1)
@@ -5417,6 +5646,15 @@ impl WorkspaceView {
                 return;
             }
         }
+        // 标签右键菜单：与终端菜单同级消费 Esc。
+        if self.tab_menu.is_some() {
+            self.tab_menu = None;
+            cx.notify();
+            if plain_escape {
+                cx.stop_propagation();
+                return;
+            }
+        }
         if self.command_dialog.is_some()
             || self.totp_dialog.is_some()
             || self.server_dialog.is_some()
@@ -5841,6 +6079,17 @@ impl Render for WorkspaceView {
                                                 .bg(rgb(ui.accent)),
                                             None => div(),
                                         })
+                                        // 右键弹标签菜单；拦截冒泡防触发
+                                        // 终端右键菜单与窗口拖动
+                                        .on_mouse_down(
+                                            MouseButton::Right,
+                                            cx.listener(
+                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.open_tab_menu(id, event.position, cx);
+                                                },
+                                            ),
+                                        )
                                         .child(
                                             div()
                                                 .px_1()
@@ -6032,6 +6281,13 @@ impl Render for WorkspaceView {
                 self.terminal_menu
                     .clone()
                     .map(|menu| self.terminal_context_menu(menu, cx)),
+                |root, menu_overlay| root.child(menu_overlay),
+            )
+            // 标签右键菜单：同一浮层基建，最顶层
+            .when_some(
+                self.tab_menu
+                    .clone()
+                    .map(|menu| self.tab_context_menu(menu, cx)),
                 |root, menu_overlay| root.child(menu_overlay),
             )
             // 在全部窗格完成绘制后提交同一帧的几何快照。
@@ -6645,6 +6901,14 @@ fn left_sidebar(
                                 } else {
                                     this.activate_tab(id, event, window, cx);
                                 }
+                            }),
+                        )
+                        // 右键弹标签菜单；拦截冒泡防误触终端菜单
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.open_tab_menu(id, event.position, cx);
                             }),
                         )
                         // 左侧竖色条：自定义标签色优先（3px）；无色回落
@@ -10654,5 +10918,88 @@ mod tab_label_tests {
             color: None,
         };
         assert_eq!(tab.tab_title(&[]), "终端");
+    }
+}
+
+#[cfg(test)]
+mod tab_menu_tests {
+    use super::{TabId, TerminalMenuState, WorkspaceView};
+    use gpui::{Point, TestAppContext, px};
+
+    /// 模式同 exit_regression_tests：会话泄漏会让测试进程收尾告警。
+    fn close_sessions(workspace: &gpui::Entity<WorkspaceView>, cx: &gpui::TestAppContext) {
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn close_other_tabs_keeps_target_only(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let keep = workspace.update_in(cx, |view, window, cx| {
+            view.spawn_tab(window, cx);
+            view.spawn_tab(window, cx);
+            assert_eq!(view.tabs.len(), 3);
+            let keep = view.tabs[0].id;
+            view.close_other_tabs(keep, window, cx);
+            assert_eq!(view.tabs.len(), 1, "只保留被右键的标签");
+            assert_eq!(view.tabs[0].id, keep);
+            keep
+        });
+        // 被关标签的窗格走 Closing → TerminalExited 后回收
+        for _ in 0..300 {
+            cx.run_until_parked();
+            if workspace.read_with(cx, |view, _| view.panes.len() == 1) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(view.panes.len(), 1, "其余标签的窗格应被回收");
+            assert_eq!(view.active_tab().id, keep, "保留标签应成为活跃标签");
+        });
+        close_sessions(&workspace, cx);
+    }
+
+    #[gpui::test]
+    fn close_other_tabs_with_single_tab_is_noop(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            let only = view.tabs[0].id;
+            view.close_other_tabs(only, window, cx);
+            assert_eq!(view.tabs.len(), 1, "没有其他标签时不动作");
+        });
+        close_sessions(&workspace, cx);
+    }
+
+    #[gpui::test]
+    fn set_tab_color_sets_and_clears(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update(cx, |view, cx| {
+            let id: TabId = view.tabs[0].id;
+            view.set_tab_color(id, Some(0xF7768E), cx);
+            assert_eq!(view.tabs[0].color, Some(0xF7768E));
+            view.set_tab_color(id, None, cx);
+            assert_eq!(view.tabs[0].color, None, "「无色」项应清除自定义色");
+        });
+        close_sessions(&workspace, cx);
+    }
+
+    #[gpui::test]
+    fn opening_tab_menu_dismisses_terminal_menu(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update(cx, |view, cx| {
+            view.terminal_menu = Some(TerminalMenuState {
+                pane_id: view.focused_pane_id(),
+                position: Point::new(px(1.0), px(1.0)),
+                url: None,
+            });
+            view.open_tab_menu(view.tabs[0].id, Point::new(px(2.0), px(2.0)), cx);
+            assert!(view.terminal_menu.is_none(), "标签菜单与终端菜单互斥");
+            assert!(view.tab_menu.is_some());
+        });
+        close_sessions(&workspace, cx);
     }
 }
