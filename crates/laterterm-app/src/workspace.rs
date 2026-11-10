@@ -3026,6 +3026,31 @@ impl WorkspaceView {
         window.zoom_window();
     }
 
+    /// 标题栏空白区双击切换最大化/还原，复用 Window::zoom_window，与 tb-zoom
+    /// 按钮完全同源（X11 发 _NET_WM_STATE Toggle、Wayland 按 maximized 状态
+    /// set/unset、macOS 原生 zoom），不自写几何恢复。注册顺序必须在本容器
+    /// start_move 之后：gpui bubble 逆序派发（vendor/gpui/src/window.rs），
+    /// 双击时本处理器先执行并 stop_propagation 拦掉窗口拖动；单击
+    /// （click_count==1）为纯 no-op，拖拽照旧透传。click_count 由平台层按
+    /// 间隔/同键/位移累计，应用侧无需计时器。
+    fn titlebar_double_click_zoom(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if Self::is_titlebar_double_click(event.click_count) {
+            cx.stop_propagation();
+            window.zoom_window();
+        }
+    }
+
+    /// 标题栏双击命中判断（纯函数）：仅 click_count≥2 算双击；单击必须返回
+    /// false 透传给 start_move，否则标题栏拖动窗口失效。
+    fn is_titlebar_double_click(click_count: usize) -> bool {
+        click_count >= 2
+    }
+
     /// 导航点击：立即高亮（不等滚动对位），并记跳转让下一帧 prepaint 消费
     /// scroll_to_top_of_item 瞬时对齐分区起点（Top 策略）。
     fn select_settings_section(
@@ -6329,7 +6354,14 @@ impl Render for WorkspaceView {
                                 ui,
                                 cx.listener(Self::new_tab),
                             ))
-                            .on_mouse_down(MouseButton::Left, cx.listener(Self::start_move)),
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::start_move))
+                            // 双击缩放必须注册在 start_move 之后：gpui bubble
+                            // 逆序派发，后注册者先执行，双击才能拦掉窗口拖动；
+                            // 单击为 no-op 直接透传（见 titlebar_double_click_zoom）
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(Self::titlebar_double_click_zoom),
+                            ),
                     )
                     .child(icon_button(
                         "tb-split-h",
@@ -6756,6 +6788,17 @@ fn show_pane_close(pane_count: usize) -> bool {
     pane_count > 1
 }
 
+/// 滚动条 thumb 配色（纯函数）：常态压暗（0x565A78 @ α0.2），悬停 scrollbar
+/// 热区加亮（0x7AA2F7 @ α0.9）。色值沿用本代码块既有字面量，不新增主题令牌，
+/// 单测锁值防漂移。
+fn scrollbar_thumb_color(hovered: bool) -> gpui::Hsla {
+    if hovered {
+        gpui::Hsla::from(rgb(0x7AA2F7)).opacity(0.9)
+    } else {
+        gpui::Hsla::from(rgb(0x565A78)).opacity(0.2)
+    }
+}
+
 fn render_layout(
     node: &LayoutNode,
     panes: &[Pane],
@@ -6813,7 +6856,10 @@ fn render_layout(
                         .size_full(),
                     )
                 });
-            // 悬浮滚动条：右侧细条平时半透明，悬停窗格加亮（无监听器，不拦截终端鼠标）
+            // 悬浮滚动条：右侧细条平时压暗，悬停 8px 热区加亮（无监听器，不拦截
+            // 终端鼠标）。轨道 group("scrollbar") 仅提供局部悬停判定，thumb 的
+            // 加亮从整窗格 group("pane") 收窄到本热区；thumb 像素几何不变
+            // （右缘 2px、宽 3px），6→8px 只是向左扩大不可见命中热区。
             if let Some((thumb, top)) = scroll.thumb() {
                 pane_div = pane_div.child(
                     div()
@@ -6821,7 +6867,8 @@ fn render_layout(
                         .top_0()
                         .bottom_0()
                         .right_0()
-                        .w(px(6.0))
+                        .w(px(8.0))
+                        .group("scrollbar")
                         .child(
                             div()
                                 .absolute()
@@ -6830,9 +6877,9 @@ fn render_layout(
                                 .h(relative(thumb))
                                 .w(px(3.0))
                                 .rounded_full()
-                                .bg(gpui::Hsla::from(rgb(0x565A78)).opacity(0.6))
-                                .group_hover("pane", |style| {
-                                    style.bg(gpui::Hsla::from(rgb(0x7AA2F7)).opacity(0.9))
+                                .bg(scrollbar_thumb_color(false))
+                                .group_hover("scrollbar", |style| {
+                                    style.bg(scrollbar_thumb_color(true))
                                 }),
                         ),
                 );
@@ -11641,5 +11688,35 @@ mod server_tab_color_tests {
         );
         // 两者皆无 → 跟随主题
         assert_eq!(WorkspaceView::restore_tab_color(None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod titlebar_scrollbar_tests {
+    use super::{WorkspaceView, scrollbar_thumb_color};
+    use gpui::{Hsla, rgb};
+
+    #[test]
+    fn titlebar_double_click_threshold() {
+        // 单击必须返回 false：透传 start_move，标题栏拖动窗口不失效
+        assert!(!WorkspaceView::is_titlebar_double_click(1));
+        // 双击及连击命中
+        assert!(WorkspaceView::is_titlebar_double_click(2));
+        assert!(WorkspaceView::is_titlebar_double_click(3));
+        // 防御：异常的 0 也视为非双击
+        assert!(!WorkspaceView::is_titlebar_double_click(0));
+    }
+
+    #[test]
+    fn scrollbar_thumb_colors_pinned() {
+        // 常态压暗 0x565A78 @ α0.2，悬停热区加亮 0x7AA2F7 @ α0.9（锁字面量）
+        assert_eq!(
+            scrollbar_thumb_color(false),
+            Hsla::from(rgb(0x565A78)).opacity(0.2)
+        );
+        assert_eq!(
+            scrollbar_thumb_color(true),
+            Hsla::from(rgb(0x7AA2F7)).opacity(0.9)
+        );
     }
 }
