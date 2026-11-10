@@ -899,16 +899,38 @@ struct WorkspaceTab {
     id: TabId,
     layout: LayoutNode,
     focused_pane: PaneId,
+    /// 用户自定义标题（双击重命名）；Some 时优先于 OSC/窗格自动标题。
+    custom_title: Option<String>,
+    /// 用户自定义标签色（0xRRGGBB，用户数据不走主题语义）；None = 跟随主题。
+    color: Option<u32>,
 }
 
 impl WorkspaceTab {
     fn tab_title(&self, panes: &[Pane]) -> String {
+        if let Some(custom) = &self.custom_title {
+            return custom.clone();
+        }
         panes
             .iter()
             .find(|pane| pane.id == self.focused_pane)
             .map(|pane| pane.title.clone())
             .unwrap_or_else(|| "终端".into())
     }
+}
+
+/// 非活跃标签标题的最大字符数（按 char 计，超长截断）。
+const TAB_TITLE_MAX_CHARS: usize = 16;
+/// 活跃标签标题的最大字符数（可稍宽）。
+const ACTIVE_TAB_TITLE_MAX_CHARS: usize = 24;
+
+/// 超长标题按 char 数截断并以「…」收尾（省略号计入上限，结果 ≤ max_chars）。
+fn truncate_tab_title(title: &str, max_chars: usize) -> String {
+    if title.chars().count() <= max_chars {
+        return title.to_string();
+    }
+    let mut truncated: String = title.chars().take(max_chars.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
 }
 
 pub struct WorkspaceView {
@@ -990,8 +1012,6 @@ pub struct WorkspaceView {
     server_notice: Option<String>,
     /// 分组折叠态（键 = 组名，None = 未分组桶；会话级，不持久化）。
     server_groups_collapsed: BTreeSet<Option<String>>,
-    /// 用户自定义标签标题（双击重命名）；优先于 OSC/窗格计算标题。
-    custom_tab_titles: BTreeMap<TabId, String>,
     /// 标签重命名输入框（双击标签时弹出）。
     tab_rename_field: Option<(TabId, Entity<CommandTextField>)>,
     /// 会话恢复是否已执行（首帧 render 时跑一次）。
@@ -1140,7 +1160,6 @@ impl WorkspaceView {
             server_error: None,
             server_notice: None,
             server_groups_collapsed: BTreeSet::new(),
-            custom_tab_titles: BTreeMap::new(),
             tab_rename_field: None,
             session_restored: false,
             server_group_confirm: None,
@@ -1191,6 +1210,8 @@ impl WorkspaceView {
                 id: first_tab,
                 layout: LayoutNode::Leaf(first_pane),
                 focused_pane: first_pane,
+                custom_title: None,
+                color: None,
             }],
             active_tab: first_tab,
             next_pane_id: 2,
@@ -1524,7 +1545,6 @@ impl WorkspaceView {
                 .tabs
                 .iter()
                 .map(|tab| {
-                    let custom_title = self.custom_tab_titles.get(&tab.id).cloned();
                     // 窗格标题匹配服务器端点 → 还原时能重连
                     let title = tab.tab_title(&self.panes);
                     let server_name = self
@@ -1541,8 +1561,10 @@ impl WorkspaceView {
                         })
                         .map(|s| s.name.clone());
                     laterterm_config::session::SessionTab {
-                        custom_title,
+                        custom_title: tab.custom_title.clone(),
                         server_name,
+                        // 色值落盘为 "#RRGGBB"（与 theme.rs 序列化同口径）
+                        color: tab.color.map(laterterm_config::theme::format_hex_color),
                     }
                 })
                 .collect(),
@@ -1589,11 +1611,13 @@ impl WorkspaceView {
             } else {
                 self.new_tab(&MouseDownEvent::default(), window, cx);
             }
-            // 还原自定义标题
-            if let Some(tab_ref) = self.tabs.last()
-                && let Some(title) = &tab.custom_title
-            {
-                self.custom_tab_titles.insert(tab_ref.id, title.clone());
+            // 还原自定义标题与标签色（坏色值按 None 忽略）
+            if let Some(tab_ref) = self.tabs.last_mut() {
+                tab_ref.custom_title = tab.custom_title.clone();
+                tab_ref.color = tab
+                    .color
+                    .as_deref()
+                    .and_then(laterterm_config::theme::parse_hex_color);
             }
         }
         // 恢复激活标签索引
@@ -1606,13 +1630,13 @@ impl WorkspaceView {
 
     /// 双击标签打开重命名输入框。
     fn start_tab_rename(&mut self, id: TabId, cx: &mut Context<Self>) {
-        let current = self.custom_tab_titles.get(&id).cloned().unwrap_or_else(|| {
-            self.tabs
-                .iter()
-                .find(|tab| tab.id == id)
-                .map(|tab| tab.tab_title(&self.panes))
-                .unwrap_or_default()
-        });
+        // tab_title 已含 custom_title 优先逻辑，直接取展示标题作预填
+        let current = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| tab.tab_title(&self.panes))
+            .unwrap_or_default();
         let field = cx.new(|cx| CommandTextField::new(current, "标签名", cx));
         self.tab_rename_field = Some((id, field));
         cx.notify();
@@ -1622,10 +1646,8 @@ impl WorkspaceView {
     fn commit_tab_rename(&mut self, cx: &mut Context<Self>) {
         if let Some((id, field)) = self.tab_rename_field.take() {
             let title = field.read(cx).value().trim().to_string();
-            if title.is_empty() {
-                self.custom_tab_titles.remove(&id);
-            } else {
-                self.custom_tab_titles.insert(id, title);
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+                tab.custom_title = (!title.is_empty()).then_some(title);
             }
         }
         self.save_session_snapshot();
@@ -1867,6 +1889,8 @@ impl WorkspaceView {
             id: tab_id,
             layout: LayoutNode::Leaf(pane_id),
             focused_pane: pane_id,
+            custom_title: None,
+            color: None,
         });
         self.focus_pane(pane_id, window, cx);
         self.save_session_snapshot();
@@ -4350,6 +4374,8 @@ impl WorkspaceView {
                     id: tab_id,
                     layout: LayoutNode::Leaf(pane_id),
                     focused_pane: pane_id,
+                    custom_title: None,
+                    color: None,
                 });
                 self.focus_pane(pane_id, window, cx);
             }
@@ -5673,18 +5699,14 @@ impl Render for WorkspaceView {
         let geometry_layout = active_layout.clone();
         let geometry_rects = pane_rects.clone();
         let focused_pane = self.active_tab().focused_pane;
-        // 每个标签的标题 = 用户自定义 > 焦点窗格标题；多窗格时附带窗格数
+        // 每个标签 = (id, 标题[自定义 > 焦点窗格], 窗格数, 自定义色)
         let tab_labels = self
             .tabs
             .iter()
             .map(|tab| {
                 let count = tab.layout.leaf_count();
-                let title = self
-                    .custom_tab_titles
-                    .get(&tab.id)
-                    .cloned()
-                    .unwrap_or_else(|| tab.tab_title(&self.panes));
-                (tab.id, title, count)
+                let title = tab.tab_title(&self.panes);
+                (tab.id, title, count, tab.color)
             })
             .collect::<Vec<_>>();
         let left_panel = self.left_panel;
@@ -5757,13 +5779,23 @@ impl Render for WorkspaceView {
                             .items_center()
                             .overflow_x_hidden()
                             .when(!left_panel, |bar| {
-                                bar.children(tab_labels.iter().map(|(id, title, count)| {
+                                bar.children(tab_labels.iter().map(|(id, title, count, color)| {
                                     let id = *id;
+                                    let color = *color;
                                     let is_active = id == active_tab_id;
+                                    // 超长标题截断：活跃标签可稍宽；计数后缀不参与截断
+                                    let title = truncate_tab_title(
+                                        title,
+                                        if is_active {
+                                            ACTIVE_TAB_TITLE_MAX_CHARS
+                                        } else {
+                                            TAB_TITLE_MAX_CHARS
+                                        },
+                                    );
                                     let label = if *count > 1 {
                                         format!("{title} ⊞{count}")
                                     } else {
-                                        title.clone()
+                                        title
                                     };
                                     div()
                                         .h_full()
@@ -5790,17 +5822,24 @@ impl Render for WorkspaceView {
                                             }),
                                         )
                                         .child(label)
-                                        // 激活标签底部强调线
-                                        .when(is_active, |tab| {
-                                            tab.child(
-                                                div()
-                                                    .absolute()
-                                                    .bottom_0()
-                                                    .left_0()
-                                                    .right_0()
-                                                    .h(px(2.0))
-                                                    .bg(rgb(ui.accent)),
-                                            )
+                                        // 底部 2px 色条：自定义标签色优先并替代
+                                        // 活跃标签的 accent 强调线；无色保持原样
+                                        .child(match color {
+                                            Some(color) => div()
+                                                .absolute()
+                                                .bottom_0()
+                                                .left_0()
+                                                .right_0()
+                                                .h(px(2.0))
+                                                .bg(rgb(color)),
+                                            None if is_active => div()
+                                                .absolute()
+                                                .bottom_0()
+                                                .left_0()
+                                                .right_0()
+                                                .h(px(2.0))
+                                                .bg(rgb(ui.accent)),
+                                            None => div(),
                                         })
                                         .child(
                                             div()
@@ -6499,7 +6538,7 @@ fn render_layout(
 /// 标签列表采用固定标题和独立滚动区域，长标题不挤占关闭按钮。
 /// 颜色全部走 `ui`（主题派生），不再写死 Tokyo Night 色值。
 fn left_sidebar(
-    tab_labels: &[(TabId, String, usize)],
+    tab_labels: &[(TabId, String, usize, Option<u32>)],
     active_tab_id: TabId,
     scroll: &ScrollHandle,
     ui: UiColors,
@@ -6551,10 +6590,19 @@ fn left_sidebar(
                 .track_scroll(scroll)
                 .px_2()
                 .pb_2()
-                .children(tab_labels.iter().map(|(id, title, count)| {
+                .children(tab_labels.iter().map(|(id, title, count, color)| {
                     let id = *id;
+                    let color = *color;
                     let selected = id == active_tab_id;
-                    let label = title.clone();
+                    // 与标题栏同口径的超长截断（活跃标签可稍宽）
+                    let label = truncate_tab_title(
+                        title,
+                        if selected {
+                            ACTIVE_TAB_TITLE_MAX_CHARS
+                        } else {
+                            TAB_TITLE_MAX_CHARS
+                        },
+                    );
                     let count = *count;
                     div()
                         .debug_selector(move || {
@@ -6599,11 +6647,18 @@ fn left_sidebar(
                                 }
                             }),
                         )
-                        .child(div().w(px(2.0)).h(px(18.0)).rounded_full().bg(if selected {
-                            rgb(ui.accent)
-                        } else {
-                            rgb(ui.panel_bg)
-                        }))
+                        // 左侧竖色条：自定义标签色优先（3px）；无色回落
+                        // 活跃 accent / 透明占位，保持行内对齐
+                        .child(match color {
+                            Some(color) => {
+                                div().w(px(3.0)).h(px(18.0)).rounded_full().bg(rgb(color))
+                            }
+                            None => div().w(px(2.0)).h(px(18.0)).rounded_full().bg(if selected {
+                                rgb(ui.accent)
+                            } else {
+                                rgb(ui.panel_bg)
+                            }),
+                        })
                         .child(
                             div()
                                 .text_size(px(13.0))
@@ -10531,5 +10586,73 @@ mod settings_panel_tests {
                 pane.session.close();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tab_label_tests {
+    use super::{
+        ACTIVE_TAB_TITLE_MAX_CHARS, LayoutNode, PaneId, TAB_TITLE_MAX_CHARS, TabId, WorkspaceTab,
+        truncate_tab_title,
+    };
+
+    #[test]
+    fn short_title_is_untouched() {
+        assert_eq!(truncate_tab_title("生产机", 16), "生产机");
+        // 恰好等于上限不截断（无省略号）
+        let exactly = "x".repeat(TAB_TITLE_MAX_CHARS);
+        assert_eq!(truncate_tab_title(&exactly, TAB_TITLE_MAX_CHARS), exactly);
+    }
+
+    #[test]
+    fn long_title_truncates_with_ellipsis_within_limit() {
+        let long = "x".repeat(64);
+        let truncated = truncate_tab_title(&long, TAB_TITLE_MAX_CHARS);
+        assert_eq!(truncated.chars().count(), TAB_TITLE_MAX_CHARS);
+        assert!(truncated.ends_with('…'));
+        // 15 个可见字符 + 省略号，且前缀来自原标题
+        assert!(long.starts_with(truncated.trim_end_matches('…')));
+    }
+
+    #[test]
+    fn active_tab_allowance_is_wider() {
+        let long = "字".repeat(30);
+        let truncated = truncate_tab_title(&long, ACTIVE_TAB_TITLE_MAX_CHARS);
+        assert_eq!(truncated.chars().count(), ACTIVE_TAB_TITLE_MAX_CHARS);
+        assert!(truncated.ends_with('…'));
+    }
+
+    #[test]
+    fn truncation_counts_chars_not_bytes() {
+        // 中文按 char 计：20 个汉字 > 16 → 截为 15 字 + …，不会按字节腰斩出乱码
+        let long = "终端服务器".repeat(4);
+        let truncated = truncate_tab_title(&long, TAB_TITLE_MAX_CHARS);
+        assert_eq!(truncated.chars().count(), TAB_TITLE_MAX_CHARS);
+        assert!(truncated.ends_with('…'));
+        assert!(long.starts_with(truncated.trim_end_matches('…')));
+    }
+
+    #[test]
+    fn tab_title_prefers_custom_over_auto() {
+        let tab = WorkspaceTab {
+            id: TabId(0),
+            layout: LayoutNode::Leaf(PaneId(1)),
+            focused_pane: PaneId(1),
+            custom_title: Some("生产环境".into()),
+            color: Some(0xFF5500),
+        };
+        assert_eq!(tab.tab_title(&[]), "生产环境");
+    }
+
+    #[test]
+    fn tab_title_falls_back_to_placeholder_without_panes() {
+        let tab = WorkspaceTab {
+            id: TabId(0),
+            layout: LayoutNode::Leaf(PaneId(1)),
+            focused_pane: PaneId(1),
+            custom_title: None,
+            color: None,
+        };
+        assert_eq!(tab.tab_title(&[]), "终端");
     }
 }

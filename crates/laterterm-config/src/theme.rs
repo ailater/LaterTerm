@@ -198,7 +198,8 @@ pub fn parse_hex_color(value: &str) -> Option<u32> {
     u32::from_str_radix(hex, 16).ok()
 }
 
-fn format_hex_color(value: u32) -> String {
+/// 反向格式化为 `#RRGGBB`（标签色落盘复用同口径）。
+pub fn format_hex_color(value: u32) -> String {
     format!("#{value:06X}")
 }
 

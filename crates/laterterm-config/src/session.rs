@@ -12,6 +12,9 @@ pub struct SessionTab {
     /// SSH 服务器名（对应 ServerEntry.name）；None = 本地终端。
     #[serde(default)]
     pub server_name: Option<String>,
+    /// 标签色（"#RRGGBB"）；None = 跟随主题。坏值在恢复时按 None 忽略。
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 /// 上次会话的完整快照。
@@ -76,14 +79,17 @@ mod tests {
                 SessionTab {
                     custom_title: Some("跳板".into()),
                     server_name: Some("生产入口".into()),
+                    color: Some("#FF5500".into()),
                 },
                 SessionTab {
                     custom_title: None,
                     server_name: None,
+                    color: None,
                 },
                 SessionTab {
                     custom_title: Some("日志机".into()),
                     server_name: Some("日志".into()),
+                    color: None,
                 },
             ],
             active_tab: 1,
@@ -93,6 +99,31 @@ mod tests {
         assert_eq!(back, snapshot);
         assert_eq!(back.tabs.len(), 3);
         assert_eq!(back.active_tab, 1);
+        assert_eq!(back.tabs[0].color.as_deref(), Some("#FF5500"));
+    }
+
+    #[test]
+    fn color_roundtrip_preserves_hex_string() {
+        let tab = SessionTab {
+            custom_title: Some("生产".into()),
+            server_name: Some("prod".into()),
+            color: Some("#1A1B26".into()),
+        };
+        let json = serde_json::to_string(&tab).expect("序列化");
+        assert!(
+            json.contains("\"#1A1B26\""),
+            "色值应为十六进制字符串: {json}"
+        );
+        let back: SessionTab = serde_json::from_str(&json).expect("反序列化");
+        assert_eq!(back.color.as_deref(), Some("#1A1B26"));
+    }
+
+    #[test]
+    fn missing_color_field_defaults_to_none() {
+        // 旧版 session.json 无 color 键 → serde(default) 回落 None，不拒载。
+        let tab: SessionTab = serde_json::from_str(r#"{"custom_title":"跳板","server_name":null}"#)
+            .expect("反序列化");
+        assert_eq!(tab.color, None);
     }
 
     #[test]
