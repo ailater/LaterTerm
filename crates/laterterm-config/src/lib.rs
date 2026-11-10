@@ -167,6 +167,11 @@ pub struct Appearance {
     #[serde(default)]
     pub bell_notification: bool,
 
+    /// 右侧工具面板是否图钉固定。默认固定（占布局宽度常驻）；
+    /// 取消固定后转为悬浮自动隐藏（点终端收起，快捷键/标题栏按钮唤出）。
+    #[serde(default = "default_true")]
+    pub right_panel_pinned: bool,
+
     /// 接收目录；空 = ~/Downloads。
     pub downloads_dir: String,
 }
@@ -191,6 +196,7 @@ impl Default for Appearance {
             smooth_scrolling: true,
             copy_on_select: true,
             bell_notification: false,
+            right_panel_pinned: true,
             font_fallbacks: Vec::new(),
             downloads_dir: String::new(),
         }
@@ -727,6 +733,22 @@ shortcut = "  legacy shortcut  "
         settings.save_to(&path).unwrap();
         let loaded = Settings::load(&path).unwrap();
         assert!(!loaded.appearance.copy_on_select);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn right_panel_pinned_defaults_and_false_roundtrip() {
+        // 旧 settings.toml 缺 right_panel_pinned 字段 → serde 补默认 true（固定）
+        let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert!(legacy.appearance.right_panel_pinned);
+
+        // 取消固定（自动隐藏模式）后 roundtrip 保持 false
+        let path = temp_settings_path("right-panel-pinned");
+        let mut settings = Settings::default();
+        settings.appearance.right_panel_pinned = false;
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert!(!loaded.appearance.right_panel_pinned);
         std::fs::remove_file(&path).unwrap();
     }
 

@@ -3749,7 +3749,7 @@ dependencies = [
 
 [[package]]
 name = "laterterm-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "ashpd 0.11.1",
@@ -3775,7 +3775,7 @@ dependencies = [
 
 [[package]]
 name = "laterterm-config"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "hmac 0.13.0",
@@ -3789,15 +3789,15 @@ dependencies = [
 
 [[package]]
 name = "laterterm-core"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "laterterm-deepin"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "laterterm-local"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "laterterm-core",
  "portable-pty",
@@ -3805,7 +3805,7 @@ dependencies = [
 
 [[package]]
 name = "laterterm-secrets"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "keyring",
@@ -3813,7 +3813,7 @@ dependencies = [
 
 [[package]]
 name = "laterterm-ssh"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "encoding_rs",
  "env_logger",
@@ -3829,7 +3829,7 @@ dependencies = [
 
 [[package]]
 name = "laterterm-termview"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -3844,7 +3844,7 @@ dependencies = [
 
 [[package]]
 name = "laterterm-transfer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.23.1",
  "flate2",
@@ -3858,7 +3858,7 @@ dependencies = [
 
 [[package]]
 name = "laterterm-xshell"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "tempfile",
 ]

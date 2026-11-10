@@ -971,6 +971,10 @@ pub struct WorkspaceView {
     left_panel: bool,
     tab_scroll: ScrollHandle,
     right_panel: bool,
+    /// 右侧面板是否图钉固定。固定 = 占布局宽度常驻（传统行为）；
+    /// 取消固定 = 悬浮覆盖终端、点终端自动收起。模式持久化在
+    /// `appearance.right_panel_pinned`，可见性仍由 `right_panel` 管。
+    right_panel_pinned: bool,
     settings_open: bool,
     broadcast: bool,
     welcome_visible: bool,
@@ -1150,6 +1154,8 @@ impl WorkspaceView {
             probe: None,
             selected_shell: settings.shell.clone(),
         };
+        // appearance 随 settings 在下面的字面量里被移动，图钉模式提前取值（注同上）。
+        let right_panel_pinned = settings.appearance.right_panel_pinned;
         let mut view = Self {
             settings,
             themes,
@@ -1242,6 +1248,7 @@ impl WorkspaceView {
             left_panel: true,
             tab_scroll: ScrollHandle::new(),
             right_panel: false,
+            right_panel_pinned,
             settings_open: false,
             broadcast: false,
             welcome_visible: first_run,
@@ -1830,7 +1837,7 @@ impl WorkspaceView {
             snapshot.tab_id == tab.id
                 && snapshot.layout == tab.layout
                 && snapshot.viewport == window.viewport_size()
-                && snapshot.panels == (self.left_panel, self.right_panel)
+                && snapshot.panels == (self.left_panel, self.right_panel_docked())
                 && snapshot.panes.len() == tab.layout.leaf_count()
                 && snapshot
                     .panes
@@ -2180,6 +2187,45 @@ impl WorkspaceView {
         cx.stop_propagation();
         self.right_panel = !self.right_panel;
         cx.notify();
+    }
+
+    /// 右面板是否"停靠"（占布局宽度）：仅固定态算停靠，悬浮态（开+未固定）
+    /// 不算。渲染分流与几何快照统一走此口径——悬浮面板不挤压终端，
+    /// pane 导航几何按无右面板计，且悬浮开合不触发快照失效重算。
+    fn right_panel_docked(&self) -> bool {
+        self.right_panel && self.right_panel_pinned
+    }
+
+    /// 图钉按钮：固定 ↔ 自动隐藏模式切换。只切模式不动可见性——未固定时
+    /// 面板就地转为悬浮，由点终端收起、快捷键/标题栏按钮唤出。
+    fn toggle_pin_right_panel(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        self.set_right_panel_pinned(!self.right_panel_pinned, cx);
+    }
+
+    /// 图钉模式写入本体：内存与 settings 同步后落盘（重启保持）。失败不回滚
+    /// 交互态——偏好类设置，下次切换会再试；口径与主题保存的 eprintln 一致。
+    fn set_right_panel_pinned(&mut self, pinned: bool, cx: &mut Context<Self>) {
+        self.right_panel_pinned = pinned;
+        self.settings.appearance.right_panel_pinned = pinned;
+        if let Err(error) = self.persist_settings() {
+            eprintln!("保存右侧面板固定模式失败: {error:#}");
+        }
+        cx.notify();
+    }
+
+    /// 未固定（自动隐藏）面板的收起判断：仅"面板可见且未固定"时收起。
+    /// 挂在终端窗格点击入口（render_layout 的 pane on_mouse_down）。
+    fn maybe_auto_hide_right_panel(&mut self, cx: &mut Context<Self>) {
+        if self.right_panel && !self.right_panel_pinned {
+            self.right_panel = false;
+            cx.notify();
+        }
     }
 
     /// 终端右键菜单浮层：anchored 定位 + snap_to_window 防贴边溢出。
@@ -5949,6 +5995,9 @@ impl Render for WorkspaceView {
             .collect::<Vec<_>>();
         let left_panel = self.left_panel;
         let right_panel = self.right_panel;
+        let right_panel_pinned = self.right_panel_pinned;
+        // 停靠口径：仅固定态占布局；与几何快照写入/比对两处保持一致
+        let right_panel_docked = self.right_panel_docked();
         let settings_open = self.settings_open;
         // 设置面板打开时先跑 scroll-spy（滚动 → 高亮联动），本帧导航绘制直接
         // 消费结果；不 notify（防自激帧循环，见 settings_scroll_spy_step 注记）。
@@ -6200,12 +6249,17 @@ impl Render for WorkspaceView {
                                 cx,
                             )),
                     )
-                    .child(if right_panel {
+                    .child(if right_panel_docked {
                         quick_panel(self, cx)
                     } else {
                         div()
                     }),
             )
+            // 未固定悬浮面板：absolute 覆盖终端右侧，不挤压布局；挂 settings
+            // 覆盖层之前，遮盖顺序与固定态一致
+            .when(right_panel && !right_panel_pinned, |root| {
+                root.child(quick_panel_overlay(self, cx))
+            })
             .when(settings_open, |root| {
                 root.child(settings_overlay(
                     cx.listener(Self::close_settings),
@@ -6297,7 +6351,7 @@ impl Render for WorkspaceView {
                     *geometry_cache.borrow_mut() = Some(PaneGeometry {
                         tab_id: active_tab_id,
                         viewport: window.viewport_size(),
-                        panels: (left_panel, right_panel),
+                        panels: (left_panel, right_panel_docked),
                         layout: geometry_layout.clone(),
                         panes: geometry_rects.borrow().clone(),
                     });
@@ -6608,6 +6662,8 @@ fn render_layout(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _event, window, cx| {
+                        // 未固定悬浮面板：点击终端即收起（固定态不受影响）
+                        this.maybe_auto_hide_right_panel(cx);
                         // 点击 pane 任意处即聚焦该 pane
                         let pane_id = close_id;
                         if this.focused_pane_id() != pane_id {
@@ -7158,7 +7214,13 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
         .bg(rgb(ui.panel_bg))
         .border_l_1()
         .border_color(rgb(ui.border))
-        .child(sidebar_header("工具", item_count, ui))
+        .child(sidebar_header(
+            "工具",
+            item_count,
+            workspace.right_panel_pinned,
+            cx.listener(WorkspaceView::toggle_pin_right_panel),
+            ui,
+        ))
         .child(
             div()
                 .mx_2()
@@ -7193,6 +7255,29 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
                 .pb_3()
                 .child(panel),
         )
+}
+
+/// 未固定态悬浮面板：absolute 覆盖终端右侧，不参与 flex 布局（终端不重排，
+/// 几何快照按无右面板计，见 render 的 right_panel_docked 注记）。复用
+/// quick_panel 本体（自带背景/左边框）；无背板遮罩——点面板外即点终端，
+/// 由窗格 on_mouse_down 收起（骨架仿 sftp_overlay 去背板）。
+///
+/// `occlude()` 必挂：hitbox 默认 Normal 不遮挡下层，悬浮面板与窗格几何重叠，
+/// 不遮挡则点面板内部（命令/服务器页签、列表、图钉）时 pane 的
+/// on_mouse_down 仍命中，面板被误收起。BlockMouse 让面板覆盖区的下层
+/// 鼠标监听全部失效——仅点面板外（终端区域）才收起。
+fn quick_panel_overlay(
+    workspace: &mut WorkspaceView,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    div()
+        .absolute()
+        .top(px(TITLEBAR_HEIGHT))
+        .right_0()
+        .bottom_0()
+        .w(px(PANEL_WIDTH))
+        .occlude()
+        .child(quick_panel(workspace, cx))
 }
 
 // ---------- 窗口级模态弹窗（命令/动态码/服务器共用） ----------
@@ -8566,7 +8651,13 @@ fn entry_card(ui: UiColors) -> gpui::Div {
 }
 
 /// 侧栏的固定标题与条目数量。
-fn sidebar_header(title: &str, count: usize, ui: UiColors) -> gpui::Div {
+fn sidebar_header(
+    title: &str,
+    count: usize,
+    pinned: bool,
+    on_toggle_pin: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ui: UiColors,
+) -> gpui::Div {
     div()
         .h(px(52.0))
         .px_3()
@@ -8586,6 +8677,18 @@ fn sidebar_header(title: &str, count: usize, ui: UiColors) -> gpui::Div {
                 .text_color(rgb(ui.text))
                 .child(count.to_string()),
         )
+        // 弹性占位：图钉推到头部右缘（固定 pin / 自动隐藏 pin-off）
+        .child(div().flex_1())
+        .child(icon_button(
+            "sidebar-pin",
+            if pinned {
+                "icons/pin.svg"
+            } else {
+                "icons/pin-off.svg"
+            },
+            ui,
+            on_toggle_pin,
+        ))
 }
 
 fn sidebar_tab_button(
@@ -9056,6 +9159,7 @@ mod exit_regression_tests {
         workspace.read_with(cx, |view, _| {
             assert!(view.left_panel, "启动时应显示左侧标签栏");
             assert!(!view.right_panel, "右侧功能面板默认保持关闭");
+            assert!(view.right_panel_pinned, "右侧面板默认图钉固定");
             for pane in &view.panes {
                 pane.session.close();
             }
@@ -9545,6 +9649,136 @@ mod exit_regression_tests {
         workspace.read_with(cx, |view, _| {
             assert!(!view.right_panel);
             assert_eq!(view.tabs.len(), 1);
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn unpinned_panel_hides_on_terminal_click_and_stays_unpinned_on_reopen(
+        cx: &mut TestAppContext,
+    ) {
+        let dir = std::env::temp_dir().join(format!("laterterm-pin-hide-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            // set_right_panel_pinned 会落盘：路径必须指向 tempdir，
+            // 否则写真实配置并经热加载冲掉并发测试的 settings（真实事故）
+            view.settings_save_path = Some(dir.join("settings.toml"));
+            window.activate_window();
+            view.focus_active(window, cx);
+            view.set_right_panel_pinned(false, cx);
+            view.right_panel = true;
+            assert!(!view.right_panel_docked(), "未固定 = 悬浮不停靠");
+        });
+        cx.run_until_parked();
+        // 点击终端（窗格 on_mouse_down 的收起入口）→ 悬浮面板收起
+        workspace.update(cx, |view, cx| {
+            view.maybe_auto_hide_right_panel(cx);
+            assert!(!view.right_panel, "未固定面板应在点击终端后收起");
+            // 唤出（标题栏按钮/快捷键同语义：只置可见性）后模式不变
+            view.right_panel = true;
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        workspace.read_with(cx, |view, _| {
+            assert!(view.right_panel);
+            assert!(!view.right_panel_pinned, "唤出只管可见性，模式不变");
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn pinned_panel_survives_terminal_click(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update(cx, |view, cx| {
+            view.right_panel = true;
+            assert!(view.right_panel_docked(), "默认固定 = 停靠");
+            view.maybe_auto_hide_right_panel(cx);
+            assert!(view.right_panel, "固定面板不因点击终端收起");
+        });
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn pin_toggle_persists_mode_to_settings_file(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("laterterm-pin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, _, _cx| {
+            // 落盘路径指向 tempdir，绝不写真实配置（口径同导入命令测试）
+            view.settings_save_path = Some(dir.join("settings.toml"));
+        });
+        // 切到未固定：内存 + settings + 落盘三处同步
+        workspace.update(cx, |view, cx| {
+            view.set_right_panel_pinned(false, cx);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |view, _| {
+            assert!(!view.right_panel_pinned);
+            assert!(!view.settings.appearance.right_panel_pinned);
+        });
+        let saved = std::fs::read_to_string(dir.join("settings.toml")).unwrap();
+        assert!(
+            saved.contains("right_panel_pinned = false"),
+            "图钉模式应写入注入路径: {saved}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn floating_panel_internal_clicks_do_not_collapse(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("laterterm-pin-occ-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            // 落盘走 tempdir（口径见 pin_toggle_persists 测试）；欢迎层会吞点击，关掉
+            view.settings_save_path = Some(dir.join("settings.toml"));
+            view.welcome_visible = false;
+            window.activate_window();
+            view.focus_active(window, cx);
+            view.set_right_panel_pinned(false, cx);
+            view.right_panel = true;
+        });
+        cx.run_until_parked();
+        cx.simulate_resize(gpui::size(gpui::px(900.0), gpui::px(600.0)));
+        cx.run_until_parked();
+        // 面板内部（头部空白区：横取面板中线避开左徽章/右图钉，纵取头部 52px 内）：
+        // 悬浮面板 occlude 遮住下层窗格监听，不得触发自动隐藏
+        let inside_panel = gpui::point(
+            gpui::px(900.0 - super::PANEL_WIDTH / 2.0),
+            gpui::px(super::TITLEBAR_HEIGHT + 26.0),
+        );
+        cx.simulate_mouse_down(
+            inside_panel,
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        workspace.read_with(cx, |view, _| {
+            assert!(view.right_panel, "点面板内部（命令/服务器区）不应收起");
+        });
+        // 面板外（终端区域，左栏默认开占 0..240，终端取中段）：正常收起
+        cx.simulate_mouse_down(
+            gpui::point(gpui::px(400.0), gpui::px(300.0)),
+            gpui::MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.run_until_parked();
+        let _ = std::fs::remove_dir_all(&dir);
+        workspace.read_with(cx, |view, _| {
+            assert!(!view.right_panel, "点终端区域应收起");
             for pane in &view.panes {
                 pane.session.close();
             }
