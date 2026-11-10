@@ -9409,8 +9409,18 @@ mod exit_regression_tests {
         assert!(!keystroke_matches_shortcut(&event, "ctrl+up"));
     }
 
+    /// 构造前注入默认 StartupSettings：测试直连构造会回退
+    /// `Settings::load_or_default()` 读取真实 ~/.config/laterterm/settings.toml，
+    /// 本机残留（如 right_panel_pinned=false）令默认值断言机器态相关地假红
+    /// （CI 无该文件反而恒绿）。注入后与生产启动路径同源。
+    fn inject_default_startup_settings(cx: &mut TestAppContext) {
+        use crate::Settings;
+        cx.set_global(crate::StartupSettings(Settings::default()));
+    }
+
     #[gpui::test]
     fn workspace_opens_with_vertical_tabs_and_right_panel_closed(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
         let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
         workspace.read_with(cx, |view, _| {
             assert!(view.left_panel, "启动时应显示左侧标签栏");
@@ -9948,6 +9958,7 @@ mod exit_regression_tests {
 
     #[gpui::test]
     fn pinned_panel_survives_terminal_click(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
         let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
         workspace.update(cx, |view, cx| {
             view.right_panel = true;
