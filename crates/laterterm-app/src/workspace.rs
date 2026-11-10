@@ -914,6 +914,21 @@ const TAB_COLOR_SWATCHES: [u32; 8] = [
     0xA9B1D6, // 灰
 ];
 
+/// 标签拖拽触发阈值（px）：按下后位移超过该值才进入拖拽重排，
+/// 避免误触（与单击激活/双击重命名共存）。
+const TAB_DRAG_THRESHOLD_PX: f32 = 6.0;
+
+/// 标签拖拽排序中：被拖标签 + 按下起点（判断位移阈值）与起始索引。
+#[derive(Clone, Copy, Debug)]
+struct TabDrag {
+    tab_id: TabId,
+    /// 按下时的鼠标位置（窗口坐标）；横移/纵移超阈值才算拖拽。
+    origin: Point<Pixels>,
+    /// 按下时的标签索引（诊断与未来视觉反馈预留；交换以实时索引为准）。
+    #[allow(dead_code)]
+    from_index: usize,
+}
+
 /// 标签：持有自己的分屏树与窗格焦点。
 struct WorkspaceTab {
     id: TabId,
@@ -973,6 +988,8 @@ pub struct WorkspaceView {
     terminal_menu: Option<TerminalMenuState>,
     /// 标签右键菜单状态（None = 关闭）。
     tab_menu: Option<TabMenuState>,
+    /// 标签拖拽排序状态（None = 空闲）；标题栏横拖 / 左栏纵拖共用。
+    tab_drag: Option<TabDrag>,
     left_panel: bool,
     tab_scroll: ScrollHandle,
     right_panel: bool,
@@ -1230,6 +1247,7 @@ impl WorkspaceView {
             split_drag: None,
             terminal_menu: None,
             tab_menu: None,
+            tab_drag: None,
             secret_store: default_store(),
             settings_section: SettingsSection::Appearance,
             settings_jump: None,
@@ -2136,6 +2154,62 @@ impl WorkspaceView {
             self.focus_pane(pane_id, window, cx);
         }
         self.save_session_snapshot();
+    }
+
+    /// 开始标签拖拽：记录被拖标签与按下起点（阈值判断在 update 侧）。
+    /// 不 notify——阈值未过前无视觉变化。
+    fn start_tab_drag(&mut self, tab_id: TabId, origin: Point<Pixels>) {
+        let Some(from_index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+            return;
+        };
+        self.tab_drag = Some(TabDrag {
+            tab_id,
+            origin,
+            from_index,
+        });
+    }
+
+    /// 拖拽中：位移超阈值且悬停到其他标签时实时交换位置（remove + insert）。
+    /// 未超阈值前不动——与单击激活/双击重命名共存。
+    fn update_tab_drag(&mut self, hovered: TabId, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(drag) = self.tab_drag else {
+            return;
+        };
+        let dx = (position.x - drag.origin.x).abs();
+        let dy = (position.y - drag.origin.y).abs();
+        // 位移取两轴较大者：标题栏横拖 / 左栏纵拖共用一套阈值
+        if dx.max(dy) <= px(TAB_DRAG_THRESHOLD_PX) || hovered == drag.tab_id {
+            return;
+        }
+        if let Some(to) = self.tabs.iter().position(|tab| tab.id == hovered)
+            && Self::reorder_tabs(&mut self.tabs, drag.tab_id, to)
+        {
+            cx.notify();
+        }
+    }
+
+    /// 松开鼠标结束拖拽；有过重排则落盘会话快照（顺序即持久化顺序）。
+    fn end_tab_drag(&mut self) -> bool {
+        let dragged = self.tab_drag.take().is_some();
+        if dragged {
+            self.save_session_snapshot();
+        }
+        dragged
+    }
+
+    /// 标签重排纯逻辑：把 `id` 从当前位置移到 `to_index`（remove + insert）。
+    /// 原地/越界/找不到返回 false；tabs 顺序即 session snapshot 落盘顺序，
+    /// 重排后无需额外持久化处理。
+    fn reorder_tabs(tabs: &mut Vec<WorkspaceTab>, id: TabId, to_index: usize) -> bool {
+        let Some(from) = tabs.iter().position(|tab| tab.id == id) else {
+            return false;
+        };
+        if from == to_index || to_index >= tabs.len() {
+            return false;
+        }
+        let tab = tabs.remove(from);
+        tabs.insert(to_index, tab);
+        true
     }
 
     fn remove_pane_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -6144,13 +6218,21 @@ impl Render for WorkspaceView {
                                             MouseButton::Left,
                                             cx.listener(move |this, event, window, cx| {
                                                 // 单击已激活（activate_tab 内）；
-                                                // 双击在此基础上弹重命名弹窗
+                                                // 双击在此基础上弹重命名弹窗；
+                                                // 记下拖拽起点，位移超阈值即进入重排
                                                 this.activate_tab(id, event, window, cx);
+                                                this.start_tab_drag(id, event.position);
                                                 if event.click_count >= 2 {
                                                     this.start_tab_rename(id, window, cx);
                                                 }
                                             }),
                                         )
+                                        // 拖拽排序：hover 到本标签且位移超阈值时交换
+                                        .on_mouse_move(cx.listener(
+                                            move |this, event: &MouseMoveEvent, _, cx| {
+                                                this.update_tab_drag(id, event.position, cx);
+                                            },
+                                        ))
                                         .child(label)
                                         // 底部 2px 色条：自定义标签色优先并替代
                                         // 活跃标签的 accent 强调线；无色保持原样
@@ -6375,7 +6457,12 @@ impl Render for WorkspaceView {
                                 return;
                             }
                             let _ = weak.update(cx, |workspace, cx| {
-                                if workspace.end_split_drag() {
+                                // 分割线拖拽与标签重排共用松开收尾（两者都要
+                                // take 清状态，故分别调用而非短路）；X11/Wayland
+                                // 按下即隐式抓取，拖出窗口的松开仍派发到本窗口
+                                let ended = workspace.end_split_drag();
+                                let reordered = workspace.end_tab_drag();
+                                if ended || reordered {
                                     cx.notify();
                                 }
                             });
@@ -6943,6 +7030,8 @@ fn left_sidebar(
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                // 记下拖拽起点（纵拖超阈值重排，松开即清）
+                                this.start_tab_drag(id, event.position);
                                 if event.click_count >= 2 {
                                     this.start_tab_rename(id, window, cx);
                                 } else {
@@ -6950,6 +7039,10 @@ fn left_sidebar(
                                 }
                             }),
                         )
+                        // 拖拽排序：hover 到本条目且位移超阈值时交换
+                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+                            this.update_tab_drag(id, event.position, cx);
+                        }))
                         // 右键弹标签菜单；拦截冒泡防误触终端菜单
                         .on_mouse_down(
                             MouseButton::Right,
@@ -11334,6 +11427,94 @@ mod tab_rename_tests {
             view.cancel_tab_rename(cx);
             assert!(view.tab_rename_field.is_none());
             assert_eq!(view.tabs[0].custom_title, None, "取消不改标题");
+        });
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod tab_drag_tests {
+    use super::{LayoutNode, PaneId, TabId, WorkspaceTab, WorkspaceView};
+    use gpui::{Point, TestAppContext, px};
+
+    fn tab(id: u64) -> WorkspaceTab {
+        WorkspaceTab {
+            id: TabId(id),
+            layout: LayoutNode::Leaf(PaneId(id)),
+            focused_pane: PaneId(id),
+            custom_title: None,
+            color: None,
+        }
+    }
+
+    #[test]
+    fn reorder_tabs_moves_forward_and_backward() {
+        let mut tabs = vec![tab(1), tab(2), tab(3)];
+        // 后移：1 号挪到 3 号位之后 → [2, 3, 1]
+        assert!(WorkspaceView::reorder_tabs(&mut tabs, TabId(1), 2));
+        assert_eq!(
+            tabs.iter().map(|t| t.id.0).collect::<Vec<_>>(),
+            vec![2, 3, 1]
+        );
+        // 前移：1 号挪回头部 → [1, 2, 3]
+        assert!(WorkspaceView::reorder_tabs(&mut tabs, TabId(1), 0));
+        assert_eq!(
+            tabs.iter().map(|t| t.id.0).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn reorder_tabs_rejects_noop_and_out_of_range() {
+        let mut tabs = vec![tab(1), tab(2)];
+        // 原地不动
+        assert!(!WorkspaceView::reorder_tabs(&mut tabs, TabId(1), 0));
+        // 目标越界
+        assert!(!WorkspaceView::reorder_tabs(&mut tabs, TabId(1), 2));
+        // 标签不存在
+        assert!(!WorkspaceView::reorder_tabs(&mut tabs, TabId(9), 0));
+        assert_eq!(tabs.len(), 2, "无效重排不得增删标签");
+    }
+
+    #[gpui::test]
+    fn tab_drag_threshold_then_swap_then_release(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            view.spawn_tab(window, cx);
+            view.spawn_tab(window, cx);
+            let ids: Vec<TabId> = view.tabs.iter().map(|t| t.id).collect();
+            let (a, b) = (ids[0], ids[1]);
+
+            // 按下记录起点
+            view.start_tab_drag(a, Point::new(px(100.0), px(10.0)));
+            assert!(view.tab_drag.is_some());
+
+            // 位移 3px < 6px 阈值：不交换（与单击激活共存）
+            view.update_tab_drag(b, Point::new(px(103.0), px(10.0)), cx);
+            assert_eq!(view.tabs[0].id, a, "未超阈值不得重排");
+
+            // 位移 12px 且悬停到 b：实时交换
+            view.update_tab_drag(b, Point::new(px(112.0), px(10.0)), cx);
+            assert_eq!(view.tabs[0].id, b, "超阈值悬停应交换到目标位置");
+            assert_eq!(view.tabs[1].id, a);
+
+            // 松开清状态；快照按新顺序落盘
+            assert!(view.end_tab_drag());
+            assert!(view.tab_drag.is_none(), "松开后应清拖拽状态");
+            let snapshot = view.snapshot_session();
+            assert_eq!(snapshot.tabs[0].server_name, None);
+            let after: Vec<TabId> = view.tabs.iter().map(|t| t.id).collect();
+            assert_eq!(
+                (after[0], after[1]),
+                (b, a),
+                "重排后 tabs 顺序即快照顺序（snapshot 按 tabs 顺序写盘）"
+            );
+            // 再次松开：无拖拽进行，返回 false
+            assert!(!view.end_tab_drag());
         });
         workspace.read_with(cx, |view, _| {
             for pane in &view.panes {
