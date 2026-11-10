@@ -143,6 +143,7 @@ pub fn parse_deepin_servers(body: &str) -> Vec<ServerEntry> {
                 _ => None,
             },
             jump: None,
+            tab_color: None,
         };
         if entry.validate().is_ok() {
             out.push(entry);
@@ -339,6 +340,7 @@ pub fn parse_xshell_session(file_stem: &str, body: &str) -> Option<ServerEntry> 
         shortcut: None,
         encoding: None,
         jump: None,
+        tab_color: None,
     };
     (entry.validate().is_ok()).then_some(entry)
 }

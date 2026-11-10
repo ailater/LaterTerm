@@ -49,6 +49,10 @@ pub struct ServerEntry {
     /// 多跳链由 [`resolve_jump_chain`] 沿引用逐跳展开。
     #[serde(default)]
     pub jump: Option<String>,
+    /// 该服务器的连接标签默认配色（"#RRGGBB"）；`None` = 跟随主题。
+    /// 使用时经 `parse_hex_color` 解析，坏值按 None 忽略（不落主题语义）。
+    #[serde(default)]
+    pub tab_color: Option<String>,
 }
 
 impl Default for ServerEntry {
@@ -65,6 +69,7 @@ impl Default for ServerEntry {
             shortcut: None,
             encoding: None,
             jump: None,
+            tab_color: None,
         }
     }
 }
@@ -552,6 +557,29 @@ mod tests {
     }
 
     #[test]
+    fn tab_color_roundtrip() {
+        let mut server = entry("生产入口", "prod.example");
+        server.tab_color = Some("#FF5500".into());
+        let json = serde_json::to_string(&server).expect("序列化");
+        assert!(
+            json.contains("\"#FF5500\""),
+            "色值应为十六进制字符串: {json}"
+        );
+        let back: ServerEntry = serde_json::from_str(&json).expect("反序列化");
+        assert_eq!(back.tab_color.as_deref(), Some("#FF5500"));
+    }
+
+    #[test]
+    fn missing_tab_color_defaults_to_none() {
+        // 旧版 servers.toml 无 tab_color 键 → serde(default) 回落 None，不拒载
+        let server = entry("日志机", "log.example");
+        assert_eq!(server.tab_color, None);
+        let json = serde_json::to_string(&server).expect("序列化");
+        let back: ServerEntry = serde_json::from_str(&json).expect("反序列化");
+        assert_eq!(back.tab_color, None);
+    }
+
+    #[test]
     fn validates_required_fields() {
         assert!(entry("跳板机", "10.0.0.1").validate().is_ok());
         assert!(entry("", "10.0.0.1").validate().is_err());
@@ -734,6 +762,7 @@ group = "坏\n组"
             shortcut: Some("ctrl+alt+1".into()),
             encoding: None,
             jump: None,
+            tab_color: None,
         }]);
         file.save_to(&path).unwrap();
         let loaded = ServersFile::load_from(&path).unwrap();

@@ -990,6 +990,10 @@ pub struct WorkspaceView {
     tab_menu: Option<TabMenuState>,
     /// 标签拖拽排序状态（None = 空闲）；标题栏横拖 / 左栏纵拖共用。
     tab_drag: Option<TabDrag>,
+    /// 会话恢复挂起的服务器标签外观（键 = 服务器名 → (自定义标题, 自定义色)）。
+    /// 服务器标签连接成功后才创建，恢复期先把快照值挂这里，
+    /// finish_ssh_connect 建标签时消费（自身色优先，缺省回落服务器默认色）。
+    pending_server_tab_restore: BTreeMap<String, (Option<String>, Option<u32>)>,
     left_panel: bool,
     tab_scroll: ScrollHandle,
     right_panel: bool,
@@ -1248,6 +1252,7 @@ impl WorkspaceView {
             terminal_menu: None,
             tab_menu: None,
             tab_drag: None,
+            pending_server_tab_restore: BTreeMap::new(),
             secret_store: default_store(),
             settings_section: SettingsSection::Appearance,
             settings_jump: None,
@@ -1645,6 +1650,12 @@ impl WorkspaceView {
     }
 
     /// 恢复上次会话：对快照中每个额外标签，本地开终端或连服务器。
+    /// 恢复时的标签最终色（纯逻辑）：快照自身自定义色优先，
+    /// 缺省回落服务器条目默认色；两者皆无 = 跟随主题。
+    fn restore_tab_color(snapshot_color: Option<u32>, server_color: Option<u32>) -> Option<u32> {
+        snapshot_color.or(server_color)
+    }
+
     fn restore_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 开关关闭 = 不恢复（测试默认关，避免把真实用户配置拉进测试）。
         if !self.settings.restore_session {
@@ -1665,17 +1676,29 @@ impl WorkspaceView {
                     .find(|s| s.name == *name)
                     .cloned()
             {
+                // 服务器标签连接成功后才创建（finish_ssh_connect），快照的
+                // 标题/色挂到待应用表按名消费；不能写 last_mut——那会把值
+                // 错写到循环里其他新建标签上
+                self.pending_server_tab_restore.insert(
+                    name.clone(),
+                    (
+                        tab.custom_title.clone(),
+                        tab.color
+                            .as_deref()
+                            .and_then(laterterm_config::theme::parse_hex_color),
+                    ),
+                );
                 self.connect_server(&entry.name, cx);
             } else {
                 self.new_tab(&MouseDownEvent::default(), window, cx);
-            }
-            // 还原自定义标题与标签色（坏色值按 None 忽略）
-            if let Some(tab_ref) = self.tabs.last_mut() {
-                tab_ref.custom_title = tab.custom_title.clone();
-                tab_ref.color = tab
-                    .color
-                    .as_deref()
-                    .and_then(laterterm_config::theme::parse_hex_color);
+                // 还原本地标签的自定义标题与标签色（坏色值按 None 忽略）
+                if let Some(tab_ref) = self.tabs.last_mut() {
+                    tab_ref.custom_title = tab.custom_title.clone();
+                    tab_ref.color = tab
+                        .color
+                        .as_deref()
+                        .and_then(laterterm_config::theme::parse_hex_color);
+                }
             }
         }
         // 恢复激活标签索引
@@ -4723,6 +4746,8 @@ impl WorkspaceView {
             if let Ok(ConnectionOutcome::Connected { session, .. }) = result {
                 session.kill();
             }
+            // 过期请求的结果不消费，挂起的恢复外观一并作废
+            self.pending_server_tab_restore.remove(&entry.name);
             if self
                 .ssh_request
                 .as_ref()
@@ -4747,22 +4772,39 @@ impl WorkspaceView {
                 self.server_field_subscriptions.clear();
                 self.server_error = None;
                 self.server_notice = warning;
+                let server_name = entry.name.clone();
                 let pane_id = self.attach_pane(entry.name, session, window, cx);
                 let tab_id = TabId(self.next_tab_id);
                 self.next_tab_id += 1;
+                // 服务器条目默认标签色（"#RRGGBB"，坏值按 None 忽略）；
+                // 标题不动——保持 OSC/窗格自动标题
+                let server_color = entry
+                    .tab_color
+                    .as_deref()
+                    .and_then(laterterm_config::theme::parse_hex_color);
                 self.tabs.push(WorkspaceTab {
                     id: tab_id,
                     layout: LayoutNode::Leaf(pane_id),
                     focused_pane: pane_id,
                     custom_title: None,
-                    color: None,
+                    color: server_color,
                 });
+                // 会话恢复挂起的外观：自身自定义色优先，缺省回落服务器默认色
+                if let Some((custom_title, snapshot_color)) =
+                    self.pending_server_tab_restore.remove(&server_name)
+                    && let Some(tab_ref) = self.tabs.last_mut()
+                {
+                    tab_ref.custom_title = custom_title;
+                    tab_ref.color = Self::restore_tab_color(snapshot_color, server_color);
+                }
                 self.focus_pane(pane_id, window, cx);
             }
             Ok(ConnectionOutcome::Prompt { kind, warning }) => {
                 self.present_credential_prompt(request_id, entry.name, kind, warning, window, cx);
             }
             Err(error) => {
+                // 连接失败不挂起恢复外观（防残留误应用到同名后续连接）
+                self.pending_server_tab_restore.remove(&entry.name);
                 self.server_error = Some(format!("连接 {} 失败: {error:#}", entry.name));
                 if matches!(self.server_dialog, Some(ServerDialog::Connecting { .. })) {
                     self.cancel_ssh_request();
@@ -7940,6 +7982,63 @@ fn server_edit_modal(
                             }),
                         )
                     }),
+                ),
+        )
+        // 标签色：该服务器的连接标签默认配色（用户数据）；选中态描边，
+        // 无色 = 跟随主题。与标签右键菜单同一套色板常量。
+        .child(
+            div()
+                .pt_2()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(div().text_color(rgb(0x7D829F)).child("标签色"))
+                .children(TAB_COLOR_SWATCHES.iter().map(|swatch| {
+                    let swatch = *swatch;
+                    let hex = laterterm_config::theme::format_hex_color(swatch);
+                    let selected = meta.tab_color.as_deref() == Some(hex.as_str());
+                    div()
+                        .size(px(14.0))
+                        .rounded_sm()
+                        .bg(rgb(swatch))
+                        .when(selected, |color_box| {
+                            color_box.border_1().border_color(rgb(0xC0CAF5))
+                        })
+                        .hover(|style| style.opacity(0.75))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.server_meta_draft.tab_color = Some(hex.clone());
+                                cx.notify();
+                            }),
+                        )
+                }))
+                // 无色项：清除该服务器的默认标签色
+                .child(
+                    div()
+                        .h(px(22.0))
+                        .px_2()
+                        .rounded_sm()
+                        .flex()
+                        .items_center()
+                        .text_size(px(11.0))
+                        .text_color(if meta.tab_color.is_none() {
+                            rgb(0xC0CAF5)
+                        } else {
+                            rgb(0x7D829F)
+                        })
+                        .when(meta.tab_color.is_none(), |no_color| {
+                            no_color.border_1().border_color(rgb(0x7AA2F7))
+                        })
+                        .hover(|style| style.bg(rgb(0x2F3147)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.server_meta_draft.tab_color = None;
+                                cx.notify();
+                            }),
+                        )
+                        .child("无色"),
                 ),
         )
         .child(div().pt_2().text_size(px(11.0)).text_color(rgb(0x7D829F)).child("私钥模式凭据为本机私钥的解锁口令，可留空。客户端仍需与服务端公钥配对的私钥；选择 Agent 时使用系统 SSH agent，不读取密码密钥环。"))
@@ -11521,5 +11620,26 @@ mod tab_drag_tests {
                 pane.session.close();
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod server_tab_color_tests {
+    use super::WorkspaceView;
+
+    #[test]
+    fn restore_tab_color_prefers_snapshot_then_server_default() {
+        // 快照自身自定义色优先
+        assert_eq!(
+            WorkspaceView::restore_tab_color(Some(0xFF5500), Some(0x7AA2F7)),
+            Some(0xFF5500)
+        );
+        // 无自定义色 → 服务器默认色
+        assert_eq!(
+            WorkspaceView::restore_tab_color(None, Some(0x9ECE6A)),
+            Some(0x9ECE6A)
+        );
+        // 两者皆无 → 跟随主题
+        assert_eq!(WorkspaceView::restore_tab_color(None, None), None);
     }
 }
