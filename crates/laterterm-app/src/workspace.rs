@@ -930,6 +930,11 @@ impl WorkspaceTab {
         if let Some(custom) = &self.custom_title {
             return custom.clone();
         }
+        self.auto_title(panes)
+    }
+
+    /// 自动标题（忽略自定义）：焦点窗格标题，无窗格时回落占位。
+    fn auto_title(&self, panes: &[Pane]) -> String {
         panes
             .iter()
             .find(|pane| pane.id == self.focused_pane)
@@ -1038,8 +1043,12 @@ pub struct WorkspaceView {
     server_notice: Option<String>,
     /// 分组折叠态（键 = 组名，None = 未分组桶；会话级，不持久化）。
     server_groups_collapsed: BTreeSet<Option<String>>,
-    /// 标签重命名输入框（双击标签时弹出）。
+    /// 标签重命名弹窗（双击标签/右键菜单「重命名」弹出）。
     tab_rename_field: Option<(TabId, Entity<CommandTextField>)>,
+    /// 重命名输入框的 Enter 订阅（FieldSubmit → 保存）。只持有不读——
+    /// Subscription 析构即退订，必须活到字段销毁。
+    #[allow(dead_code)]
+    tab_rename_submit: Option<gpui::Subscription>,
     /// 会话恢复是否已执行（首帧 render 时跑一次）。
     session_restored: bool,
     /// 待二次确认解散的分组名。
@@ -1189,6 +1198,7 @@ impl WorkspaceView {
             server_notice: None,
             server_groups_collapsed: BTreeSet::new(),
             tab_rename_field: None,
+            tab_rename_submit: None,
             session_restored: false,
             server_group_confirm: None,
             settings_save_path: None,
@@ -1658,35 +1668,48 @@ impl WorkspaceView {
 
     // ───────────────────── 标签重命名 ─────────────────────
 
-    /// 双击标签打开重命名输入框。
-    fn start_tab_rename(&mut self, id: TabId, cx: &mut Context<Self>) {
-        // tab_title 已含 custom_title 优先逻辑，直接取展示标题作预填
-        let current = self
-            .tabs
-            .iter()
-            .find(|tab| tab.id == id)
-            .map(|tab| tab.tab_title(&self.panes))
-            .unwrap_or_default();
-        let field = cx.new(|cx| CommandTextField::new(current, "标签名", cx));
-        self.tab_rename_field = Some((id, field));
+    /// 双击标签/右键菜单打开重命名弹窗：预填当前生效标题，占位提示 =
+    /// 自动标题（清空输入保存即回到自动标题）。Enter 保存由 FieldSubmit
+    /// 订阅触发，Esc 取消走 on_key_down 分支。
+    fn start_tab_rename(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) else {
+            return;
+        };
+        let auto_title = tab.auto_title(&self.panes);
+        let (current, placeholder) = match &tab.custom_title {
+            Some(custom) => (custom.clone(), auto_title),
+            None => (auto_title.clone(), auto_title),
+        };
+        let field = cx.new(|cx| CommandTextField::new(current, placeholder, cx));
+        self.tab_rename_submit = Some(cx.subscribe(&field, |workspace, _, _: &FieldSubmit, cx| {
+            workspace.commit_tab_rename(cx)
+        }));
+        self.tab_rename_field = Some((id, field.clone()));
+        field.read(cx).focus_handle().focus(window);
         cx.notify();
     }
 
-    /// 确认重命名：空 = 恢复自动标题。
+    /// 确认重命名：空白输入 = 恢复自动标题（custom_title 置 None）。
     fn commit_tab_rename(&mut self, cx: &mut Context<Self>) {
         if let Some((id, field)) = self.tab_rename_field.take() {
-            let title = field.read(cx).value().trim().to_string();
+            let title = Self::normalized_custom_title(field.read(cx).value());
             if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
-                tab.custom_title = (!title.is_empty()).then_some(title);
+                tab.custom_title = title;
             }
+            self.save_session_snapshot();
         }
-        self.save_session_snapshot();
         cx.notify();
     }
 
     fn cancel_tab_rename(&mut self, cx: &mut Context<Self>) {
         self.tab_rename_field = None;
         cx.notify();
+    }
+
+    /// 重命名输入归一（保存分支的纯逻辑）：去首尾空白，空白 = None（自动标题）。
+    fn normalized_custom_title(input: &str) -> Option<String> {
+        let trimmed = input.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
     }
 
     fn dismiss_welcome(
@@ -2569,8 +2592,16 @@ impl WorkspaceView {
                     // 菜单内的点击不穿透，避免误触标签/终端
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                    // 重命名占位：本任务只留入口，交互在任务 3 接（点了仅收起菜单）
-                    .child(item(ui, cx, "重命名", true, Box::new(|_, _, _| {})))
+                    // 重命名：打开标签重命名弹窗（item 工厂会顺带收起菜单）
+                    .child(item(
+                        ui,
+                        cx,
+                        "重命名",
+                        true,
+                        Box::new(move |this, window, cx| {
+                            this.start_tab_rename(tab_id, window, cx);
+                        }),
+                    ))
                     .child(separator())
                     .child(
                         div()
@@ -5683,6 +5714,13 @@ impl WorkspaceView {
             cx.stop_propagation();
             return;
         }
+        // 标签重命名弹窗：Esc 取消（Enter 由字段 FieldSubmit 订阅保存，
+        // 捕获阶段不拦普通按键，让输入框正常收字）。
+        if self.tab_rename_field.is_some() && plain_escape {
+            self.cancel_tab_rename(cx);
+            cx.stop_propagation();
+            return;
+        }
         // 终端右键菜单：Esc 直接关闭；其他按键先关菜单再正常分发。
         if self.terminal_menu.is_some() {
             self.terminal_menu = None;
@@ -6105,7 +6143,12 @@ impl Render for WorkspaceView {
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(move |this, event, window, cx| {
-                                                this.activate_tab(id, event, window, cx)
+                                                // 单击已激活（activate_tab 内）；
+                                                // 双击在此基础上弹重命名弹窗
+                                                this.activate_tab(id, event, window, cx);
+                                                if event.click_count >= 2 {
+                                                    this.start_tab_rename(id, window, cx);
+                                                }
                                             }),
                                         )
                                         .child(label)
@@ -6273,59 +6316,7 @@ impl Render for WorkspaceView {
             .when(self.welcome_visible, |root| {
                 root.child(self.welcome_overlay(cx))
             })
-            // 标签重命名浮层（双击标签触发）
-            .when_some(self.tab_rename_field.clone(), |root, (_id, field)| {
-                root.child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .bottom_0()
-                        .left_0()
-                        .bg(gpui::Hsla::from(rgb(0x161722)).opacity(0.85))
-                        .flex()
-                        .items_start()
-                        .justify_center()
-                        .pt(px(120.0))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _, _, cx| this.cancel_tab_rename(cx)),
-                        )
-                        .child(
-                            div()
-                                .w(px(360.0))
-                                .p_4()
-                                .bg(rgb(0x1A1B26))
-                                .rounded_md()
-                                .flex()
-                                .flex_col()
-                                .gap_3()
-                                .on_mouse_down(MouseButton::Left, |_, _, _| {})
-                                .child(div().text_color(rgb(0x7DCFFF)).child("重命名标签"))
-                                .child(field)
-                                .child(
-                                    div()
-                                        .flex()
-                                        .gap_2()
-                                        .child(setting_button(
-                                            "保存",
-                                            true,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.commit_tab_rename(cx)
-                                            }),
-                                        ))
-                                        .child(setting_button(
-                                            "取消",
-                                            false,
-                                            cx.listener(|this, _, _, cx| {
-                                                this.cancel_tab_rename(cx)
-                                            }),
-                                        )),
-                                ),
-                        ),
-                )
-            })
-            // 命令/动态码/服务器对话框：窗口级模态弹窗（最上层）
+            // 命令/动态码/服务器/标签重命名对话框：窗口级模态弹窗（最上层）
             .when_some(
                 render_active_dialog(self, self.ui_colors(), cx),
                 |root, overlay| root.child(overlay),
@@ -6953,7 +6944,7 @@ fn left_sidebar(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                 if event.click_count >= 2 {
-                                    this.start_tab_rename(id, cx);
+                                    this.start_tab_rename(id, window, cx);
                                 } else {
                                     this.activate_tab(id, event, window, cx);
                                 }
@@ -7289,6 +7280,32 @@ fn render_active_dialog(
     ui: UiColors,
     cx: &mut Context<WorkspaceView>,
 ) -> Option<gpui::Div> {
+    // 标签重命名弹窗：双击标签/右键菜单「重命名」触发，与其它弹窗同骨架。
+    // Enter 保存走 FieldSubmit 订阅，Esc 取消走 on_key_down 分支。
+    if let Some((_, field)) = workspace.tab_rename_field.clone() {
+        let body = div()
+            .flex()
+            .flex_col()
+            .p_4()
+            .child(dialog_field_row("标签名", field))
+            .child(dialog_footer(vec![
+                setting_button(
+                    "保存",
+                    true,
+                    cx.listener(|this, _, _, cx| this.commit_tab_rename(cx)),
+                ),
+                setting_button(
+                    "取消",
+                    false,
+                    cx.listener(|this, _, _, cx| this.cancel_tab_rename(cx)),
+                ),
+            ]));
+        return Some(modal_dialog(
+            "重命名标签",
+            body,
+            dismiss_listener(cx, |this, _window, cx| this.cancel_tab_rename(cx)),
+        ));
+    }
     // SFTP 栏内操作弹窗（新建目录/重命名）：窗口级模态，与其它弹窗同骨架
     if let Some(prompt) = workspace.sftp_prompt.clone() {
         let fields = workspace.sftp_prompt_fields.clone();
@@ -11235,5 +11252,93 @@ mod tab_menu_tests {
             assert!(view.tab_menu.is_some());
         });
         close_sessions(&workspace, cx);
+    }
+}
+
+#[cfg(test)]
+mod tab_rename_tests {
+    use super::WorkspaceView;
+    use gpui::{EntityInputHandler, TestAppContext};
+
+    #[test]
+    fn normalized_custom_title_trims_and_blank_clears() {
+        assert_eq!(
+            WorkspaceView::normalized_custom_title("生产机"),
+            Some("生产机".into())
+        );
+        // 首尾空白剔除，避免「看起来同名却带空格」的重复标题
+        assert_eq!(
+            WorkspaceView::normalized_custom_title("  生产机  "),
+            Some("生产机".into())
+        );
+        // 空串/纯空白 = 恢复自动标题
+        assert_eq!(WorkspaceView::normalized_custom_title(""), None);
+        assert_eq!(WorkspaceView::normalized_custom_title("   "), None);
+    }
+
+    #[gpui::test]
+    fn rename_dialog_save_clear_cancel(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let tab_id = workspace.read_with(cx, |view, _| view.tabs[0].id);
+
+        // 打开弹窗：预填自动标题，字段获得焦点
+        workspace.update_in(cx, |view, window, cx| {
+            view.start_tab_rename(tab_id, window, cx);
+            assert!(view.tab_rename_field.is_some());
+        });
+        let field_open = workspace.read_with(cx, |view, _| {
+            let (_, field) = view.tab_rename_field.clone().expect("弹窗应打开");
+            field
+        });
+        let prefilled = field_open.read_with(cx, |field, _| field.value().to_string());
+        assert!(!prefilled.is_empty(), "预填 = 当前自动标题: {prefilled}");
+
+        // 保存分支：填入新标题 → 提交 → custom_title 更新、弹窗关闭
+        workspace.update_in(cx, |view, window, cx| {
+            let (_, field) = view.tab_rename_field.clone().expect("弹窗应打开");
+            // 预填文本全选替换（range 为 UTF-16 偏移，模拟全选后输入）
+            let end = field.read(cx).value().encode_utf16().count();
+            field.update(cx, |field, cx| {
+                field.replace_text_in_range(Some(0..end), "web-1", window, cx);
+            });
+            view.commit_tab_rename(cx);
+            assert_eq!(view.tabs[0].custom_title.as_deref(), Some("web-1"));
+            assert!(view.tab_rename_field.is_none());
+            // 快照应携带自定义标题（restore_session 读回链路见 restore_session）
+            let snapshot = view.snapshot_session();
+            assert_eq!(snapshot.tabs[0].custom_title.as_deref(), Some("web-1"));
+        });
+
+        // 清空分支：清空输入框再提交 = 恢复自动标题
+        workspace.update_in(cx, |view, window, cx| {
+            view.start_tab_rename(tab_id, window, cx);
+            let (_, field) = view.tab_rename_field.clone().unwrap();
+            let end = field.read(cx).value().encode_utf16().count();
+            field.update(cx, |field, cx| {
+                field.replace_text_in_range(Some(0..end), "", window, cx)
+            });
+        });
+        workspace.update(cx, |view, cx| {
+            view.commit_tab_rename(cx);
+            assert_eq!(view.tabs[0].custom_title, None, "空白输入应恢复自动标题");
+        });
+
+        // 取消分支：改动被丢弃，custom_title 不动
+        workspace.update_in(cx, |view, window, cx| {
+            view.start_tab_rename(tab_id, window, cx);
+            let (_, field) = view.tab_rename_field.clone().unwrap();
+            let end = field.read(cx).value().encode_utf16().count();
+            field.update(cx, |field, cx| {
+                field.replace_text_in_range(Some(0..end), "被丢弃", window, cx)
+            });
+            view.cancel_tab_rename(cx);
+            assert!(view.tab_rename_field.is_none());
+            assert_eq!(view.tabs[0].custom_title, None, "取消不改标题");
+        });
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
     }
 }
