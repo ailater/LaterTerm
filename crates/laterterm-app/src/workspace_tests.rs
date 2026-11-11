@@ -173,6 +173,54 @@ fn unified_shortcut_conflicts_detect_cross_kind() {
     assert!(shortcut_conflict_with(&bindings, "ctrl", None).is_none());
 }
 
+/// 搜索模态三开关（alt+c/r/w）注册进内置注册表：all_shortcut_bindings 的
+/// 内置段逐条来自 BUILTIN_SHORTCUTS（归一化失败跳过），用户把命令/服务器/
+/// 动态码绑到同键时 shortcut_conflict_with 必须命中 BindingOwner::Builtin
+/// ——工作区 capture 分发先于搜索拦截，注册表标红是唯一的失灵预警。
+#[test]
+fn search_toggle_shortcuts_are_registered_for_conflict_detection() {
+    use super::workspace::{
+        BUILTIN_SHORTCUTS, BindingOwner, ShortcutBinding, shortcut_conflict_with,
+    };
+    use laterterm_config::normalize_shortcut;
+
+    // 三键进注册表且 label 正确（进 all_shortcut_bindings → 设置页「内置」组展示）
+    for (keystroke, label) in [
+        ("alt+c", "搜索：大小写"),
+        ("alt+r", "搜索：正则"),
+        ("alt+w", "搜索：全字"),
+    ] {
+        assert_eq!(
+            BUILTIN_SHORTCUTS
+                .iter()
+                .find(|(key, _)| *key == keystroke)
+                .map(|(_, label)| *label),
+            Some(label),
+            "{keystroke} 应注册进 BUILTIN_SHORTCUTS"
+        );
+    }
+    // 与 all_shortcut_bindings 内置段同构地构建注册表，冲突检测命中 Builtin
+    let bindings: Vec<ShortcutBinding> = BUILTIN_SHORTCUTS
+        .iter()
+        .filter_map(|(keystroke, label)| {
+            normalize_shortcut(keystroke)
+                .ok()
+                .map(|normalized| ShortcutBinding {
+                    owner: BindingOwner::Builtin,
+                    normalized,
+                    label: (*label).to_string(),
+                })
+        })
+        .collect();
+    for key in ["alt+c", "alt+r", "alt+w"] {
+        assert_eq!(
+            shortcut_conflict_with(&bindings, key, None).as_deref(),
+            Some("内置快捷键"),
+            "用户绑 {key} 到命令/服务器/动态码时必须得到内置冲突预警"
+        );
+    }
+}
+
 #[test]
 fn settings_scroll_spy_follows_judge_line_and_pins_bottom() {
     use super::workspace::{SettingsSection, settings_scroll_spy};

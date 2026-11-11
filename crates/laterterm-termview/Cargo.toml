@@ -16,6 +16,8 @@ parking_lot.workspace = true
 flume.workspace = true
 # select!(PTY 数据 / 保活定时器)用；锁 0.3 与 gpui 的 futures-util 同源。
 futures = "0.3"
+# 回滚搜索正则模式（search_with_options 的 regex 路径）。
+regex.workspace = true
 arboard.workspace = true
 
 [dev-dependencies]

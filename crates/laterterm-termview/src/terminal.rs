@@ -51,6 +51,7 @@ use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use parking_lot::Mutex;
+use regex::Regex;
 use std::sync::Arc;
 
 /// 回滚搜索命中。
@@ -63,6 +64,18 @@ pub struct SearchMatch {
     pub line: usize,
     pub column: usize,
     pub len: usize,
+}
+
+/// 搜索选项（[`TerminalState::search_with_options`] 用）。
+/// 默认值等价于 [`TerminalState::search`]（大小写不敏感的普通子串搜索）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// 大小写敏感。
+    pub case_sensitive: bool,
+    /// 按正则表达式匹配（regex crate 语法；开启时全字选项忽略，用户自写 `\b`）。
+    pub regex: bool,
+    /// 全字匹配（仅子串路径生效；词定义与正则 `\b` 一致：字母数字或下划线）。
+    pub whole_word: bool,
 }
 
 /// 大小写不敏感的逐字符子串搜索（避免 UTF-8 字节索引在中文场景错位）。
@@ -126,21 +139,105 @@ fn extract_url_span_containing(
     None
 }
 
+/// 全字词字符判定：字母数字或下划线，与正则 `\b` 的 Unicode 词定义一致
+/// （汉字属词字符，`\b中文\b` 在 CJK 相邻文本间不命中，同 grep -w 口径）。
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+/// 全字边界判定：命中首字符之前与末字符之后都不是词字符（行首尾为边界）。
+/// 行尾的空 cell 填充空格天然不是词字符，无需裁剪。
+fn is_word_boundary(text: &[char], start: usize, len: usize) -> bool {
+    let prev_ok = start == 0 || !is_word_char(text[start - 1]);
+    let end = start + len;
+    let next_ok = end >= text.len() || !is_word_char(text[end]);
+    prev_ok && next_ok
+}
+
+/// 正则路径逐行匹配：提取行文本（宽字符续列跳过）→ 裁剪尾部空白 → find_iter。
+///
+/// 锚点语义（本实现的契约，锚点组单测钉死）：
+/// - `$` = 每个网格行**最后一个非空白字符之后**——行尾空 cell 的默认填充
+///   ' '（alacritty cell 默认字符）与用户敲入的空格不可区分，匹配前统一
+///   裁剪，否则 `foo$`/`\d+$` 等锚定模式系统性失配；代价是 `\s+$` 等
+///   显式匹配行尾空白的模式不再命中（有意取舍，行中/行首空白不受影响）；
+/// - `^` = 每个网格行的列 0——软换行续行是独立 grid row，`^` 在续行列 0
+///   亦命中；
+/// - 零宽命中（如 `a*` 的空匹配）一律过滤，命中语义 = 非空匹配。
+///
+/// 字节偏移换算：regex 返回 UTF-8 字节区间，经 `text[..start].chars().count()`
+/// 换算回字符下标，再查 char_columns 得网格列；len 沿用「末字符列 + 宽字符
+/// 占宽 − 首列」公式（与子串路径 search_grid_exact 同式）。
+fn search_grid_regex(grid: &Grid<Cell>, pattern: &Regex) -> Vec<SearchMatch> {
+    let total_lines = grid.total_lines();
+    let history = total_lines - grid.screen_lines();
+    let columns = grid.columns();
+    let mut matches = Vec::new();
+    for absolute in 0..total_lines {
+        let line = Line(absolute as i32 - history as i32);
+        let mut text: Vec<char> = Vec::with_capacity(columns);
+        let mut char_columns: Vec<usize> = Vec::with_capacity(columns);
+        for column in 0..columns {
+            let cell = &grid[AlacPoint::new(line, Column(column))];
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            text.push(cell.c);
+            char_columns.push(column);
+        }
+        // 尾部空白裁剪：行文本与列映射同步收缩，保持下标对位。
+        // 填充空格与用户尾随空格不可区分，一并裁剪（见函数级锚点语义注记）。
+        while text.last().is_some_and(|ch| ch.is_whitespace()) {
+            text.pop();
+            char_columns.pop();
+        }
+        if text.is_empty() {
+            continue;
+        }
+        let line_text: String = text.iter().collect();
+        for found in pattern.find_iter(&line_text) {
+            let start = line_text[..found.start()].chars().count();
+            let end = line_text[..found.end()].chars().count();
+            // 零宽命中过滤：如 a* 在词边界处的空匹配，无高亮意义
+            if end == start {
+                continue;
+            }
+            let first = char_columns[start];
+            let last = char_columns[end - 1];
+            let last_width = if grid[AlacPoint::new(line, Column(last))]
+                .flags
+                .contains(Flags::WIDE_CHAR)
+            {
+                2
+            } else {
+                1
+            };
+            matches.push(SearchMatch {
+                line: absolute,
+                column: first,
+                len: last + last_width - first,
+            });
+        }
+    }
+    matches
+}
+
 /// 大小写敏感可切换的行搜索（大小写不敏感时与 search_grid 同口径）。
 fn search_grid_sensitivity(
     grid: &Grid<Cell>,
     needle: &[char],
     case_sensitive: bool,
+    whole_word: bool,
 ) -> Vec<SearchMatch> {
     if case_sensitive {
-        search_grid_exact(grid, needle)
+        search_grid_exact(grid, needle, whole_word)
     } else {
-        search_grid(grid, needle)
+        search_grid(grid, needle, whole_word)
     }
 }
 
 /// 大小写敏感的行搜索（不 lowercase）。
-fn search_grid_exact(grid: &Grid<Cell>, needle: &[char]) -> Vec<SearchMatch> {
+fn search_grid_exact(grid: &Grid<Cell>, needle: &[char], whole_word: bool) -> Vec<SearchMatch> {
     let total_lines = grid.total_lines();
     let history = total_lines - grid.screen_lines();
     let columns = grid.columns();
@@ -159,7 +256,10 @@ fn search_grid_exact(grid: &Grid<Cell>, needle: &[char]) -> Vec<SearchMatch> {
         }
         let mut start = 0;
         while start + needle.len() <= text.len() {
-            if text[start..start + needle.len()] == *needle {
+            // 全字模式：在既有命中处加词边界判定（行尾填充空格天然是边界）
+            if text[start..start + needle.len()] == *needle
+                && (!whole_word || is_word_boundary(&text, start, needle.len()))
+            {
                 let first = char_columns[start];
                 let last = char_columns[start + needle.len() - 1];
                 let last_width = if grid[AlacPoint::new(line, Column(last))]
@@ -184,7 +284,7 @@ fn search_grid_exact(grid: &Grid<Cell>, needle: &[char]) -> Vec<SearchMatch> {
     matches
 }
 
-fn search_grid(grid: &Grid<Cell>, needle: &[char]) -> Vec<SearchMatch> {
+fn search_grid(grid: &Grid<Cell>, needle: &[char], whole_word: bool) -> Vec<SearchMatch> {
     let total_lines = grid.total_lines();
     let history = total_lines - grid.screen_lines();
     let columns = grid.columns();
@@ -216,7 +316,11 @@ fn search_grid(grid: &Grid<Cell>, needle: &[char]) -> Vec<SearchMatch> {
         }
         let mut start = 0;
         while start + needle.len() <= haystack.len() {
-            if haystack[start..start + needle.len()] == *needle {
+            // 全字模式：边界判定用小写化后的扩展文本（多对一展开时相邻
+            // 扩展字符同属一词，逐字符判定结果与原文本一致）
+            if haystack[start..start + needle.len()] == *needle
+                && (!whole_word || is_word_boundary(&haystack, start, needle.len()))
+            {
                 let first = haystack_columns[start];
                 let last = haystack_columns[start + needle.len() - 1];
                 // 末字符可能占两列（宽字符），按其实际占宽计算命中列跨度
@@ -533,7 +637,53 @@ impl TerminalState {
         if needle.is_empty() {
             return Vec::new();
         }
-        self.with_term(|term| search_grid_sensitivity(term.grid(), &needle, case_sensitive))
+        self.with_term(|term| search_grid_sensitivity(term.grid(), &needle, case_sensitive, false))
+    }
+
+    /// 带选项的搜索：普通子串 / 全字 / 正则三模式。
+    ///
+    /// - 子串与全字路径大小写不敏感时按字符小写化匹配（与 [`Self::search`]
+    ///   同口径，避免 UTF-8 字节索引在中文场景错位）；行尾空 cell 填充空格
+    ///   不裁剪（全字模式下天然是词边界）。
+    /// - 正则路径的锚点语义（`$` = 行尾最后一个非空白字符之后、`^` = 每个
+    ///   网格行列 0、零宽命中过滤）见 [`search_grid_regex`] 的契约注记；
+    ///   大小写不敏感经 `(?i)` 前缀实现。
+    /// - 非法正则返回 `Err(错误信息)`（供搜索栏内联红字展示），**绝不
+    ///   panic**；调用方应保留上次有效结果。
+    pub fn search_with_options(
+        &self,
+        query: &str,
+        options: SearchOptions,
+    ) -> Result<Vec<SearchMatch>, String> {
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        if options.regex {
+            let pattern = if options.case_sensitive {
+                Regex::new(query)
+            } else {
+                Regex::new(&format!("(?i){query}"))
+            };
+            let pattern = pattern.map_err(|error| error.to_string())?;
+            Ok(self.with_term(|term| search_grid_regex(term.grid(), &pattern)))
+        } else {
+            let needle: Vec<char> = if options.case_sensitive {
+                query.chars().collect()
+            } else {
+                query.to_lowercase().chars().collect()
+            };
+            if needle.is_empty() {
+                return Ok(Vec::new());
+            }
+            Ok(self.with_term(|term| {
+                search_grid_sensitivity(
+                    term.grid(),
+                    &needle,
+                    options.case_sensitive,
+                    options.whole_word,
+                )
+            }))
+        }
     }
 
     /// 从网格中提取点击位置处的 URL。
@@ -1065,6 +1215,257 @@ mod tests {
         assert_eq!(matches[0].column, 0);
         assert_eq!(matches[1].column, 3);
         assert_eq!(matches[2].column, 6);
+    }
+
+    // ───────────── search_with_options：正则 / 全字 / 锚点 ─────────────
+
+    /// 正则模式选项快捷构造（大小写不敏感默认）。
+    fn regex_opts(case_sensitive: bool) -> SearchOptions {
+        SearchOptions {
+            case_sensitive,
+            regex: true,
+            whole_word: false,
+        }
+    }
+
+    #[test]
+    fn test_search_regex_basic() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        terminal.process_bytes(b"foo=1 bar=22\n");
+
+        let matches = terminal
+            .search_with_options(r"bar=\d+", regex_opts(false))
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line, 0);
+        // f(0)o(1)o(2)=(3)1(4)␣(5)b(6)a(7)r(8)=(9)2(10)2(11)
+        assert_eq!(matches[0].column, 6);
+        assert_eq!(matches[0].len, 6);
+    }
+
+    #[test]
+    fn test_search_regex_cjk_column_width() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        terminal.process_bytes("第二行 中文\n".as_bytes());
+
+        let matches = terminal
+            .search_with_options("中文", regex_opts(false))
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        // 列宽口径同 test_search_cjk_text：3 汉字 6 列 + 1 空格 → 列 7，
+        // 两个宽字符共占 4 列
+        assert_eq!(matches[0].column, 7);
+        assert_eq!(matches[0].len, 4);
+    }
+
+    #[test]
+    fn test_search_regex_case_sensitivity() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        terminal.process_bytes(b"abc ABC\n");
+
+        // 大小写不敏感（默认）：经 (?i) 前缀，两组都命中
+        assert_eq!(
+            terminal
+                .search_with_options("abc", regex_opts(false))
+                .unwrap()
+                .len(),
+            2
+        );
+        // 大小写敏感：只命中各自字面
+        let lower = terminal
+            .search_with_options("abc", regex_opts(true))
+            .unwrap();
+        assert_eq!(lower.len(), 1);
+        assert_eq!(lower[0].column, 0);
+        let upper = terminal
+            .search_with_options("ABC", regex_opts(true))
+            .unwrap();
+        assert_eq!(upper.len(), 1);
+        assert_eq!(upper[0].column, 4);
+    }
+
+    #[test]
+    fn test_search_regex_invalid_returns_err() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        terminal.process_bytes(b"hello world\n");
+
+        // 非法正则返回 Err（供搜索栏内联红字展示），绝不 panic
+        let error = terminal
+            .search_with_options("(unclosed", regex_opts(false))
+            .unwrap_err();
+        assert!(!error.is_empty(), "错误信息供搜索栏红字展示");
+        // 子串路径同查询不受影响（括号是字面字符，无命中）
+        assert_eq!(terminal.search("(unclosed"), Vec::<SearchMatch>::new());
+    }
+
+    #[test]
+    fn test_search_whole_word_boundaries() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        terminal.process_bytes(b"ab ab ab\nxab abc\n");
+        let options = SearchOptions {
+            whole_word: true,
+            ..Default::default()
+        };
+
+        let matches = terminal.search_with_options("ab", options).unwrap();
+        // 仅独立成词的三处（行首行尾与空格两侧是边界）；
+        // xab 的 ab（前邻 x）与 abc 的 ab（后邻 c）不命中
+        assert_eq!(matches.len(), 3);
+        assert!(matches.iter().all(|m| m.line == 0));
+        // 非全字默认路径不受影响：xab/abc 中的 ab 也命中
+        assert_eq!(
+            terminal
+                .search_with_options("ab", SearchOptions::default())
+                .unwrap()
+                .len(),
+            5
+        );
+
+        // 全字 CJK：汉字属词字符（与正则 \b 一致），「中文」邻接「测试」
+        // 不命中，行尾填充空格天然是边界
+        let (tx, _rx) = channel();
+        let mut cjk_terminal = TerminalState::new(40, 4, 32, GpuiEventProxy::new(tx));
+        cjk_terminal.process_bytes("中文测试\n中文\n".as_bytes());
+        let cjk = cjk_terminal.search_with_options("中文", options).unwrap();
+        assert_eq!(cjk.len(), 1);
+        assert_eq!(cjk[0].line, 1);
+    }
+
+    #[test]
+    fn test_search_regex_zero_width_matches_filtered() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        terminal.process_bytes(b"bab\n");
+
+        // a* 会在位置 0/2/3 产生零宽空匹配，只保留非空命中「a」
+        let matches = terminal
+            .search_with_options("a*", regex_opts(false))
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].column, 1);
+        assert_eq!(matches[0].len, 1);
+    }
+
+    #[test]
+    fn test_search_regex_order_and_options_default_compat() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        terminal.process_bytes(b"alpha one\nbeta two\nalpha three\n");
+
+        // 正则路径与子串路径同 push 顺序：按 absolute line 升序，结果一致
+        let by_regex = terminal
+            .search_with_options("alpha", regex_opts(false))
+            .unwrap();
+        assert_eq!(by_regex, terminal.search("alpha"));
+        assert!(by_regex.windows(2).all(|w| w[0].line <= w[1].line));
+        // 默认选项（关正则/关全字）与既有 search() 完全同口径
+        assert_eq!(
+            terminal
+                .search_with_options("alpha", SearchOptions::default())
+                .unwrap(),
+            terminal.search("alpha")
+        );
+    }
+
+    /// 锚点组：$ = 每行最后一个非空白字符之后（行尾空 cell 填充空格
+    /// 先裁剪，见 search_grid_regex 契约注记），^ = 每个网格行列 0。
+    #[test]
+    fn test_search_regex_end_anchor_ignores_cell_padding() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        // 20 列网格：「中文abc」后有 13 个填充空格，不裁剪时 c$ 失配
+        terminal.process_bytes("中文abc\r\n".as_bytes());
+
+        let matches = terminal
+            .search_with_options("c$", regex_opts(false))
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        // 中(0-1) 文(2-3) a(4) b(5) c(6)：命中在列 6，单字符宽 1
+        assert_eq!(matches[0].line, 0);
+        assert_eq!(matches[0].column, 6);
+        assert_eq!(matches[0].len, 1);
+    }
+
+    #[test]
+    fn test_search_regex_digits_end_anchor() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        terminal.process_bytes(b"error=42\r\n");
+
+        let matches = terminal
+            .search_with_options(r"\d+$", regex_opts(false))
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        // e(0)r(1)r(2)o(3)r(4)=(5)4(6)2(7)：命中行尾数字「42」
+        assert_eq!(matches[0].column, 6);
+        assert_eq!(matches[0].len, 2);
+    }
+
+    #[test]
+    fn test_search_regex_start_anchor_at_row_start() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        terminal.process_bytes("中文abc\r\n".as_bytes());
+
+        let matches = terminal
+            .search_with_options("^中文", regex_opts(false))
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].line, 0);
+        assert_eq!(matches[0].column, 0);
+        assert_eq!(matches[0].len, 4); // 两个宽字符占 4 列
+    }
+
+    #[test]
+    fn test_search_regex_start_anchor_hits_wrapped_continuation_row() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        // 22 个 a：软换行把后 2 个折到续行——续行是独立 grid row，
+        // ^ 在续行列 0 亦命中（锚点语义契约）
+        terminal.process_bytes(b"aaaaaaaaaaaaaaaaaaaaaa\r\n");
+
+        let matches = terminal
+            .search_with_options("^a+$", regex_opts(false))
+            .unwrap();
+        assert_eq!(matches.len(), 2, "首行与续行各命中一次 ^a+$");
+        assert_eq!(matches[0].line, 0);
+        assert_eq!(matches[0].column, 0);
+        assert_eq!(matches[0].len, 20);
+        assert_eq!(matches[1].line, 1);
+        assert_eq!(matches[1].column, 0);
+        assert_eq!(matches[1].len, 2);
+    }
+
+    #[test]
+    fn test_search_regex_inline_flag_with_end_anchor() {
+        let (tx, _rx) = channel();
+        let event_proxy = GpuiEventProxy::new(tx);
+        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        terminal.process_bytes("中文ABC\r\n".as_bytes());
+
+        // (?i) 内联大小写开关 × $ 锚点组合：大小写敏感开启时内联标志仍生效
+        let matches = terminal
+            .search_with_options("(?i)c$", regex_opts(true))
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].column, 6);
+        assert_eq!(matches[0].len, 1);
     }
 
     #[test]
