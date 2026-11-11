@@ -234,6 +234,11 @@ pub struct TerminalConfig {
 
     /// 终端 bell 时发送系统桌面通知。默认关闭（bell 走视觉提示，测试环境不外发）。
     pub bell_notification: bool,
+
+    /// 终端背景不透明度（0.15~1.0）。1.0 = 完全不透明（历史行为，default
+    /// 底色满幅绘制）；<1.0 时整幅 default 底色跳绘、单元格背景 quad 按
+    /// alpha 缩放，窗口底色由宿主层（如 LaterTerm 工作区根容器）承载。
+    pub background_opacity: f32,
 }
 
 impl Default for TerminalConfig {
@@ -254,6 +259,7 @@ impl Default for TerminalConfig {
             smooth_scrolling: true,
             copy_on_select: true,
             bell_notification: false,
+            background_opacity: 1.0,
         }
     }
 }
@@ -797,7 +803,7 @@ impl TerminalView {
         let state = TerminalState::new(config.cols, config.rows, config.scrollback, event_proxy);
 
         // Create renderer with font settings and color palette
-        let renderer = TerminalRenderer::new(
+        let mut renderer = TerminalRenderer::new(
             config.font_family.clone(),
             config.font_size,
             config.line_height_multiplier,
@@ -806,6 +812,8 @@ impl TerminalView {
             config.font_fallbacks.clone(),
             config.cursor_style,
         );
+        // 首帧即按配置的不透明度绘制（update_config 同口径钳制，见其注释）
+        renderer.background_opacity = config.background_opacity.clamp(0.15, 1.0);
 
         // Create focus handle
         let focus_handle = cx.focus_handle();
@@ -2217,6 +2225,9 @@ impl TerminalView {
         self.renderer.font_fallbacks = config.font_fallbacks.clone();
         // 光标形状只改绘制几何，同样无需重新测量
         self.renderer.cursor_style = config.cursor_style;
+        // 背景不透明度同样不影响单元格度量，不参与 font_changed 重测判定；
+        // 钳制与配置层 sanitize（0.15~1.0）同口径
+        self.renderer.background_opacity = config.background_opacity.clamp(0.15, 1.0);
         if font_changed {
             self.renderer.invalidate_measurement();
             self.font_trace_changed = true;
@@ -2485,9 +2496,17 @@ impl Render for TerminalView {
                 )
         });
 
+        // 透明模式（background_opacity<1）该 filler 改画全透明：它被下方
+        // canvas 满覆盖，保留不透明色会把窗口透明像素盖死（alpha 承载单点
+        // 在宿主层，如 LaterTerm 工作区根容器的主题 background 原色@o）。
+        let root_bg: gpui::Fill = if self.config.background_opacity < 1.0 {
+            gpui::transparent_black().into()
+        } else {
+            rgb(0x1e1e1e).into()
+        };
         let root = div()
             .size_full()
-            .bg(rgb(0x1e1e1e))
+            .bg(root_bg)
             .track_focus(&self.focus_handle)
             // 悬停 URL 时小手光标（命中才有下划线与跳转语义，否则保持箭头）
             .when(url_hover.is_some(), |root| {

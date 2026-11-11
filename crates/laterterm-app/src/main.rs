@@ -35,6 +35,11 @@ fn window_options(cx: &mut gpui::App, settings: &Settings) -> gpui::WindowOption
         }),
         app_id: Some(branding::APP_ID.into()),
         window_decorations: Some(gpui::WindowDecorations::Client),
+        // 创建期即按设置落窗口背景三态（映射与运行期共用
+        // workspace::window_background_appearance，唯一口径）：透明配置下
+        // 首帧直接以透明合成，避免「先不透明、apply_appearance 再切换」
+        // 的首帧闪变。
+        window_background: workspace::window_background_appearance(&settings.appearance),
         ..Default::default()
     };
     // Quake 几何仅 Linux + 已启用时：全屏宽 × 50% 高、顶部水平居中。
@@ -54,11 +59,10 @@ fn window_options(cx: &mut gpui::App, settings: &Settings) -> gpui::WindowOption
             }));
         }
     }
-    // 非 Linux 平台不读 quake 设置，参数仅为签名统一。
+    // 非 Linux 平台不读 quake 设置，cx 仅为签名统一（settings 已被
+    // window_background 全平台消费）。
     #[cfg(not(target_os = "linux"))]
     let _ = cx;
-    #[cfg(not(target_os = "linux"))]
-    let _ = settings;
     #[cfg(target_os = "macos")]
     let options = {
         let mut options = options;

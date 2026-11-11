@@ -194,12 +194,28 @@ pub struct Appearance {
     #[serde(default = "default_true")]
     pub right_panel_pinned: bool,
 
+    /// 终端背景不透明度：1.0 = 完全不透明（默认，绘制与旧版逐字节一致）；
+    /// 允许 0.15~1.0，载入期 sanitize 钳制。低于 1.0 时窗口走透明合成，
+    /// 窗口底色由 app 层根容器以主题 background 原色@不透明度承载。
+    #[serde(default = "default_background_opacity")]
+    pub background_opacity: f32,
+
+    /// 背景模糊：background_opacity < 1.0 时请求窗口管理器/合成器模糊窗口
+    /// 背后内容。Linux 仅 Wayland KDE blur 协议支持；X11 无此路径，按纯
+    /// 透明显示（设置页有降级提示）。默认关闭。
+    #[serde(default)]
+    pub background_blur: bool,
+
     /// 接收目录；空 = ~/Downloads。
     pub downloads_dir: String,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_background_opacity() -> f32 {
+    1.0
 }
 
 impl Default for Appearance {
@@ -222,6 +238,8 @@ impl Default for Appearance {
             confirm_close_running: true,
             bell_notification: false,
             right_panel_pinned: true,
+            background_opacity: 1.0,
+            background_blur: false,
             font_fallbacks: Vec::new(),
             downloads_dir: String::new(),
         }
@@ -475,6 +493,8 @@ impl Appearance {
         self.line_height = self.line_height.clamp(0.8, 2.0);
         self.padding = self.padding.clamp(0.0, 24.0);
         self.scrollback = self.scrollback.clamp(1_000, 1_000_000);
+        // 背景不透明度下限 0.15：再低终端内容基本不可读，只留微弱剪影
+        self.background_opacity = self.background_opacity.clamp(0.15, 1.0);
         if self.font_family.trim().is_empty() {
             self.font_family = Self::default().font_family;
         }
@@ -809,6 +829,36 @@ shortcut = "  legacy shortcut  "
         settings.save_to(&path).unwrap();
         let loaded = Settings::load(&path).unwrap();
         assert!(!loaded.appearance.right_panel_pinned);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn background_opacity_and_blur_defaults_roundtrip_and_clamp() {
+        // 旧 settings.toml 缺 background_opacity/background_blur 字段
+        // → serde 补默认 1.0 / false（与透明功能上线前的绘制逐字节一致）
+        let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert_eq!(legacy.appearance.background_opacity, 1.0);
+        assert!(!legacy.appearance.background_blur);
+
+        // 显式值 roundtrip：0.7 + 模糊开，保存/加载相等
+        let path = temp_settings_path("background-opacity");
+        let mut settings = Settings::default();
+        settings.appearance.background_opacity = 0.7;
+        settings.appearance.background_blur = true;
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert_eq!(loaded.appearance.background_opacity, 0.7);
+        assert!(loaded.appearance.background_blur);
+
+        // 越界钳制：手改坏值载入期 sanitize 拉回 0.15~1.0
+        std::fs::write(
+            &path,
+            "[appearance]\nbackground_opacity = 0.01\nbackground_blur = true\n",
+        )
+        .unwrap();
+        let clamped = Settings::load(&path).unwrap();
+        assert_eq!(clamped.appearance.background_opacity, 0.15);
+        assert!(clamped.appearance.background_blur);
         std::fs::remove_file(&path).unwrap();
     }
 
