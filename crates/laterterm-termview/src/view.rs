@@ -613,6 +613,7 @@ pub struct TerminalView {
 }
 
 /// 搜索栏状态。
+#[derive(Clone)]
 struct SearchState {
     query: String,
     matches: Vec<crate::terminal::SearchMatch>,
@@ -620,6 +621,80 @@ struct SearchState {
     current: usize,
     /// 大小写敏感（搜索栏 Aa 按钮切换）。
     case_sensitive: bool,
+    /// 正则模式（Alt+R / .* 钮切换；开启时全字禁用——互斥语义，
+    /// 正则用户自行写 \b）。
+    regex: bool,
+    /// 全字匹配（Alt+W / W 钮切换；正则开启时置灰无效）。
+    whole_word: bool,
+    /// 非法正则的内联报错（Some 时计数区红字「正则无效：<msg>」替代，
+    /// 上次有效结果保留不动不滚动）。
+    regex_error: Option<String>,
+    /// 查询/选项变化后的防抖搜索在途标记（150ms 合并连击；
+    /// Enter 在此标记置位时同步提交挂起的搜索）。
+    search_pending: bool,
+}
+
+/// 搜索栏计数文案：空查询 0/0 / 无命中 / n/m 三分支；非法正则时
+/// 「正则无效：<msg>」红字替代计数（与计数共用一个槽位）。
+fn search_counter_text(search: &SearchState) -> String {
+    if let Some(error) = &search.regex_error {
+        format!("正则无效：{error}")
+    } else if search.query.is_empty() {
+        "0/0".to_string()
+    } else if search.matches.is_empty() {
+        "无命中".to_string()
+    } else {
+        format!("{}/{}", search.current + 1, search.matches.len())
+    }
+}
+
+/// 搜索栏 24px 方钮工厂（Aa / .* / W / ▲ / ▼）。
+///
+/// termview 本地实现：ui_button / icon_button 是 app 层（workspace.rs）私有
+/// 函数，termview 反向依赖成环，故按 ui_button 体系（描边 + hover 底色）
+/// 对齐做 24px 紧凑版；色值沿用本搜索栏既定的 Tokyo Night 内联值。
+/// 所有钮 on_mouse_down 首句 `cx.stop_propagation()`（先例 workspace.rs
+/// 右键菜单项）：点击不落入底层网格建选区；禁用钮只吞点击不动作。
+fn search_bar_button(
+    cx: &mut Context<TerminalView>,
+    label: &'static str,
+    active: bool,
+    disabled: bool,
+    on_click: impl Fn(&mut TerminalView, &mut Context<TerminalView>) + 'static,
+) -> Div {
+    // 开启 = 主题黄描边高亮；关闭 = 暗色可点；禁用 = 更暗无 hover
+    let (text, border) = if disabled {
+        (rgb(0x363B54), rgb(0x24283B))
+    } else if active {
+        (rgb(0xE0AF68), rgb(0xE0AF68))
+    } else {
+        (rgb(0x565A78), rgb(0x363B54))
+    };
+    let base = div()
+        .size(px(24.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_sm()
+        .border_1()
+        .border_color(border)
+        .text_size(px(11.0))
+        .text_color(text)
+        .child(label);
+    if disabled {
+        base.on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+        )
+    } else {
+        base.hover(|style| style.bg(rgb(0x2F3147))).on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                on_click(this, cx);
+            }),
+        )
+    }
 }
 
 /// 会话退出事件；不依赖终端是否可见。
@@ -1164,7 +1239,20 @@ impl TerminalView {
             match keystroke.key.as_str() {
                 "escape" => self.close_search(cx),
                 "enter" | "return" => {
-                    if keystroke.modifiers.shift {
+                    // Enter 双分支（语义钉死）：
+                    // - 有挂起防抖（150ms 窗口内「刚改完查询就按 Enter」）：
+                    //   同步提交挂起的搜索（落首命中）并消费本次按键——
+                    //   消除「在滞后结果上跳 → 防抖刷新又被重置回首命中」
+                    //   的双重定位；
+                    // - 无挂起防抖：与历史行为逐字一致——在既有 matches
+                    //   上循环跳转，不触发搜索。
+                    if self
+                        .search
+                        .as_ref()
+                        .is_some_and(|search| search.search_pending)
+                    {
+                        self.run_pending_search(cx);
+                    } else if keystroke.modifiers.shift {
                         self.search_select_prev(cx);
                     } else {
                         self.search_select_next(cx);
@@ -1174,9 +1262,20 @@ impl TerminalView {
                 "up" => self.search_select_prev(cx),
                 "down" => self.search_select_next(cx),
                 "c" if keystroke.modifiers.alt => {
-                    // Alt+C 切换大小写敏感
+                    // Alt+C 切换大小写敏感（与 Aa 钮共用路径）
+                    self.toggle_search_case(cx);
+                }
+                "r" if keystroke.modifiers.alt => {
+                    // Alt+R 切换正则；开关切换即时刷新（唯一绕过防抖的路径）
+                    self.toggle_search_regex(cx);
+                }
+                // Alt+W 切全字；正则开启时臂卫失败落入 _ 分支吞掉（无效），
+                // 与 W 钮置灰所见即所得
+                "w" if keystroke.modifiers.alt
+                    && !self.search.as_ref().is_some_and(|search| search.regex) =>
+                {
                     if let Some(search) = &mut self.search {
-                        search.case_sensitive = !search.case_sensitive;
+                        search.whole_word = !search.whole_word;
                     }
                     self.refresh_search(cx);
                 }
@@ -1807,6 +1906,10 @@ impl TerminalView {
                 matches: Vec::new(),
                 current: 0,
                 case_sensitive: false,
+                regex: false,
+                whole_word: false,
+                regex_error: None,
+                search_pending: false,
             });
             cx.notify();
         }
@@ -1889,7 +1992,7 @@ impl TerminalView {
     fn search_push_text(&mut self, text: &str, cx: &mut Context<Self>) {
         if let Some(search) = &mut self.search {
             search.query.push_str(text);
-            self.refresh_search(cx);
+            self.schedule_search(cx);
         }
     }
 
@@ -1898,21 +2001,111 @@ impl TerminalView {
         if let Some(search) = &mut self.search
             && search.query.pop().is_some()
         {
-            self.refresh_search(cx);
+            self.schedule_search(cx);
         }
     }
 
-    /// 查询变化后重新执行搜索并跳到首个命中。
-    fn refresh_search(&mut self, cx: &mut Context<Self>) {
+    /// 查询变化后的 150ms 防抖搜索（先例 schedule_scroll_report）：合并
+    /// 快速连击，洪峰期只跑最后一次。挂起期间按 Enter 会同步提交（见
+    /// on_key_down 的 Enter 双分支），届时本任务醒来发现无挂起直接丢弃。
+    fn schedule_search(&mut self, cx: &mut Context<Self>) {
+        if self
+            .search
+            .as_ref()
+            .is_some_and(|search| search.search_pending)
+        {
+            return;
+        }
         if let Some(search) = &mut self.search {
+            search.search_pending = true;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(150))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                // 防抖期间搜索已关闭、或已被 Enter 同步提交：直接丢弃
+                if this
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| search.search_pending)
+                {
+                    this.run_pending_search(cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// 执行挂起的搜索（防抖任务与 Enter 提交共用）。
+    ///
+    /// 完整 refresh 语义：更新 matches、current=0、滚到首命中；非法正则
+    /// 只写 regex_error（红字内联报错），上次有效结果保留不动不滚动。
+    fn run_pending_search(&mut self, cx: &mut Context<Self>) {
+        if let Some(search) = &mut self.search {
+            search.search_pending = false;
             let query = search.query.clone();
-            let case = search.case_sensitive;
-            let matches = self.state.search_with(&query, case);
-            search.matches = matches;
-            search.current = 0;
-            self.scroll_to_current_match();
+            let options = crate::terminal::SearchOptions {
+                case_sensitive: search.case_sensitive,
+                regex: search.regex,
+                whole_word: search.whole_word,
+            };
+            match self.state.search_with_options(&query, options) {
+                Ok(matches) => {
+                    search.matches = matches;
+                    search.current = 0;
+                    search.regex_error = None;
+                    self.scroll_to_current_match();
+                }
+                Err(message) => {
+                    // 非法正则：内联报错，matches/current 不动
+                    search.regex_error = Some(message);
+                }
+            }
         }
         cx.notify();
+    }
+
+    /// 立即按当前查询与选项执行搜索（Alt+C/R/W 开关切换路径，唯一绕过
+    /// 防抖的入口）：清掉挂起标记后走 run_pending_search 完整语义。
+    fn refresh_search(&mut self, cx: &mut Context<Self>) {
+        if let Some(search) = &mut self.search {
+            search.search_pending = false;
+        }
+        self.run_pending_search(cx);
+    }
+
+    /// Alt+R / .* 钮：切换正则模式；开启瞬间关闭全字（互斥语义：
+    /// 正则用户自行写 \b），并清掉上一次的非法正则报错。
+    fn toggle_search_regex(&mut self, cx: &mut Context<Self>) {
+        if let Some(search) = &mut self.search {
+            search.regex = !search.regex;
+            if search.regex {
+                search.whole_word = false;
+            }
+            search.regex_error = None;
+        }
+        self.refresh_search(cx);
+    }
+
+    /// Alt+C / Aa 钮：切换大小写敏感。
+    fn toggle_search_case(&mut self, cx: &mut Context<Self>) {
+        if let Some(search) = &mut self.search {
+            search.case_sensitive = !search.case_sensitive;
+        }
+        self.refresh_search(cx);
+    }
+
+    /// Alt+W / W 钮：切换全字匹配。正则开启时整段无效（键臂卫 + 按钮置灰
+    /// 同一语义），不做任何动作也不触发搜索。
+    fn toggle_search_whole_word(&mut self, cx: &mut Context<Self>) {
+        if self.search.as_ref().is_some_and(|search| search.regex) {
+            return;
+        }
+        if let Some(search) = &mut self.search {
+            search.whole_word = !search.whole_word;
+        }
+        self.refresh_search(cx);
     }
 
     /// 跳到下一个命中（回环）。
@@ -2220,12 +2413,12 @@ impl Render for TerminalView {
         // URL 悬停快照（canvas 闭包绘制下划线用）
         let url_hover = self.url_hover.clone();
         let search_bar = self.search.as_ref().map(|search| {
-            let counter = if search.query.is_empty() {
-                "0/0".to_string()
-            } else if search.matches.is_empty() {
-                "无命中".to_string()
+            let counter_text = search_counter_text(search);
+            // 非法正则时计数槽位换红字报错（0xF7768E = 主题 red）
+            let counter_color = if search.regex_error.is_some() {
+                rgb(0xF7768E)
             } else {
-                format!("{}/{}", search.current + 1, search.matches.len())
+                rgb(0xE0AF68)
             };
             div()
                 .absolute()
@@ -2242,20 +2435,45 @@ impl Render for TerminalView {
                 .text_color(rgb(0xC0CAF5))
                 .child(div().text_color(rgb(0x7DCFFF)).child("搜索"))
                 .child(div().child(format!("{}▏", search.query)))
+                // Aa / .* / W 三开关钮 + ▲▼ 跳转钮（24px 方钮，见
+                // search_bar_button：点击 stop_propagation 不建选区）
+                .child(search_bar_button(
+                    cx,
+                    "Aa",
+                    search.case_sensitive,
+                    false,
+                    |this, cx| this.toggle_search_case(cx),
+                ))
+                .child(search_bar_button(
+                    cx,
+                    ".*",
+                    search.regex,
+                    false,
+                    |this, cx| this.toggle_search_regex(cx),
+                ))
+                .child(search_bar_button(
+                    cx,
+                    "W",
+                    search.whole_word,
+                    search.regex, // 正则开启时全字置灰（互斥语义）
+                    |this, cx| this.toggle_search_whole_word(cx),
+                ))
+                .child(search_bar_button(cx, "▲", false, false, |this, cx| {
+                    this.search_select_prev(cx)
+                }))
+                .child(search_bar_button(cx, "▼", false, false, |this, cx| {
+                    this.search_select_next(cx)
+                }))
                 .child(
                     div()
-                        .text_color(if search.case_sensitive {
-                            rgb(0xE0AF68)
-                        } else {
-                            rgb(0x565A78)
-                        })
-                        .child("Aa"),
+                        .ml_auto()
+                        .text_color(counter_color)
+                        .child(counter_text),
                 )
-                .child(div().ml_auto().text_color(rgb(0xE0AF68)).child(counter))
                 .child(
                     div()
                         .text_color(rgb(0x565A78))
-                        .child("Enter↓ Shift+Enter↑ Alt+C 大小写 Esc 关闭"),
+                        .child("Enter↓ Shift+Enter↑ Alt+C 大小写 Alt+R 正则 Alt+W 全字 Esc 关闭"),
                 )
         });
 
@@ -2658,6 +2876,23 @@ mod tests {
             Ok(())
         }
         fn kill(&self) {}
+    }
+
+    /// 搜索态按键直驱（与 on_right_click 直调先例同口径）。
+    fn press_key(
+        terminal: &mut TerminalView,
+        key: &str,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<TerminalView>,
+    ) {
+        terminal.on_key_down(
+            &gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse(key).unwrap(),
+                is_held: false,
+            },
+            window,
+            cx,
+        );
     }
 
     #[test]
@@ -3478,6 +3713,212 @@ mod tests {
                 cx,
             );
             assert!(terminal.search.is_some(), "精确 Ctrl+Shift+F 必须打开搜索");
+        });
+    }
+
+    /// 计数三分支 + 非法正则红字替代（纯函数，无需 GPUI 上下文）。
+    #[test]
+    fn search_counter_text_branches() {
+        use super::SearchState;
+
+        let base = SearchState {
+            query: String::new(),
+            matches: Vec::new(),
+            current: 0,
+            case_sensitive: false,
+            regex: false,
+            whole_word: false,
+            regex_error: None,
+            search_pending: false,
+        };
+        // 分支一：空查询
+        assert_eq!(super::search_counter_text(&base), "0/0");
+        // 分支二：有查询但无命中
+        let mut no_match = base.clone();
+        no_match.query = "zzz".into();
+        assert_eq!(super::search_counter_text(&no_match), "无命中");
+        // 分支三：n/m（current 循环移动后计数跟随）
+        let mut hits = base.clone();
+        hits.query = "ab".into();
+        hits.matches = vec![
+            crate::terminal::SearchMatch {
+                line: 0,
+                column: 0,
+                len: 2
+            };
+            3
+        ];
+        hits.current = 2;
+        assert_eq!(super::search_counter_text(&hits), "3/3");
+        // 非法正则：红字「正则无效：<msg>」替代计数槽位
+        let mut invalid = hits;
+        invalid.regex_error = Some("(unclosed".into());
+        assert_eq!(super::search_counter_text(&invalid), "正则无效：(unclosed");
+    }
+
+    #[gpui::test]
+    fn search_alt_r_w_toggles_are_mutually_exclusive(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler;
+
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.state.process_bytes(b"xab ab\n");
+            terminal.open_search(cx);
+            terminal.replace_text_in_range(None, "ab", window, cx);
+            assert!(
+                terminal.search.as_ref().unwrap().search_pending,
+                "输入后挂起 150ms 防抖"
+            );
+            // Alt+R 开正则：开关切换即时刷新（唯一绕过防抖路径）
+            press_key(terminal, "alt-r", window, cx);
+            {
+                let search = terminal.search.as_ref().unwrap();
+                assert!(search.regex, "Alt+R 开启正则");
+                assert!(!search.search_pending, "开关切换即时刷新，无挂起");
+                assert_eq!(search.matches.len(), 2, "正则搜索立即生效（xab/ab 各一处）");
+            }
+            // 互斥：正则开启时 Alt+W 无效（W 钮置灰同语义）
+            press_key(terminal, "alt-w", window, cx);
+            assert!(
+                !terminal.search.as_ref().unwrap().whole_word,
+                "正则开启时 Alt+W 无效"
+            );
+            // 关正则后 Alt+W 生效；全字口径下 xab 的 ab 被排除
+            press_key(terminal, "alt-r", window, cx);
+            assert!(!terminal.search.as_ref().unwrap().regex);
+            press_key(terminal, "alt-w", window, cx);
+            let search = terminal.search.as_ref().unwrap();
+            assert!(search.whole_word, "正则关闭后 Alt+W 生效");
+            assert_eq!(search.matches.len(), 1, "全字排除 xab 中的 ab");
+        });
+    }
+
+    #[gpui::test]
+    fn search_invalid_regex_keeps_previous_matches(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler;
+
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.state.process_bytes(b"ab ab\n");
+            terminal.open_search(cx);
+            terminal.replace_text_in_range(None, "ab", window, cx);
+            press_key(terminal, "alt-r", window, cx);
+            assert!(terminal.search.as_ref().unwrap().regex_error.is_none());
+
+            // 追加 "(" 使正则非法（查询 "ab("），Enter 在防抖窗口内同步提交
+            terminal.replace_text_in_range(None, "(", window, cx);
+            assert!(terminal.search.as_ref().unwrap().search_pending);
+            press_key(terminal, "enter", window, cx);
+            {
+                let search = terminal.search.as_ref().unwrap();
+                assert!(search.regex_error.is_some(), "非法正则内联报错");
+                assert_eq!(search.matches.len(), 2, "保留上次有效结果");
+                assert!(!search.search_pending, "Enter 已消费挂起");
+                assert_eq!(
+                    super::search_counter_text(search),
+                    format!("正则无效：{}", search.regex_error.as_ref().unwrap()),
+                    "计数槽位换红字错误文案"
+                );
+            }
+
+            // 修正查询（退格弹出括号）后 Enter 再次提交：报错清除
+            terminal.search_backspace(cx);
+            press_key(terminal, "enter", window, cx);
+            let search = terminal.search.as_ref().unwrap();
+            assert!(search.regex_error.is_none(), "合法正则刷新后清除报错");
+            assert_eq!(search.matches.len(), 2);
+        });
+    }
+
+    #[gpui::test]
+    fn search_bar_button_actions_never_create_selection(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler;
+
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.state.process_bytes(b"ab ab\n");
+            terminal.open_search(cx);
+            terminal.replace_text_in_range(None, "ab", window, cx);
+            // 按钮动作链直驱（on_right_click 直调先例同口径）；真正的
+            // stop_propagation 挂在 search_bar_button 的 on_mouse_down 注册里，
+            // 处理器本体只改搜索态，绝不触碰 selection / PTY。
+            terminal.toggle_search_case(cx); // Aa
+            terminal.toggle_search_regex(cx); // .*
+            terminal.toggle_search_whole_word(cx); // W（正则开启 → 无动作）
+            terminal.toggle_search_regex(cx); // .* 关
+            terminal.toggle_search_whole_word(cx); // W 开
+            terminal.search_select_prev(cx); // ▲
+            terminal.search_select_next(cx); // ▼
+            assert!(!terminal.has_selection(), "搜索栏按钮点击不建选区");
+            let search = terminal.search.as_ref().unwrap();
+            assert!(search.case_sensitive, "Aa 动作生效");
+            assert!(search.whole_word, "W 动作生效（正则已关）");
+            assert!(!search.regex, ".* 开关往返复原");
+        });
+    }
+
+    #[gpui::test]
+    fn search_enter_flushes_pending_and_jumps_without_pending(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler;
+
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.state.process_bytes(b"ab ab ab\n");
+            terminal.open_search(cx);
+            terminal.replace_text_in_range(None, "ab", window, cx);
+            assert!(terminal.search.as_ref().unwrap().search_pending);
+        });
+        // 防抖到期：假时钟推进 150ms 后挂起任务执行（先例 scroll 防抖测试）
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(150));
+        cx.run_until_parked();
+        terminal.update_in(cx, |terminal, window, cx| {
+            let search = terminal.search.as_ref().unwrap();
+            assert!(!search.search_pending, "防抖到期已执行");
+            assert_eq!(search.matches.len(), 3);
+            assert_eq!(search.current, 0, "防抖刷新落首命中");
+            // 分支一（无挂起）：Enter 维持历史行为——在既有 matches 上循环跳转
+            press_key(terminal, "enter", window, cx);
+            assert_eq!(
+                terminal.search.as_ref().unwrap().current,
+                1,
+                "无挂起 Enter=跳下一命中"
+            );
+            press_key(terminal, "enter", window, cx);
+            assert_eq!(terminal.search.as_ref().unwrap().current, 2);
+            assert_eq!(
+                terminal.search.as_ref().unwrap().matches.len(),
+                3,
+                "跳转不重算 matches"
+            );
+
+            // 分支二（有挂起）：改查询后 150ms 内按 Enter → 同步提交挂起搜索
+            // （查询 "aba" 无命中：flush 后 matches 清空、落首命中、消费按键）
+            terminal.replace_text_in_range(None, "a", window, cx);
+            assert!(terminal.search.as_ref().unwrap().search_pending);
+            press_key(terminal, "enter", window, cx);
+            let search = terminal.search.as_ref().unwrap();
+            assert!(!search.search_pending, "Enter 同步消费挂起");
+            assert_eq!(search.query, "aba");
+            assert!(search.matches.is_empty(), "flush 按新查询重算");
+            assert_eq!(search.current, 0, "flush 落首命中");
+        });
+        // Enter 消费挂起后，原防抖任务醒来必须直接丢弃（不复活旧结果）
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(150));
+        cx.run_until_parked();
+        terminal.update(cx, |terminal, _| {
+            let search = terminal.search.as_ref().unwrap();
+            assert!(!search.search_pending);
+            assert!(search.matches.is_empty(), "迟到的防抖任务不得复活旧结果");
         });
     }
 

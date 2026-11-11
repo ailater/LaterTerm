@@ -580,7 +580,8 @@ struct SftpPromptDialog {
 }
 
 /// 内置快捷键（不可改，但参与全局冲突检测）。
-const BUILTIN_SHORTCUTS: &[(&str, &str)] = &[
+/// pub(crate) 供 workspace_tests.rs 校验注册表内容与冲突链路。
+pub(crate) const BUILTIN_SHORTCUTS: &[(&str, &str)] = &[
     ("ctrl+t", "新建标签"),
     ("ctrl+w", "关闭窗格 / 标签"),
     ("ctrl+j", "左右分屏"),
@@ -593,6 +594,13 @@ const BUILTIN_SHORTCUTS: &[(&str, &str)] = &[
     ("ctrl+shift+]", "下一个窗格"),
     ("ctrl+shift+f", "回滚搜索"),
     ("ctrl+shift+b", "广播输入"),
+    // 搜索模态内三开关（模态内硬编码生效，此处补注册）：进 all_shortcut_bindings
+    // 后设置页「内置」组展示，并参与冲突检测——工作区 capture 分发先于搜索
+    // 拦截，用户把命令/服务器/动态码绑到这三键会使搜索内开关失灵，
+    // 注册表标红正是「不可改但参与冲突检测」的预警用途。
+    ("alt+c", "搜索：大小写"),
+    ("alt+r", "搜索：正则"),
+    ("alt+w", "搜索：全字"),
     // 两条粘贴键同 label（设置页行展示用）：用户绑命令到这两键时，
     // 冲突链路（all_shortcut_bindings → shortcut_conflict_with → 录制器）
     // 命中 BindingOwner::Builtin，提示「快捷键与内置快捷键冲突」。

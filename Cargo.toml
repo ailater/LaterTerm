@@ -40,6 +40,9 @@ serde_json = "1"
 # 不启 json/gzip：解析走 serde_json 纯函数；不启用时 ureq 不发 Accept-Encoding，
 # GitHub 返回 identity，无需解压。
 ureq = { version = "3", default-features = false, features = ["rustls"] }
+# 回滚搜索正则模式：lock 已含 regex 1.13.1（bindgen/env_filter/gpui_util 等
+# 反向依赖引入），直接依赖零新增 crate。正则不自造轮子（同 VT 仿真口径）。
+regex = "1"
 laterterm-core = { path = "crates/laterterm-core" }
 laterterm-local = { path = "crates/laterterm-local" }
 laterterm-secrets = { path = "crates/laterterm-secrets" }

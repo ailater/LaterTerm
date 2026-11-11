@@ -3839,6 +3839,7 @@ dependencies = [
  "gpui",
  "laterterm-core",
  "parking_lot",
+ "regex",
  "ropey",
 ]
 
