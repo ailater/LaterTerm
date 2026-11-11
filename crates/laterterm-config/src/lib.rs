@@ -179,6 +179,12 @@ pub struct Appearance {
     #[serde(default = "default_true")]
     pub copy_toast: bool,
 
+    /// 关闭运行中终端确认：关闭窗格/标签/窗口时若探测到会话内仍有前台或
+    /// 子进程在运行（如 sleep/vim/后台 job），先弹确认弹窗再执行关闭。
+    /// 默认开启；旧配置缺字段自动为 true。
+    #[serde(default = "default_true")]
+    pub confirm_close_running: bool,
+
     /// 终端 bell 时发送系统桌面通知。默认关闭（bell 走视觉提示，测试环境也不外发）。
     #[serde(default)]
     pub bell_notification: bool,
@@ -213,6 +219,7 @@ impl Default for Appearance {
             copy_on_select: true,
             confirm_multiline_paste: true,
             copy_toast: true,
+            confirm_close_running: true,
             bell_notification: false,
             right_panel_pinned: true,
             font_fallbacks: Vec::new(),
@@ -821,6 +828,22 @@ shortcut = "  legacy shortcut  "
         let loaded = Settings::load(&path).unwrap();
         assert!(!loaded.appearance.confirm_multiline_paste);
         assert!(!loaded.appearance.copy_toast);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn confirm_close_running_defaults_true_and_false_roundtrip() {
+        // 旧 settings.toml 缺 confirm_close_running 字段 → serde 补默认 true（开启确认）
+        let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert!(legacy.appearance.confirm_close_running);
+
+        // 显式关闭后 roundtrip 保持 false（不会被默认值覆盖）
+        let path = temp_settings_path("confirm-close-running");
+        let mut settings = Settings::default();
+        settings.appearance.confirm_close_running = false;
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert!(!loaded.appearance.confirm_close_running);
         std::fs::remove_file(&path).unwrap();
     }
 

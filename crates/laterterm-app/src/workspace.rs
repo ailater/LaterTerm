@@ -23,7 +23,7 @@ use laterterm_config::{
     deepin_commands_default_path, deepin_default_path, generate_code, load_deepin_commands,
     load_deepin_servers, load_xshell_sessions, normalize_shortcut, parse_secret_input,
 };
-use laterterm_core::TerminalSession;
+use laterterm_core::{ProcessSnapshot, TerminalSession};
 use laterterm_local::{LocalOptions, LocalSession};
 use laterterm_secrets::{SecretStore, default_store, totp_account};
 use laterterm_termview::view::ScrollSummary;
@@ -467,6 +467,15 @@ impl SessionControl {
         }
         self.session.kill();
         true
+    }
+
+    /// 关闭确认探测透传：快照槽由请求方（一次关闭请求）持有并跨窗格共享，
+    /// 会话实现（Linux 本地）据此把 /proc 全表扫描收敛到每请求至多一次。
+    fn probe_running(
+        &self,
+        snapshot: &mut Option<ProcessSnapshot>,
+    ) -> Option<laterterm_core::RunningProcess> {
+        self.session.probe_running(snapshot)
     }
 }
 
@@ -916,6 +925,40 @@ struct PasteConfirmState {
     pane: PaneId,
 }
 
+/// 关闭二次确认的作用域：确认后按 scope 分派回既有关闭路径
+/// （close_pane / close_tab / close_other_tabs / shutdown+quit），
+/// 弹窗本身不实现任何关闭逻辑。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CloseScope {
+    /// 单窗格（窗格角标 ×、Ctrl+W、右键「关闭窗格」）。
+    Pane(PaneId),
+    /// 整标签（标签栏 ×、侧栏悬停 ×、右键「关闭标签」）。
+    Tab(TabId),
+    /// 关闭其他标签（标签右键「关闭其他标签」）。
+    OtherTabs(TabId),
+    /// 整窗口（自绘 ×、原生窗口关闭）。
+    Window,
+}
+
+/// 关闭确认弹窗的一条「运行中」条目（弹窗列表如实显示探测到的进程名）。
+#[derive(Clone, Debug)]
+struct CloseConfirmEntry {
+    /// 目标窗格所在标签的标题（WorkspaceTab::tab_title，custom_title 优先）。
+    tab_title: String,
+    /// 探测到的进程名（判据 a 读前台组长 comm、b1 显示当前 comm、b2 显示
+    /// 子树内进程 comm；读不到时为「未知进程」占位）。
+    process: String,
+}
+
+/// 关闭运行中终端的二次确认弹窗状态（None = 关闭）。批量关闭聚合为一个
+/// 确认；弹窗期间目标自然退出的迟到条目由 close_* 的 find-else-return
+/// 防御兜住（列表可能陈旧，不做实时刷新）。
+#[derive(Clone, Debug)]
+struct CloseConfirmState {
+    scope: CloseScope,
+    entries: Vec<CloseConfirmEntry>,
+}
+
 /// 复制提示 toast 状态（窗口右下角「已复制 N 字符」）。
 struct CopyToastState {
     /// 已复制字符数（文案显示用）。
@@ -1144,6 +1187,8 @@ pub struct WorkspaceView {
     sftp_prompt_subscriptions: Vec<gpui::Subscription>,
     /// 多行粘贴确认弹窗（None = 关闭）。text 为弹窗打开时的剪贴板快照。
     paste_confirm: Option<PasteConfirmState>,
+    /// 关闭运行中终端的二次确认弹窗（None = 关闭）。
+    close_confirm: Option<CloseConfirmState>,
     /// 复制提示 toast（None = 隐藏；窗口右下角浮层）。
     copy_toast: Option<CopyToastState>,
     /// toast 代数计数器（连续复制续期用，见 CopyToastState.generation）。
@@ -1287,6 +1332,7 @@ impl WorkspaceView {
             sftp_prompt_fields: Vec::new(),
             sftp_prompt_subscriptions: Vec::new(),
             paste_confirm: None,
+            close_confirm: None,
             copy_toast: None,
             next_toast_generation: 0,
             pending_focus: None,
@@ -2274,6 +2320,149 @@ impl WorkspaceView {
         self.save_session_snapshot();
     }
 
+    // ------------------------------------------------------------------
+    // 关闭二次确认（request 门卫 + 聚合弹窗）
+    // ------------------------------------------------------------------
+
+    /// 收集 scope 内「运行中」窗格的探测结果（空 = 无需确认）。
+    /// 仅 status==Running 参与：Exited/Closing 由 TerminalExited 自然回收，
+    /// 绝不因关闭动作弹窗。探测异常/不可判定（None）一律放行——关闭优先
+    /// 于误拦截。快照槽跨窗格共享：一次关闭请求至多一遍 /proc 全表扫描。
+    fn collect_running_entries(
+        &self,
+        scope: CloseScope,
+        snapshot: &mut Option<ProcessSnapshot>,
+    ) -> Vec<CloseConfirmEntry> {
+        let pane_ids: Vec<PaneId> = match scope {
+            CloseScope::Pane(id) => vec![id],
+            CloseScope::Tab(id) => {
+                let mut leaves = Vec::new();
+                if let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) {
+                    tab.layout.leaves(&mut leaves);
+                }
+                leaves
+            }
+            CloseScope::OtherTabs(id) => {
+                let mut leaves = Vec::new();
+                for tab in &self.tabs {
+                    if tab.id != id {
+                        tab.layout.leaves(&mut leaves);
+                    }
+                }
+                leaves
+            }
+            CloseScope::Window => self.panes.iter().map(|pane| pane.id).collect(),
+        };
+        let mut entries = Vec::new();
+        for pane_id in pane_ids {
+            let Some(pane) = self.pane(pane_id) else {
+                continue;
+            };
+            if !matches!(pane.status, TabStatus::Running) {
+                continue;
+            }
+            let Some(process) = pane.session.probe_running(snapshot) else {
+                continue;
+            };
+            let tab_title = self
+                .tabs
+                .iter()
+                .find(|tab| tab.layout.contains(pane_id))
+                .map(|tab| tab.tab_title(&self.panes))
+                .unwrap_or_else(|| pane.title.clone());
+            entries.push(CloseConfirmEntry {
+                tab_title,
+                process: process.name,
+            });
+        }
+        entries
+    }
+
+    /// 关闭门卫本体：开关开启且 scope 内探测到运行中进程时弹聚合确认
+    /// （返回 true = 已挂起，调用方不得继续关闭）；否则返回 false 放行。
+    /// 确认弹窗已开时早退 true——按钮在遮罩下不可达，此为键盘路径防御。
+    fn guard_close(&mut self, scope: CloseScope, cx: &mut Context<Self>) -> bool {
+        if self.close_confirm.is_some() {
+            return true;
+        }
+        if !self.settings.appearance.confirm_close_running {
+            return false;
+        }
+        let mut snapshot = None;
+        let entries = self.collect_running_entries(scope, &mut snapshot);
+        if entries.is_empty() {
+            return false;
+        }
+        self.close_confirm = Some(CloseConfirmState { scope, entries });
+        cx.notify();
+        true
+    }
+
+    /// 关闭窗格请求（窗格角标 × / Ctrl+W / 右键「关闭窗格」）：
+    /// 无运行中直呼 close_pane，有则弹确认，确认后走既有 Closing 回收。
+    fn request_close_pane(&mut self, id: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.guard_close(CloseScope::Pane(id), cx) {
+            return;
+        }
+        self.close_pane(id, window, cx);
+    }
+
+    /// 关闭标签请求（标签栏 × / 侧栏悬停 × / 右键「关闭标签」）。
+    fn request_close_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.guard_close(CloseScope::Tab(id), cx) {
+            return;
+        }
+        self.close_tab(id, window, cx);
+    }
+
+    /// 关闭其他标签请求（标签右键「关闭其他标签」）。
+    fn request_close_other_tabs(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.guard_close(CloseScope::OtherTabs(id), cx) {
+            return;
+        }
+        self.close_other_tabs(id, window, cx);
+    }
+
+    /// 关闭窗口请求（原生窗口关闭 / 自绘 ×）。
+    /// 返回 true = 无需确认或已放行（调用方继续 quit / 放行窗口销毁）；
+    /// false = 已弹确认挂起，窗口保持打开，确认回调里 shutdown+quit。
+    /// 与 close_pane 等 UI 触发点不同：这里直接执行 shutdown——原生
+    /// should_close 回调必须同步返回 bool，确认后 quit() 不重入
+    /// （platform.quit 仅 signal.stop()）。
+    pub(crate) fn request_window_close(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.guard_close(CloseScope::Window, cx) {
+            return false;
+        }
+        self.shutdown();
+        true
+    }
+
+    /// 确认关闭：按 scope 分派回既有关闭路径（弹窗不做任何关闭逻辑）。
+    /// 弹窗期间目标自然退出无害：close_* 对已消失 pane/tab 是 no-op
+    /// （find-else-return 防御），列表陈旧可接受。
+    fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(state) = self.close_confirm.take() else {
+            return;
+        };
+        match state.scope {
+            CloseScope::Pane(id) => self.close_pane(id, window, cx),
+            CloseScope::Tab(id) => self.close_tab(id, window, cx),
+            CloseScope::OtherTabs(id) => self.close_other_tabs(id, window, cx),
+            CloseScope::Window => {
+                self.shutdown();
+                cx.quit();
+            }
+        }
+        cx.notify();
+    }
+
+    /// 取消关闭：仅清状态不关任何会话（Esc / 遮罩 / 取消按钮共用）。
+    fn cancel_close(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.close_confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
     /// 开始标签拖拽：记录被拖标签与按下起点（阈值判断在 update 侧）。
     /// 不 notify——阈值未过前无视觉变化。
     fn start_tab_drag(&mut self, tab_id: TabId, origin: Point<Pixels>) {
@@ -2460,6 +2649,7 @@ impl WorkspaceView {
         // 粘贴模态与其它模态互斥：任一打开即静默放弃（模态期间用户注意力
         // 在弹窗，无反馈属可接受简化）。粘贴确认弹窗自身打开时同样忽略。
         if self.paste_confirm.is_some()
+            || self.close_confirm.is_some()
             || self.command_dialog.is_some()
             || self.totp_dialog.is_some()
             || self.server_dialog.is_some()
@@ -2705,7 +2895,7 @@ impl WorkspaceView {
                 "关闭窗格",
                 true,
                 Box::new(move |this, window, cx| {
-                    this.close_pane(menu_pane, window, cx);
+                    this.request_close_pane(menu_pane, window, cx);
                 }),
             ));
         }
@@ -2724,7 +2914,7 @@ impl WorkspaceView {
             Box::new(move |this, window, cx| {
                 if let Some(tab) = this.tabs.iter().find(|tab| tab.layout.contains(menu_pane)) {
                     let tab_id = tab.id;
-                    this.close_tab(tab_id, window, cx);
+                    this.request_close_tab(tab_id, window, cx);
                 }
             }),
         ));
@@ -2920,7 +3110,7 @@ impl WorkspaceView {
                         "关闭标签",
                         true,
                         Box::new(move |this, window, cx| {
-                            this.close_tab(tab_id, window, cx);
+                            this.request_close_tab(tab_id, window, cx);
                         }),
                     ))
                     .child(item(
@@ -2929,7 +3119,7 @@ impl WorkspaceView {
                         "关闭其他标签",
                         has_others,
                         Box::new(move |this, window, cx| {
-                            this.close_other_tabs(tab_id, window, cx);
+                            this.request_close_other_tabs(tab_id, window, cx);
                         }),
                     )),
             ),
@@ -5724,8 +5914,11 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        self.shutdown();
-        cx.quit();
+        // 先过关闭确认门卫：有运行中终端时挂起弹窗（确认回调里 shutdown+quit）；
+        // 无需确认时 request_window_close 已完成 shutdown，这里补 quit 退出。
+        if self.request_window_close(cx) {
+            cx.quit();
+        }
     }
 
     /// 自绘与原生关闭入口共用；重复调用不会重复终止会话。
@@ -6145,6 +6338,20 @@ impl WorkspaceView {
             }
             return;
         }
+        // 关闭运行中终端确认弹窗：Esc 取消 / Enter 确认关闭；其余按键吞掉
+        //（模态语义，与粘贴确认同款）。吞键 + 全窗遮罩保证与其它模态互斥；
+        // 与粘贴确认本身也互斥（begin_paste 互斥列表 + request 入口早退）。
+        if self.close_confirm.is_some() {
+            let plain_enter = matches!(event.keystroke.key.as_str(), "enter" | "return")
+                && event.keystroke.modifiers == gpui::Modifiers::default();
+            if plain_escape {
+                self.cancel_close(window, cx);
+            } else if plain_enter {
+                self.confirm_close(window, cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         // 粘贴确认弹窗：Esc 取消 / Enter 确认写入；其余按键吞掉（模态语义）。
         // 位于模态弹窗分支之后、sftp 面板之前——粘贴模态与其它模态互斥不并开，
         // 但比 sftp 面板（非模态浮层）后开先关：同屏时 Esc 先关本弹窗。
@@ -6342,7 +6549,7 @@ impl WorkspaceView {
             cx.stop_propagation();
         } else if keystroke_matches_shortcut(event, "ctrl+w") {
             let id = self.focused_pane_id();
-            self.close_pane(id, window, cx);
+            self.request_close_pane(id, window, cx);
             cx.stop_propagation();
         }
     }
@@ -6615,7 +6822,7 @@ impl Render for WorkspaceView {
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(move |this, _, window, cx| {
-                                                        this.close_tab(id, window, cx)
+                                                        this.request_close_tab(id, window, cx)
                                                     }),
                                                 )
                                                 .child("×"),
@@ -7198,7 +7405,7 @@ fn render_layout(
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _event, window, cx| {
-                                this.close_pane(close_id, window, cx)
+                                this.request_close_pane(close_id, window, cx)
                             }),
                         )
                         .child("×"),
@@ -7478,7 +7685,7 @@ fn left_sidebar(
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _, window, cx| {
-                                        this.close_tab(id, window, cx)
+                                        this.request_close_tab(id, window, cx)
                                     }),
                                 )
                                 .child("×"),
@@ -7756,6 +7963,50 @@ fn render_active_dialog(
     ui: UiColors,
     cx: &mut Context<WorkspaceView>,
 ) -> Option<gpui::Div> {
+    // 关闭运行中终端确认（最前位）：批量关闭聚合为一个确认，条目列表
+    // 如实显示探测到的进程名（含 b1 命中场景显示当前 comm）；
+    // Window/OtherTabs 场景额外给出将关闭的运行中终端计数。
+    if let Some(state) = workspace.close_confirm.clone() {
+        let batch = matches!(state.scope, CloseScope::Window | CloseScope::OtherTabs(_));
+        let intro = if batch {
+            format!("将关闭 {} 个运行中的终端：", state.entries.len())
+        } else {
+            "以下终端仍在运行：".into()
+        };
+        let body = div()
+            .p_4()
+            .child(intro)
+            .child(
+                div()
+                    .mt_2()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(state.entries.iter().map(|entry| {
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(ui.text_secondary))
+                            .child(format!("{} · {}", entry.tab_title, entry.process))
+                    })),
+            )
+            .child(dialog_footer(vec![
+                setting_button(
+                    "关闭",
+                    true,
+                    cx.listener(|this, _, window, cx| this.confirm_close(window, cx)),
+                ),
+                setting_button(
+                    "取消",
+                    false,
+                    dismiss_listener(cx, WorkspaceView::cancel_close),
+                ),
+            ]));
+        return Some(modal_dialog(
+            "确认关闭",
+            body,
+            dismiss_listener(cx, WorkspaceView::cancel_close),
+        ));
+    }
     // 标签重命名弹窗：双击标签/右键菜单「重命名」触发，与其它弹窗同骨架。
     // Enter 保存走 FieldSubmit 订阅，Esc 取消走 on_key_down 分支。
     if let Some((_, field)) = workspace.tab_rename_field.clone() {
@@ -9392,6 +9643,15 @@ impl TerminalSession for TransferWrappedSession {
 
     fn kill(&self) {
         self.inner.kill();
+    }
+
+    /// 关闭确认探测透传：包装层不参与判定，inner（本地 PTY）的三级判据
+    /// 原样生效；快照槽由请求方持有，跨窗格共享不受包装影响。
+    fn probe_running(
+        &self,
+        snapshot: &mut Option<laterterm_core::ProcessSnapshot>,
+    ) -> Option<laterterm_core::RunningProcess> {
+        self.inner.probe_running(snapshot)
     }
 }
 
@@ -12850,6 +13110,275 @@ mod pane_zoom_tests {
             assert!(
                 view.pane(view.focused_pane_id()).is_some(),
                 "活动焦点必须解析到存活窗格（否则终端区整屏空白）"
+            );
+        });
+        close_sessions(&workspace, cx);
+    }
+}
+
+/// 关闭运行中终端的二次确认：request 门卫 + 聚合弹窗 + 确认后走既有
+/// Closing 回收。FakeSession 注入 attach_pane（经 wrap_transfer 包装，
+/// 探测透传链路一并被测）。
+#[cfg(test)]
+mod close_confirm_tests {
+    use super::{CloseScope, LayoutNode, PaneId, TabId, TabStatus, WorkspaceTab, WorkspaceView};
+    use gpui::TestAppContext;
+    use laterterm_core::{
+        BackendKind, ProcessSnapshot, RunningProcess, SessionStreams, TerminalSession,
+    };
+    use std::io::{self, Read};
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// 可注入探测结果的假会话：reader 挂在永不喂食的管道上（不 EOF，窗格
+    /// 保持 Running）；kill 时 drop 发送端制造 EOF，让 TerminalExited 走真实
+    /// 回收路径（mark_exited → remove），而非绕过生命周期直接改状态。
+    struct FakeSession {
+        /// probe_running 的注入返回值（None = 探测不可用，应放行关闭）。
+        running: Option<String>,
+        killed: Arc<AtomicBool>,
+        feeder: Mutex<Option<std::sync::mpsc::Sender<u8>>>,
+        receiver: Mutex<Option<std::sync::mpsc::Receiver<u8>>>,
+    }
+
+    /// 阻塞 reader：recv 挂起（无数据即不 EOF）；发送端被 drop 后 recv
+    /// 出错返回 0（EOF 语义）。
+    struct BlockingReader(std::sync::mpsc::Receiver<u8>);
+    impl Read for BlockingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.recv() {
+                Ok(byte) => {
+                    buf[0] = byte;
+                    Ok(1)
+                }
+                Err(_) => Ok(0),
+            }
+        }
+    }
+
+    impl TerminalSession for FakeSession {
+        fn backend(&self) -> BackendKind {
+            BackendKind::Local
+        }
+
+        fn title(&self) -> String {
+            "fake".into()
+        }
+
+        fn take_streams(&self) -> io::Result<SessionStreams> {
+            let receiver = self.receiver.lock().unwrap().take().ok_or_else(|| {
+                io::Error::other("会话字节流已被取走（take_streams 只能调用一次）")
+            })?;
+            Ok(SessionStreams {
+                reader: Box::new(BlockingReader(receiver)),
+                writer: Box::new(std::io::sink()),
+            })
+        }
+
+        fn resize(&self, _: u16, _: u16) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) {
+            self.killed.store(true, Ordering::Release);
+            // drop 发送端 → 读泵 EOF → TerminalExited → Closing 窗格回收
+            self.feeder.lock().unwrap().take();
+        }
+
+        fn probe_running(&self, _snapshot: &mut Option<ProcessSnapshot>) -> Option<RunningProcess> {
+            self.running.clone().map(|name| RunningProcess { name })
+        }
+    }
+
+    /// 构造假会话，返回 (会话, kill 标志)。feeder 里的发送端由 kill 路径
+    /// drop，接收端在 take_streams 时交给读泵。
+    fn fake_session(running: Option<&str>) -> (Arc<FakeSession>, Arc<AtomicBool>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let killed = Arc::new(AtomicBool::new(false));
+        (
+            Arc::new(FakeSession {
+                running: running.map(str::to_string),
+                killed: Arc::clone(&killed),
+                feeder: Mutex::new(Some(sender)),
+                receiver: Mutex::new(Some(receiver)),
+            }),
+            killed,
+        )
+    }
+
+    /// 构造前注入默认 StartupSettings：直连构造会回退读真实
+    /// ~/.config/laterterm/settings.toml，本机残留令默认值断言机器态假红。
+    fn inject_default_startup_settings(cx: &mut TestAppContext) {
+        cx.set_global(crate::StartupSettings(laterterm_config::Settings::default()));
+    }
+
+    /// 会话泄漏会让测试进程收尾告警（同 pane_zoom_tests 口径）。
+    fn close_sessions(workspace: &gpui::Entity<WorkspaceView>, cx: &TestAppContext) {
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    /// 注入一个挂假会话的新标签，返回 (tab_id, pane_id, kill 标志)。
+    /// 标签栏 ×、侧栏悬停 ×、右键「关闭标签」共用 request_close_tab 门卫，
+    /// 这里直接从门卫入口驱动（UI 按钮只是同一调用的触发器）。
+    fn inject_running_tab(
+        view: &mut WorkspaceView,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<WorkspaceView>,
+        process: Option<&str>,
+    ) -> (TabId, PaneId, Arc<AtomicBool>) {
+        let (session, killed) = fake_session(process);
+        let pane_id = view.attach_pane("假终端".into(), session, window, cx);
+        let tab_id = TabId(view.next_tab_id);
+        view.next_tab_id += 1;
+        view.tabs.push(WorkspaceTab {
+            id: tab_id,
+            layout: LayoutNode::Leaf(pane_id),
+            focused_pane: pane_id,
+            zoomed: false,
+            custom_title: None,
+            color: None,
+        });
+        view.focus_pane(pane_id, window, cx);
+        (tab_id, pane_id, killed)
+    }
+
+    /// 轮询等待条件成立（TerminalExited 事件异步到达，固定 sleep 会 flaky）。
+    fn wait_for(
+        cx: &mut TestAppContext,
+        workspace: &gpui::Entity<WorkspaceView>,
+        ready: impl Fn(&WorkspaceView) -> bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            cx.run_until_parked();
+            if workspace.read_with(cx, |view, _| ready(view)) {
+                return;
+            }
+            assert!(Instant::now() < deadline, "等待工作区状态超时");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// ① 运行中标签从门卫关闭：弹窗打开、条目如实显示进程名、标签未被关
+    ///（不 kill），弹窗渲染为模态卡片。
+    #[gpui::test]
+    fn request_close_tab_with_running_process_opens_confirm(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let (tab_id, pane_id, killed) = workspace.update_in(cx, |view, window, cx| {
+            inject_running_tab(view, window, cx, Some("fakesleep"))
+        });
+        workspace.update_in(cx, |view, window, cx| {
+            view.request_close_tab(tab_id, window, cx);
+            let state = view.close_confirm.as_ref().expect("应弹关闭确认");
+            assert_eq!(state.scope, CloseScope::Tab(tab_id));
+            assert_eq!(state.entries.len(), 1, "只聚合该标签的运行中窗格");
+            assert_eq!(state.entries[0].process, "fakesleep");
+            assert_eq!(state.entries[0].tab_title, "假终端");
+            // 挂起语义：标签还在、窗格仍 Running、会话未被杀
+            assert!(view.tabs.iter().any(|tab| tab.id == tab_id));
+            assert_eq!(view.pane(pane_id).unwrap().status, TabStatus::Running);
+            assert!(!killed.load(Ordering::Acquire));
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("modal-card").is_some(),
+            "关闭确认弹窗应渲染为模态卡片"
+        );
+        workspace.update_in(cx, |view, window, cx| {
+            view.cancel_close(window, cx);
+            assert!(view.close_confirm.is_none(), "取消后弹窗关闭");
+        });
+        close_sessions(&workspace, cx);
+    }
+
+    /// ② 确认关闭：走既有 Closing 生命周期（SessionControl.close → kill →
+    /// TerminalExited → 窗格/标签回收），弹窗清空。
+    #[gpui::test]
+    fn confirm_close_runs_closing_lifecycle(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let (tab_id, pane_id, killed) = workspace.update_in(cx, |view, window, cx| {
+            inject_running_tab(view, window, cx, Some("fakesleep"))
+        });
+        workspace.update_in(cx, |view, window, cx| {
+            view.request_close_tab(tab_id, window, cx);
+            assert!(view.close_confirm.is_some(), "先弹确认");
+            view.confirm_close(window, cx);
+        });
+        // kill → EOF → TerminalExited → 回收（异步事件，轮询等待）
+        wait_for(cx, &workspace, |view| {
+            !view.tabs.iter().any(|tab| tab.id == tab_id) && view.pane(pane_id).is_none()
+        });
+        assert!(killed.load(Ordering::Acquire), "确认后必须 kill 会话");
+        workspace.read_with(cx, |view, _| {
+            assert!(view.close_confirm.is_none(), "确认后弹窗清空");
+        });
+        close_sessions(&workspace, cx);
+    }
+
+    /// ③ 开关关闭（confirm_close_running=false）：门卫直通既有 close_tab，
+    /// 不弹窗直接关闭。
+    #[gpui::test]
+    fn disabled_flag_closes_without_confirm(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let (tab_id, _, killed) = workspace.update_in(cx, |view, window, cx| {
+            inject_running_tab(view, window, cx, Some("fakesleep"))
+        });
+        workspace.update_in(cx, |view, window, cx| {
+            view.settings.appearance.confirm_close_running = false;
+            view.request_close_tab(tab_id, window, cx);
+            assert!(view.close_confirm.is_none(), "开关关闭不得弹窗");
+        });
+        wait_for(cx, &workspace, |view| {
+            !view.tabs.iter().any(|tab| tab.id == tab_id)
+        });
+        assert!(killed.load(Ordering::Acquire), "直通路径照常 kill");
+        close_sessions(&workspace, cx);
+    }
+
+    /// ④ request_window_close 两分支：有运行中 → false 挂起（scope Window，
+    /// 全部窗格参与聚合）；探测不可用（None）→ true 放行并 shutdown。
+    #[gpui::test]
+    fn request_window_close_returns_false_only_when_running(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let (_, _, killed) = workspace.update_in(cx, |view, window, cx| {
+            inject_running_tab(view, window, cx, Some("fakesleep"))
+        });
+        workspace.update_in(cx, |view, window, cx| {
+            // 分支一：运行中 → false（原生窗口关闭应挂起）
+            assert!(!view.request_window_close(cx));
+            let state = view.close_confirm.as_ref().expect("窗口关闭应弹确认");
+            assert_eq!(state.scope, CloseScope::Window);
+            view.cancel_close(window, cx);
+        });
+        // 分支二：探测不可用 → true 放行。把既有窗格直接标 Exited 模拟自然
+        // 退出（Exited 不参与聚合；不真移除——移除末标签会触发补位
+        // spawn_tab 造出新的 Running 真 shell，其启动竞态会让聚合不确定），
+        // 再注入 probe=None 的假会话钉 request 层「探测不可判定一律放行」。
+        workspace.update_in(cx, |view, window, cx| {
+            for pane in &mut view.panes {
+                pane.status = TabStatus::Exited;
+            }
+            let (session, killed_none) = fake_session(None);
+            let _ = view.attach_pane("假终端2".into(), session, window, cx);
+            assert!(view.request_window_close(cx), "探测不可用应放行");
+            assert!(view.close_confirm.is_none());
+            assert!(
+                killed.load(Ordering::Acquire),
+                "放行即 shutdown（关闭旧会话）"
+            );
+            assert!(
+                killed_none.load(Ordering::Acquire),
+                "shutdown 收掉全部窗格会话"
             );
         });
         close_sessions(&workspace, cx);
