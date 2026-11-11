@@ -1986,6 +1986,12 @@ impl WorkspaceView {
         if self.tabs[tab_index].layout.leaf_count() < 2 {
             return;
         }
+        // 进入放大时分屏线随合成单叶树消失，拖拽中的 split_drag 若不终止，
+        // update_split_drag 会继续把鼠标位置写进真实布局树（改动不可见），
+        // 结束拖拽时比例已悄然变化——进入放大即终止拖拽。
+        if !self.tabs[tab_index].zoomed {
+            self.split_drag = None;
+        }
         self.tabs[tab_index].zoomed = !self.tabs[tab_index].zoomed;
         cx.notify();
     }
@@ -2355,14 +2361,16 @@ impl WorkspaceView {
             self.active_tab = last.id;
             self.tab_scroll.scroll_to_item(self.tabs.len() - 1);
         }
-        // 焦点窗格失效时回退到活动标签的首个窗格
-        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == self.active_tab)
-            && !tab.layout.contains(tab.focused_pane)
-        {
-            let mut leaves = Vec::new();
-            tab.layout.leaves(&mut leaves);
-            if let Some(first) = leaves.first() {
-                tab.focused_pane = *first;
+        // 焦点窗格失效时回退到所在标签的首个叶——必须遍历所有标签：后台
+        // zoom 标签的焦点窗格退出后死引用若不校正，切回该标签时合成树取
+        // Leaf(死id) 渲染空 div，终端区整屏空白（聚焦窗格永远可见不变量）。
+        for tab in &mut self.tabs {
+            if !tab.layout.contains(tab.focused_pane) {
+                let mut leaves = Vec::new();
+                tab.layout.leaves(&mut leaves);
+                if let Some(first) = leaves.first() {
+                    tab.focused_pane = *first;
+                }
             }
         }
         let pane_id = self.focused_pane_id();
@@ -5892,7 +5900,10 @@ impl WorkspaceView {
             let panel_normalized = [
                 normalized(&self.settings.shortcuts.commands_panel),
                 normalized(&self.settings.shortcuts.servers_panel),
-                normalized(&self.settings.shortcuts.zoom_pane),
+                // zoom 第三位收「生效键」：None = 默认键也参与冲突判定（与
+                // 注册表 counts 口径一致，设置页默认键被占用时行标红）；
+                // 非法 Some 归一化失败回落 None → 行标红走 invalid 分支。
+                normalized(&Some(self.effective_zoom_shortcut().to_string())),
             ];
             // 无效快捷键展示行（原文保留修复入口），重算时一次 format!
             let mut invalid_rows: Vec<(String, String)> = Vec::new();
@@ -12319,7 +12330,10 @@ mod titlebar_scrollbar_tests {
 
 #[cfg(test)]
 mod pane_zoom_tests {
-    use super::{BindingOwner, DEFAULT_ZOOM_SHORTCUT, LayoutNode, SplitDirection, WorkspaceView};
+    use super::{
+        BindingOwner, CommandTemplate, DEFAULT_ZOOM_SHORTCUT, LayoutNode, SplitDirection,
+        WorkspaceView,
+    };
     use gpui::TestAppContext;
 
     /// 模式同 tab_menu_tests：会话泄漏会让测试进程收尾告警。
@@ -12616,6 +12630,39 @@ mod pane_zoom_tests {
         close_sessions(&workspace, cx);
     }
 
+    /// ⑩ 默认键参与冲突计数：zoom_pane = None 时缓存第三位收生效键
+    /// （默认 ctrl+shift+z），命令占用该键时 counts 计 2——设置页 zoom 行
+    /// 据此标红（修复：此前 None 行永不判冲突，默认键被占用户不可见）。
+    #[gpui::test]
+    fn default_zoom_key_participates_in_conflict_counts(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let dir = test_dir("default-conflict");
+        workspace.update_in(cx, |view, _, cx| {
+            isolate_settings(view, &dir);
+            view.settings.commands.push(CommandTemplate {
+                name: "占位命令".into(),
+                template: "echo hi".into(),
+                shortcut: Some("ctrl+shift+z".into()),
+                ..Default::default()
+            });
+            // 直接改字段不经 persist_settings，须手动推进版本破缓存快照
+            view.settings_version += 1;
+            cx.notify();
+        });
+        let cache = workspace.update(cx, |view, _| view.shortcut_bindings_cache());
+        assert_eq!(
+            cache.panel_normalized[2].as_deref(),
+            Some("ctrl+shift+z"),
+            "未设置时第三位应为默认键的归一化形式"
+        );
+        assert_eq!(
+            cache.counts.get("ctrl+shift+z").copied(),
+            Some(2),
+            "命令 + zoom 默认键各计一次，行标红依据 counts > 1"
+        );
+        close_sessions(&workspace, cx);
+    }
+
     /// ⑪ 清空 = 恢复默认：面板快捷键弹窗保存空值后 zoom_pane 回 None、
     /// 生效键回到 ctrl+shift+z 且仍触发 toggle、弹窗正常关闭。
     /// 设置行回显文案「未设置（默认 Ctrl+Shift+Z）」由 settings_ui 的
@@ -12734,6 +12781,77 @@ mod pane_zoom_tests {
                     && binding.normalized == "ctrl+alt+z")
         );
         assert!(cache.invalid_rows.is_empty());
+        close_sessions(&workspace, cx);
+    }
+
+    /// ⑭ 后台 zoom 标签焦点窗格退出：remove_pane_at 必须校正所有标签的
+    /// 死 focused_pane（修复前只校正活动标签）——否则切回该标签时合成树取
+    /// Leaf(死id)，render_layout 渲染空 div，终端区整屏空白仅剩放大徽标。
+    #[gpui::test]
+    fn background_zoomed_tab_survives_focused_pane_exit(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let dir = test_dir("bg-zoom-exit");
+        let (zoomed, other_tab_pane) = workspace.update_in(cx, |view, window, cx| {
+            isolate_settings(view, &dir);
+            // 标签 A：三窗格，焦点 = 第二刀新窗格，进入 zoom
+            let _first = split_focused_once(view, window, cx);
+            let second = split_focused_once(view, window, cx);
+            view.toggle_zoom(cx);
+            // 新标签 B 抢走 active，A 连同 zoom 态转入后台
+            view.spawn_tab(window, cx);
+            let b_pane = view.focused_pane_id();
+            (second, b_pane)
+        });
+        cx.run_until_parked();
+        // 后台退出 A 的焦点窗格（走 Closing → TerminalExited → remove_pane_at）
+        workspace.update_in(cx, |view, window, cx| {
+            view.close_pane(zoomed, window, cx);
+        });
+        for _ in 0..300 {
+            cx.run_until_parked();
+            let pruned = workspace.read_with(cx, |view, _| {
+                view.tabs
+                    .iter()
+                    .any(|tab| tab.zoomed && tab.layout.leaf_count() == 2)
+            });
+            if pruned {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        workspace.read_with(cx, |view, _| {
+            let tab = view
+                .tabs
+                .iter()
+                .find(|tab| tab.zoomed)
+                .expect("后台标签应保持 zoom 态（仍 ≥2 窗格）");
+            assert_ne!(tab.focused_pane, zoomed, "死引用不得残留在 focused_pane");
+            assert!(
+                tab.layout.contains(tab.focused_pane),
+                "后台标签焦点必须回退到存活叶（切回后渲染空白回归）"
+            );
+        });
+        // 关掉标签 B（单窗格即整标签关闭）→ active 回退到 A，合成树必须
+        // 落在存活窗格上：focused_pane_id 可解析到真实 pane 即无空白。
+        workspace.update_in(cx, |view, window, cx| {
+            view.close_pane(other_tab_pane, window, cx);
+        });
+        for _ in 0..300 {
+            cx.run_until_parked();
+            let done = workspace.read_with(cx, |view, _| view.tabs.len() == 1);
+            if done {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        workspace.read_with(cx, |view, _| {
+            let tab = view.active_tab();
+            assert!(tab.zoomed, "切回后应仍处放大态（2 窗格）");
+            assert!(
+                view.pane(view.focused_pane_id()).is_some(),
+                "活动焦点必须解析到存活窗格（否则终端区整屏空白）"
+            );
+        });
         close_sessions(&workspace, cx);
     }
 }
