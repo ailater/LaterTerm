@@ -542,8 +542,9 @@ fn transparency_hint(appearance: &Appearance) -> Option<&'static str> {
     let transparent = appearance.background_opacity < 1.0;
     match gpui::guess_compositor() {
         "X11" => {
-            if appearance.background_blur {
-                // X11 后端没有 blur 实现路径（Blurred 静默等同 Transparent）
+            if appearance.background_blur && transparent {
+                // X11 后端没有 blur 实现路径（Blurred 静默等同 Transparent）；
+                // o=1 时窗口映射 Opaque，无透明可降级，不提示
                 Some("X11 会话不支持背景模糊，将按纯透明显示")
             } else if transparent {
                 Some("透明需运行中的合成器（picom/KWin 等），否则透明区域显示为黑色")
@@ -552,7 +553,7 @@ fn transparency_hint(appearance: &Appearance) -> Option<&'static str> {
             }
         }
         "Wayland" => {
-            if appearance.background_blur {
+            if appearance.background_blur && transparent {
                 Some("背景模糊需合成器支持 KDE blur 协议（KWin），不支持时按纯透明显示")
             } else {
                 None

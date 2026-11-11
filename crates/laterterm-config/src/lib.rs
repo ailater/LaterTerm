@@ -493,7 +493,13 @@ impl Appearance {
         self.line_height = self.line_height.clamp(0.8, 2.0);
         self.padding = self.padding.clamp(0.0, 24.0);
         self.scrollback = self.scrollback.clamp(1_000, 1_000_000);
-        // 背景不透明度下限 0.15：再低终端内容基本不可读，只留微弱剪影
+        // 背景不透明度下限 0.15：再低终端内容基本不可读，只留微弱剪影。
+        // clamp 不拦 NaN（TOML 规范支持 nan 字面量），先 is_finite 兜底回
+        // 默认不透明，否则 NaN 会让下游 <1.0 / >=1.0 判定双双落空、渲染
+        // 极性分裂（透明口径画不透明底、alpha 位算出 0）。
+        if !self.background_opacity.is_finite() {
+            self.background_opacity = 1.0;
+        }
         self.background_opacity = self.background_opacity.clamp(0.15, 1.0);
         if self.font_family.trim().is_empty() {
             self.font_family = Self::default().font_family;
@@ -860,6 +866,19 @@ shortcut = "  legacy shortcut  "
         assert_eq!(clamped.appearance.background_opacity, 0.15);
         assert!(clamped.appearance.background_blur);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn background_opacity_nan_falls_back_to_opaque() {
+        // TOML 规范支持 nan 字面量：clamp 不拦 NaN（比较恒 false），
+        // sanitize 必须 is_finite 兜底，否则下游透明判定极性分裂。
+        // sanitize 在 load 流程内执行，走临时文件路径验证。
+        let path = temp_settings_path("background-opacity-nan");
+        std::fs::write(&path, "[appearance]\nbackground_opacity = nan\n").unwrap();
+        let nan = Settings::load(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(nan.appearance.background_opacity.is_finite());
+        assert_eq!(nan.appearance.background_opacity, 1.0);
     }
 
     #[test]
