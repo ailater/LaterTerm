@@ -90,12 +90,17 @@ impl QuakeSettings {
     pub fn sanitize(&mut self) {}
 }
 
-/// 内置面板的快捷键覆盖；`None` 表示使用默认绑定，原始文本保持不变。
+/// 内置面板与窗格操作的快捷键覆盖；`None` 表示使用默认绑定，原始文本保持不变。
+/// `zoom_pane` 的 `None` = 默认 `ctrl+shift+z`（窗格缩放是内置功能，永远有生效键，
+/// 「清空」语义即恢复默认，与命令/服务器面板的「清空 = 真解绑」不同——区分口径见
+/// 设置页行文案与编辑弹窗说明）。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PanelShortcuts {
     pub commands_panel: Option<String>,
     pub servers_panel: Option<String>,
+    /// 窗格缩放（放大/还原焦点窗格）；`None` = 默认 `ctrl+shift+z`。
+    pub zoom_pane: Option<String>,
 }
 
 impl PanelShortcuts {
@@ -104,6 +109,7 @@ impl PanelShortcuts {
         for (panel, shortcut) in [
             ("快捷命令面板", &self.commands_panel),
             ("服务器面板", &self.servers_panel),
+            ("窗格缩放", &self.zoom_pane),
         ] {
             if let Some(shortcut) = shortcut {
                 normalize_shortcut(shortcut).with_context(|| format!("{panel}快捷键格式不合法"))?;
@@ -578,6 +584,7 @@ mod tests {
         let shortcuts = PanelShortcuts {
             commands_panel: Some("  Control + Shift + K  ".into()),
             servers_panel: Some(" Super + Alt + S ".into()),
+            zoom_pane: None,
         };
         let original = shortcuts.clone();
         shortcuts.validate().unwrap();
@@ -604,12 +611,46 @@ mod tests {
                     servers_panel: Some(shortcut.into()),
                     ..Default::default()
                 },
+                PanelShortcuts {
+                    zoom_pane: Some(shortcut.into()),
+                    ..Default::default()
+                },
             ] {
                 let original = shortcuts.clone();
                 assert!(shortcuts.validate().is_err(), "{shortcuts:?}");
                 assert_eq!(shortcuts, original);
             }
         }
+    }
+
+    // 窗格缩放（zoom_pane）：解析 / 校验 / 默认 None 三例——None = 默认
+    // ctrl+shift+z 由 app 层 effective_zoom_shortcut 回落，配置侧只存 override。
+    #[test]
+    fn zoom_pane_parses_override_and_defaults_to_none() {
+        for raw in ["", "[appearance]\nfont_size = 15.0\n", "[shortcuts]\n"] {
+            let settings: Settings = toml::from_str(raw).unwrap();
+            assert_eq!(settings.shortcuts.zoom_pane, None, "旧配置缺字段 = 默认键");
+        }
+        let settings: Settings = toml::from_str("[shortcuts]\nzoom_pane = 'ctrl+alt+z'\n").unwrap();
+        assert_eq!(settings.shortcuts.zoom_pane.as_deref(), Some("ctrl+alt+z"));
+        settings.shortcuts.validate().unwrap();
+        // 保存往返：override 原文（含空格大小写）不清洗不丢失
+        let saved = toml::to_string_pretty(&settings).unwrap();
+        assert_eq!(toml::from_str::<Settings>(&saved).unwrap(), settings);
+    }
+
+    #[test]
+    fn zoom_pane_validate_uses_normalizer() {
+        PanelShortcuts {
+            zoom_pane: Some("  Ctrl + Shift + Z  ".into()),
+            ..Default::default()
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(
+            normalize_shortcut("  Ctrl + Shift + Z  ").unwrap(),
+            "ctrl+shift+z"
+        );
     }
 
     #[test]

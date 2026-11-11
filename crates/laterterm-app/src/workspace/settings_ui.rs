@@ -1068,17 +1068,27 @@ fn settings_shortcuts_body(
         body.push(row(binding));
     }
     body.push(group_title("面板"));
-    // 归一化读缓存（下标与 panel_normalized 对位），不再每帧 normalize
-    for (index, (label, shortcut, owner)) in [
+    // 归一化读缓存（下标与 panel_normalized 对位），不再每帧 normalize。
+    // 第四元 = 未设置时的行内文案：窗格缩放永远有生效键（None = 默认
+    // Ctrl+Shift+Z，清空 = 恢复默认），文案注明以区别于面板项的「未设置」。
+    for (index, (label, shortcut, unset_text, owner)) in [
         (
             "命令面板",
             workspace.settings.shortcuts.commands_panel.as_deref(),
+            "未设置",
             BindingOwner::CommandsPanel,
         ),
         (
             "服务器面板",
             workspace.settings.shortcuts.servers_panel.as_deref(),
+            "未设置",
             BindingOwner::ServersPanel,
+        ),
+        (
+            "窗格缩放",
+            workspace.settings.shortcuts.zoom_pane.as_deref(),
+            "未设置（默认 Ctrl+Shift+Z）",
+            BindingOwner::PaneZoom,
         ),
     ]
     .into_iter()
@@ -1093,7 +1103,7 @@ fn settings_shortcuts_body(
             setting_card()
                 .child(shortcut_row(
                     label,
-                    shortcut.unwrap_or("未设置"),
+                    shortcut.unwrap_or(unset_text),
                     invalid || conflicted,
                 ))
                 .child(setting_button(
