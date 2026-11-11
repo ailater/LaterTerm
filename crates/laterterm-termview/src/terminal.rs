@@ -664,7 +664,20 @@ impl TerminalState {
             } else {
                 Regex::new(&format!("(?i){query}"))
             };
-            let pattern = pattern.map_err(|error| error.to_string())?;
+            let pattern = pattern.map_err(|error| {
+                // regex 的 Display 是多行 caret 对齐报告（含 (?i) 前缀回显），
+                // 搜索栏只容单行：取最后一行（"error: …" 摘要）并截断。
+                let text = error.to_string();
+                let line = text.lines().last().unwrap_or(&text).trim();
+                const MAX: usize = 60;
+                if line.chars().count() <= MAX {
+                    line.to_string()
+                } else {
+                    let mut cut: String = line.chars().take(MAX).collect();
+                    cut.push('…');
+                    cut
+                }
+            })?;
             Ok(self.with_term(|term| search_grid_regex(term.grid(), &pattern)))
         } else {
             let needle: Vec<char> = if options.case_sensitive {
@@ -1302,6 +1315,19 @@ mod tests {
             .search_with_options("(unclosed", regex_opts(false))
             .unwrap_err();
         assert!(!error.is_empty(), "错误信息供搜索栏红字展示");
+        // 错误信息必须单行且短：regex 原生 Display 是多行 caret 报告，
+        // 直塞单行搜索栏会撑爆布局（取尾行摘要 + 60 字符截断）
+        assert!(!error.contains('\n'), "错误串必须单行: {error:?}");
+        assert!(
+            error.starts_with("error: "),
+            "应取 regex 报告的尾行摘要: {error:?}"
+        );
+        assert!(error.chars().count() <= 61, "超长错误应截断: {error:?}");
+        // 大小写不敏感路径同样单行（(?i) 前缀不外泄）
+        let error_ci = terminal
+            .search_with_options("(unclosed", regex_opts(true))
+            .unwrap_err();
+        assert!(!error_ci.contains('\n'), "大小写路径同样单行: {error_ci:?}");
         // 子串路径同查询不受影响（括号是字面字符，无命中）
         assert_eq!(terminal.search("(unclosed"), Vec::<SearchMatch>::new());
     }
