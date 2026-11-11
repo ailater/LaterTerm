@@ -163,6 +163,16 @@ pub struct Appearance {
     #[serde(default = "default_true")]
     pub copy_on_select: bool,
 
+    /// 多行粘贴确认：剪贴板内容含换行（含单行命令+尾回车）时先弹确认弹窗，
+    /// 防误粘贴即执行。默认开启；旧配置缺字段自动为 true。
+    #[serde(default = "default_true")]
+    pub confirm_multiline_paste: bool,
+
+    /// 复制提示 toast：选区复制成功后窗口右下角短暂显示「已复制 N 字符」。
+    /// 默认开启；旧配置缺字段自动为 true。
+    #[serde(default = "default_true")]
+    pub copy_toast: bool,
+
     /// 终端 bell 时发送系统桌面通知。默认关闭（bell 走视觉提示，测试环境也不外发）。
     #[serde(default)]
     pub bell_notification: bool,
@@ -195,6 +205,8 @@ impl Default for Appearance {
             cursor_style: CursorStyle::Block,
             smooth_scrolling: true,
             copy_on_select: true,
+            confirm_multiline_paste: true,
+            copy_toast: true,
             bell_notification: false,
             right_panel_pinned: true,
             font_fallbacks: Vec::new(),
@@ -749,6 +761,25 @@ shortcut = "  legacy shortcut  "
         settings.save_to(&path).unwrap();
         let loaded = Settings::load(&path).unwrap();
         assert!(!loaded.appearance.right_panel_pinned);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn paste_and_toast_flags_default_true_and_false_roundtrip() {
+        // 旧 settings.toml 缺 confirm_multiline_paste/copy_toast 字段 → serde 补默认 true
+        let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert!(legacy.appearance.confirm_multiline_paste);
+        assert!(legacy.appearance.copy_toast);
+
+        // 显式关闭后 roundtrip 保持 false（不会被默认值覆盖）
+        let path = temp_settings_path("paste-toast-flags");
+        let mut settings = Settings::default();
+        settings.appearance.confirm_multiline_paste = false;
+        settings.appearance.copy_toast = false;
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert!(!loaded.appearance.confirm_multiline_paste);
+        assert!(!loaded.appearance.copy_toast);
         std::fs::remove_file(&path).unwrap();
     }
 

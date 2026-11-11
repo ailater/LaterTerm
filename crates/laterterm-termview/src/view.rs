@@ -395,6 +395,45 @@ pub type TitleCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>, &st
 /// ```
 pub type ClipboardStoreCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>, &str)>;
 
+/// 复制成功通知回调。
+///
+/// 选区复制成功（选中即复制路径）后触发，携带写入剪贴板的字符数，
+/// 供宿主弹「已复制 N 字符」提示。
+///
+/// # Arguments
+///
+/// * `window` - The GPUI window
+/// * `cx` - The context for the TerminalView
+/// * `chars` - 实际写入剪贴板的字符数
+///
+/// # Example
+///
+/// ```ignore
+/// terminal.with_copy_notice_callback(|window, cx, chars| {
+///     // 在窗口右下角弹 toast：已复制 chars 个字符
+/// });
+/// ```
+pub type CopyNoticeCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>, usize)>;
+
+/// 粘贴请求回调。
+///
+/// 用户在终端视图内按下粘贴快捷键（Ctrl+Shift+V / Shift+Insert）时触发，
+/// 由宿主决定读取剪贴板与多行确认流程；搜索打开期间不触发（按键被搜索拦截）。
+///
+/// # Arguments
+///
+/// * `window` - The GPUI window
+/// * `cx` - The context for the TerminalView
+///
+/// # Example
+///
+/// ```ignore
+/// terminal.with_paste_request_callback(|window, cx| {
+///     // 读剪贴板 → 多行则弹确认 → 写 PTY
+/// });
+/// ```
+pub type PasteRequestCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>)>;
+
 /// Callback for terminal exit events.
 ///
 /// This callback is invoked when the terminal process exits (e.g., shell exits,
@@ -536,6 +575,12 @@ pub struct TerminalView {
 
     /// Callback for clipboard store requests
     clipboard_store_callback: Option<ClipboardStoreCallback>,
+
+    /// 复制成功通知回调（选中即复制路径触发，携带字符数）
+    copy_notice_callback: Option<CopyNoticeCallback>,
+
+    /// 粘贴请求回调（终端视图内粘贴快捷键触发，由宿主走确认流程）
+    paste_request_callback: Option<PasteRequestCallback>,
 
     /// Callback for terminal exit events
     exit_callback: Option<ExitCallback>,
@@ -851,6 +896,8 @@ impl TerminalView {
             url_hover: None,
             title_callback: None,
             clipboard_store_callback: None,
+            copy_notice_callback: None,
+            paste_request_callback: None,
             exit_callback: None,
             scroll_callback: None,
             last_scroll: None,
@@ -988,6 +1035,46 @@ impl TerminalView {
         self
     }
 
+    /// Set a callback to be invoked when a selection copy succeeds.
+    ///
+    /// 回调在选中即复制路径写完剪贴板后触发，携带写入的字符数，
+    /// 供宿主显示「已复制 N 字符」提示。
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// terminal.with_copy_notice_callback(|window, cx, chars| {
+    ///     // 弹 toast 提示
+    /// })
+    /// ```
+    pub fn with_copy_notice_callback(
+        mut self,
+        callback: impl Fn(&mut Window, &mut Context<TerminalView>, usize) + 'static,
+    ) -> Self {
+        self.copy_notice_callback = Some(Box::new(callback));
+        self
+    }
+
+    /// Set a callback to be invoked when the user presses a paste shortcut
+    /// (Ctrl+Shift+V / Shift+Insert) inside the terminal view.
+    ///
+    /// 回调触发后按键不再透传 PTY；搜索打开期间快捷键被搜索拦截，不触发本回调。
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// terminal.with_paste_request_callback(|window, cx| {
+    ///     // 读剪贴板 → 多行确认 → 写 PTY
+    /// })
+    /// ```
+    pub fn with_paste_request_callback(
+        mut self,
+        callback: impl Fn(&mut Window, &mut Context<TerminalView>) + 'static,
+    ) -> Self {
+        self.paste_request_callback = Some(Box::new(callback));
+        self
+    }
+
     /// Set a callback to be invoked when the terminal process exits.
     ///
     /// The callback receives a mutable reference to the window and context,
@@ -1050,7 +1137,7 @@ impl TerminalView {
     /// Converts GPUI keystrokes to terminal escape sequences and writes them
     /// to the stdin writer. If a key handler is set and returns true, the event
     /// is consumed and not sent to the terminal.
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         // Check if key handler wants to consume this event
         if let Some(ref handler) = self.key_handler
             && handler(event)
@@ -1097,6 +1184,15 @@ impl TerminalView {
                     // 可打印字符走 InputHandler 提交路径追加查询；
                     // 其余组合键（Ctrl+C 等）在搜索态直接吞掉。
                 }
+            }
+            return;
+        }
+
+        // 粘贴快捷键（Ctrl+Shift+V / Shift+Insert）：交给宿主回调走
+        // 多行确认流程；搜索态在上面分支已被吞（口径同上），不在此触发。
+        if paste_shortcut_matches(keystroke) {
+            if let Some(callback) = &self.paste_request_callback {
+                callback(window, cx);
             }
             return;
         }
@@ -1260,7 +1356,7 @@ impl TerminalView {
     }
 
     /// Handle mouse up events: 结束拖拽；未成形的单击选区直接清除。
-    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
         // 上报期间的 release：与已上报的 press 配对发给应用。take() 立即清理
         // 按下标记；期间不存在本地选区，直接返回。门控与 down/move/scroll
         // 三入口同口径——模式中途翻转（按住期间应用单独发 ?1006l 退到
@@ -1302,8 +1398,13 @@ impl TerminalView {
         // 选中即复制：只挂在有效选区支路（前两条支路已提前 return——上报接管
         // 期间无本地选区、单击清选区路径无有效选区），finalize 后 has_selection
         // 恰好等价于 to_range 非空；copy_selection 自带空文本保护。
-        if self.config.copy_on_select && self.has_selection() {
-            self.copy_selection(cx);
+        // 复制成功后再通知宿主（「已复制 N 字符」toast 由宿主决定显隐）。
+        if self.config.copy_on_select
+            && self.has_selection()
+            && let Some(chars) = self.copy_selection(cx)
+            && let Some(callback) = &self.copy_notice_callback
+        {
+            callback(window, cx, chars);
         }
     }
 
@@ -1724,13 +1825,20 @@ impl TerminalView {
         self.state.with_term(|term| term.selection.is_some())
     }
 
-    /// 复制选中文本到剪贴板；无选区时不动作。
-    pub fn copy_selection(&mut self, cx: &mut Context<Self>) {
+    /// 复制选中文本到剪贴板；无选区或空文本时不动作。
+    ///
+    /// 返回 `Some(字符数)` 表示已写入剪贴板（供宿主弹「已复制 N 字符」提示），
+    /// `None` 表示无有效内容。
+    pub fn copy_selection(&mut self, cx: &mut Context<Self>) -> Option<usize> {
         let text = self.state.with_term(|term| term.selection_to_string());
         if let Some(text) = text
             && !text.is_empty()
         {
+            let chars = text.chars().count();
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+            Some(chars)
+        } else {
+            None
         }
     }
 
@@ -2505,6 +2613,23 @@ fn send_desktop_notification(title: &str, body: &str) {
         )
     };
     let _ = std::process::Command::new(program).args(args).spawn();
+}
+
+/// 粘贴快捷键判定：Ctrl+Shift+V 或 Shift+Insert。
+///
+/// 纯函数无视图状态，供 `on_key_down` 在搜索拦截分支之后匹配；
+/// 命中后按键交宿主 [`PasteRequestCallback`] 处理，不再透传 PTY。
+pub fn paste_shortcut_matches(keystroke: &Keystroke) -> bool {
+    let m = &keystroke.modifiers;
+    if m.alt || m.platform || m.function {
+        return false;
+    }
+    // Ctrl+Shift+V：三个修饰位全亮才认（避免 Ctrl+V 0x16 透传终端惯例被误伤）
+    if m.control && m.shift && keystroke.key.eq_ignore_ascii_case("v") {
+        return true;
+    }
+    // Shift+Insert：笔记本无菜单键场景的主粘贴键；Ctrl/Alt 附加时不认
+    !m.control && m.shift && keystroke.key == "insert"
 }
 
 #[cfg(test)]
@@ -3624,5 +3749,140 @@ mod tests {
         for _ in 0..frames {
             cx.update(|window, cx| window.draw(cx).clear());
         }
+    }
+
+    #[test]
+    fn paste_shortcut_matches_only_exact_two_combos() {
+        use super::paste_shortcut_matches;
+
+        for hit in ["ctrl-shift-v", "ctrl-shift-V", "shift-insert"] {
+            assert!(
+                paste_shortcut_matches(&gpui::Keystroke::parse(hit).unwrap()),
+                "{hit} 应命中粘贴快捷键"
+            );
+        }
+        // 单 Ctrl+V 是终端 0x16 惯例、Ctrl+C/Ctrl+Shift+C 等均不命中；
+        // 附加修饰（Alt/Super/Fn）与 Shift+其它键也不命中。
+        for miss in [
+            "ctrl-v",
+            "ctrl-c",
+            "ctrl-shift-c",
+            "ctrl-alt-shift-v",
+            "ctrl-shift-super-v",
+            "ctrl-shift-fn-v",
+            "insert",
+            "ctrl-insert",
+            "shift-v",
+        ] {
+            assert!(
+                !paste_shortcut_matches(&gpui::Keystroke::parse(miss).unwrap()),
+                "{miss} 不应命中粘贴快捷键"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn copy_selection_reports_char_count_and_notice_callback(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseMoveEvent, MouseUpEvent};
+        use std::sync::Mutex;
+
+        let noticed = Arc::new(Mutex::new(Vec::<usize>::new()));
+        let observed = noticed.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+                .with_copy_notice_callback(move |_, _, chars| {
+                    observed.lock().unwrap().push(chars);
+                })
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            view.state.process_bytes(b"hello selection\r\n$ ");
+            view.last_content_origin = Some(gpui::Point {
+                x: gpui::px(0.0),
+                y: gpui::px(0.0),
+            });
+            view.renderer.cell_width = gpui::px(10.0);
+            view.renderer.cell_height = gpui::px(20.0);
+
+            let down = |position, click_count| MouseDownEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count,
+                first_mouse: false,
+            };
+            let move_to = |position| MouseMoveEvent {
+                position,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            };
+            let up = |position| MouseUpEvent {
+                button: MouseButton::Left,
+                position,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+
+            // 拖拽松开：copy_on_select 路径写剪贴板并回调字符数
+            view.on_mouse_down(
+                &down(gpui::point(gpui::px(5.0), gpui::px(10.0)), 1),
+                window,
+                cx,
+            );
+            view.on_mouse_move(
+                &move_to(gpui::point(gpui::px(45.0), gpui::px(10.0))),
+                window,
+                cx,
+            );
+            view.on_mouse_up(&up(gpui::point(gpui::px(45.0), gpui::px(10.0))), window, cx);
+            assert_eq!(*noticed.lock().unwrap(), vec![5], "应回调已复制的字符数");
+
+            // 公开 API 返回字符数；无选区时返回 None
+            assert_eq!(view.copy_selection(cx), Some(5));
+            view.state.with_term_mut(|term| term.selection = None);
+            assert_eq!(view.copy_selection(cx), None);
+        });
+    }
+
+    #[gpui::test]
+    fn paste_request_callback_fires_only_outside_search(cx: &mut TestAppContext) {
+        use std::sync::Mutex;
+
+        let requests = Arc::new(Mutex::new(0usize));
+        let observed = requests.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+                .with_paste_request_callback(move |_, _| {
+                    *observed.lock().unwrap() += 1;
+                })
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            for key in ["ctrl-shift-v", "shift-insert"] {
+                view.on_key_down(
+                    &gpui::KeyDownEvent {
+                        keystroke: gpui::Keystroke::parse(key).unwrap(),
+                        is_held: false,
+                    },
+                    window,
+                    cx,
+                );
+            }
+            assert_eq!(*requests.lock().unwrap(), 2, "两种粘贴快捷键都应触发回调");
+
+            // 搜索打开时快捷键被搜索分支吞掉，不触发粘贴请求
+            view.open_search(cx);
+            view.on_key_down(
+                &gpui::KeyDownEvent {
+                    keystroke: gpui::Keystroke::parse("ctrl-shift-v").unwrap(),
+                    is_held: false,
+                },
+                window,
+                cx,
+            );
+            assert_eq!(
+                *requests.lock().unwrap(),
+                2,
+                "搜索态粘贴快捷键被拦截，不触发回调"
+            );
+        });
     }
 }

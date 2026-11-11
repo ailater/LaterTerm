@@ -584,6 +584,11 @@ const BUILTIN_SHORTCUTS: &[(&str, &str)] = &[
     ("ctrl+shift+]", "下一个窗格"),
     ("ctrl+shift+f", "回滚搜索"),
     ("ctrl+shift+b", "广播输入"),
+    // 两条粘贴键同 label（设置页行展示用）：用户绑命令到这两键时，
+    // 冲突链路（all_shortcut_bindings → shortcut_conflict_with → 录制器）
+    // 命中 BindingOwner::Builtin，提示「快捷键与内置快捷键冲突」。
+    ("ctrl+shift+v", "粘贴"),
+    ("shift+insert", "粘贴"),
 ];
 
 /// 快捷键绑定归属：内置项不可编辑；其余以「类别:名称」唯一标识。
@@ -894,6 +899,26 @@ struct TerminalMenuState {
 /// 右键菜单动作：拿到工作区、窗口与上下文执行具体操作。
 type TerminalMenuAction = Box<dyn Fn(&mut WorkspaceView, &mut Window, &mut Context<WorkspaceView>)>;
 
+/// 粘贴确认弹窗状态：text 是弹窗打开瞬间的剪贴板快照（确认时写快照而非
+/// 重读剪贴板，防弹窗期间剪贴板被改的 TOCTOU）；pane 是粘贴目标窗格。
+#[derive(Clone)]
+struct PasteConfirmState {
+    text: String,
+    pane: PaneId,
+}
+
+/// 复制提示 toast 状态（窗口右下角「已复制 N 字符」）。
+struct CopyToastState {
+    /// 已复制字符数（文案显示用）。
+    chars: usize,
+    /// 续期代数：show 时自增；到期任务比对代数，不匹配（期间又有新复制）
+    /// 不动新状态，避免旧定时误清新 toast。
+    generation: u64,
+}
+
+/// toast 停留时长：到期直接消失（不做动画框架）。
+const COPY_TOAST_DURATION: Duration = Duration::from_millis(1500);
+
 /// 标签右键菜单的打开状态与来源标签。
 #[derive(Clone)]
 struct TabMenuState {
@@ -1103,6 +1128,12 @@ pub struct WorkspaceView {
     sftp_prompt: Option<SftpPromptDialog>,
     sftp_prompt_fields: Vec<(String, Entity<CommandTextField>)>,
     sftp_prompt_subscriptions: Vec<gpui::Subscription>,
+    /// 多行粘贴确认弹窗（None = 关闭）。text 为弹窗打开时的剪贴板快照。
+    paste_confirm: Option<PasteConfirmState>,
+    /// 复制提示 toast（None = 隐藏；窗口右下角浮层）。
+    copy_toast: Option<CopyToastState>,
+    /// toast 代数计数器（连续复制续期用，见 CopyToastState.generation）。
+    next_toast_generation: u64,
     /// 待生效的焦点请求：异步上下文拿不到 window，先记下 handle，render 期统一 focus。
     pending_focus: Option<FocusHandle>,
     secret_store: Arc<dyn SecretStore>,
@@ -1238,6 +1269,9 @@ impl WorkspaceView {
             sftp_prompt: None,
             sftp_prompt_fields: Vec::new(),
             sftp_prompt_subscriptions: Vec::new(),
+            paste_confirm: None,
+            copy_toast: None,
+            next_toast_generation: 0,
             pending_focus: None,
             window_handle: window.window_handle(),
             quake: quake_machine,
@@ -2348,6 +2382,95 @@ impl WorkspaceView {
         }
     }
 
+    // ------------------------------------------------------------------
+    // 粘贴护栏（多行确认）与复制提示 toast
+    // ------------------------------------------------------------------
+
+    /// 开始粘贴流程：读剪贴板 → 多行（含尾回车）判定 → 单行直接写 /
+    /// 多行弹确认弹窗。快捷键、右键菜单共用本入口。
+    fn begin_paste(&mut self, pane: PaneId, _window: &mut Window, cx: &mut Context<Self>) {
+        // 粘贴模态与其它模态互斥：任一打开即静默放弃（模态期间用户注意力
+        // 在弹窗，无反馈属可接受简化）。粘贴确认弹窗自身打开时同样忽略。
+        if self.paste_confirm.is_some()
+            || self.command_dialog.is_some()
+            || self.totp_dialog.is_some()
+            || self.server_dialog.is_some()
+            || self.server_import_dialog.is_some()
+            || self.sftp_prompt.is_some()
+            || self.tab_rename_field.is_some()
+            || self.panel_shortcut_dialog.is_some()
+            || self.server_save.is_some()
+        {
+            return;
+        }
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        // 多行判定按「含换行符」而非 lines()>1：单行命令+尾回车（如
+        // "rm -rf x\n"）lines()==1 但粘贴即执行，是护栏核心场景
+        // （alacritty/iTerm2 同口径）；行数仅作弹窗预览显示。
+        if self.settings.appearance.confirm_multiline_paste
+            && (text.contains('\n') || text.contains('\r'))
+        {
+            self.paste_confirm = Some(PasteConfirmState { text, pane });
+            cx.notify();
+        } else {
+            self.paste_to_pane(pane, &text, cx);
+        }
+    }
+
+    /// 确认粘贴：写弹窗快照文本（不重读剪贴板，防 TOCTOU）。
+    fn confirm_paste(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.paste_confirm.take() {
+            self.paste_to_pane(state.pane, &state.text, cx);
+        }
+    }
+
+    /// 取消粘贴：仅清状态，不写任何字节。
+    fn cancel_paste(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.paste_confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 把文本原样写进目标窗格 PTY（bracketed paste 仓库无实现，维持直写口径）；
+    /// 窗格已回收则静默丢弃。
+    fn paste_to_pane(&self, pane: PaneId, text: &str, cx: &mut Context<Self>) {
+        if let Some(pane) = self.pane(pane) {
+            let terminal = pane.terminal.clone();
+            terminal.update(cx, |view, _| view.write_input(text.as_bytes()));
+        }
+    }
+
+    /// 显示复制提示 toast；1.5s 后到期消失，连续复制以代数续期
+    /// （旧定时任务到期时代数不匹配，不动新状态）。
+    fn show_copy_toast(&mut self, chars: usize, cx: &mut Context<Self>) {
+        if !self.settings.appearance.copy_toast {
+            return;
+        }
+        self.next_toast_generation += 1;
+        let generation = self.next_toast_generation;
+        self.copy_toast = Some(CopyToastState { chars, generation });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(COPY_TOAST_DURATION).await;
+            let _ = this.update(cx, |workspace, cx| {
+                if workspace
+                    .copy_toast
+                    .as_ref()
+                    .is_some_and(|toast| toast.generation == generation)
+                {
+                    workspace.copy_toast = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// 终端右键菜单浮层：anchored 定位 + snap_to_window 防贴边溢出。
     /// 样式与命令输入框右键菜单同一套（Tokyo Night 深色）。
     fn terminal_context_menu(
@@ -2427,12 +2550,8 @@ impl WorkspaceView {
             cx,
             "粘贴",
             true,
-            Box::new(move |this, _, cx| {
-                if let Some(pane) = this.pane(menu_pane) {
-                    let terminal = pane.terminal.clone();
-                    terminal.update(cx, |view, cx| view.paste_from_clipboard(cx));
-                }
-            }),
+            // 走 begin_paste 统一入口：多行内容先过确认弹窗
+            Box::new(move |this, window, cx| this.begin_paste(menu_pane, window, cx)),
         ));
         items.push(item(
             cx,
@@ -5922,6 +6041,20 @@ impl WorkspaceView {
             }
             return;
         }
+        // 粘贴确认弹窗：Esc 取消 / Enter 确认写入；其余按键吞掉（模态语义）。
+        // 位于模态弹窗分支之后、sftp 面板之前——粘贴模态与其它模态互斥不并开，
+        // 但比 sftp 面板（非模态浮层）后开先关：同屏时 Esc 先关本弹窗。
+        if self.paste_confirm.is_some() {
+            let plain_enter = matches!(event.keystroke.key.as_str(), "enter" | "return")
+                && event.keystroke.modifiers == gpui::Modifiers::default();
+            if plain_escape {
+                self.cancel_paste(window, cx);
+            } else if plain_enter {
+                self.confirm_paste(cx);
+            }
+            cx.stop_propagation();
+            return;
+        }
         // SFTP 双栏面板：Esc 关闭（输入弹窗打开时先关弹窗）；面板打开期间
         // 拦截 pane 方向导航与全局快捷键（终端被覆盖，键盘穿过去只会打进
         // 看不见的 shell——口径对齐模态弹窗分支）。必须位于下方 pane 方向
@@ -6469,6 +6602,26 @@ impl Render for WorkspaceView {
             })
             // SFTP 双栏面板：窗口级大覆盖层（右面板 240px 放不下双栏）
             .when_some(sftp_overlay(self, cx), |root, overlay| root.child(overlay))
+            // 复制提示 toast：窗口右下角短暂浮层。不 occlude、不挂鼠标事件，
+            // 纯展示（挂 workspace 层而非窗格层——分屏下窗格右下角≠窗口右下角）。
+            .when_some(
+                self.copy_toast.as_ref().map(|toast| {
+                    div()
+                        .absolute()
+                        .bottom_4()
+                        .right_4()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .text_size(px(12.0))
+                        .bg(rgba((0x252939 << 8) | 0xEB))
+                        .border_1()
+                        .border_color(rgb(0x292D40))
+                        .text_color(rgb(0xC0CAF5))
+                        .child(format!("已复制 {} 字符", toast.chars))
+                }),
+                |root, toast| root.child(toast),
+            )
             .when(self.welcome_visible, |root| {
                 root.child(self.welcome_overlay(cx))
             })
@@ -7631,6 +7784,49 @@ fn render_active_dialog(
     }
     if let Some(ServerDialog::Connect { name, remember, .. }) = workspace.server_dialog.clone() {
         return Some(server_connect_modal(workspace, name, remember, cx));
+    }
+    // 粘贴确认弹窗（链尾）：text 是弹窗打开时的剪贴板快照，确认写快照
+    // 而非重读剪贴板。预览前 5 行、每行截 60 字符（行数/字符数仅作显示，
+    // 多行判定本身按「含换行符」口径在 begin_paste 完成）。
+    if let Some(state) = workspace.paste_confirm.clone() {
+        let total_lines = state.text.lines().count().max(1);
+        let mut preview = String::new();
+        for line in state.text.lines().take(5) {
+            let truncated: String = line.chars().take(60).collect();
+            preview.push_str(&truncated);
+            preview.push('\n');
+        }
+        let body = div()
+            .p_4()
+            .child(format!(
+                "即将粘贴 {} 行内容（含换行，粘贴即执行的命令请留意）：",
+                total_lines
+            ))
+            .child(
+                div()
+                    .mt_2()
+                    .p_2()
+                    .text_size(px(12.0))
+                    .text_color(rgb(ui.text_muted))
+                    .child(preview),
+            )
+            .child(dialog_footer(vec![
+                setting_button(
+                    "粘贴",
+                    true,
+                    cx.listener(|this, _, _, cx| this.confirm_paste(cx)),
+                ),
+                setting_button(
+                    "取消",
+                    false,
+                    dismiss_listener(cx, WorkspaceView::cancel_paste),
+                ),
+            ]));
+        return Some(modal_dialog(
+            "确认多行粘贴",
+            body,
+            dismiss_listener(cx, WorkspaceView::cancel_paste),
+        ));
     }
     None
 }
@@ -9240,6 +9436,25 @@ fn create_terminal_view(
                     }
                 }
             })
+            // 选中即复制成功 → 右下角 toast（即时读 settings 开关；热加载
+            // 整份替换 settings 后天然生效，不走 apply_appearance 热应用链）
+            .with_copy_notice_callback({
+                let workspace = workspace.clone();
+                move |_window, cx, chars| {
+                    let _ = workspace.update(cx, |workspace, cx| {
+                        workspace.show_copy_toast(chars, cx);
+                    });
+                }
+            })
+            // 视图内粘贴快捷键（Ctrl+Shift+V / Shift+Insert）→ 粘贴护栏流程
+            .with_paste_request_callback({
+                let workspace = workspace.clone();
+                move |window, cx| {
+                    let _ = workspace.update(cx, |workspace, cx| {
+                        workspace.begin_paste(id, window, cx);
+                    });
+                }
+            })
             // 滚动/输出变化时唤醒工作区，让滚动条指示器跟手
             .with_scroll_callback({
                 let workspace = workspace.clone();
@@ -9353,7 +9568,9 @@ mod exit_regression_tests {
         cursor_style_for, keystroke_matches_shortcut, pane_direction_for_keystroke,
         terminal_config_for,
     };
-    use gpui::{KeyDownEvent, Keystroke, MouseDownEvent, TestAppContext};
+    use gpui::{Context, KeyDownEvent, Keystroke, MouseDownEvent, TestAppContext, Window};
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn config_watcher_ignores_read_access_but_keeps_mutations() {
@@ -10358,6 +10575,230 @@ mod exit_regression_tests {
             assert_eq!(view.next_pane_id, 5, "最后窗格退出后只补位一次");
             assert_eq!(view.panes.len(), 1);
             assert_eq!(view.tabs.len(), 1);
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // 粘贴护栏与复制提示 toast
+    // ------------------------------------------------------------------
+
+    /// 可观测写入的会话替身：PTY 写入收集到共享缓冲；读端立即 EOF。
+    struct SharedSpySession {
+        written: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+    impl laterterm_core::TerminalSession for SharedSpySession {
+        fn backend(&self) -> laterterm_core::BackendKind {
+            laterterm_core::BackendKind::Local
+        }
+        fn title(&self) -> String {
+            "paste-spy".into()
+        }
+        fn take_streams(&self) -> std::io::Result<laterterm_core::SessionStreams> {
+            Ok(laterterm_core::SessionStreams {
+                reader: Box::new(std::io::empty()),
+                writer: Box::new(PasteSpyWriter(self.written.clone())),
+            })
+        }
+        fn resize(&self, _: u16, _: u16) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn kill(&self) {}
+    }
+    struct PasteSpyWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for PasteSpyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 建一个可观测写入的窗格，返回 (pane id, 写入缓冲)。
+    fn attach_paste_spy(
+        view: &mut WorkspaceView,
+        window: &mut Window,
+        cx: &mut Context<WorkspaceView>,
+    ) -> (super::PaneId, Arc<std::sync::Mutex<Vec<u8>>>) {
+        let written = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pane_id = view.attach_pane(
+            "paste-spy".into(),
+            Arc::new(SharedSpySession {
+                written: written.clone(),
+            }),
+            window,
+            cx,
+        );
+        (pane_id, written)
+    }
+
+    #[gpui::test]
+    fn paste_guard_single_line_writes_multiline_confirms(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            let (pane, written) = attach_paste_spy(view, window, cx);
+
+            // 单行：不弹弹窗，直接写入
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("echo ok".into()));
+            view.begin_paste(pane, window, cx);
+            assert!(view.paste_confirm.is_none(), "单行粘贴不应弹确认弹窗");
+            assert_eq!(*written.lock().unwrap(), b"echo ok".to_vec());
+
+            // 多行：弹弹窗且未写入
+            written.lock().unwrap().clear();
+            let multiline = "echo a\nrm -rf /tmp/x\n";
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(multiline.into()));
+            view.begin_paste(pane, window, cx);
+            let state = view.paste_confirm.as_ref().expect("多行粘贴应弹确认弹窗");
+            assert_eq!(state.text, multiline, "弹窗必须快照剪贴板文本");
+            assert_eq!(state.pane, pane);
+            assert!(written.lock().unwrap().is_empty(), "弹窗打开期间不得写 PTY");
+
+            // Enter（走 on_key_down 模态分支）确认 → 写入快照文本
+            view.on_key_down(
+                &KeyDownEvent {
+                    keystroke: Keystroke::parse("enter").unwrap(),
+                    is_held: false,
+                },
+                window,
+                cx,
+            );
+            assert!(view.paste_confirm.is_none(), "Enter 应确认并关弹窗");
+            assert_eq!(*written.lock().unwrap(), multiline.as_bytes().to_vec());
+
+            // 尾回车单行命令（"rm -rf x\n"）：lines()==1 但含换行，是护栏核心场景
+            written.lock().unwrap().clear();
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("rm -rf x\n".into()));
+            view.begin_paste(pane, window, cx);
+            assert!(
+                view.paste_confirm.is_some(),
+                "单行命令+尾回车粘贴即执行，必须弹确认"
+            );
+            view.cancel_paste(window, cx);
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn paste_guard_escape_cancels_and_disabled_flag_writes_directly(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            let (pane, written) = attach_paste_spy(view, window, cx);
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("echo a\n".into()));
+
+            // Esc（走 on_key_down 模态分支）取消：不写任何字节
+            view.begin_paste(pane, window, cx);
+            assert!(view.paste_confirm.is_some());
+            view.on_key_down(
+                &KeyDownEvent {
+                    keystroke: Keystroke::parse("escape").unwrap(),
+                    is_held: false,
+                },
+                window,
+                cx,
+            );
+            assert!(view.paste_confirm.is_none(), "Esc 应取消弹窗");
+            assert!(written.lock().unwrap().is_empty(), "取消不得写 PTY");
+
+            // 关闭开关：多行也直接写
+            view.settings.appearance.confirm_multiline_paste = false;
+            view.begin_paste(pane, window, cx);
+            assert!(view.paste_confirm.is_none(), "开关关闭不弹弹窗");
+            assert_eq!(*written.lock().unwrap(), b"echo a\n".to_vec());
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn paste_guard_modal_mutex_and_shortcut_registry(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            let (pane, written) = attach_paste_spy(view, window, cx);
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string("echo a\n".into()));
+
+            // 服务器导入弹窗打开：begin_paste 静默放弃（粘贴模态与其它模态互斥）
+            view.server_import_dialog = Some(super::ServerImportSource::LaterTerm);
+            view.begin_paste(pane, window, cx);
+            assert!(view.paste_confirm.is_none(), "其它模态打开时不得弹粘贴弹窗");
+            assert!(written.lock().unwrap().is_empty());
+            view.server_import_dialog = None;
+
+            // 粘贴键已登记冲突注册表：用户绑命令到这两键会得到冲突提示。
+            // BUILTIN_SHORTCUTS 统一归属 BindingOwner::Builtin，describe 返回
+            // 「内置快捷键」（label 字段只进设置页行展示，不进冲突文案）。
+            for key in ["ctrl+shift+v", "shift+insert"] {
+                let conflict = view.check_shortcut_conflict(Some(key), None);
+                assert_eq!(conflict.as_deref(), Some("快捷键与内置快捷键冲突"), "{key}");
+            }
+            // 反例：未登记的组合键无冲突
+            assert_eq!(view.check_shortcut_conflict(Some("ctrl+alt+p"), None), None);
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn copy_toast_expires_after_duration_and_renews(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update(cx, |view, cx| {
+            view.show_copy_toast(5, cx);
+            assert_eq!(
+                view.copy_toast.as_ref().map(|toast| toast.chars),
+                Some(5),
+                "toast 应立即显示"
+            );
+        });
+        // t=700ms：未到期仍显示
+        cx.executor().advance_clock(Duration::from_millis(700));
+        cx.run_until_parked();
+        workspace.read_with(cx, |view, _| {
+            assert!(view.copy_toast.is_some(), "未满 1.5s 不得提前消失");
+        });
+        // t=700ms 续期：新 toast 代数自增，旧定时（t=1500ms 到期）不动新状态
+        workspace.update(cx, |view, cx| {
+            view.show_copy_toast(9, cx);
+        });
+        cx.executor().advance_clock(Duration::from_millis(900)); // t=1600ms，第一代已到期
+        cx.run_until_parked();
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(
+                view.copy_toast.as_ref().map(|toast| toast.chars),
+                Some(9),
+                "续期后旧定时任务不得清除新 toast"
+            );
+        });
+        // t=2200ms：第二代（t=700ms 创建）到期 → 消失
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        workspace.read_with(cx, |view, _| {
+            assert!(view.copy_toast.is_none(), "到期后 toast 应消失");
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn copy_toast_respects_disabled_flag(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update(cx, |view, cx| {
+            view.settings.appearance.copy_toast = false;
+            view.show_copy_toast(5, cx);
+            assert!(view.copy_toast.is_none(), "开关关闭不得显示 toast");
             for pane in &view.panes {
                 pane.session.close();
             }
