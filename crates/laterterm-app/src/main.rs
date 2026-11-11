@@ -83,9 +83,15 @@ fn main() -> Result<()> {
                 let workspace = cx.new(|cx| WorkspaceView::new(window, cx));
                 workspace.update(cx, |workspace, cx| workspace.focus_active(window, cx));
                 let weak = workspace.downgrade();
+                // 原生窗口关闭（X11 WM_DELETE_WINDOW / Wayland Close / Alt+F4）：
+                // 经工作区关闭确认门卫——探测到运行中终端时返回 false 挂起窗口
+                // 销毁（弹窗确认回调里再 shutdown+quit），无需确认时 shutdown 后
+                // 放行（true）。实体已亡的极端情形按放行处理。must 同步返回：
+                // 异步探测会让空闲窗口的原生关闭出现闪延迟（见 vendor/gpui
+                // window.rs on_window_should_close 注释）。
                 window.on_window_should_close(cx, move |_, cx| {
-                    let _ = weak.update(cx, |workspace, _| workspace.shutdown());
-                    true
+                    weak.update(cx, |workspace, cx| workspace.request_window_close(cx))
+                        .unwrap_or(true)
                 });
                 workspace
             })?;

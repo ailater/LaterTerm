@@ -527,6 +527,10 @@ impl SshSession {
 }
 
 impl TerminalSession for SshSession {
+    // 关闭二次确认探测（probe_running）刻意不覆写：远程进程表在服务器侧，
+    // 本地无低成本探测手段，走 trait 默认 None = 远程会话一律不确认直接
+    // 关闭。远程探测留后续里程碑（需经 SSH 通道查询远端前台/子进程）。
+
     fn backend(&self) -> BackendKind {
         BackendKind::Ssh
     }

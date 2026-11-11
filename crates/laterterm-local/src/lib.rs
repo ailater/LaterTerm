@@ -4,7 +4,9 @@
 //! 收敛在本 crate，应用层只拿到 [`TerminalSession`] 契约；shell 子进程的
 //! 回收线程在 spawn 时一并启动，调用方无需关心 wait。
 
-use laterterm_core::{BackendKind, SessionStreams, TerminalSession};
+use laterterm_core::{
+    BackendKind, ProcessSnapshot, RunningProcess, SessionStreams, TerminalSession,
+};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::io;
 use std::path::Path;
@@ -91,6 +93,10 @@ pub struct LocalSession {
     killer: Mutex<Option<Box<dyn ChildKiller + Send + Sync>>>,
     closing: AtomicBool,
     title: String,
+    /// shell 主进程 pid（spawn 时 `child.process_id()`，move 进回收线程前取）。
+    /// 关闭确认探测的三级判据都以它为锚：pre_exec 已 setsid()+TIOCSCTTY，
+    /// 故 shell_pid == pgid == sid。None 仅在平台拿不到 pid（防御口径）。
+    shell_pid: Option<u32>,
 }
 
 impl LocalSession {
@@ -120,6 +126,8 @@ impl LocalSession {
             .spawn_command(command)
             .map_err(io::Error::other)?;
 
+        // shell pid 必须在 child move 进回收线程前取走（探测判据的锚点）。
+        let shell_pid = child.process_id();
         let killer = child.clone_killer();
         // 回收线程：wait 阻塞到 shell 退出，防止僵尸进程
         std::thread::spawn(move || {
@@ -143,6 +151,7 @@ impl LocalSession {
             killer: Mutex::new(Some(killer)),
             closing: AtomicBool::new(false),
             title,
+            shell_pid,
         })
     }
 }
@@ -186,6 +195,195 @@ impl TerminalSession for LocalSession {
         {
             eprintln!("终止终端会话失败: {error}");
         }
+    }
+
+    /// 关闭二次确认探测（仅 Linux 实现，其余平台降级为不确认）。
+    ///
+    /// 探测时机在关闭请求时同步执行：判据 a/b1 微秒级，判据 b2 走共享
+    /// 快照槽——由调用方（一次关闭请求）持有，首个走到 b2 的窗格建表
+    /// 一次，后续窗格复用，全表扫描每请求至多一遍。
+    fn probe_running(&self, snapshot: &mut Option<ProcessSnapshot>) -> Option<RunningProcess> {
+        #[cfg(target_os = "linux")]
+        {
+            let shell_pid = self.shell_pid?;
+            probe::probe_running(
+                &self.master,
+                shell_pid,
+                &self.title,
+                snapshot,
+                probe::scan_proc_snapshot,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // macOS/Windows 无 /proc 的低成本等价物（sysctl kinfo_proc /
+            // Toolhelp32 快照成本不成比例），按需求定调降级为不确认。
+            // tcgetpgrp 本身 POSIX 通用，macOS 未来放开判据 a 的 cfg 即可。
+            let _ = (self, snapshot);
+            None
+        }
+    }
+}
+
+/// 关闭二次确认的进程探测（Linux /proc 口径）。
+///
+/// 「运行中」= 三级判据短路组合：
+/// - a：前台进程组——`tcgetpgrp(master)` 与 shell_pid 比较（主场景
+///   「跑着前台命令」微秒级命中，不触发任何 /proc 扫描）；
+/// - b1：exec 替换——shell 被别的程序替换（comm 变了）但 pgid 没变；
+/// - b2：子树兜底——后台 job / `sh -c "sleep N; echo"` 类真子进程。
+#[cfg(target_os = "linux")]
+mod probe {
+    use laterterm_core::{ProcEntry, ProcessSnapshot, RunningProcess};
+    use portable_pty::MasterPty;
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
+    /// 判据 b1 的常见 shell comm 豁免集合。
+    ///
+    /// 误报面：交互 shell 里 `exec zsh`/`exec fish` 换 shell 后 comm 不再是
+    /// spawn 时的 shell 名，若不豁免则该窗格每次关闭都会误弹确认（直至会话
+    /// 结束）；实测 `exec sleep` 后 comm="sleep"（真实程序不在集合，判定力
+    /// 不损）。自定义 REPL 不在集合内 → 多弹一次确认，保守方向可接受
+    /// （弹窗会如实显示进程名）。spawn 时记录的 shell 名另在
+    /// [`is_exempt_shell`] 里兜底（自定义安装路径的 shell）。
+    pub(super) const SHELL_COMM: &[&str] = &[
+        "sh", "bash", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "nu", "elvish", "pwsh",
+        "busybox",
+    ];
+
+    /// /proc 全表扫描上限（每请求口径：共享快照至多扫一次，上限随共享）。
+    /// 宿主 pid 命名空间共享的容器等极端机器超限时整体放弃判据 b2，
+    /// 视为不确认——宁可漏弹不可卡 UI。
+    pub(super) const PROC_SCAN_LIMIT: usize = 8192;
+
+    /// 三级判据探测。`scan` 参数化全表扫描函数，测试注入计数闭包验证
+    /// 「共享快照每请求只扫一次」。
+    pub(super) fn probe_running(
+        master: &Mutex<Box<dyn MasterPty + Send>>,
+        shell_pid: u32,
+        shell_name: &str,
+        snapshot: &mut Option<ProcessSnapshot>,
+        scan: impl Fn() -> Option<ProcessSnapshot>,
+    ) -> Option<RunningProcess> {
+        // 判据 a：前台进程组。portable-pty pre_exec 已 setsid()+TIOCSCTTY，
+        // shell_pid == pgid；tcgetpgrp 返回别的 pgid = 有前台进程组接管终端
+        //（sleep/vim/tmux client 等），前台组长 pid == pgid。
+        // None（tcgetpgrp<=0：shell 将死/EOF/EIO）不参与「不等于 shell_pid」
+        // 比较，直接落判据 b1——杜绝拿垃圾 pgid 读 /proc/<pgid>/comm。
+        if let Ok(master) = master.lock()
+            && let Some(pgid) = master.process_group_leader()
+            && pgid as u32 != shell_pid
+        {
+            // 前台组长 pid == pgid；comm 读不到（进程刚退出等）回落占位名
+            let name = read_comm(pgid as u32).unwrap_or_else(|| "未知进程".into());
+            return Some(RunningProcess { name });
+        }
+        // 判据 b1：exec 替换。`sh -c "sleep 30"` 里 shell 被 sleep 替换，
+        // tcgetpgrp == shell_pid 但 comm 已非 shell 名 → 命中；comm 仍在
+        // 豁免集合视为「仍是 shell」（`exec zsh` 换 shell 不该每次关闭都弹）
+        // → 落 b2。读不到 comm（shell 已退出/僵尸间隙，僵尸 comm 恒为
+        // shell 名无误报）不命中，继续 b2。
+        if let Some(comm) = read_comm(shell_pid)
+            && !is_exempt_shell(&comm, shell_name)
+        {
+            return Some(RunningProcess { name: comm });
+        }
+        // 判据 b2：子树兜底。`sh -c "sleep 30; echo"` 的 sleep 是真子进程、
+        // 后台 job 同理——a/b1 都看不出差别。共享快照槽惰性建表（每请求
+        // 至多一次全表扫描），以 shell_pid 为根按 ppid 可达、排僵尸。
+        // 扫描失败/超限 → 空表，子树判定不命中（= 不确认），与「跳过 b2」
+        // 同效且不重试。
+        let table = snapshot.get_or_insert_with(|| scan().unwrap_or_default());
+        find_running_descendant(table, shell_pid, |comm| is_exempt_shell(comm, shell_name))
+            .map(|name| RunningProcess { name })
+    }
+
+    /// 「仍是 shell」判定：comm 在常见 shell 豁免集合，或等于本会话 spawn
+    /// 的 shell 名。sleep/vim 等真实程序不在集合内，判定力不受损。
+    pub(super) fn is_exempt_shell(comm: &str, spawn_shell: &str) -> bool {
+        SHELL_COMM.contains(&comm) || comm == spawn_shell
+    }
+
+    /// b2 子树判定：以 `root` 为根按 ppid 向下可达的后代（不含根、排僵尸）
+    /// 中，返回第一个 comm 不在豁免集合内的进程名。
+    /// visited 防 ppid 成环异常数据死循环。
+    pub(super) fn find_running_descendant(
+        snapshot: &ProcessSnapshot,
+        root: u32,
+        is_exempt: impl Fn(&str) -> bool,
+    ) -> Option<String> {
+        let mut pending = vec![root];
+        let mut visited = BTreeSet::from([root]);
+        while let Some(parent) = pending.pop() {
+            for entry in &snapshot.entries {
+                if entry.ppid != parent || entry.pid == root || entry.state == 'Z' {
+                    continue;
+                }
+                if !is_exempt(&entry.comm) {
+                    return Some(entry.comm.clone());
+                }
+                if visited.insert(entry.pid) {
+                    pending.push(entry.pid);
+                }
+            }
+        }
+        None
+    }
+
+    /// 读 /proc/<pid>/comm（判据 a/b1 用；内核截 15 字符）。
+    fn read_comm(pid: u32) -> Option<String> {
+        std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .ok()
+            .map(|text| text.trim_end().to_string())
+            .filter(|text| !text.is_empty())
+    }
+
+    /// 单遍扫 /proc/[0-9]+/stat 建全表快照；条目数超 [`PROC_SCAN_LIMIT`]
+    /// 返回 None（判据 b2 整体放弃）。单条读取/解析失败（进程瞬时退出、
+    /// 假 pid 目录）静默跳过。
+    pub(super) fn scan_proc_snapshot() -> Option<ProcessSnapshot> {
+        let dir = std::fs::read_dir("/proc").ok()?;
+        let mut entries = Vec::new();
+        for item in dir.flatten() {
+            let Some(pid) = item
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue; // 非 pid 条目（/proc/cpuinfo 等）
+            };
+            let Some(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok() else {
+                continue;
+            };
+            if let Some(entry) = parse_proc_stat(&stat) {
+                entries.push(entry);
+            }
+            if entries.len() > PROC_SCAN_LIMIT {
+                return None;
+            }
+        }
+        Some(ProcessSnapshot { entries })
+    }
+
+    /// 解析 /proc/<pid>/stat 单行 → [`ProcEntry`]。
+    ///
+    /// comm 可含空格与括号（如 `systemd:(sd-)`、`Weird Name (x)`），必须
+    /// `rfind(')')` 定位 comm 结束再切后续字段——按空格盲 split 会把 ppid
+    /// 取错，树判定整个打歪。字段序：`pid (comm) state ppid pgrp ...`。
+    pub(super) fn parse_proc_stat(stat: &str) -> Option<ProcEntry> {
+        let close = stat.rfind(')')?;
+        let open = stat.find('(')?;
+        let pid = stat[..open].trim().parse::<u32>().ok()?;
+        let mut fields = stat[close + 1..].split_whitespace();
+        let state = fields.next()?.chars().next()?;
+        let ppid = fields.next()?.parse::<u32>().ok()?;
+        Some(ProcEntry {
+            pid,
+            ppid,
+            state,
+            comm: stat[open + 1..close].to_string(),
+        })
     }
 }
 
@@ -312,5 +510,254 @@ mod tests {
 
         session.kill();
         session.kill(); // 幂等：二次调用不应 panic
+    }
+
+    /// 关闭确认探测（三级判据）。真实 PTY 时序敏感（shell exec 完成前后
+    /// comm 是父进程名），断言一律走轮询而非固定 sleep；纯函数用合成串。
+    #[cfg(target_os = "linux")]
+    mod probe_tests {
+        use super::super::probe::{
+            self, SHELL_COMM, find_running_descendant, is_exempt_shell, parse_proc_stat,
+        };
+        use super::*;
+        use std::cell::Cell;
+        use std::thread::sleep;
+        use std::time::{Duration, Instant};
+
+        /// 轮询探测直至 `want`（超时 panic）。shell 启动竞态窗口内探测结果
+        /// 不稳定（exec 未完成时 comm 是测试二进制名），必须等收敛。
+        fn probe_until(
+            session: &LocalSession,
+            want: impl Fn(Option<String>) -> bool + Copy,
+            context: &str,
+        ) -> Option<String> {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                let mut snapshot = None;
+                let found = session.probe_running(&mut snapshot).map(|p| p.name);
+                if want(found.clone()) {
+                    return found;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "探测未收敛（{context}），最后结果: {found:?}"
+                );
+                sleep(Duration::from_millis(100));
+            }
+        }
+
+        /// 等 shell 的 comm 稳定为 `expect`（exec 完成的可靠信号）。
+        fn wait_comm(pid: u32, expect: &str) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                let comm = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                    .map(|text| text.trim_end().to_string());
+                if comm.as_deref().is_ok_and(|comm| comm == expect) {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "shell comm 未就绪，最后: {comm:?}"
+                );
+                sleep(Duration::from_millis(100));
+            }
+        }
+
+        fn spawn_shell(args: &[&str]) -> LocalSession {
+            LocalSession::spawn(LocalOptions {
+                shell: "/bin/sh".into(),
+                args: args.iter().map(|a| (*a).to_string()).collect(),
+                env: vec![],
+                cols: 20,
+                rows: 5,
+            })
+            .expect("spawn 失败")
+        }
+
+        /// 判据 a 主场景：交互 shell 跑前台命令（sleep），tcgetpgrp ≠ shell
+        /// pid，进程组名即「sleep」。这里借 `sh -c "sleep 30"`（exec 优化后
+        /// 走 b1、未优化走 b2，两条路径的结论一致）钉「运行中必命中」。
+        #[test]
+        fn running_sleep_is_detected() {
+            let session = spawn_shell(&["-c", "sleep 30"]);
+            let found = probe_until(
+                &session,
+                |found| found.as_deref() == Some("sleep"),
+                "sleep 应命中",
+            );
+            assert_eq!(found.as_deref(), Some("sleep"));
+            session.kill();
+        }
+
+        /// 空闲交互 shell（无前台命令、无子进程）不应确认。
+        /// 先等 exec 完成（comm=父进程名 → sh），再断言探测 None——绕开
+        /// 启动竞态窗口（该窗口内 b1 会拿测试二进制名误命中）。
+        #[test]
+        fn idle_interactive_shell_is_not_running() {
+            let session = spawn_shell(&[]);
+            let pid = session.shell_pid.expect("shell pid");
+            wait_comm(pid, "sh");
+            probe_until(
+                &session,
+                |found| found.is_none(),
+                "空闲 shell 应探测为无运行中",
+            );
+            session.kill();
+        }
+
+        /// `exec 同款豁免 shell` 后不确认：换 shell（comm 仍在豁免集合）
+        /// 不该让每次关闭都弹窗，直至会话结束。
+        #[test]
+        fn exec_into_exempt_shell_is_not_running() {
+            let session = spawn_shell(&["-c", "exec sh"]);
+            let pid = session.shell_pid.expect("shell pid");
+            // exec 前后 comm 都是 sh：等就绪即可（exec 完成 + 新 shell 交互
+            // 初始化），随后的 None 收敛由轮询兜住初始化瞬态
+            wait_comm(pid, "sh");
+            sleep(Duration::from_millis(300));
+            probe_until(
+                &session,
+                |found| found.is_none(),
+                "exec 豁免 shell 应探测为无运行中",
+            );
+            session.kill();
+        }
+
+        /// shell 退出后（进程消失）不再确认：探测放行关闭。
+        #[test]
+        fn exited_shell_is_not_running() {
+            let session = spawn_shell(&["-c", "sleep 0.05"]);
+            probe_until(
+                &session,
+                |found| found.is_none(),
+                "shell 退出后应探测为无运行中",
+            );
+            // 稳定复测一次（防退出过渡态偶然通过）
+            sleep(Duration::from_millis(200));
+            let mut snapshot = None;
+            assert!(session.probe_running(&mut snapshot).is_none());
+        }
+
+        /// 共享快照：同一请求（同一 snapshot 槽）内两会话探测，全表扫描
+        /// 只发生一次（第二个会话复用），且两者都能命中各自的 sleep 子进程。
+        #[test]
+        fn shared_snapshot_scans_once_across_sessions() {
+            let first = spawn_shell(&["-c", "sleep 30; echo done"]);
+            let second = spawn_shell(&["-c", "sleep 30; echo done"]);
+            // 等两个 sleep 子进程都就位（b2 命中前置条件）
+            probe_until(
+                &first,
+                |found| found.as_deref() == Some("sleep"),
+                "首个会话 sleep 就位",
+            );
+            probe_until(
+                &second,
+                |found| found.as_deref() == Some("sleep"),
+                "第二个会话 sleep 就位",
+            );
+
+            // 正式请求：一个槽、两次探测；计数扫描闭包经 Cell 捕获保持 Copy
+            let mut snapshot = None;
+            let scans = Cell::new(0usize);
+            let found_first = probe::probe_running(
+                &first.master,
+                first.shell_pid.expect("shell pid"),
+                &first.title,
+                &mut snapshot,
+                || {
+                    scans.set(scans.get() + 1);
+                    probe::scan_proc_snapshot()
+                },
+            );
+            let found_second = probe::probe_running(
+                &second.master,
+                second.shell_pid.expect("shell pid"),
+                &second.title,
+                &mut snapshot,
+                || {
+                    scans.set(scans.get() + 1);
+                    probe::scan_proc_snapshot()
+                },
+            );
+            assert_eq!(found_first.map(|p| p.name), Some("sleep".into()));
+            assert_eq!(found_second.map(|p| p.name), Some("sleep".into()));
+            assert_eq!(scans.get(), 1, "共享快照槽应只扫描一次");
+            first.kill();
+            second.kill();
+        }
+
+        /// stat 解析：comm 含空格/括号时 rfind(')') 口径不歪字段。
+        #[test]
+        fn parse_proc_stat_handles_commas_spaces_and_parens() {
+            let entry = parse_proc_stat("42 (weird proc) S 1 7 1").unwrap();
+            assert_eq!(entry.pid, 42);
+            assert_eq!(entry.comm, "weird proc");
+            assert_eq!(entry.state, 'S');
+            assert_eq!(entry.ppid, 1);
+
+            // comm 自带括号（systemd 用户实例真实形态）
+            let entry = parse_proc_stat("7 (systemd:(sd-)) S 1 7 1").unwrap();
+            assert_eq!(entry.comm, "systemd:(sd-)");
+            assert_eq!(entry.state, 'S');
+            assert_eq!(entry.ppid, 1);
+
+            // 非法串（空/缺字段/pid 非数字）一律 None
+            assert!(parse_proc_stat("").is_none());
+            assert!(parse_proc_stat("(no pid) S 1").is_none());
+            assert!(parse_proc_stat("x (bad) S 1").is_none());
+            assert!(parse_proc_stat("9 (truncated) S").is_none());
+        }
+
+        /// 豁免判定：常见 shell 与 spawn 名豁免；真实程序不豁免。
+        #[test]
+        fn exempt_shell_names_vs_real_programs() {
+            for comm in SHELL_COMM {
+                assert!(is_exempt_shell(comm, "bash"), "{comm} 应豁免");
+            }
+            assert!(is_exempt_shell("my-custom-shell", "my-custom-shell"));
+            for comm in ["sleep", "vim", "python3", "my-custom-shell"] {
+                assert!(!is_exempt_shell(comm, "bash"), "{comm} 不应豁免");
+            }
+        }
+
+        /// 子树判定：真子进程命中、豁免后代穿透到孙代、僵尸排除、环数据不死循环。
+        #[test]
+        fn subtree_detection_walks_descendants() {
+            use laterterm_core::{ProcEntry, ProcessSnapshot};
+            let snapshot = |entries: &[(u32, u32, char, &str)]| ProcessSnapshot {
+                entries: entries
+                    .iter()
+                    .map(|&(pid, ppid, state, comm)| ProcEntry {
+                        pid,
+                        ppid,
+                        state,
+                        comm: comm.into(),
+                    })
+                    .collect(),
+            };
+            let exempt = |comm: &str| is_exempt_shell(comm, "sh");
+
+            // 直接子进程是真实程序 → 命中
+            let table = snapshot(&[(2, 1, 'S', "sleep")]);
+            assert_eq!(
+                find_running_descendant(&table, 1, exempt),
+                Some("sleep".into())
+            );
+            // 子进程是 shell（豁免）且无后代 → 不命中
+            let table = snapshot(&[(2, 1, 'S', "bash")]);
+            assert_eq!(find_running_descendant(&table, 1, exempt), None);
+            // 豁免子进程的后代有真实程序 → 穿透命中孙代
+            let table = snapshot(&[(2, 1, 'S', "bash"), (3, 2, 'S', "python3")]);
+            assert_eq!(
+                find_running_descendant(&table, 1, exempt),
+                Some("python3".into())
+            );
+            // 僵尸后代不算运行中
+            let table = snapshot(&[(2, 1, 'Z', "sleep")]);
+            assert_eq!(find_running_descendant(&table, 1, exempt), None);
+            // ppid 成环异常数据不死循环
+            let table = snapshot(&[(2, 3, 'S', "bash"), (3, 2, 'S', "bash")]);
+            assert_eq!(find_running_descendant(&table, 1, exempt), None);
+        }
     }
 }

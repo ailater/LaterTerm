@@ -572,6 +572,19 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
                 ),
             ))
             .child(setting_row(
+                // 关闭窗格/标签/窗口时若探测到会话内仍有前台或子进程在运行，
+                // 先弹确认再执行关闭（防误杀 sleep/编辑器/后台 job）
+                "关闭运行中确认",
+                div(),
+                toggle_controls(
+                    cx,
+                    ("开", true),
+                    ("关", false),
+                    appearance.confirm_close_running,
+                    |s: &mut Appearance, value| s.confirm_close_running = value,
+                ),
+            ))
+            .child(setting_row(
                 // 复制成功后窗口右下角短暂显示「已复制 N 字符」
                 "复制提示",
                 div(),
