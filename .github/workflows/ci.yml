@@ -58,6 +58,15 @@ jobs:
 
       - name: 安装 GPUI 系统依赖
         run: |
+          # runner 到 security.ubuntu.com 的 DNS 曾持续故障（azure 主源可达，
+          # 三连红全为拉包失败）：security 源改指 azure 归档，dev headers
+          # 同源等价。sources.list（旧格式）与 ubuntu.sources/apt-mirrors.txt
+          #（24.04 deb822 与 GitHub 镜像机制）并存，逐个替换、缺文件忽略。
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/apt-mirrors.txt; do
+            if sudo test -f "$f"; then
+              sudo sed -i 's/security\.ubuntu\.com/azure.archive.ubuntu.com/g' "$f"
+            fi
+          done
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev \
