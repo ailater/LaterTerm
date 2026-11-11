@@ -96,6 +96,8 @@ pub struct LocalSession {
     /// shell 主进程 pid（spawn 时 `child.process_id()`，move 进回收线程前取）。
     /// 关闭确认探测的三级判据都以它为锚：pre_exec 已 setsid()+TIOCSCTTY，
     /// 故 shell_pid == pgid == sid。None 仅在平台拿不到 pid（防御口径）。
+    /// 非 Linux 的探测降级分支不读它，防 cfg 差异 dead_code 告警。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     shell_pid: Option<u32>,
 }
 

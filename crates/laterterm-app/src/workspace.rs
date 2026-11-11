@@ -2393,6 +2393,10 @@ impl WorkspaceView {
         if entries.is_empty() {
             return false;
         }
+        // 确认弹窗与标签重命名互斥：rename 开着时直接丢弃（rename 未保存
+        // 无损失，模态注意力让位给关闭确认）。不先关的话两态叠加，Esc 会被
+        // on_key_down 里靠前的 rename 分支先消费，确认框要多按一次才关。
+        self.cancel_tab_rename(cx);
         self.close_confirm = Some(CloseConfirmState { scope, entries });
         cx.notify();
         true
@@ -13380,6 +13384,38 @@ mod close_confirm_tests {
                 killed_none.load(Ordering::Acquire),
                 "shutdown 收掉全部窗格会话"
             );
+        });
+        close_sessions(&workspace, cx);
+    }
+
+    /// ⑤ 标签重命名弹窗打开时关闭运行中标签：guard_close 必须先丢弃 rename
+    /// 再弹确认（两态互斥）。修复前 rename 不在门卫互斥内，两弹窗叠加且
+    /// Esc 被 on_key_down 靠前的 rename 分支先消费，确认框要多按一次才关。
+    #[gpui::test]
+    fn guard_close_dismisses_open_tab_rename(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let (tab_id, _, _) = workspace.update_in(cx, |view, window, cx| {
+            let ids = inject_running_tab(view, window, cx, Some("fakesleep"));
+            // 先开重命名弹窗，再从门卫路径关闭同一标签
+            view.start_tab_rename(ids.0, window, cx);
+            assert!(view.tab_rename_field.is_some(), "前置：rename 已打开");
+            view.request_close_tab(ids.0, window, cx);
+            ids
+        });
+        let _ = tab_id;
+        workspace.read_with(cx, |view, _| {
+            assert!(
+                view.tab_rename_field.is_none(),
+                "确认弹窗打开时 rename 必须已被丢弃（互斥）"
+            );
+            assert!(view.close_confirm.is_some(), "关闭确认应正常弹出");
+            assert!(!view.tabs.is_empty());
+        });
+        // Esc 直接关确认框（不再被 rename 分支截走语义）：模拟键盘路径
+        workspace.update_in(cx, |view, window, cx| {
+            view.cancel_close(window, cx);
+            assert!(view.close_confirm.is_none(), "取消后弹窗关闭");
         });
         close_sessions(&workspace, cx);
     }
