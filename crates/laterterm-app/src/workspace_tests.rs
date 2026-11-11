@@ -409,3 +409,51 @@ fn palette_preview_orders_ansi_rows_and_copies_values() {
         ],
     );
 }
+
+/// window_background_appearance 三态映射（启动首帧 window_options 与运行期
+/// apply_appearance 共用的唯一口径）：o≥1 → Opaque、o<1+blur → Blurred、
+/// o<1 无 blur → Transparent。边界 1.0 必须落在 Opaque（差 1e-6 的浮点
+/// 误差走向透明会无谓请求合成器）。
+#[test]
+fn window_background_appearance_three_state_mapping() {
+    use super::workspace::window_background_appearance;
+    use laterterm_config::Appearance;
+
+    let opaque = Appearance {
+        background_opacity: 1.0,
+        ..Appearance::default()
+    };
+    assert!(matches!(
+        window_background_appearance(&opaque),
+        gpui::WindowBackgroundAppearance::Opaque
+    ));
+    // o=1 + blur 开：映射仍 Opaque（无透明底可模糊），提示层据此不误导
+    let opaque_blur = Appearance {
+        background_opacity: 1.0,
+        background_blur: true,
+        ..Appearance::default()
+    };
+    assert!(matches!(
+        window_background_appearance(&opaque_blur),
+        gpui::WindowBackgroundAppearance::Opaque
+    ));
+
+    let blurred = Appearance {
+        background_opacity: 0.7,
+        background_blur: true,
+        ..Appearance::default()
+    };
+    assert!(matches!(
+        window_background_appearance(&blurred),
+        gpui::WindowBackgroundAppearance::Blurred
+    ));
+
+    let transparent = Appearance {
+        background_opacity: 0.7,
+        ..Appearance::default()
+    };
+    assert!(matches!(
+        window_background_appearance(&transparent),
+        gpui::WindowBackgroundAppearance::Transparent
+    ));
+}
