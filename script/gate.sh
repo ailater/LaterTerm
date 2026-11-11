@@ -13,7 +13,10 @@ cargo fmt --all --check
 echo "[gate] 2/3 cargo clippy --workspace --all-targets -- -D warnings"
 cargo clippy --workspace --all-targets -- -D warnings
 
-echo "[gate] 3/3 cargo test --workspace --lib --bins"
-cargo test --workspace --lib --bins
+echo "[gate] 3/3 cargo test --workspace --lib --bins（隔离 XDG_CONFIG_HOME，与 CI 全新机器同构："
+echo "        杜绝本机 ~/.config/laterterm 残留导致机器态相关假红，PR#4/#5 两连红教训）"
+GATE_CONFIG_DIR="$(mktemp -d)"
+trap 'rm -rf "$GATE_CONFIG_DIR"' EXIT
+XDG_CONFIG_HOME="$GATE_CONFIG_DIR" cargo test --workspace --lib --bins
 
 echo "[gate] 全部通过 ✓"
