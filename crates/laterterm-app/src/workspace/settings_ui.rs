@@ -1107,7 +1107,7 @@ fn settings_servers_body(
             ),
         setting_card()
             .child(info_row("本地 Shell", "已内置"))
-            .child(info_row("SSH", "远程模块接入后可用")),
+            .child(info_row("SSH", "已接入（断线自动重连，见上方设置）")),
     ]
 }
 

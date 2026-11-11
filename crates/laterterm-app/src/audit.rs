@@ -322,10 +322,16 @@ impl TapControl {
                 return;
             };
             // 文件名在开启瞬间一次定型：时间戳取此刻、label 就地净化（评审 4）；
-            // 建目录/开文件在工作线程（OpenFile 消息），主线程零文件 IO
+            // 建目录/开文件在工作线程（OpenFile 消息），主线程零文件 IO。
+            // OpenFile 是控制消息：通道满被丢 = logging=true 但文件从未打开，
+            // 整个日志会话静默缺失——比丢一块数据重得多，故失败即回滚旗标
+            // （UI 呈现为"未开启"，用户可重试；chunk 丢失仍走 v1 计数口径）。
             let name = log_file_name(&self.label, SystemTime::now());
-            self.send(LogMessage::OpenFile(dir.join(name)));
-            self.logging.store(true, Ordering::Release);
+            if self.send(LogMessage::OpenFile(dir.join(name))) {
+                self.logging.store(true, Ordering::Release);
+            } else {
+                eprintln!("会话日志开启失败（控制通道饱和），本次未生效，可重试");
+            }
         } else {
             // 关：先清快路径（读泵不再按日志口径 send），再发 CloseFile——
             // 工作线程 flush+关文件（非 EOF，会话仍在可再开新文件）
@@ -358,10 +364,17 @@ impl TapControl {
     }
 
     /// 通道发送 + 丢帧计数（Full 计入；Disconnected = 工作线程已收尾，静默）。
-    fn send(&self, message: LogMessage) {
+    /// 返回是否落地：调用方据此区分数据块（丢失走计数口径）与控制消息
+    /// （丢失需回滚状态，见 set_logging_in 的 OpenFile 分支）。
+    fn send(&self, message: LogMessage) -> bool {
         let tx = self.inner.lock().tx.clone();
-        if let Err(flume::TrySendError::Full(_)) = tx.try_send(message) {
-            self.dropped_chunks.fetch_add(1, Ordering::Relaxed);
+        match tx.try_send(message) {
+            Ok(()) => true,
+            Err(flume::TrySendError::Full(_)) => {
+                self.dropped_chunks.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            Err(flume::TrySendError::Disconnected(_)) => false,
         }
     }
 }

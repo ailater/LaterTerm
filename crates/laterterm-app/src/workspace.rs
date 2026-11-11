@@ -4194,6 +4194,9 @@ impl WorkspaceView {
 
     /// 启用开关翻转：落盘 + 规则集热替换（停用规则不参与编译，即休眠）。
     fn toggle_trigger(&mut self, name: &str, cx: &mut Context<Self>) {
+        // 翻转前克隆快照（save_trigger/delete_trigger 同口径）：先翻转后克隆
+        // 会让 persist 失败时"回滚"到已翻转状态，UI/磁盘/审计工作线程三方漂移。
+        let previous = self.settings.clone();
         let Some(rule) = self
             .settings
             .triggers
@@ -4203,7 +4206,6 @@ impl WorkspaceView {
             return;
         };
         rule.enabled = !rule.enabled;
-        let previous = self.settings.clone();
         if let Err(error) = self.persist_settings() {
             self.settings = previous;
             self.trigger_error = Some(format!("保存规则失败: {error}"));
@@ -7302,6 +7304,12 @@ impl WorkspaceView {
         };
         // 与 attach_pane 同一装配口径：审计 tap 内层、传输拦截外层；
         // label 沿用 attach 时的标题参数（SSH = 条目名）。
+        // 会话延续语义：旧 tap 在录则新 tap 立即续录（新 tap 初值=全局默认，
+        // 不继承的话全局关+手动开的会话重连后日志静默停止）。
+        let was_logging = self.panes[index]
+            .audit
+            .as_ref()
+            .is_some_and(|tap| tap.is_logging());
         let (session, audit) = wrap_session(
             session,
             pane_id,
@@ -7309,6 +7317,9 @@ impl WorkspaceView {
             &self.settings.appearance,
             &self.audit_hub,
         );
+        if was_logging {
+            audit.set_logging(true);
+        }
         let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
         // 新会话尺寸按当前窗口视口重估（与 attach_pane 同口径）
         let theme = self.themes.resolve(self.effective_theme_name()).clone();
@@ -11000,6 +11011,41 @@ mod exit_regression_tests {
     fn inject_default_startup_settings(cx: &mut TestAppContext) {
         use crate::Settings;
         cx.set_global(crate::StartupSettings(Settings::default()));
+    }
+
+    /// toggle_trigger 落盘失败的回滚语义：persist 失败时必须恢复翻转前的
+    /// enabled（修复前先翻转后克隆快照，"回滚"恢复的是已翻转状态，UI/磁盘/
+    /// 审计工作线程三方漂移）。persist 注入不可写路径必败。
+    #[gpui::test]
+    fn toggle_trigger_rolls_back_when_persist_fails(cx: &mut TestAppContext) {
+        use laterterm_config::{TriggerAction, TriggerRule};
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, _, _cx| {
+            // 落盘指向不存在的目录：persist_settings 必败（回滚路径触发器）
+            view.settings_save_path = Some(std::path::PathBuf::from(
+                "/proc/nonexistent-laterterm/settings.toml",
+            ));
+            view.settings.triggers.push(TriggerRule {
+                name: "r1".into(),
+                pattern: "ERROR".into(),
+                action: TriggerAction::Notify,
+                enabled: false,
+            });
+        });
+        workspace.update(cx, |view, cx| {
+            view.toggle_trigger("r1", cx);
+            assert!(view.trigger_error.is_some(), "落盘失败应有错误提示");
+            assert!(
+                !view.settings.triggers[0].enabled,
+                "回滚必须恢复翻转前的 enabled=false（内存态与磁盘一致）"
+            );
+        });
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
     }
 
     #[gpui::test]
