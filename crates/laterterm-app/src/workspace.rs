@@ -62,6 +62,11 @@ const PANEL_WIDTH: f32 = 240.0;
 struct UiColors {
     /// 根容器/标题栏底色（background 压暗 6%，比边栏更深，拉开层次）。
     base_bg: u32,
+    /// 终端区底色（主题 background 原色，不做亮度调整）。o=1 时终端 canvas
+    /// 自画此色（palette_for 原样传入）；o<1 时根容器以此色@o 承载窗口底色
+    /// ——两口径同源同色，降档只变 alpha 不变色（base_bg 的 darken 6% 在
+    /// 深色主题下 L 骤降近半，1.0→0.95 一步即整体骤暗，不参与透明承载）。
+    terminal_bg: u32,
     /// 边栏底色（background 提亮 4%）。
     panel_bg: u32,
     /// 卡片底色（background 提亮 8%）。
@@ -91,6 +96,7 @@ impl UiColors {
     fn from_theme(colors: &laterterm_config::theme::ThemeColors) -> Self {
         Self {
             base_bg: darken(colors.background, 0.06),
+            terminal_bg: colors.background,
             panel_bg: lighten(colors.background, 0.04),
             card_bg: lighten(colors.background, 0.08),
             hover_bg: lighten(colors.background, 0.12),
@@ -1914,7 +1920,13 @@ impl WorkspaceView {
     /// 热更新即时生效），但落盘统一走 persist_settings——change_setting 内部
     /// 的 settings.save() 写死默认路径，测试注入的 settings_save_path 会被
     /// 绕过、拿内存态覆盖真实配置（评审阻断3，同一覆盖层只留一条持久化路径）。
-    fn onboarding_apply_font(&mut self, name: &str, cx: &mut Context<Self>) {
+    /// `window` 透传给 apply_appearance，见其注记。
+    fn onboarding_apply_font(
+        &mut self,
+        name: &str,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
         if self.settings.appearance.font_family == name {
             return; // 等值短路：不重复保存/重应用
         }
@@ -1922,7 +1934,7 @@ impl WorkspaceView {
         if let Err(error) = self.persist_settings() {
             eprintln!("保存首启引导字体设置失败: {error:#}");
         }
-        self.apply_appearance(cx);
+        self.apply_appearance(window, cx);
         cx.notify();
     }
 
@@ -2943,8 +2955,8 @@ impl WorkspaceView {
             cx,
             "设置",
             true,
-            Box::new(|this, _, cx| {
-                this.toggle_settings(cx);
+            Box::new(|this, window, cx| {
+                this.toggle_settings(Some(window), cx);
             }),
         ));
 
@@ -3139,7 +3151,7 @@ impl WorkspaceView {
         .with_priority(1)
     }
 
-    fn toggle_settings(&mut self, cx: &mut Context<Self>) {
+    fn toggle_settings(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         cx.stop_propagation();
         self.settings_open = !self.settings_open;
         if self.settings_open {
@@ -3155,7 +3167,7 @@ impl WorkspaceView {
             // 关闭路径之二（标题栏 ⚙ / 右键菜单）：未保存的主题预览在此恢复，
             // 与 close_settings（scrim/×）同一恢复语义——恢复只挂一条路径的话，
             // 从菜单关面板会残留预览色（方案风险3）。
-            self.cancel_theme_preview(cx);
+            self.cancel_theme_preview(window, cx);
         }
         cx.notify();
     }
@@ -3191,7 +3203,7 @@ impl WorkspaceView {
     fn change_setting(
         &mut self,
         _event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
         change: impl FnOnce(&mut Appearance),
     ) {
@@ -3207,7 +3219,7 @@ impl WorkspaceView {
         self.settings.save();
         let save_elapsed = save_started.map(|started| started.elapsed());
         let apply_started = trace.then(std::time::Instant::now);
-        self.apply_appearance(cx);
+        self.apply_appearance(Some(window), cx);
         if let (Some(save), Some(apply_started)) = (save_elapsed, apply_started) {
             eprintln!(
                 "[font-trace] phase=settings-save-and-apply panes={} save_us={} apply_us={}",
@@ -3242,19 +3254,19 @@ impl WorkspaceView {
         &mut self,
         _event: &MouseDownEvent,
         name: String,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
         if name == self.settings.appearance.theme {
-            self.cancel_theme_preview(cx);
+            self.cancel_theme_preview(Some(window), cx);
             return;
         }
         if self.theme_preview.as_deref() == Some(name.as_str()) {
             return; // 重复点击同一预览主题：等值短路
         }
         self.theme_preview = Some(name);
-        self.apply_appearance(cx);
+        self.apply_appearance(Some(window), cx);
     }
 
     /// 提交预览主题：先用 `themes.get` 严格校验再落盘——自定义主题可能被
@@ -3270,7 +3282,7 @@ impl WorkspaceView {
     fn commit_theme_preview(
         &mut self,
         _event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
@@ -3278,7 +3290,7 @@ impl WorkspaceView {
             return; // 无预览无可提交（按钮仅在预览期渲染，双击兜底）
         };
         if self.themes.get(&name).is_none() {
-            self.cancel_theme_preview(cx);
+            self.cancel_theme_preview(Some(window), cx);
             return;
         }
         self.settings.appearance.theme = name;
@@ -3286,21 +3298,29 @@ impl WorkspaceView {
         if let Err(error) = self.persist_settings() {
             eprintln!("保存主题设置失败: {error:#}");
         }
-        self.apply_appearance(cx);
+        self.apply_appearance(Some(window), cx);
         cx.notify();
     }
 
     /// 放弃预览：有预览才恢复（cursor_blink 同一条 update_config 热更新链路），
     /// 无预览时零操作（close_settings / toggle_settings 关闭分支无条件调用，
-    /// 空操作必须便宜且不通知）。
-    fn cancel_theme_preview(&mut self, cx: &mut Context<Self>) {
+    /// 空操作必须便宜且不通知）。`window` 透传给 apply_appearance，见其注记。
+    fn cancel_theme_preview(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         if self.theme_preview.take().is_some() {
-            self.apply_appearance(cx);
+            self.apply_appearance(window, cx);
         }
     }
 
-    /// 把当前设置（外观五项 + 主题）应用到所有窗格，不重建终端。
-    fn apply_appearance(&mut self, cx: &mut Context<Self>) {
+    /// 把当前设置（外观五项 + 主题 + 背景不透明度/模糊）应用到所有窗格与窗口，
+    /// 不重建终端。
+    ///
+    /// `window` 的两种取值对应两条生效路径（调用方按自身上下文二选一）：
+    /// UI 点击链（change_setting/主题预览等）运行在窗口更新内，此刻窗口正被
+    /// take 出 App 的窗口表（vendor gpui app.rs update_window_id），嵌套
+    /// `window_handle.update` 同一窗口必 Err("window not found")——须传
+    /// `Some(window)` 直接对当前窗口生效；仅热加载泵等窗口更新之外的上下文
+    /// 传 `None`（走 handle.update，Err = 窗口已关，按 quake 泵先例忽略）。
+    fn apply_appearance(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
         let appearance = self.settings.appearance.clone();
         // 主题解析必须读 effective：cancel 的恢复链路也走这里，漏改会把
         // 预览色「恢复」成预览色自身，恢复语义整个失效（方案风险1）。
@@ -3320,8 +3340,23 @@ impl WorkspaceView {
                 config.font_fallbacks = appearance.font_fallbacks.clone();
                 config.copy_on_select = appearance.copy_on_select;
                 config.bell_notification = appearance.bell_notification;
+                config.background_opacity = appearance.background_opacity;
                 terminal.update_config(config, cx);
             });
+        }
+        // 窗口背景三态单点生效（映射见 window_background_appearance）：
+        // o≥1 → Opaque；o<1 且 blur → Blurred；否则 → Transparent。
+        // change_setting / 主题预览 / 取消预览 / 热加载全部经本尾部自动覆盖，
+        // 无第二生效点。同值重复设置在平台层幂等（X11 is_transparent 布尔
+        // 不翻转、blade update_transparency 同值守卫，零重配）。
+        let background_appearance = window_background_appearance(&appearance);
+        match window {
+            Some(window) => window.set_background_appearance(background_appearance),
+            None => {
+                let _ = self.window_handle.update(cx, |_, window, _| {
+                    window.set_background_appearance(background_appearance);
+                });
+            }
         }
         cx.notify();
     }
@@ -3349,7 +3384,9 @@ impl WorkspaceView {
             if quake_changed {
                 self.sync_quake_worker(cx);
             }
-            self.apply_appearance(cx);
+            // 本函数跑在热加载泵（异步上下文），窗口未被 take：None 走
+            // handle.update 生效（apply_appearance 注记的两条路径之一）。
+            self.apply_appearance(None, cx);
         }
     }
 
@@ -3408,7 +3445,7 @@ impl WorkspaceView {
         // 与「已恢复默认」矛盾且无恢复路径（评审必改3）。原为 Some 时无条件
         // 补一次 apply——此时读的是恢复后的已保存值，天然正确。
         if self.theme_preview.take().is_some() {
-            self.apply_appearance(cx);
+            self.apply_appearance(Some(window), cx);
         }
     }
 
@@ -3517,7 +3554,7 @@ impl WorkspaceView {
         self.settings_open = false;
         // 关闭路径之一（scrim / ×）：未保存的主题预览在关面板时自动还原
         // （LaterScreen discard 语义移植）。toggle_settings 关闭分支挂同款。
-        self.cancel_theme_preview(cx);
+        self.cancel_theme_preview(Some(window), cx);
         self.focus_active(window, cx);
         cx.notify();
     }
@@ -6664,11 +6701,24 @@ impl Render for WorkspaceView {
         }
 
         let ui = self.ui_colors();
+        // 背景不透明度（0.15~1.0，与 Appearance::sanitize 同口径钳制）。
+        let background_opacity = self.settings.appearance.background_opacity.clamp(0.15, 1.0);
+        // 透明承载（alpha 单点）：o<1 时窗口底色唯一承载者 = 根容器的
+        // terminal_bg@o——主题 background 原色，与 o=1 时终端区画的 palette
+        // 原色同源同色，降档只变 alpha 不变色；标题栏随之跳过自己的底色
+        // （再叠 base_bg 会把标题栏有效 alpha 提到 1-(1-o)² 破坏「严格=o」）。
+        // 侧栏/卡片仍用 darken/lighten 层次色保持可读性（范围克制，v1 只动
+        // 根容器+标题栏+终端区）。
+        let root_bg: gpui::Fill = if background_opacity < 1.0 {
+            rgba((ui.terminal_bg << 8) | ((background_opacity * 255.0).round() as u32)).into()
+        } else {
+            rgb(ui.base_bg).into()
+        };
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(ui.base_bg))
+            .bg(root_bg)
             .capture_key_down(cx.listener(WorkspaceView::on_key_down))
             .child({
                 let pane_rects = pane_rects.clone();
@@ -6683,7 +6733,9 @@ impl Render for WorkspaceView {
                     .w_full()
                     .flex()
                     .items_center()
-                    .bg(rgb(ui.base_bg))
+                    // o<1 时跳过标题栏重复底色：透出根容器的 terminal_bg@o，
+                    // 与终端区同源同色（base_bg 只服务 o=1 的层次观感）
+                    .when(background_opacity >= 1.0, |bar| bar.bg(rgb(ui.base_bg)))
                     .child(
                         div()
                             .h_full()
@@ -6884,7 +6936,7 @@ impl Render for WorkspaceView {
                         "tb-settings",
                         "icons/settings.svg",
                         ui,
-                        cx.listener(|this, _, _, cx| this.toggle_settings(cx)),
+                        cx.listener(|this, _, window, cx| this.toggle_settings(Some(window), cx)),
                     ))
                     .when(!cfg!(target_os = "macos"), |titlebar| {
                         titlebar
@@ -7146,8 +7198,8 @@ impl WorkspaceView {
             setting_button(
                 label,
                 selected,
-                cx.listener(move |this, _, _, cx| {
-                    this.onboarding_apply_font(&name, cx);
+                cx.listener(move |this, _, window, cx| {
+                    this.onboarding_apply_font(&name, Some(window), cx);
                 }),
             )
         });
@@ -9808,6 +9860,23 @@ fn terminal_config_for(
         colors: palette_for(theme),
         ligatures: settings.ligatures,
         font_fallbacks: settings.font_fallbacks.clone(),
+        background_opacity: settings.background_opacity,
+    }
+}
+
+/// 窗口背景三态映射（唯一口径）：o≥1 → Opaque；o<1 且 blur → Blurred；
+/// 否则 → Transparent。启动（main.rs window_options，防透明配置下首帧
+/// 不透明闪变）与运行期（apply_appearance 尾部）共用，调整映射只落这一处。
+pub(crate) fn window_background_appearance(
+    appearance: &Appearance,
+) -> gpui::WindowBackgroundAppearance {
+    let opacity = appearance.background_opacity.clamp(0.15, 1.0);
+    if opacity >= 1.0 {
+        gpui::WindowBackgroundAppearance::Opaque
+    } else if appearance.background_blur {
+        gpui::WindowBackgroundAppearance::Blurred
+    } else {
+        gpui::WindowBackgroundAppearance::Transparent
     }
 }
 
@@ -10132,7 +10201,7 @@ mod exit_regression_tests {
             view.spawn_tab(window, cx);
             let enabled = !view.panes[0].terminal.read(cx).config().cursor_blink;
             view.settings.appearance.cursor_blink = enabled;
-            view.apply_appearance(cx);
+            view.apply_appearance(Some(window), cx);
             for pane in &view.panes {
                 assert_eq!(pane.terminal.read(cx).config().cursor_blink, enabled);
                 pane.session.close();
@@ -10148,7 +10217,7 @@ mod exit_regression_tests {
             let enabled = !view.panes[0].terminal.read(cx).config().copy_on_select;
             view.settings.appearance.copy_on_select = enabled;
             // 既有窗格链路：apply_appearance 逐窗格热更新
-            view.apply_appearance(cx);
+            view.apply_appearance(Some(window), cx);
             for pane in &view.panes {
                 assert_eq!(pane.terminal.read(cx).config().copy_on_select, enabled);
             }
@@ -10172,7 +10241,7 @@ mod exit_regression_tests {
             // config() 返回 termview 侧 TerminalConfig，断言值须映射成 termview 枚举
             for target in [CursorStyle::Bar, CursorStyle::Underline, CursorStyle::Block] {
                 view.settings.appearance.cursor_style = target;
-                view.apply_appearance(cx);
+                view.apply_appearance(Some(window), cx);
                 for pane in &view.panes {
                     assert_eq!(
                         pane.terminal.read(cx).config().cursor_style,
@@ -11614,9 +11683,11 @@ mod onboarding_tests {
             cx.notify();
         });
         cx.run_until_parked();
-        // 点字体芯片（直接调 handler：持久化走注入路径，等值短路不触发）
+        // 点字体芯片（直接调 handler：持久化走注入路径，等值短路不触发；
+        // update 无窗口上下文，透明窗口路径传 None 走 handle.update——
+        // 测试平台该调用为 no-op stub，不会崩）
         workspace.update(cx, |view, cx| {
-            view.onboarding_apply_font("DejaVu Sans Mono", cx);
+            view.onboarding_apply_font("DejaVu Sans Mono", None, cx);
         });
         cx.run_until_parked();
         let saved = std::fs::read_to_string(dir.join("settings.toml")).unwrap();
@@ -11677,9 +11748,9 @@ mod settings_panel_tests {
         cx: &mut TestAppContext,
     ) -> (Entity<WorkspaceView>, &mut VisualTestContext) {
         let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
-        workspace.update_in(cx, |view, _window, cx| {
+        workspace.update_in(cx, |view, window, cx| {
             view.welcome_visible = false;
-            view.toggle_settings(cx);
+            view.toggle_settings(Some(window), cx);
         });
         cx.run_until_parked();
         (workspace, cx)
@@ -11904,7 +11975,8 @@ mod settings_panel_tests {
             view.close_settings(&MouseDownEvent::default(), window, cx);
         });
         cx.run_until_parked();
-        workspace.update(cx, |view, cx| view.toggle_settings(cx));
+        // update 无窗口上下文：None 走 handle.update（测试平台窗口 stub 无操作）
+        workspace.update(cx, |view, cx| view.toggle_settings(None, cx));
         cx.run_until_parked();
         workspace.read_with(cx, |view, _| {
             assert_eq!(
@@ -11935,7 +12007,7 @@ mod settings_panel_tests {
         // 恢复目标不能写死 tokyo-night（评审必改2，否则随本机配置抖动）。
         workspace.update(cx, |view, cx| {
             view.settings.appearance.theme = "tokyo-night".into();
-            view.apply_appearance(cx);
+            view.apply_appearance(None, cx);
         });
         workspace.update_in(cx, |view, window, cx| {
             view.spawn_tab(window, cx);
@@ -12049,7 +12121,7 @@ mod settings_panel_tests {
         workspace.update_in(cx, |view, window, cx| {
             view.settings_save_path = Some(dir.join("settings.toml"));
             view.settings.appearance.theme = "tokyo-night".into();
-            view.apply_appearance(cx);
+            view.apply_appearance(Some(window), cx);
             view.spawn_tab(window, cx);
             view.preview_theme(
                 &MouseDownEvent::default(),
@@ -12104,7 +12176,7 @@ mod settings_panel_tests {
         workspace.update_in(cx, |view, window, cx| {
             view.settings_save_path = Some(dir.join("settings.toml"));
             view.settings.appearance.theme = "tokyo-night".into();
-            view.apply_appearance(cx);
+            view.apply_appearance(Some(window), cx);
             view.spawn_tab(window, cx);
             view.preview_theme(
                 &MouseDownEvent::default(),
@@ -12179,7 +12251,7 @@ mod settings_panel_tests {
         workspace.update(cx, |view, cx| {
             // 外观钉成默认值：触发 change_setting 的等值早退分支（不落盘不 apply）
             view.settings.appearance = laterterm_config::Appearance::default();
-            view.apply_appearance(cx);
+            view.apply_appearance(None, cx);
         });
         workspace.update_in(cx, |view, window, cx| {
             view.preview_theme(

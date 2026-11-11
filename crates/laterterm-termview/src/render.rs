@@ -475,6 +475,12 @@ pub struct TerminalRenderer {
     /// Color palette for resolving terminal colors
     pub palette: ColorPalette,
 
+    /// 背景不透明度（0.15~1.0）。1.0 = 历史行为（default 底色满幅绘制）；
+    /// <1.0 时 default 底色跳绘（窗口底色由宿主层承载），单元格背景 quad 在
+    /// 绘制时按 alpha 缩放——合并（layout_row/merge_backgrounds）仍按原色
+    /// 相等比较，缩放只在 paint 时乘一次。
+    pub background_opacity: f32,
+
     /// Whether cell metrics need to be measured again.
     needs_measurement: bool,
 }
@@ -537,6 +543,8 @@ impl TerminalRenderer {
             font_fallbacks,
             cursor_style,
             palette,
+            // 默认完全不透明（历史行为）；宿主经 pub 字段按需覆写
+            background_opacity: 1.0,
             needs_measurement: true,
         }
     }
@@ -874,14 +882,19 @@ impl TerminalRenderer {
         );
 
         // Paint default background (covers full bounds including padding)
-        window.paint_quad(quad(
-            bounds,
-            px(0.0),
-            default_bg,
-            Edges::<Pixels>::default(),
-            transparent_black(),
-            Default::default(),
-        ));
+        // 透明模式（background_opacity<1）跳绘：窗口底色由宿主层以主题
+        // background 原色@o 承载，此处再画满幅底色会叠高有效 alpha
+        // （多层同画合成 1-(1-o)^n，o=0.7 时两层即 0.91），静默破坏透明口径。
+        if self.background_opacity >= 1.0 {
+            window.paint_quad(quad(
+                bounds,
+                px(0.0),
+                default_bg,
+                Edges::<Pixels>::default(),
+                transparent_black(),
+                Default::default(),
+            ));
+        }
 
         // Calculate origin offset (content starts after padding)
         let origin = Point {
@@ -920,7 +933,10 @@ impl TerminalRenderer {
                 window.paint_quad(quad(
                     rect_bounds,
                     px(0.0),
-                    bg_rect.color,
+                    // 不透明度单点缩放：合并/跳过判定（上方 == default_bg）仍按
+                    // 原色进行，alpha 缩放只在绘制时乘一次；o=1.0 时 opacity(1.0)
+                    // 原样返回，历史绘制零变化。
+                    bg_rect.color.opacity(self.background_opacity),
                     Edges::<Pixels>::default(),
                     transparent_black(),
                     Default::default(),

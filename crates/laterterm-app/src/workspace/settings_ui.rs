@@ -447,47 +447,119 @@ pub(crate) fn settings_content(
         .children(children)
 }
 
-/// 「终端外观」卡：字号 / 行高 / 内边距。
+/// 「终端外观」卡：字号 / 行高 / 内边距 / 背景不透明度 / 背景模糊。
 fn settings_appearance_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) -> Vec<Div> {
-    vec![
-        setting_card()
-            .child(setting_row(
-                "字号",
-                value_chip(&format!("{:.0} px", appearance.font_size)),
-                stepper_controls(
-                    cx,
-                    "font-size",
-                    |s: &mut Appearance| s.font_size = (s.font_size - 1.0).max(8.0),
-                    |s: &mut Appearance| s.font_size = (s.font_size + 1.0).min(32.0),
-                ),
-            ))
-            .child(setting_row(
-                "行高",
-                value_chip(&format!("{:.1}", appearance.line_height)),
-                stepper_controls(
-                    cx,
-                    "line-height",
-                    |s: &mut Appearance| {
-                        s.line_height = ((s.line_height - 0.1) * 10.0).round() / 10.0;
-                        s.line_height = s.line_height.clamp(0.8, 2.0);
-                    },
-                    |s: &mut Appearance| {
-                        s.line_height = ((s.line_height + 0.1) * 10.0).round() / 10.0;
-                        s.line_height = s.line_height.clamp(0.8, 2.0);
-                    },
-                ),
-            ))
-            .child(setting_row(
-                "内边距",
-                value_chip(&format!("{:.0} px", appearance.padding)),
-                stepper_controls(
-                    cx,
-                    "padding",
-                    |s: &mut Appearance| s.padding = (s.padding - 1.0).max(0.0),
-                    |s: &mut Appearance| s.padding = (s.padding + 1.0).min(24.0),
-                ),
+    let mut card = setting_card()
+        .child(setting_row(
+            "字号",
+            value_chip(&format!("{:.0} px", appearance.font_size)),
+            stepper_controls(
+                cx,
+                "font-size",
+                |s: &mut Appearance| s.font_size = (s.font_size - 1.0).max(8.0),
+                |s: &mut Appearance| s.font_size = (s.font_size + 1.0).min(32.0),
+            ),
+        ))
+        .child(setting_row(
+            "行高",
+            value_chip(&format!("{:.1}", appearance.line_height)),
+            stepper_controls(
+                cx,
+                "line-height",
+                |s: &mut Appearance| {
+                    s.line_height = ((s.line_height - 0.1) * 10.0).round() / 10.0;
+                    s.line_height = s.line_height.clamp(0.8, 2.0);
+                },
+                |s: &mut Appearance| {
+                    s.line_height = ((s.line_height + 0.1) * 10.0).round() / 10.0;
+                    s.line_height = s.line_height.clamp(0.8, 2.0);
+                },
+            ),
+        ))
+        .child(setting_row(
+            "内边距",
+            value_chip(&format!("{:.0} px", appearance.padding)),
+            stepper_controls(
+                cx,
+                "padding",
+                |s: &mut Appearance| s.padding = (s.padding - 1.0).max(0.0),
+                |s: &mut Appearance| s.padding = (s.padding + 1.0).min(24.0),
+            ),
+        ))
+        .child(setting_row(
+            // ±5% 步进，两位小数取整防浮点尾巴；钳制与配置层 sanitize 同口径
+            "背景不透明度",
+            value_chip(&format!(
+                "{:.0}%",
+                (appearance.background_opacity * 100.0).round()
             )),
-    ]
+            stepper_controls(
+                cx,
+                "background-opacity",
+                |s: &mut Appearance| {
+                    s.background_opacity = ((s.background_opacity - 0.05) * 100.0).round() / 100.0;
+                    s.background_opacity = s.background_opacity.clamp(0.15, 1.0);
+                },
+                |s: &mut Appearance| {
+                    s.background_opacity = ((s.background_opacity + 0.05) * 100.0).round() / 100.0;
+                    s.background_opacity = s.background_opacity.clamp(0.15, 1.0);
+                },
+            ),
+        ))
+        .child(setting_row(
+            "背景模糊",
+            div(),
+            toggle_controls(
+                cx,
+                ("开", true),
+                ("关", false),
+                appearance.background_blur,
+                |s: &mut Appearance, value| s.background_blur = value,
+            ),
+        ));
+    // 降级提示（仅 Linux）：基于 gpui::guess_compositor() 的静态会话判定。
+    // gpui 未暴露「blur 是否真实生效」的查询口（X11 无 blur 路径、Wayland
+    // 非 KWin 合成器静默降级纯透明），无法运行时探测，只能静态提示兜底。
+    #[cfg(target_os = "linux")]
+    if let Some(hint) = transparency_hint(appearance) {
+        card = card.child(
+            div()
+                .pt_1()
+                .text_size(px(11.0))
+                .text_color(rgb(COLOR_TEXT_MUTED))
+                .child(hint),
+        );
+    }
+    vec![card]
+}
+
+/// 背景透明/模糊的降级提示（仅 Linux 编译；X11/Wayland 之外的会话类型
+/// 如 Headless 不提示）。判定值与 gpui 选后端同源（platform.rs
+/// guess_compositor，gpui.rs `pub use platform::*` 公开重导出），不自造
+/// 镜像判定。o=1（完全不透明）时两平台都无提示。
+#[cfg(target_os = "linux")]
+fn transparency_hint(appearance: &Appearance) -> Option<&'static str> {
+    let transparent = appearance.background_opacity < 1.0;
+    match gpui::guess_compositor() {
+        "X11" => {
+            if appearance.background_blur {
+                // X11 后端没有 blur 实现路径（Blurred 静默等同 Transparent）
+                Some("X11 会话不支持背景模糊，将按纯透明显示")
+            } else if transparent {
+                Some("透明需运行中的合成器（picom/KWin 等），否则透明区域显示为黑色")
+            } else {
+                None
+            }
+        }
+        "Wayland" => {
+            if appearance.background_blur {
+                Some("背景模糊需合成器支持 KDE blur 协议（KWin），不支持时按纯透明显示")
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// 「字体」卡：字体族 / 连字 / 光标闪烁 / 光标样式 / 平滑滚动 / 选中即复制 / 备选。
@@ -703,9 +775,9 @@ fn settings_scrolling_body(
                     .child(setting_button(
                         "还原",
                         false,
-                        cx.listener(|this, _event, _window, cx| {
+                        cx.listener(|this, _event, window, cx| {
                             cx.stop_propagation();
-                            this.cancel_theme_preview(cx);
+                            this.cancel_theme_preview(Some(window), cx);
                         }),
                     )),
             );
