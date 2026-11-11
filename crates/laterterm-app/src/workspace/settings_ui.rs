@@ -560,6 +560,30 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
                 ),
             ))
             .child(setting_row(
+                // 剪贴板内容含换行（含单行命令+尾回车）时先弹确认，防误粘贴即执行
+                "多行粘贴确认",
+                div(),
+                toggle_controls(
+                    cx,
+                    ("开", true),
+                    ("关", false),
+                    appearance.confirm_multiline_paste,
+                    |s: &mut Appearance, value| s.confirm_multiline_paste = value,
+                ),
+            ))
+            .child(setting_row(
+                // 复制成功后窗口右下角短暂显示「已复制 N 字符」
+                "复制提示",
+                div(),
+                toggle_controls(
+                    cx,
+                    ("开", true),
+                    ("关", false),
+                    appearance.copy_toast,
+                    |s: &mut Appearance, value| s.copy_toast = value,
+                ),
+            ))
+            .child(setting_row(
                 // 终端 bell 响铃时弹系统桌面通知；默认关（只视觉提示，测试不外发）
                 "响铃系统通知",
                 div(),
