@@ -1159,7 +1159,10 @@ impl WorkspaceView {
         // main 启动时已读一份 settings 共享在 App 全局（StartupSettings）：
         // 取走即得（move，零拷贝），消掉启动路径的第二次读盘+TOML 解析；
         // 测试等直连构造路径无此全局，回退自行加载（与此前行为一致）。
-        let mut settings = if cx.has_global::<crate::StartupSettings>() {
+        // 该全局同时充当「启动路径」标记：是否挂配置热加载 watcher 以它为准
+        // （原因见下方 watch_config_files 调用处）。
+        let from_startup = cx.has_global::<crate::StartupSettings>();
+        let mut settings = if from_startup {
             cx.remove_global::<crate::StartupSettings>().0
         } else {
             Settings::load_or_default()
@@ -1325,7 +1328,13 @@ impl WorkspaceView {
             broadcast_tx,
             broadcast_rx,
         };
-        Self::watch_config_files(cx);
+        // 仅启动路径监听真实配置目录：测试直连构造若也挂 watcher，CI 上首个
+        // 测试 ensure_settings_file 落盘 settings.toml 的 create 事件会广播给
+        // 所有存活视图，reload_from_disk 整份替换内存 settings，冲掉并发测试
+        // 刚写入的值（panel_shortcuts 竞态假红，PR#4/#5 两次 CI 首跑命中）。
+        if from_startup {
+            Self::watch_config_files(cx);
+        }
         view.start_shortcut_pump(cx);
         view.start_broadcast_pump(cx);
         view.start_totp_ticker(cx);
