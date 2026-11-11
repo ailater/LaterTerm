@@ -332,4 +332,5 @@ pub use terminal::TerminalState;
 pub use view::{
     BellCallback, ClipboardStoreCallback, CursorStyle, ExitCallback, KeyHandler, ResizeCallback,
     TerminalConfig, TerminalMenuRequested, TerminalView, TitleCallback, open_url,
+    send_desktop_notification,
 };

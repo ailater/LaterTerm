@@ -16,6 +16,7 @@ pub mod servers;
 pub mod session;
 pub mod theme;
 pub mod totp;
+pub mod triggers;
 
 pub use commands::{CommandTemplate, normalize_shortcut, shortcut_conflicts};
 pub use importers::{
@@ -28,6 +29,7 @@ pub use servers::{
 };
 pub use theme::{DEFAULT_THEME, Theme, ThemeRegistry, themes_dir};
 pub use totp::{TotpAlgorithm, TotpConfig, TotpEntry, generate_code, parse_secret_input};
+pub use triggers::{TriggerAction, TriggerRule};
 
 pub const APP_DIR: &str = "laterterm";
 pub const SETTINGS_FILE: &str = "settings.toml";
@@ -49,10 +51,17 @@ pub struct Settings {
     /// 服务器连接元数据；凭据同样只在密钥环。
     #[serde(default)]
     pub servers: Vec<servers::ServerEntry>,
+    /// 输出触发器规则（正则命中 → 通知/高亮）；正则语法在 app 侧编译期校验，
+    /// 本 crate 保持零 regex 依赖（见 triggers.rs 模块头注记）。
+    #[serde(default)]
+    pub triggers: Vec<triggers::TriggerRule>,
     /// Quake 下拉模式设置；热键本体由桌面端 portal 存储与改绑，
     /// 应用侧不持有键位文本，避免与桌面端真实绑定漂移。
     #[serde(default)]
     pub quake: QuakeSettings,
+    /// SSH 断线自动重连设置（设置→服务器页「自动重连」卡片）。
+    #[serde(default)]
+    pub reconnect: ReconnectSettings,
     /// 启动时恢复上次会话的标签列表（默认关——避免测试环境误触发）。
     #[serde(default)]
     pub restore_session: bool,
@@ -88,6 +97,34 @@ impl QuakeSettings {
     /// 载入期钳制。当前全为布尔字段无可钳制范围，保留入口与外观项对齐，
     /// 后续新增数值字段（如宽限期）时在此收紧。
     pub fn sanitize(&mut self) {}
+}
+
+/// SSH 断线自动重连设置（设置→服务器页「自动重连」卡片）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReconnectSettings {
+    /// 断线自动重连开关。默认开——断线自动重拨是终端的常规预期；
+    /// 密钥环命中免补输，缺失才弹既有补输对话框。
+    pub enabled: bool,
+    /// 最大自动尝试次数（指数退避 1s/2s/4s…）；0 = 只提示不自动重试。
+    pub max_attempts: u32,
+}
+
+impl Default for ReconnectSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_attempts: 3,
+        }
+    }
+}
+
+impl ReconnectSettings {
+    /// 载入期钳制：次数封顶 10，防手改出天文数字拖垮后台
+    /// （Appearance::sanitize 先例；容器级 serde(default) 覆盖缺字段）。
+    pub fn sanitize(&mut self) {
+        self.max_attempts = self.max_attempts.clamp(0, 10);
+    }
 }
 
 /// 内置面板与窗格操作的快捷键覆盖；`None` 表示使用默认绑定，原始文本保持不变。
@@ -189,6 +226,12 @@ pub struct Appearance {
     #[serde(default)]
     pub bell_notification: bool,
 
+    /// 会话日志全局默认：新会话（标签/分屏/SSH）attach 时读此值作审计 tee 初值。
+    /// 默认关闭——PTY 输出含潜在敏感内容（回显型密码提示仍可能入盘），不宜默认落盘；
+    /// 运行中窗格的热开/热关在工作区标签右键菜单逐标签进行，不随此处联动。
+    #[serde(default)]
+    pub session_logging: bool,
+
     /// 右侧工具面板是否图钉固定。默认固定（占布局宽度常驻）；
     /// 取消固定后转为悬浮自动隐藏（点终端收起，快捷键/标题栏按钮唤出）。
     #[serde(default = "default_true")]
@@ -237,6 +280,7 @@ impl Default for Appearance {
             copy_toast: true,
             confirm_close_running: true,
             bell_notification: false,
+            session_logging: false,
             right_panel_pinned: true,
             background_opacity: 1.0,
             background_blur: false,
@@ -285,6 +329,27 @@ impl Settings {
         let before = self.commands.len();
         self.commands.retain(|command| command.name != name);
         before != self.commands.len()
+    }
+
+    /// 新增或按名称替换触发器规则（upsert_command 同款）。
+    pub fn upsert_trigger(&mut self, trigger: triggers::TriggerRule) -> Result<()> {
+        trigger.validate()?;
+        if let Some(existing) = self
+            .triggers
+            .iter_mut()
+            .find(|item| item.name == trigger.name)
+        {
+            *existing = trigger;
+        } else {
+            self.triggers.push(trigger);
+        }
+        Ok(())
+    }
+
+    pub fn remove_trigger(&mut self, name: &str) -> bool {
+        let before = self.triggers.len();
+        self.triggers.retain(|trigger| trigger.name != name);
+        before != self.triggers.len()
     }
 
     pub fn command_shortcut_conflicts(&self) -> Vec<String> {
@@ -416,6 +481,7 @@ impl Settings {
             toml::from_str(&raw).with_context(|| format!("解析设置失败: {}", path.display()))?;
         settings.appearance.sanitize();
         settings.quake.sanitize();
+        settings.reconnect.sanitize();
         settings.sanitize_totp();
         let cleared_jumps = settings.sanitize_servers();
         // 载入期可见回报：措辞与导入侧（workspace「无效跳板引用已清除 N（…）」）
@@ -520,6 +586,42 @@ impl Appearance {
 /// 应用配置目录（`<配置目录>/laterterm`），用于文件监听等。
 pub fn app_config_dir() -> Option<PathBuf> {
     Some(config_dir()?.join(APP_DIR))
+}
+
+/// 应用状态目录（`<状态目录>/laterterm`），存放会话日志等可再生数据——
+/// 与 settings.toml（用户配置、应随备份迁移）区分：状态目录删了可重建。
+pub fn app_state_dir() -> Option<PathBuf> {
+    Some(state_dir()?.join(APP_DIR))
+}
+
+/// 平台状态目录（Linux 优先，遵循 XDG Base Directory 的 state 规范）。
+/// 与 [`config_dir`] 同构：Linux 读 `XDG_STATE_HOME`（绝对路径校验同口径），
+/// 回落 `~/.local/state`；macOS / Windows 无 state 惯例，按配置目录同源处理。
+fn state_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_STATE_HOME")
+            && Path::new(&xdg).is_absolute()
+        {
+            return Some(PathBuf::from(xdg));
+        }
+        home_dir().map(|home| home.join(".local").join("state"))
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return home_dir().map(|home| home.join("Library").join("Application Support"));
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
 }
 
 /// 平台配置目录（Linux 优先，遵循 XDG）。
@@ -917,6 +1019,76 @@ shortcut = "  legacy shortcut  "
     }
 
     #[test]
+    fn session_logging_defaults_off_and_false_roundtrip() {
+        // 旧 settings.toml 缺 session_logging 字段 → serde 补默认 false：
+        // 日志含终端输出（回显型密码提示可能入盘），全局默认必须收敛在「关」
+        let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert!(!legacy.appearance.session_logging);
+
+        // 显式开启后 roundtrip 保持 true（不会被默认值覆盖）
+        let path = temp_settings_path("session-logging");
+        let mut settings = Settings::default();
+        settings.appearance.session_logging = true;
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert!(loaded.appearance.session_logging);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn triggers_crud_upsert_remove_and_toml_roundtrip() {
+        // 旧 settings.toml 缺 [[triggers]] 段 → 空表（不缺字段报错）
+        let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert!(legacy.triggers.is_empty());
+
+        // upsert 按名替换 + remove 删除（commands 同款语义）
+        let mut settings = Settings::default();
+        settings
+            .upsert_trigger(triggers::TriggerRule {
+                name: "错误".into(),
+                pattern: "ERROR".into(),
+                action: triggers::TriggerAction::Highlight,
+                enabled: true,
+            })
+            .unwrap();
+        settings
+            .upsert_trigger(triggers::TriggerRule {
+                name: "错误".into(),
+                pattern: "FATAL".into(),
+                action: triggers::TriggerAction::Notify,
+                enabled: false,
+            })
+            .unwrap();
+        assert_eq!(settings.triggers.len(), 1);
+        assert_eq!(settings.triggers[0].pattern, "FATAL");
+        assert!(!settings.triggers[0].enabled);
+        assert!(
+            settings
+                .upsert_trigger(triggers::TriggerRule::default())
+                .is_err()
+        );
+        assert!(settings.remove_trigger("错误"));
+        assert!(!settings.remove_trigger("错误"));
+
+        // TOML roundtrip：动作小写、未知动作兜底 Notify（triggers.rs 内已单测）
+        let path = temp_settings_path("triggers");
+        settings
+            .upsert_trigger(triggers::TriggerRule {
+                name: "完成".into(),
+                pattern: "构建完成".into(),
+                action: triggers::TriggerAction::Notify,
+                enabled: true,
+            })
+            .unwrap();
+        settings.save_to(&path).unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("[[triggers]]"), "{body}");
+        let loaded = Settings::load(&path).unwrap();
+        assert_eq!(loaded.triggers, settings.triggers);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn cursor_style_defaults_roundtrip_and_unknown_falls_back() {
         // 旧文件缺 cursor_style 字段 → 容器级 serde(default) 得 Block
         let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
@@ -934,6 +1106,34 @@ shortcut = "  legacy shortcut  "
         // 手改坏值：serde(other) 兜底为 Block，整份配置不解析失败
         let patched: Settings = toml::from_str("[appearance]\ncursor_style = \"wave\"\n").unwrap();
         assert_eq!(patched.appearance.cursor_style, CursorStyle::Block);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn reconnect_defaults_true_and_max_attempts_clamped() {
+        // 旧 settings.toml 缺 [reconnect] 段 → 默认开 + 3 次（重连开关默认开）
+        let legacy: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert!(legacy.reconnect.enabled);
+        assert_eq!(legacy.reconnect.max_attempts, 3);
+
+        // 显式值 roundtrip
+        let path = temp_settings_path("reconnect");
+        let mut settings = Settings::default();
+        settings.reconnect.enabled = false;
+        settings.reconnect.max_attempts = 7;
+        settings.save_to(&path).unwrap();
+        let loaded = Settings::load(&path).unwrap();
+        assert!(!loaded.reconnect.enabled);
+        assert_eq!(loaded.reconnect.max_attempts, 7);
+
+        // 越界钳制：0 保留（只提示不重试的合法语义），天文数字拉回 10
+        std::fs::write(&path, "[reconnect]\nenabled = true\nmax_attempts = 999\n").unwrap();
+        let clamped = Settings::load(&path).unwrap();
+        assert!(clamped.reconnect.enabled);
+        assert_eq!(clamped.reconnect.max_attempts, 10);
+        std::fs::write(&path, "[reconnect]\nmax_attempts = 0\n").unwrap();
+        let zero = Settings::load(&path).unwrap();
+        assert_eq!(zero.reconnect.max_attempts, 0);
         std::fs::remove_file(&path).unwrap();
     }
 

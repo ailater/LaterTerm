@@ -2829,7 +2829,9 @@ pub fn open_url(url: &str) {
 }
 
 /// 发送系统桌面通知（终端 bell → 通知，长命令跑完提醒）。
-fn send_desktop_notification(title: &str, body: &str) {
+///
+/// 触发器（audit.rs 泵）复用同一出口：spawn 后台进程即返回，不阻塞调用线程。
+pub fn send_desktop_notification(title: &str, body: &str) {
     let (program, args): (&str, Vec<String>) = if cfg!(target_os = "macos") {
         (
             "osascript",

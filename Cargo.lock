@@ -3768,6 +3768,7 @@ dependencies = [
  "laterterm-xshell",
  "notify",
  "parking_lot",
+ "regex",
  "serde_json",
  "shellexpand",
  "ureq",

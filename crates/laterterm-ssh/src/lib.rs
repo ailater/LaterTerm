@@ -466,6 +466,10 @@ pub struct SshSession {
     streams: Mutex<Option<SessionStreams>>,
     title: String,
     closing: AtomicBool,
+    /// 非预期退出标记：网络线程在连接层死亡路径置位（channel wait None /
+    /// window_change 失败），供上层断线自动重连判别（`exit_unexpected`）。
+    /// 用户 exit（Eof|Close）与用户关闭（Shutdown）不置位。
+    unexpected_exit: Arc<AtomicBool>,
 }
 
 /// 网络线程就绪后移交给 `spawn` 侧的三件套：写桥发送端、控制桥发送端、
@@ -488,15 +492,21 @@ impl SshSession {
         // 超时按跳数缩放；spawn 侧比网络侧多留 1s，让网络线程先报真实原因
         let timeout_secs = connect_timeout_secs(options.jump.len());
         let (ready_tx, ready_rx) = std_mpsc::channel::<SessionHandles>();
+        // 非预期退出标记：spawn 侧持有、clone 进网络线程（两处连接层死亡
+        // break 前置位），SshSession 构造后经 exit_unexpected 读出
+        let unexpected_exit = Arc::new(AtomicBool::new(false));
 
         let network = std::thread::Builder::new()
             .name("laterterm-ssh".into())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("构建 tokio runtime 失败");
-                runtime.block_on(network_main(options, ready_tx));
+            .spawn({
+                let unexpected_exit = Arc::clone(&unexpected_exit);
+                move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("构建 tokio runtime 失败");
+                    runtime.block_on(network_main(options, ready_tx, unexpected_exit));
+                }
             })
             .map_err(io::Error::other)?;
 
@@ -522,6 +532,7 @@ impl SshSession {
             streams: Mutex::new(Some(encoding.apply(streams))),
             title,
             closing: AtomicBool::new(false),
+            unexpected_exit,
         })
     }
 }
@@ -533,6 +544,12 @@ impl TerminalSession for SshSession {
 
     fn backend(&self) -> BackendKind {
         BackendKind::Ssh
+    }
+
+    /// 非预期退出（连接层死亡）判别：网络线程在 wait None / window_change
+    /// 失败两处置位（见 select 循环注记）；用户 exit / Shutdown 不置位。
+    fn exit_unexpected(&self) -> bool {
+        self.unexpected_exit.load(Ordering::Acquire)
     }
 
     fn title(&self) -> String {
@@ -903,7 +920,11 @@ async fn authenticate(
 /// - 收发任务：`select` 上 SSH 通道消息（Data/ExtendedData → std 通道）
 ///   与控制指令（Resize → window_change；Shutdown → 断连并退出）
 /// - 写任务：tokio 通道的字节 → `make_writer` 异步写入
-async fn network_main(options: SshOptions, ready_tx: std_mpsc::Sender<SessionHandles>) {
+async fn network_main(
+    options: SshOptions,
+    ready_tx: std_mpsc::Sender<SessionHandles>,
+    unexpected_exit: Arc<AtomicBool>,
+) {
     let connect_result: io::Result<()> = async {
         let (handle, mut channel, tunnels) = tokio::time::timeout(
             std::time::Duration::from_secs(connect_timeout_secs(options.jump.len())),
@@ -1022,11 +1043,20 @@ async fn network_main(options: SshOptions, ready_tx: std_mpsc::Sender<SessionHan
                     }
                     Some(russh::ChannelMsg::Eof | russh::ChannelMsg::Close) => break,
                     Some(_) => continue,
-                    None => break, // 通道关闭（远程退出/断连）
+                    // 连接层死亡（russh 0.65：wait None = 通道/连接已关闭），
+                    // 区别于 Eof|Close 的远端 shell 正常退出——置位供重连判别。
+                    // 写任务失败不经此判别（只自行退出，由本路径迟到兜住，
+                    // keepalive 30s×3 把检测期封顶约 90s）。
+                    None => {
+                        unexpected_exit.store(true, Ordering::Release);
+                        break;
+                    }
                 },
                 cmd = cmd_rx.recv() => match cmd {
                     Some(SessionCmd::Resize { cols, rows }) => {
                         if channel.window_change(cols, rows, 0, 0).await.is_err() {
+                            // window_change 失败 = 连接层死亡，同 wait None 置位
+                            unexpected_exit.store(true, Ordering::Release);
                             break;
                         }
                     }
