@@ -1,5 +1,6 @@
 //! LaterTerm — 跨平台 GPU 终端。
 
+mod audit;
 mod branding;
 mod command_text_field;
 mod import;

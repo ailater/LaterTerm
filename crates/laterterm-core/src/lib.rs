@@ -93,4 +93,20 @@ pub trait TerminalSession: Send + Sync {
         let _ = snapshot;
         None
     }
+
+    /// 会话是否为「非预期退出」——连接层死亡而非用户主动退出/关闭。
+    ///
+    /// 判别语义由后端自定义（本地 PTY 无从区分，默认恒 false，shell exit 是
+    /// 正常生命周期）；SSH 覆写：网络线程在两处连接层死亡路径置位——
+    /// channel `wait()` 返回 None（russh 0.65 channels/mod.rs：None = 通道/
+    /// 连接已关闭）与 window_change 失败；`Eof|Close` = 远端 shell 正常退出
+    /// （用户 exit / 优雅踢下线）不置位，协议层无法与 exit 区分，如实接受。
+    /// 写任务失败不是判别点（它只自行退出，该路径由 wait None 迟到兜住，
+    /// keepalive 30s×3 把检测期封顶约 90s）。
+    ///
+    /// **装饰器纪律**：默认方法不会自动穿透包装层，`TransferWrappedSession`
+    /// 与 `AuditSession` 必须显式转发——漏转发则静默恒 false、重连永不触发。
+    fn exit_unexpected(&self) -> bool {
+        false
+    }
 }

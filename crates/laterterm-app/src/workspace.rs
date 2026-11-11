@@ -1,3 +1,4 @@
+use crate::audit::TapControl;
 use crate::branding::titlebar_logo;
 use crate::command_text_field::{CommandTextChanged, CommandTextField, FieldSubmit};
 use crate::onboarding::{self, FONT_PRESETS, OnboardingState, ProbeResults};
@@ -19,9 +20,10 @@ use gpui::{
 };
 use laterterm_config::{
     Appearance, CommandTemplate, ServerAuthKind, ServerEntry, ServersFile, Settings, Theme,
-    ThemeRegistry, TotpAlgorithm, TotpConfig, TotpEntry, app_config_dir,
-    deepin_commands_default_path, deepin_default_path, generate_code, load_deepin_commands,
-    load_deepin_servers, load_xshell_sessions, normalize_shortcut, parse_secret_input,
+    ThemeRegistry, TotpAlgorithm, TotpConfig, TotpEntry, TriggerAction, TriggerRule,
+    app_config_dir, deepin_commands_default_path, deepin_default_path, generate_code,
+    load_deepin_commands, load_deepin_servers, load_xshell_sessions, normalize_shortcut,
+    parse_secret_input,
 };
 use laterterm_core::{ProcessSnapshot, TerminalSession};
 use laterterm_local::{LocalOptions, LocalSession};
@@ -459,6 +461,66 @@ struct SessionControl {
     closing: AtomicBool,
 }
 
+/// SSH 链路快照：finish_ssh_connect attach 时记录，断线自动重连各次尝试
+/// 直接用它调 server_connection::connect（「随请求持有不回查配置表」口径
+/// 在重连路径完整保持，跳板链不因中途配置改动降级直连）。
+#[derive(Clone, Debug)]
+struct SshLink {
+    entry: ServerEntry,
+    jump: Vec<ServerEntry>,
+}
+
+/// SSH 重连进行态（挂 Pane.reconnect；None = 不在重连流程）。
+/// base_title 是触发重连时的窗格标题原文（不含任何退出/重连后缀），
+/// 后缀更新以它重建标题——避免对固定后缀串做 strip 的脆弱写法。
+#[derive(Clone, Debug)]
+struct ReconnectState {
+    base_title: String,
+    link: SshLink,
+    attempt: u32,
+    max_attempts: u32,
+    abandoned: bool,
+}
+
+impl ReconnectState {
+    /// 带状态后缀的完整标题（重连中随次数更新；放弃比「已退出」如实）。
+    fn display_title(&self) -> String {
+        let mut title = self.base_title.clone();
+        if self.abandoned {
+            title.push_str("（连接断开，重连已放弃）");
+        } else {
+            title.push_str(&format!(
+                "（重连中 {}/{}…）",
+                self.attempt, self.max_attempts
+            ));
+        }
+        title
+    }
+}
+
+/// 重连退避策略（纯逻辑，可单测）：第 attempt 次（1 起）尝试前等待
+/// 1s×2^(attempt-1)——1s/2s/4s…，封顶 30s（次数大时不再翻倍，防溢出
+/// 与无意义长等）；重连「上限读设置」（max_attempts 由调用方控制）。
+struct ReconnectPolicy;
+
+impl ReconnectPolicy {
+    /// 第 attempt 次尝试前的等待时长。
+    fn delay(attempt: u32) -> Duration {
+        const MAX_DELAY: Duration = Duration::from_secs(30);
+        let exp = attempt.saturating_sub(1).min(5);
+        Duration::from_secs(1 << exp).min(MAX_DELAY)
+    }
+}
+
+/// 重连成功的在途结果：job 从后台线程收到 Connected 后投入待处理队列，
+/// render 头部消费（订阅重挂需要 window，异步上下文拿不到——与
+/// pending_ssh_results 同款模式）。
+struct PendingReconnect {
+    pane: PaneId,
+    session: Arc<dyn TerminalSession>,
+    warning: Option<String>,
+}
+
 impl SessionControl {
     fn new(session: Arc<dyn TerminalSession>) -> Self {
         Self {
@@ -508,6 +570,16 @@ enum TotpDialog {
         code: Option<String>,
         generated_at: SystemTime,
         period: u64,
+    },
+}
+
+/// 触发器规则编辑弹窗（设置页「终端」节触发器卡的新增入口）。
+/// action 是弹窗内的动作二选状态（通知/高亮），随保存落盘。
+#[derive(Clone, Debug)]
+enum TriggerDialog {
+    Edit {
+        original: Option<String>,
+        action: TriggerAction,
     },
 }
 
@@ -915,6 +987,17 @@ struct Pane {
     title: String,
     terminal: Entity<TerminalView>,
     session: Arc<SessionControl>,
+    /// 会话日志开关句柄（audit tap）：标签右键菜单热开/热关；随窗格 drop
+    /// 走审计收尾（sender 摘走 → 工作线程排空退出）。
+    audit: Option<Arc<TapControl>>,
+    /// 触发器高亮锁存（Highlight 命中置位）：标签栏渲染 accent 圆点；
+    /// 窗格获得焦点/所在标签激活时清除（评审 6b 清除语义，无死锁路径）。
+    highlighted: bool,
+    /// SSH 链路快照（SSH 会话 attach 时记录；本地窗格恒 None）：
+    /// 断线自动重连按此快照直调 connect，不回查配置表。
+    ssh_link: Option<SshLink>,
+    /// SSH 重连进行态（None = 不在重连流程；成功替换即清）。
+    reconnect: Option<ReconnectState>,
     status: TabStatus,
 }
 
@@ -1148,6 +1231,12 @@ pub struct WorkspaceView {
     totp_error: Option<String>,
     totp_target: Option<PaneId>,
     totp_generating: bool,
+    /// 触发器规则编辑弹窗与字段/错误（设置页「终端」节触发器卡，命令弹窗同构）。
+    trigger_dialog: Option<TriggerDialog>,
+    trigger_fields: Vec<(String, Entity<CommandTextField>)>,
+    trigger_field_subscriptions: Vec<gpui::Subscription>,
+    trigger_delete_confirm: Option<String>,
+    trigger_error: Option<String>,
     right_panel_tab: RightPanelTab,
     server_dialog: Option<ServerDialog>,
     server_fields: Vec<(String, Entity<CommandTextField>)>,
@@ -1190,9 +1279,18 @@ pub struct WorkspaceView {
     /// SFTP 双栏面板状态（None = 关闭；同一时刻至多一个面板）。
     /// 跨模块只读访问限于 sftp_panel.rs 的覆盖层渲染。
     pub(crate) sftp_panel: Option<SftpPanelState>,
+    /// SSH 断线重连的在途成功结果（重连 job → render 头部消费：
+    /// 原位替换的订阅重挂需要 window，异步上下文拿不到）。
+    pending_reconnect_results: Vec<PendingReconnect>,
     /// SFTP 面板后台事件（列表/传输进度）→ UI pump。
     sftp_events_tx: flume::Sender<SftpEvent>,
     sftp_events_rx: flume::Receiver<SftpEvent>,
+    /// 触发器事件接收端（audit 工作线程 → render 头部 process_trigger_events
+    /// 泵消费）。去抖后低频（Notify 30s 冷却 / Highlight 锁存），unbounded。
+    trigger_rx: flume::Receiver<crate::audit::TriggerEvent>,
+    /// 审计共享枢纽：规则集句柄（设置保存/热加载时整体热替换）+ 事件发送端，
+    /// 所有会话 tap（wrap_audit）克隆同源。
+    audit_hub: crate::audit::AuditHub,
     /// 传输任务自增 id。
     next_sftp_transfer_id: u64,
     /// 栏内新建目录/重命名弹窗（走窗口级模态弹窗模式）。
@@ -1250,6 +1348,9 @@ impl WorkspaceView {
         let (shortcut_tx, shortcut_rx) = flume::unbounded();
         let (broadcast_tx, broadcast_rx) = flume::unbounded();
         let (sftp_events_tx, sftp_events_rx) = flume::unbounded();
+        // 审计枢纽：先于首窗格建好（tap 克隆同源），初始规则集就位
+        let (audit_hub, trigger_rx) = crate::audit::AuditHub::new();
+        audit_hub.swap_rules(&settings.triggers);
         let (quake_tx, quake_rx) = flume::unbounded();
         let (onboarding_tx, onboarding_rx) = flume::unbounded();
         let quake_machine = crate::quake::QuakeMachine::new(settings.quake.auto_hide_on_blur);
@@ -1264,7 +1365,7 @@ impl WorkspaceView {
             height: viewport.height - px(TITLEBAR_HEIGHT),
         };
         let (initial_cols, initial_rows) = estimate_grid_size(&settings.appearance, terminal_area);
-        let (terminal, session) = create_local_terminal(
+        let (terminal, session, first_audit) = create_local_terminal(
             first_pane,
             weak_workspace,
             cx,
@@ -1272,19 +1373,14 @@ impl WorkspaceView {
             &theme,
             shortcut_tx.clone(),
             broadcast_tx.clone(),
+            &audit_hub,
             initial_cols,
             initial_rows,
             resolve_shell(settings.shell.as_deref()),
+            // 审计 label 与下方 Pane.title 同源同值
+            "本地终端",
         );
-        cx.subscribe_in(
-            &terminal,
-            window,
-            move |this, _, _: &laterterm_termview::view::TerminalExited, window, cx| {
-                this.mark_exited(first_pane, window, cx);
-            },
-        )
-        .detach();
-        subscribe_terminal_menu(&terminal, first_pane, window, cx).detach();
+        subscribe_pane_lifecycle(&terminal, first_pane, window, cx);
         // 引导暂选从当前设置出发（正常首启为 None = 跟随默认；settings 在
         // 上面的字面量里被移动，需提前取值）。变量名避开模块别名 onboarding。
         let onboarding_state = OnboardingState {
@@ -1309,6 +1405,11 @@ impl WorkspaceView {
             command_error: None,
             command_notice: None,
             totp_dialog: None,
+            trigger_dialog: None,
+            trigger_fields: Vec::new(),
+            trigger_field_subscriptions: Vec::new(),
+            trigger_delete_confirm: None,
+            trigger_error: None,
             totp_fields: Vec::new(),
             totp_meta_draft: TotpEntry::default(),
             totp_delete_confirm: None,
@@ -1341,6 +1442,9 @@ impl WorkspaceView {
             sftp_panel: None,
             sftp_events_tx,
             sftp_events_rx,
+            pending_reconnect_results: Vec::new(),
+            trigger_rx,
+            audit_hub,
             next_sftp_transfer_id: 1,
             sftp_prompt: None,
             sftp_prompt_fields: Vec::new(),
@@ -1377,6 +1481,10 @@ impl WorkspaceView {
                 title: "本地终端".into(),
                 terminal,
                 session,
+                audit: Some(first_audit),
+                highlighted: false,
+                ssh_link: None,
+                reconnect: None,
                 status: TabStatus::Running,
             }],
             tabs: vec![WorkspaceTab {
@@ -1601,6 +1709,27 @@ impl WorkspaceView {
         }
         self.settings.save();
         self.sync_quake_worker(cx);
+        cx.notify();
+    }
+
+    /// 设置→服务器页的 SSH 自动重连开关/次数：落盘（change_setting 只收
+    /// Appearance，本变体与 change_quake_setting 同构分路）。重连各窗格
+    /// 独立判定，改设置只影响后续新触发的重连，进行中的 job 不被打断
+    /// （等待期取消语义见 begin_ssh_reconnect 的窗格关闭检查）。
+    fn change_reconnect_setting(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&mut laterterm_config::ReconnectSettings),
+    ) {
+        cx.stop_propagation();
+        let previous = self.settings.reconnect.clone();
+        change(&mut self.settings.reconnect);
+        if self.settings.reconnect == previous {
+            return;
+        }
+        self.settings.save();
         cx.notify();
     }
 
@@ -1989,12 +2118,30 @@ impl WorkspaceView {
             }
             self.active_tab = self.tabs[tab_index].id;
             self.tabs[tab_index].focused_pane = id;
+            // 触发器高亮清除语义（评审 6b）：焦点落在窗格即视为「已看过」
+            self.clear_pane_highlight(id, cx);
             if let Some(pane) = self.pane(id) {
                 window.set_window_title(&pane.title);
                 pane.terminal.read(cx).focus_handle().focus(window);
             }
             cx.notify();
         }
+    }
+
+    /// 清除窗格的触发器高亮锁存：UI 旗标复位 + 通知 audit 工作线程重置
+    /// 侧抑制（下次命中可重新点亮）。未点亮时 no-op，避免无谓消息。
+    fn clear_pane_highlight(&mut self, id: PaneId, cx: &mut Context<Self>) {
+        let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id) else {
+            return;
+        };
+        if !pane.highlighted {
+            return;
+        }
+        pane.highlighted = false;
+        if let Some(tap) = &pane.audit {
+            tap.clear_highlights();
+        }
+        cx.notify();
     }
 
     fn cycle_focus(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -2091,7 +2238,17 @@ impl WorkspaceView {
         self.next_pane_id += 1;
         // 预览期间新建的分屏/标签与既有窗格同色：读 effective 而非已保存值。
         let theme = self.themes.resolve(self.effective_theme_name()).clone();
-        let session = wrap_transfer(session, &self.settings.appearance);
+        // 会话装配：审计 tap 内层 tee、传输拦截外层（wrap_session 统一组合）。
+        // 日志 label 取 attach 标题参数（SSH=条目名、本地=「终端 N」）；全局
+        // 默认（session_logging）作文件日志初值，运行期在标签右键菜单热开/
+        // 热关；触发器扫描与该开关无关（共享规则句柄见 audit.rs）。
+        let (session, audit) = wrap_session(
+            session,
+            pane_id,
+            &title,
+            &self.settings.appearance,
+            &self.audit_hub,
+        );
         let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
         // 新窗格继承当前窗口的估算网格尺寸（与首窗格同一口径）。
         let viewport = window.viewport_size();
@@ -2109,20 +2266,16 @@ impl WorkspaceView {
             self.broadcast_tx.clone(),
             cx,
         );
-        cx.subscribe_in(
-            &terminal,
-            window,
-            move |this, _, _: &laterterm_termview::view::TerminalExited, window, cx| {
-                this.mark_exited(pane_id, window, cx);
-            },
-        )
-        .detach();
-        subscribe_terminal_menu(&terminal, pane_id, window, cx).detach();
+        subscribe_pane_lifecycle(&terminal, pane_id, window, cx);
         self.panes.push(Pane {
             id: pane_id,
             title,
             terminal,
             session: session_control,
+            audit: Some(audit),
+            highlighted: false,
+            ssh_link: None,
+            reconnect: None,
             status: TabStatus::Running,
         });
         pane_id
@@ -2239,10 +2392,21 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         cx.stop_propagation();
-        if let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) {
-            let pane_id = tab.focused_pane;
-            self.focus_pane(pane_id, window, cx);
+        // 先拷出叶窗格与焦点窗格（tab 借用与下方清除/聚焦的 &mut 分离）
+        let (leaves, focused) = {
+            let Some(tab) = self.tabs.iter().find(|tab| tab.id == id) else {
+                return;
+            };
+            let mut leaves = Vec::new();
+            tab.layout.leaves(&mut leaves);
+            (leaves, tab.focused_pane)
+        };
+        // 触发器高亮清除语义（评审 6b）：激活标签清该标签全部窗格——
+        // 覆盖活动标签内后台分屏窗格命中的场景（圆点亮起后重进即清）
+        for pane_id in leaves {
+            self.clear_pane_highlight(pane_id, cx);
         }
+        self.focus_pane(focused, window, cx);
     }
 
     /// 关闭窗格（pane 角标 × / Ctrl+W）。 exited 直接移除，Running 走 Closing 生命周期；
@@ -2297,6 +2461,42 @@ impl WorkspaceView {
         self.terminal_menu = None;
         self.tab_menu = Some(TabMenuState { tab_id, position });
         cx.notify();
+    }
+
+    /// 标签内 Running 叶窗格的审计开关句柄（会话日志菜单项的作用域）：
+    /// Exited/Closing 不参与——已退出/回收中的窗格无输出可记，天然不涉及。
+    fn running_tab_taps(&self, tab_id: TabId) -> Vec<Arc<TapControl>> {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) else {
+            return Vec::new();
+        };
+        let mut leaves = Vec::new();
+        tab.layout.leaves(&mut leaves);
+        leaves
+            .iter()
+            .filter_map(|id| {
+                let pane = self.panes.iter().find(|pane| pane.id == *id)?;
+                pane.audit
+                    .clone()
+                    .filter(|_| pane.status == TabStatus::Running)
+            })
+            .collect()
+    }
+
+    /// 会话日志菜单项勾选态：任一 Running 叶窗格开启即勾选。
+    fn tab_session_logging_any_on(&self, tab_id: TabId) -> bool {
+        self.running_tab_taps(tab_id)
+            .iter()
+            .any(|tap| tap.is_logging())
+    }
+
+    /// 标签右键「会话日志」点击：有开启则全部关，否则全部开（作用于该标签
+    /// 全部 Running 叶窗格，分屏下行为确定）。热开/热关互不影响其他窗格。
+    fn toggle_tab_session_logging(&mut self, tab_id: TabId) {
+        let taps = self.running_tab_taps(tab_id);
+        let any_on = taps.iter().any(|tap| tap.is_logging());
+        for tap in taps {
+            tap.set_logging(!any_on);
+        }
     }
 
     /// 设置标签色（菜单色块/无色项共用）；None = 清除自定义色。
@@ -2675,6 +2875,7 @@ impl WorkspaceView {
         if self.paste_confirm.is_some()
             || self.close_confirm.is_some()
             || self.command_dialog.is_some()
+            || self.trigger_dialog.is_some()
             || self.totp_dialog.is_some()
             || self.server_dialog.is_some()
             || self.server_import_dialog.is_some()
@@ -2999,10 +3200,11 @@ impl WorkspaceView {
 
         // 菜单项工厂：行高/字号口径同终端菜单（26px / 12px），禁用置灰；
         // 动作执行后统一收起标签菜单。嵌套 fn 需显式传 ui（不能捕获外层）。
+        // label 收 Into<SharedString>：勾选态项需按状态拼「✓ 」前缀。
         fn item(
             ui: UiColors,
             cx: &mut Context<WorkspaceView>,
-            label: &'static str,
+            label: impl Into<gpui::SharedString>,
             enabled: bool,
             action: TerminalMenuAction,
         ) -> Div {
@@ -3027,9 +3229,12 @@ impl WorkspaceView {
             } else {
                 base.text_color(rgb(ui.text_muted))
             }
-            .child(label)
+            .child(label.into())
         }
         let separator = || div().mx_2().my_1().h(px(1.0)).bg(rgb(ui.border));
+
+        // 会话日志勾选态：任一 Running 叶窗格开启即勾选（与点击语义配套）
+        let logging_on = self.tab_session_logging_any_on(tab_id);
 
         // 快捷色板行：点色块即设色并收起；当前色加选中描边（用户数据，不随主题）
         let swatches: Vec<Div> = TAB_COLOR_SWATCHES
@@ -3128,6 +3333,22 @@ impl WorkspaceView {
                     )
                     .child(no_color_row)
                     .child(separator())
+                    // 会话日志：✓ = 标签内任一 Running 叶窗格在记录；点击 =
+                    // 有开启则全部关、否则全部开（分屏下行为确定）。全局默认
+                    // 只约束新会话初值，运行期开关在此逐标签进行。
+                    .child(item(
+                        ui,
+                        cx,
+                        if logging_on {
+                            "✓ 会话日志"
+                        } else {
+                            "会话日志"
+                        },
+                        true,
+                        Box::new(move |this, _, _| {
+                            this.toggle_tab_session_logging(tab_id);
+                        }),
+                    ))
                     .child(item(
                         ui,
                         cx,
@@ -3374,6 +3595,9 @@ impl WorkspaceView {
             self.settings = settings;
             // 热加载整份替换设置：同步推进版本（快捷键派生缓存失效）
             self.settings_version += 1;
+            // 触发器规则集随设置热替换（外部手改 settings.toml 的 [[triggers]]
+            // 立即生效；坏正则在编译期休眠 + eprintln 告警）
+            self.audit_hub.swap_rules(&self.settings.triggers);
             self.themes = themes;
             // 外部改文件后旧预览作废：不清的话关面板时预览会覆盖用户在文件里
             // 选的主题（apply_appearance 在块尾统一执行，读已保存值天然正确）。
@@ -3827,6 +4051,186 @@ impl WorkspaceView {
         self.command_field_subscriptions.clear();
         self.command_values.clear();
         self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    // ---------- 触发器规则（设置页「终端」节触发器卡；命令弹窗同构） ----------
+
+    /// 打开触发器规则编辑弹窗（None = 新增）；字段 = 名称/模式，动作二选
+    /// 状态挂在 TriggerDialog 上。
+    fn begin_trigger_edit(
+        &mut self,
+        rule: Option<&TriggerRule>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let draft = rule.cloned().unwrap_or_default();
+        self.trigger_fields.clear();
+        self.trigger_field_subscriptions.clear();
+        for (name, value) in [
+            ("名称", draft.name.clone()),
+            ("模式", draft.pattern.clone()),
+        ] {
+            let field = cx.new(|cx| CommandTextField::new(value, name, cx));
+            self.trigger_fields.push((name.to_string(), field));
+        }
+        self.trigger_dialog = Some(TriggerDialog::Edit {
+            original: rule.map(|item| item.name.clone()),
+            action: draft.action,
+        });
+        self.trigger_error = None;
+        focus_first_field(&self.trigger_fields, window, cx);
+        cx.notify();
+    }
+
+    /// 保存触发器规则：UI 保存路径先行 `regex::bytes::Regex::new` 校验（错误
+    /// 就地显示；config 层保持零 regex 依赖，加载期不校验语法），再走
+    /// upsert_trigger + persist_settings（尊重测试注入路径），成功后规则集
+    /// 热替换即时生效。
+    fn save_trigger(
+        &mut self,
+        original: Option<String>,
+        action: TriggerAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let values = self
+            .trigger_fields
+            .iter()
+            .map(|(name, field)| (name.as_str(), field.read(cx).value()))
+            .collect::<BTreeMap<_, _>>();
+        let name = values
+            .get("名称")
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let pattern = values
+            .get("模式")
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        if let Err(error) = regex::bytes::Regex::new(&pattern) {
+            self.trigger_error = Some(format!("正则无效: {error}"));
+            cx.notify();
+            return;
+        }
+        let trigger = TriggerRule {
+            name,
+            pattern,
+            action,
+            enabled: true,
+        };
+        if let Err(error) = trigger.validate() {
+            self.trigger_error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        if original.as_deref() != Some(trigger.name.as_str())
+            && self
+                .settings
+                .triggers
+                .iter()
+                .any(|item| item.name == trigger.name)
+        {
+            self.trigger_error = Some("已存在同名规则".into());
+            cx.notify();
+            return;
+        }
+        let previous = self.settings.clone();
+        if let Some(original) = original.as_ref()
+            && original != &trigger.name
+        {
+            self.settings.remove_trigger(original);
+        }
+        if let Err(error) = self.settings.upsert_trigger(trigger) {
+            self.trigger_error = Some(error.to_string());
+            self.settings = previous;
+            cx.notify();
+            return;
+        }
+        if let Err(error) = self.persist_settings() {
+            self.settings = previous;
+            self.trigger_error = Some(format!("保存规则失败: {error}"));
+        } else {
+            // 规则集热替换：保存即生效（启停/删除路径共用同一 swap 口径）
+            self.audit_hub.swap_rules(&self.settings.triggers);
+            self.trigger_error = None;
+            self.trigger_dialog = None;
+            self.trigger_fields.clear();
+            self.trigger_field_subscriptions.clear();
+            self.focus_active(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn cancel_trigger(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.stop_propagation();
+        self.dismiss_trigger(window, cx);
+    }
+
+    /// 关闭触发器编辑弹窗（取消/遮罩/× 共用）。
+    fn dismiss_trigger(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.trigger_dialog = None;
+        self.trigger_error = None;
+        self.trigger_fields.clear();
+        self.trigger_field_subscriptions.clear();
+        self.focus_active(window, cx);
+        cx.notify();
+    }
+
+    /// 弹窗内动作二选切换（通知/高亮），不落盘——保存时一并写入。
+    fn select_trigger_action(&mut self, action: TriggerAction, cx: &mut Context<Self>) {
+        if let Some(TriggerDialog::Edit {
+            action: current, ..
+        }) = &mut self.trigger_dialog
+        {
+            *current = action;
+            cx.notify();
+        }
+    }
+
+    /// 启用开关翻转：落盘 + 规则集热替换（停用规则不参与编译，即休眠）。
+    fn toggle_trigger(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(rule) = self
+            .settings
+            .triggers
+            .iter_mut()
+            .find(|rule| rule.name == name)
+        else {
+            return;
+        };
+        rule.enabled = !rule.enabled;
+        let previous = self.settings.clone();
+        if let Err(error) = self.persist_settings() {
+            self.settings = previous;
+            self.trigger_error = Some(format!("保存规则失败: {error}"));
+        } else {
+            self.audit_hub.swap_rules(&self.settings.triggers);
+            self.trigger_error = None;
+        }
+        cx.notify();
+    }
+
+    /// 删除规则：二次确认（command_delete_confirm 同款），落盘 + 热替换。
+    fn delete_trigger(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.trigger_delete_confirm.as_deref() != Some(name) {
+            self.trigger_delete_confirm = Some(name.to_string());
+            cx.notify();
+            return;
+        }
+        let previous = self.settings.clone();
+        self.settings.remove_trigger(name);
+        if let Err(error) = self.persist_settings() {
+            self.settings = previous;
+            self.trigger_error = Some(format!("删除规则失败: {error}"));
+        } else {
+            self.audit_hub.swap_rules(&self.settings.triggers);
+            self.trigger_delete_confirm = None;
+            self.trigger_error = None;
+        }
         cx.notify();
     }
 
@@ -5231,6 +5635,13 @@ impl WorkspaceView {
             request.running = false;
         }
         self.ssh_connecting = None;
+        // 链路快照：请求持有的跳板链随窗格记录，断线自动重连按此直调
+        // connect（不回查配置表，跳板链口径与手动连接一致）
+        let request_jump = self
+            .ssh_request
+            .as_ref()
+            .map(|request| request.jump.clone())
+            .unwrap_or_default();
         match result {
             Ok(ConnectionOutcome::Connected { session, warning }) => {
                 self.ssh_request = None;
@@ -5240,7 +5651,14 @@ impl WorkspaceView {
                 self.server_error = None;
                 self.server_notice = warning;
                 let server_name = entry.name.clone();
-                let pane_id = self.attach_pane(entry.name, session, window, cx);
+                let pane_id = self.attach_pane(entry.name.clone(), session, window, cx);
+                // SSH 链路快照挂到窗格（本地窗格恒 None）
+                if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
+                    pane.ssh_link = Some(SshLink {
+                        entry: entry.clone(),
+                        jump: request_jump,
+                    });
+                }
                 let tab_id = TabId(self.next_tab_id);
                 self.next_tab_id += 1;
                 // 服务器条目默认标签色（"#RRGGBB"，坏值按 None 忽略）；
@@ -5410,6 +5828,41 @@ impl WorkspaceView {
     fn process_ssh_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for (request_id, entry, result) in std::mem::take(&mut self.pending_ssh_results) {
             self.finish_ssh_connect(request_id, entry, result, window, cx);
+        }
+    }
+
+    /// 触发器事件泵（render 头部，process_shortcuts 等同款位置）：事件已在
+    /// audit 工作线程去抖（Notify 30s 冷却 / Highlight 锁存），这里只落地——
+    /// Highlight 置位窗格锁存（标签栏圆点），Notify 弹桌面通知（复用 bell
+    /// 通道，后台 spawn 不阻塞）。窗格已回收的迟到事件自然丢弃。
+    fn process_trigger_events(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let mut changed = false;
+        while let Ok(event) = self.trigger_rx.try_recv() {
+            match event.action {
+                TriggerAction::Highlight => {
+                    if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == event.pane)
+                        && !pane.highlighted
+                    {
+                        pane.highlighted = true; // 锁存：重复命中在此天然 no-op
+                        changed = true;
+                    }
+                }
+                TriggerAction::Notify => {
+                    let title = self
+                        .panes
+                        .iter()
+                        .find(|pane| pane.id == event.pane)
+                        .map(|pane| pane.title.as_str())
+                        .unwrap_or("终端");
+                    laterterm_termview::send_desktop_notification(
+                        "LaterTerm 触发器",
+                        &format!("「{}」命中于 {title}", event.rule),
+                    );
+                }
+            }
+        }
+        if changed {
+            cx.notify();
         }
     }
 
@@ -6634,13 +7087,270 @@ impl WorkspaceView {
             }
             return;
         }
+        // 触发重连的判据先于后缀落定：非预期退出（连接层死亡，SSH 网络线程
+        // 置位、装饰器逐层转发到最外层）+ 带链路快照 + 设置开启 → 走重连，
+        // 后缀显示进行时；否则维持「（已退出）」。
+        let (unexpected, link) = self
+            .panes
+            .iter()
+            .find(|pane| pane.id == id)
+            .map(|pane| {
+                (
+                    pane.session.session.exit_unexpected(),
+                    pane.ssh_link.clone(),
+                )
+            })
+            .unwrap_or((false, None));
+        let max_attempts = self.settings.reconnect.max_attempts;
+        let mut start_reconnect = None;
         if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id)
             && pane.status.mark_exited()
         {
-            if !pane.title.ends_with("（已退出）") {
+            // let-chain 短路取链接快照：非预期退出 + 带快照 + 设置开启才走重连
+            if unexpected
+                && self.settings.reconnect.enabled
+                && max_attempts > 0
+                && let Some(link) = link
+            {
+                let state = ReconnectState {
+                    base_title: pane.title.clone(),
+                    link,
+                    attempt: 1,
+                    max_attempts,
+                    abandoned: false,
+                };
+                pane.reconnect = Some(state.clone());
+                pane.title = state.display_title();
+                start_reconnect = Some(state);
+            } else if !pane.title.ends_with("（已退出）") {
                 pane.title.push_str("（已退出）");
             }
             cx.notify();
+        }
+        if let Some(state) = start_reconnect {
+            self.begin_ssh_reconnect(id, state, cx);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // SSH 断线自动重连（仅 SSH 会话；本地 shell exit 是正常生命周期）
+    // ------------------------------------------------------------------
+
+    /// 启动重连 job：指数退避逐次 attempt（快照直调 connect 全链：密钥环
+    /// 命中免补输、缺失返回 Prompt），成功走 render 头部原位替换；Prompt
+    /// 委托既有补输对话框；次数用尽置放弃态。等待期窗格被关闭（update
+    /// 失败/窗格查无/重连态被改）即自动退出。
+    fn begin_ssh_reconnect(
+        &mut self,
+        pane_id: PaneId,
+        state: ReconnectState,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.secret_store.clone();
+        cx.spawn(async move |this, cx| {
+            let mut state = state;
+            loop {
+                if state.abandoned || state.attempt > state.max_attempts {
+                    return;
+                }
+                // 退避等待（blink_task 同款 background timer，不新增 gpui 能力）
+                cx.background_executor()
+                    .timer(ReconnectPolicy::delay(state.attempt))
+                    .await;
+                // 取消检查：窗格已关或重连态已被干预（放弃/被替换）
+                let proceed = this
+                    .read_with(cx, |ws, _| {
+                        ws.panes.iter().any(|pane| {
+                            pane.id == pane_id
+                                && pane
+                                    .reconnect
+                                    .as_ref()
+                                    .is_some_and(|state| !state.abandoned)
+                        })
+                    })
+                    .unwrap_or(false);
+                if !proceed {
+                    return;
+                }
+                // 阻塞连接放后台线程（连接/密钥环都可能秒级耗时）
+                let (tx, rx) = flume::bounded(1);
+                let entry = state.link.entry.clone();
+                let jump = state.link.jump.clone();
+                let thread_store = Arc::clone(&store);
+                let thread_active = Arc::new(AtomicBool::new(true));
+                std::thread::spawn(move || {
+                    let result = server_connection::connect(
+                        &entry,
+                        jump,
+                        None,
+                        false,
+                        thread_store,
+                        thread_active,
+                    );
+                    let _ = tx.send(result);
+                });
+                let Ok(result) = rx.recv_async().await else {
+                    return;
+                };
+                let attempt = state.attempt;
+                match result {
+                    Ok(ConnectionOutcome::Connected { session, warning }) => {
+                        // 成功交给 render 头部替换（订阅重挂需要 window）；
+                        // 实体已亡/重连态被改则丢弃会话，不留游魂连接。
+                        let pending = Arc::clone(&session);
+                        let delivered = this.update(cx, |ws, cx| {
+                            let keep = ws.panes.iter().any(|pane| {
+                                pane.id == pane_id
+                                    && pane
+                                        .reconnect
+                                        .as_ref()
+                                        .is_some_and(|state| !state.abandoned)
+                            });
+                            if !keep {
+                                pending.kill();
+                                return;
+                            }
+                            ws.pending_reconnect_results.push(PendingReconnect {
+                                pane: pane_id,
+                                session: pending,
+                                warning,
+                            });
+                            cx.notify();
+                        });
+                        if delivered.is_err() {
+                            session.kill();
+                        }
+                        return;
+                    }
+                    Ok(ConnectionOutcome::Prompt { .. }) => {
+                        // 凭据缺失：停止重连（放弃态）并委托既有补输流程；
+                        // 条目已删时 begin_ssh_connect 静默 return，此处
+                        // server_notice 兜底不留无提示死窗格（评审 5）。
+                        let _ = this.update(cx, |ws, cx| {
+                            state.abandoned = true;
+                            ws.apply_reconnect_title(pane_id, &state, cx);
+                            ws.begin_ssh_connect(&state.link.entry.name, ConnectDest::Shell, cx);
+                            if ws.ssh_request.is_none() {
+                                ws.server_notice = Some(
+                                    "凭据缺失且无法发起补输（条目可能已删除/跳板链失效），已停止自动重连"
+                                        .into(),
+                                );
+                            }
+                            cx.notify();
+                        });
+                        return;
+                    }
+                    Err(error) => {
+                        // 失败：次数未满推进尝试数并更新后缀，否则放弃
+                        eprintln!(
+                            "SSH 自动重连第 {attempt}/{} 次失败（{}）: {error:#}",
+                            state.max_attempts, state.link.entry.name
+                        );
+                        let _ = this.update(cx, |ws, cx| {
+                            if attempt >= state.max_attempts {
+                                state.abandoned = true;
+                            } else {
+                                state.attempt += 1;
+                            }
+                            ws.apply_reconnect_title(pane_id, &state, cx);
+                        });
+                        if state.abandoned {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 用重连状态重建窗格标题后缀（「（重连中 n/3…）」随次数更新）。
+    fn apply_reconnect_title(
+        &mut self,
+        pane_id: PaneId,
+        state: &ReconnectState,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
+            pane.reconnect = Some(state.clone());
+            pane.title = state.display_title();
+            cx.notify();
+        }
+    }
+
+    /// 重连成功的原位替换：换 terminal 实体 + SessionControl + 审计 tap，
+    /// 三件配套同做（评审 2 必须项）——(a) TerminalExited 订阅按实体重挂、
+    /// (b) 右键菜单订阅重挂（subscribe_pane_lifecycle 共用入口）、(c)
+    /// TabStatus 复位 Running（否则 is_exited 门卫拒收新会话全部 OSC 标题、
+    /// close_pane 绕过 Closing 生命周期）；复位同时清重连后缀，标题交还
+    /// 新会话 OSC 接管。链路快照保留（下次断线仍可重连）。
+    fn apply_reconnect_success(
+        &mut self,
+        pane_id: PaneId,
+        session: Arc<dyn TerminalSession>,
+        warning: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(index) = self.panes.iter().position(|pane| pane.id == pane_id) else {
+            session.kill(); // 窗格已回收的迟到结果：不留游魂连接
+            return;
+        };
+        let Some(state) = self.panes[index].reconnect.clone() else {
+            session.kill();
+            return;
+        };
+        // 与 attach_pane 同一装配口径：审计 tap 内层、传输拦截外层；
+        // label 沿用 attach 时的标题参数（SSH = 条目名）。
+        let (session, audit) = wrap_session(
+            session,
+            pane_id,
+            &state.link.entry.name,
+            &self.settings.appearance,
+            &self.audit_hub,
+        );
+        let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
+        // 新会话尺寸按当前窗口视口重估（与 attach_pane 同口径）
+        let theme = self.themes.resolve(self.effective_theme_name()).clone();
+        let viewport = window.viewport_size();
+        let terminal_area = gpui::Size {
+            width: viewport.width,
+            height: viewport.height - px(TITLEBAR_HEIGHT),
+        };
+        let (cols, rows) = estimate_grid_size(&self.settings.appearance, terminal_area);
+        let terminal = create_terminal_view(
+            pane_id,
+            session,
+            terminal_config_for(&self.settings.appearance, &theme, cols, rows),
+            cx.weak_entity(),
+            self.shortcut_tx.clone(),
+            self.broadcast_tx.clone(),
+            cx,
+        );
+        subscribe_pane_lifecycle(&terminal, pane_id, window, cx);
+        let pane = &mut self.panes[index];
+        pane.terminal = terminal;
+        pane.session = session_control;
+        pane.audit = Some(audit);
+        pane.status = TabStatus::Running;
+        pane.highlighted = false; // 新会话从干净状态开始
+        pane.reconnect = None;
+        pane.title = state.base_title; // 清后缀，新会话标题经 OSC 接管
+        if warning.is_some() {
+            self.server_notice = warning; // 非致命警告如实提示（与手动连接同通道）
+        }
+        // 已恢复提示 = 后缀清除 + 状态复位 Running；仅当窗格在活动标签时
+        // 聚焦（不抢用户当前焦点，后台标签恢复由标签行标题自然呈现）。
+        if self.active_tab().layout.contains(pane_id) {
+            self.focus_pane(pane_id, window, cx);
+        }
+        cx.notify();
+    }
+
+    /// 重连在途结果落地（render 头部，process_ssh_results 同款位置）。
+    fn process_reconnect_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        for result in std::mem::take(&mut self.pending_reconnect_results) {
+            self.apply_reconnect_success(result.pane, result.session, result.warning, window, cx);
         }
     }
 }
@@ -6655,6 +7365,8 @@ impl Render for WorkspaceView {
         self.process_shortcuts(window, cx);
         self.process_ssh_results(window, cx);
         self.process_sftp_results(window, cx);
+        self.process_trigger_events(window, cx);
+        self.process_reconnect_results(window, cx);
         if let Some(handle) = self.pending_focus.take() {
             handle.focus(window);
         }
@@ -6678,14 +7390,22 @@ impl Render for WorkspaceView {
         let geometry_layout = active_layout.clone();
         let geometry_rects = pane_rects.clone();
         let focused_pane = self.active_tab().focused_pane;
-        // 每个标签 = (id, 标题[自定义 > 焦点窗格], 窗格数, 自定义色)
+        // 每个标签 = (id, 标题[自定义 > 焦点窗格], 窗格数, 自定义色, 高亮)
         let tab_labels = self
             .tabs
             .iter()
             .map(|tab| {
                 let count = tab.layout.leaf_count();
                 let title = tab.tab_title(&self.panes);
-                (tab.id, title, count, tab.color)
+                // 触发器高亮圆点：任一叶窗格锁存即亮（跨标签可见的提醒面）
+                let mut leaves = Vec::new();
+                tab.layout.leaves(&mut leaves);
+                let highlighted = leaves.iter().any(|id| {
+                    self.panes
+                        .iter()
+                        .any(|pane| pane.id == *id && pane.highlighted)
+                });
+                (tab.id, title, count, tab.color, highlighted)
             })
             .collect::<Vec<_>>();
         let left_panel = self.left_panel;
@@ -6790,108 +7510,121 @@ impl Render for WorkspaceView {
                             .items_center()
                             .overflow_x_hidden()
                             .when(!left_panel, |bar| {
-                                bar.children(tab_labels.iter().map(|(id, title, count, color)| {
-                                    let id = *id;
-                                    let color = *color;
-                                    let is_active = id == active_tab_id;
-                                    // 超长标题截断：活跃标签可稍宽；计数后缀不参与截断
-                                    let title = truncate_tab_title(
-                                        title,
-                                        if is_active {
-                                            ACTIVE_TAB_TITLE_MAX_CHARS
-                                        } else {
-                                            TAB_TITLE_MAX_CHARS
-                                        },
-                                    );
-                                    let label = if *count > 1 {
-                                        format!("{title} ⊞{count}")
-                                    } else {
-                                        title
-                                    };
-                                    div()
-                                        .h_full()
-                                        .relative()
-                                        .group("tab")
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .px_3()
-                                        .bg(if is_active {
-                                            rgb(ui.hover_bg)
-                                        } else {
-                                            rgb(ui.panel_bg)
-                                        })
-                                        .text_color(if is_active {
-                                            rgb(ui.text)
-                                        } else {
-                                            rgb(ui.text_secondary)
-                                        })
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, event, window, cx| {
-                                                // 单击已激活（activate_tab 内）；
-                                                // 双击在此基础上弹重命名弹窗；
-                                                // 记下拖拽起点，位移超阈值即进入重排
-                                                this.activate_tab(id, event, window, cx);
-                                                this.start_tab_drag(id, event.position);
-                                                if event.click_count >= 2 {
-                                                    this.start_tab_rename(id, window, cx);
-                                                }
-                                            }),
-                                        )
-                                        // 拖拽排序：hover 到本标签且位移超阈值时交换
-                                        .on_mouse_move(cx.listener(
-                                            move |this, event: &MouseMoveEvent, _, cx| {
-                                                this.update_tab_drag(id, event.position, cx);
+                                bar.children(tab_labels.iter().map(
+                                    |(id, title, count, color, highlighted)| {
+                                        let id = *id;
+                                        let color = *color;
+                                        let highlighted = *highlighted;
+                                        let is_active = id == active_tab_id;
+                                        // 超长标题截断：活跃标签可稍宽；计数后缀不参与截断
+                                        let title = truncate_tab_title(
+                                            title,
+                                            if is_active {
+                                                ACTIVE_TAB_TITLE_MAX_CHARS
+                                            } else {
+                                                TAB_TITLE_MAX_CHARS
                                             },
-                                        ))
-                                        .child(label)
-                                        // 底部 2px 色条：自定义标签色优先并替代
-                                        // 活跃标签的 accent 强调线；无色保持原样
-                                        .child(match color {
-                                            Some(color) => div()
-                                                .absolute()
-                                                .bottom_0()
-                                                .left_0()
-                                                .right_0()
-                                                .h(px(2.0))
-                                                .bg(rgb(color)),
-                                            None if is_active => div()
-                                                .absolute()
-                                                .bottom_0()
-                                                .left_0()
-                                                .right_0()
-                                                .h(px(2.0))
-                                                .bg(rgb(ui.accent)),
-                                            None => div(),
-                                        })
-                                        // 右键弹标签菜单；拦截冒泡防触发
-                                        // 终端右键菜单与窗口拖动
-                                        .on_mouse_down(
-                                            MouseButton::Right,
-                                            cx.listener(
-                                                move |this, event: &MouseDownEvent, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.open_tab_menu(id, event.position, cx);
+                                        );
+                                        let label = if *count > 1 {
+                                            format!("{title} ⊞{count}")
+                                        } else {
+                                            title
+                                        };
+                                        div()
+                                            .h_full()
+                                            .relative()
+                                            .group("tab")
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .px_3()
+                                            .bg(if is_active {
+                                                rgb(ui.hover_bg)
+                                            } else {
+                                                rgb(ui.panel_bg)
+                                            })
+                                            .text_color(if is_active {
+                                                rgb(ui.text)
+                                            } else {
+                                                rgb(ui.text_secondary)
+                                            })
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, event, window, cx| {
+                                                    // 单击已激活（activate_tab 内）；
+                                                    // 双击在此基础上弹重命名弹窗；
+                                                    // 记下拖拽起点，位移超阈值即进入重排
+                                                    this.activate_tab(id, event, window, cx);
+                                                    this.start_tab_drag(id, event.position);
+                                                    if event.click_count >= 2 {
+                                                        this.start_tab_rename(id, window, cx);
+                                                    }
+                                                }),
+                                            )
+                                            // 拖拽排序：hover 到本标签且位移超阈值时交换
+                                            .on_mouse_move(cx.listener(
+                                                move |this, event: &MouseMoveEvent, _, cx| {
+                                                    this.update_tab_drag(id, event.position, cx);
                                                 },
-                                            ),
-                                        )
-                                        .child(
-                                            div()
-                                                .px_1()
-                                                .text_color(rgb(ui.text_muted))
-                                                .opacity(0.55)
-                                                .group_hover("tab", |style| style.opacity(1.0))
-                                                .hover(|style| style.text_color(rgb(ui.danger)))
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, _, window, cx| {
-                                                        this.request_close_tab(id, window, cx)
-                                                    }),
+                                            ))
+                                            .child(label)
+                                            // 触发器高亮圆点：accent 实心点，焦点/
+                                            // 激活标签后清除（评审 6b 语义）
+                                            .when(highlighted, |tab| {
+                                                tab.child(
+                                                    div()
+                                                        .size(px(6.0))
+                                                        .rounded_full()
+                                                        .bg(rgb(ui.accent)),
                                                 )
-                                                .child("×"),
-                                        )
-                                }))
+                                            })
+                                            // 底部 2px 色条：自定义标签色优先并替代
+                                            // 活跃标签的 accent 强调线；无色保持原样
+                                            .child(match color {
+                                                Some(color) => div()
+                                                    .absolute()
+                                                    .bottom_0()
+                                                    .left_0()
+                                                    .right_0()
+                                                    .h(px(2.0))
+                                                    .bg(rgb(color)),
+                                                None if is_active => div()
+                                                    .absolute()
+                                                    .bottom_0()
+                                                    .left_0()
+                                                    .right_0()
+                                                    .h(px(2.0))
+                                                    .bg(rgb(ui.accent)),
+                                                None => div(),
+                                            })
+                                            // 右键弹标签菜单；拦截冒泡防触发
+                                            // 终端右键菜单与窗口拖动
+                                            .on_mouse_down(
+                                                MouseButton::Right,
+                                                cx.listener(
+                                                    move |this, event: &MouseDownEvent, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.open_tab_menu(id, event.position, cx);
+                                                    },
+                                                ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px_1()
+                                                    .text_color(rgb(ui.text_muted))
+                                                    .opacity(0.55)
+                                                    .group_hover("tab", |style| style.opacity(1.0))
+                                                    .hover(|style| style.text_color(rgb(ui.danger)))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(move |this, _, window, cx| {
+                                                            this.request_close_tab(id, window, cx)
+                                                        }),
+                                                    )
+                                                    .child("×"),
+                                            )
+                                    },
+                                ))
                             })
                             .child(icon_button(
                                 "tb-new-tab",
@@ -7582,7 +8315,7 @@ fn render_layout(
 /// 标签列表采用固定标题和独立滚动区域，长标题不挤占关闭按钮。
 /// 颜色全部走 `ui`（主题派生），不再写死 Tokyo Night 色值。
 fn left_sidebar(
-    tab_labels: &[(TabId, String, usize, Option<u32>)],
+    tab_labels: &[(TabId, String, usize, Option<u32>, bool)],
     active_tab_id: TabId,
     scroll: &ScrollHandle,
     ui: UiColors,
@@ -7634,127 +8367,146 @@ fn left_sidebar(
                 .track_scroll(scroll)
                 .px_2()
                 .pb_2()
-                .children(tab_labels.iter().map(|(id, title, count, color)| {
-                    let id = *id;
-                    let color = *color;
-                    let selected = id == active_tab_id;
-                    // 与标题栏同口径的超长截断（活跃标签可稍宽）
-                    let label = truncate_tab_title(
-                        title,
-                        if selected {
-                            ACTIVE_TAB_TITLE_MAX_CHARS
-                        } else {
-                            TAB_TITLE_MAX_CHARS
-                        },
-                    );
-                    let count = *count;
-                    div()
-                        .debug_selector(move || {
-                            if selected {
-                                "sidebar-active-tab".into()
-                            } else {
-                                "sidebar-other-tab".into()
-                            }
-                        })
-                        .group("session-row")
-                        .h(px(38.0))
-                        .mb_1()
-                        .px_2()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .rounded_md()
-                        .bg(if selected {
-                            rgb(ui.selected_bg)
-                        } else {
-                            rgb(ui.panel_bg)
-                        })
-                        .text_color(if selected {
-                            rgb(ui.text)
-                        } else {
-                            rgb(ui.text_secondary)
-                        })
-                        .hover(|style| {
-                            style.bg(if selected {
-                                rgb(ui.hover_bg)
-                            } else {
-                                rgb(ui.border)
-                            })
-                        })
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                // 记下拖拽起点（纵拖超阈值重排，松开即清）
-                                this.start_tab_drag(id, event.position);
-                                if event.click_count >= 2 {
-                                    this.start_tab_rename(id, window, cx);
+                .children(
+                    tab_labels
+                        .iter()
+                        .map(|(id, title, count, color, highlighted)| {
+                            let id = *id;
+                            let color = *color;
+                            let highlighted = *highlighted;
+                            let selected = id == active_tab_id;
+                            // 与标题栏同口径的超长截断（活跃标签可稍宽）
+                            let label = truncate_tab_title(
+                                title,
+                                if selected {
+                                    ACTIVE_TAB_TITLE_MAX_CHARS
                                 } else {
-                                    this.activate_tab(id, event, window, cx);
-                                }
-                            }),
-                        )
-                        // 拖拽排序：hover 到本条目且位移超阈值时交换
-                        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
-                            this.update_tab_drag(id, event.position, cx);
-                        }))
-                        // 右键弹标签菜单；拦截冒泡防误触终端菜单
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.open_tab_menu(id, event.position, cx);
-                            }),
-                        )
-                        // 左侧竖色条：自定义标签色优先（3px）；无色回落
-                        // 活跃 accent / 透明占位，保持行内对齐
-                        .child(match color {
-                            Some(color) => {
-                                div().w(px(3.0)).h(px(18.0)).rounded_full().bg(rgb(color))
-                            }
-                            None => div().w(px(2.0)).h(px(18.0)).rounded_full().bg(if selected {
-                                rgb(ui.accent)
-                            } else {
-                                rgb(ui.panel_bg)
-                            }),
-                        })
-                        .child(
+                                    TAB_TITLE_MAX_CHARS
+                                },
+                            );
+                            let count = *count;
                             div()
-                                .text_size(px(13.0))
-                                .text_color(rgb(ui.accent))
-                                .child("›_"),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .truncate()
-                                .text_size(px(13.0))
-                                .child(label),
-                        )
-                        .when(count > 1, |row| {
-                            row.child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(ui.text_secondary))
-                                    .child(count.to_string()),
-                            )
-                        })
-                        .child(
-                            div()
-                                .px_1()
-                                .opacity(0.0)
-                                .group_hover("session-row", |style| style.opacity(1.0))
-                                .text_color(rgb(ui.text_secondary))
-                                .hover(|style| style.text_color(rgb(ui.danger)))
+                                .debug_selector(move || {
+                                    if selected {
+                                        "sidebar-active-tab".into()
+                                    } else {
+                                        "sidebar-other-tab".into()
+                                    }
+                                })
+                                .group("session-row")
+                                .h(px(38.0))
+                                .mb_1()
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .rounded_md()
+                                .bg(if selected {
+                                    rgb(ui.selected_bg)
+                                } else {
+                                    rgb(ui.panel_bg)
+                                })
+                                .text_color(if selected {
+                                    rgb(ui.text)
+                                } else {
+                                    rgb(ui.text_secondary)
+                                })
+                                .hover(|style| {
+                                    style.bg(if selected {
+                                        rgb(ui.hover_bg)
+                                    } else {
+                                        rgb(ui.border)
+                                    })
+                                })
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(move |this, _, window, cx| {
-                                        this.request_close_tab(id, window, cx)
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        // 记下拖拽起点（纵拖超阈值重排，松开即清）
+                                        this.start_tab_drag(id, event.position);
+                                        if event.click_count >= 2 {
+                                            this.start_tab_rename(id, window, cx);
+                                        } else {
+                                            this.activate_tab(id, event, window, cx);
+                                        }
                                     }),
                                 )
-                                .child("×"),
-                        )
-                })),
+                                // 拖拽排序：hover 到本条目且位移超阈值时交换
+                                .on_mouse_move(cx.listener(
+                                    move |this, event: &MouseMoveEvent, _, cx| {
+                                        this.update_tab_drag(id, event.position, cx);
+                                    },
+                                ))
+                                // 右键弹标签菜单；拦截冒泡防误触终端菜单
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.open_tab_menu(id, event.position, cx);
+                                    }),
+                                )
+                                // 左侧竖色条：自定义标签色优先（3px）；无色回落
+                                // 活跃 accent / 透明占位，保持行内对齐
+                                .child(match color {
+                                    Some(color) => {
+                                        div().w(px(3.0)).h(px(18.0)).rounded_full().bg(rgb(color))
+                                    }
+                                    None => div().w(px(2.0)).h(px(18.0)).rounded_full().bg(
+                                        if selected {
+                                            rgb(ui.accent)
+                                        } else {
+                                            rgb(ui.panel_bg)
+                                        },
+                                    ),
+                                })
+                                .child(
+                                    div()
+                                        .text_size(px(13.0))
+                                        .text_color(rgb(ui.accent))
+                                        .child("›_"),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .text_size(px(13.0))
+                                        .child(label),
+                                )
+                                .when(count > 1, |row| {
+                                    row.child(
+                                        div()
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(ui.text_secondary))
+                                            .child(count.to_string()),
+                                    )
+                                })
+                                // 触发器高亮圆点：与标题栏标签同语义（命中锁存指示）
+                                .when(highlighted, |row| {
+                                    row.child(
+                                        div()
+                                            .size(px(6.0))
+                                            .rounded_full()
+                                            .flex_shrink_0()
+                                            .bg(rgb(ui.accent)),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .px_1()
+                                        .opacity(0.0)
+                                        .group_hover("session-row", |style| style.opacity(1.0))
+                                        .text_color(rgb(ui.text_secondary))
+                                        .hover(|style| style.text_color(rgb(ui.danger)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.request_close_tab(id, window, cx)
+                                            }),
+                                        )
+                                        .child("×"),
+                                )
+                        }),
+                ),
         )
 }
 
@@ -8176,6 +8928,9 @@ fn render_active_dialog(
     if let Some(CommandDialog::Edit { original_name }) = workspace.command_dialog.clone() {
         return Some(command_edit_modal(workspace, original_name, cx));
     }
+    if let Some(TriggerDialog::Edit { original, action }) = workspace.trigger_dialog.clone() {
+        return Some(trigger_edit_modal(workspace, original, action, cx));
+    }
     if let Some(CommandDialog::Preview { template, preview }) = workspace.command_dialog.clone() {
         return Some(command_preview_modal(workspace, template, preview, cx));
     }
@@ -8456,6 +9211,78 @@ fn command_edit_modal(
         title,
         body,
         dismiss_listener(cx, WorkspaceView::dismiss_command),
+    )
+}
+
+/// 触发器规则编辑弹窗：名称/模式字段 + 动作二选（通知/高亮）+ 正则错误就地
+/// 显示。保存走 save_trigger（UI 侧先行正则校验，config 层不依赖 regex）。
+fn trigger_edit_modal(
+    workspace: &WorkspaceView,
+    original: Option<String>,
+    action: TriggerAction,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let fields = workspace.trigger_fields.clone();
+    let error = workspace.trigger_error.clone();
+    let title = if original.is_some() {
+        "编辑触发器"
+    } else {
+        "新建触发器"
+    };
+    // 动作二选（选中侧高亮，toggle_controls 语义）：随保存一并落盘
+    let action_button = |label: &'static str, value: TriggerAction| -> gpui::Div {
+        setting_button(
+            label,
+            action == value,
+            cx.listener(move |this, _event, _window, cx| {
+                this.select_trigger_action(value, cx);
+            }),
+        )
+    };
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .p_4()
+        .when_some(error, |body, error| body.child(dialog_error_line(error)))
+        .children(
+            fields
+                .into_iter()
+                .map(|(name, field)| dialog_field_row(&name, field)),
+        )
+        .child(
+            div()
+                .pt_2()
+                .child(div().text_color(rgb(0x7D829F)).child("动作"))
+                .child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .pt_1()
+                        .child(action_button("桌面通知", TriggerAction::Notify))
+                        .child(action_button("标签高亮", TriggerAction::Highlight)),
+                ),
+        )
+        .child(
+            div()
+                .pt_2()
+                .text_size(px(11.0))
+                .text_color(rgb(0x7D829F))
+                .child("正则按终端输出字节流匹配（如 ERROR|FATAL，中文可用）；通知按规则 30 秒去抖，高亮在聚焦窗格或重进标签后清除"),
+        );
+    body = body.child(dialog_footer(vec![
+        setting_button(
+            "保存",
+            true,
+            cx.listener(move |this, _event, window, cx| {
+                this.save_trigger(original.clone(), action, window, cx);
+            }),
+        ),
+        setting_button("取消", false, cx.listener(WorkspaceView::cancel_trigger)),
+    ]));
+    modal_dialog(
+        title,
+        body,
+        dismiss_listener(cx, WorkspaceView::dismiss_trigger),
     )
 }
 
@@ -9717,6 +10544,13 @@ impl TerminalSession for TransferWrappedSession {
     ) -> Option<laterterm_core::RunningProcess> {
         self.inner.probe_running(snapshot)
     }
+
+    /// 非预期退出判别透传（重连判别读最外层——SessionControl 持有的是本层，
+    /// 见 attach_pane 装配顺序）：默认方法不穿透装饰器，漏转发则静默恒
+    /// false、重连永不触发（评审 1 必须项，probe_running 同款纪律）。
+    fn exit_unexpected(&self) -> bool {
+        self.inner.exit_unexpected()
+    }
 }
 
 fn wrap_transfer(
@@ -9736,6 +10570,21 @@ fn wrap_transfer(
         download_dir,
     })
 }
+
+/// 会话装配统一组合：审计 tap（内层，贴近真实字节源）→ 传输拦截（外层）。
+/// 叠放顺序固定：ZMODEM 传输期间入日志的是 PTY 原始输出字节（audit.rs 模块
+/// 头注记）；新增装饰器一律在此串联，装配点只认本函数。
+fn wrap_session(
+    session: Arc<dyn TerminalSession>,
+    pane: PaneId,
+    label: &str,
+    settings: &Appearance,
+    hub: &crate::audit::AuditHub,
+) -> (Arc<dyn TerminalSession>, Arc<TapControl>) {
+    let (session, tap) =
+        crate::audit::wrap_audit(session, pane, label, settings.session_logging, hub);
+    (wrap_transfer(session, settings), tap)
+}
 /// 解析本地会话 shell：显式配置（首启引导固化 / 手改 settings.toml）优先，
 /// 否则跟随平台默认（$SHELL / COMSPEC，由 laterterm-local 动态解析）。
 fn resolve_shell(shell: Option<&str>) -> String {
@@ -9754,10 +10603,12 @@ fn create_local_terminal(
     theme: &Theme,
     shortcut_tx: flume::Sender<(PaneId, WorkspaceShortcut)>,
     broadcast_tx: flume::Sender<(PaneId, Vec<u8>)>,
+    audit_hub: &crate::audit::AuditHub,
     cols: usize,
     rows: usize,
     shell: String,
-) -> (Entity<TerminalView>, Arc<SessionControl>) {
+    label: &str,
+) -> (Entity<TerminalView>, Arc<SessionControl>, Arc<TapControl>) {
     // 会话的开启/spawn/回收线程全部内聚在 LocalSession（laterterm-local）。
     // PTY 初始尺寸直接用窗口实际尺寸：避免启动后 resize 触发 bash readline
     // 的 \r 重画，把光标拉回提示符行首。
@@ -9771,7 +10622,9 @@ fn create_local_terminal(
         })
         .expect("启动本地会话失败"),
     );
-    let session = wrap_transfer(session, settings);
+    // 与 attach_pane 同一装配口径：审计 tap 内层、传输拦截外层；label 显式
+    // 传入（首窗格 = 「本地终端」，与 Pane.title 一致）
+    let (session, audit) = wrap_session(session, id, label, settings, audit_hub);
     let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
     let terminal = create_terminal_view(
         id,
@@ -9782,7 +10635,7 @@ fn create_local_terminal(
         broadcast_tx,
         cx,
     );
-    (terminal, session_control)
+    (terminal, session_control, audit)
 }
 
 /// 密钥环操作包一层 5s 超时：Secret Service 偶发卡住（等解锁/授权确认而
@@ -9973,6 +10826,27 @@ macro_rules! set_color {
 
 /// 订阅终端右键菜单请求：把事件转成工作区的菜单状态。
 /// 首窗格（内联创建）与后续窗格（attach_pane）共用。
+/// 窗格生命周期订阅统一入口：TerminalExited 事件 + 终端右键菜单请求。
+/// attach_pane / 首窗格 / 重连原位替换三处共用——订阅按实体挂，替换实体
+/// 后必须对新实体重挂，否则新会话退出后窗格变僵尸、右键菜单失灵
+/// （重连三件配套评审 2 必须项 a/b）。
+fn subscribe_pane_lifecycle(
+    terminal: &Entity<TerminalView>,
+    pane_id: PaneId,
+    window: &mut Window,
+    cx: &mut Context<WorkspaceView>,
+) {
+    cx.subscribe_in(
+        terminal,
+        window,
+        move |this, _, _: &laterterm_termview::view::TerminalExited, window, cx| {
+            this.mark_exited(pane_id, window, cx);
+        },
+    )
+    .detach();
+    subscribe_terminal_menu(terminal, pane_id, window, cx).detach();
+}
+
 fn subscribe_terminal_menu(
     terminal: &Entity<TerminalView>,
     pane_id: PaneId,
@@ -13201,8 +14075,8 @@ mod pane_zoom_tests {
 }
 
 /// 关闭运行中终端的二次确认：request 门卫 + 聚合弹窗 + 确认后走既有
-/// Closing 回收。FakeSession 注入 attach_pane（经 wrap_transfer 包装，
-/// 探测透传链路一并被测）。
+/// Closing 回收。FakeSession 注入 attach_pane（经 wrap_session 组合包装
+/// = 审计 tap 内层 + 传输拦截外层，装饰器转发链路一并被测）。
 #[cfg(test)]
 mod close_confirm_tests {
     use super::{CloseScope, LayoutNode, PaneId, TabId, TabStatus, WorkspaceTab, WorkspaceView};
@@ -13496,6 +14370,338 @@ mod close_confirm_tests {
         workspace.update_in(cx, |view, window, cx| {
             view.cancel_close(window, cx);
             assert!(view.close_confirm.is_none(), "取消后弹窗关闭");
+        });
+        close_sessions(&workspace, cx);
+    }
+}
+
+/// SSH 断线自动重连：退避策略纯逻辑、装饰器转发链路（评审 1 必须项钉死）、
+/// mark_exited 触发状态机、原位替换三件配套（评审 2 必须项）。
+#[cfg(test)]
+mod reconnect_tests {
+    use super::{PaneId, ReconnectPolicy, ReconnectState, SshLink, TabStatus, WorkspaceView};
+    use gpui::{Point, TestAppContext, px};
+    use laterterm_config::ServerEntry;
+    use laterterm_core::{BackendKind, SessionStreams, TerminalSession};
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// 可注入非预期退出标记的 SSH 会话桩：reader 挂在永不喂食的管道上；
+    /// kill 时 drop 发送端制造 EOF（close_confirm_tests 的 FakeSession 同款）。
+    struct ReconnectStub {
+        unexpected: Arc<AtomicBool>,
+        feeder: Mutex<Option<std::sync::mpsc::Sender<u8>>>,
+        receiver: Mutex<Option<std::sync::mpsc::Receiver<u8>>>,
+    }
+
+    struct BlockingReader(std::sync::mpsc::Receiver<u8>);
+    impl io::Read for BlockingReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self.0.recv() {
+                Ok(byte) => {
+                    buf[0] = byte;
+                    Ok(1)
+                }
+                Err(_) => Ok(0),
+            }
+        }
+    }
+
+    impl TerminalSession for ReconnectStub {
+        fn backend(&self) -> BackendKind {
+            BackendKind::Ssh
+        }
+
+        fn title(&self) -> String {
+            "stub".into()
+        }
+
+        fn take_streams(&self) -> io::Result<SessionStreams> {
+            let receiver = self.receiver.lock().unwrap().take().ok_or_else(|| {
+                io::Error::other("会话字节流已被取走（take_streams 只能调用一次）")
+            })?;
+            Ok(SessionStreams {
+                reader: Box::new(BlockingReader(receiver)),
+                writer: Box::new(std::io::sink()),
+            })
+        }
+
+        fn resize(&self, _: u16, _: u16) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn kill(&self) {
+            self.feeder.lock().unwrap().take();
+        }
+
+        fn exit_unexpected(&self) -> bool {
+            self.unexpected.load(Ordering::Acquire)
+        }
+    }
+
+    /// 构造 SSH 会话桩，返回 (会话, 非预期退出标记)。
+    fn stub_ssh_session() -> (Arc<ReconnectStub>, Arc<AtomicBool>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let unexpected = Arc::new(AtomicBool::new(false));
+        (
+            Arc::new(ReconnectStub {
+                unexpected: Arc::clone(&unexpected),
+                feeder: Mutex::new(Some(sender)),
+                receiver: Mutex::new(Some(receiver)),
+            }),
+            unexpected,
+        )
+    }
+
+    fn test_entry() -> ServerEntry {
+        ServerEntry {
+            name: "测试机".into(),
+            host: "web.example.test".into(),
+            username: "ops".into(),
+            ..Default::default()
+        }
+    }
+
+    fn test_link() -> SshLink {
+        SshLink {
+            entry: test_entry(),
+            jump: Vec::new(),
+        }
+    }
+
+    /// 构造前注入默认 StartupSettings（close_confirm_tests 同款，防本机残留
+    /// settings.toml 令断言机器态假红）。
+    fn inject_default_startup_settings(cx: &mut TestAppContext) {
+        cx.set_global(crate::StartupSettings(laterterm_config::Settings::default()));
+    }
+
+    fn close_sessions(workspace: &gpui::Entity<WorkspaceView>, cx: &gpui::TestAppContext) {
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    // ---------- 退避策略纯逻辑 ----------
+
+    #[test]
+    fn reconnect_policy_doubles_then_caps() {
+        // 1s×2^(attempt-1)：1s/2s/4s/8s/16s，第 6 次起封顶 30s（防溢出与无意义长等）
+        assert_eq!(ReconnectPolicy::delay(1), std::time::Duration::from_secs(1));
+        assert_eq!(ReconnectPolicy::delay(2), std::time::Duration::from_secs(2));
+        assert_eq!(ReconnectPolicy::delay(3), std::time::Duration::from_secs(4));
+        assert_eq!(ReconnectPolicy::delay(4), std::time::Duration::from_secs(8));
+        assert_eq!(
+            ReconnectPolicy::delay(5),
+            std::time::Duration::from_secs(16)
+        );
+        assert_eq!(
+            ReconnectPolicy::delay(6),
+            std::time::Duration::from_secs(30),
+            "封顶 30s"
+        );
+        assert_eq!(
+            ReconnectPolicy::delay(u32::MAX),
+            std::time::Duration::from_secs(30),
+            "极端入参不溢出"
+        );
+    }
+
+    // ---------- 装饰器转发链路（评审 1 必须项） ----------
+
+    #[test]
+    fn decorator_chain_forwards_exit_unexpected() {
+        // 默认方法不穿透装饰器：mark_exited 读的是最外层包装（SessionControl
+        // 持有 wrap_session 的产物）。漏转发则静默恒 false、重连永不触发且
+        // 无报错——本断言钉死该失效面。
+        let unexpected = Arc::new(AtomicBool::new(false));
+        let inner: Arc<dyn TerminalSession> = Arc::new(ReconnectStub {
+            unexpected: Arc::clone(&unexpected),
+            feeder: Mutex::new(None),
+            receiver: Mutex::new(None),
+        });
+        let (hub, _rx) = crate::audit::AuditHub::new();
+        let (session, _tap) =
+            crate::audit::wrap_audit(Arc::clone(&inner), PaneId(99), "测试", false, &hub);
+        let wrapped = super::wrap_transfer(session, &laterterm_config::Appearance::default());
+        assert!(!wrapped.exit_unexpected(), "未置位时全链路应为 false");
+        unexpected.store(true, Ordering::Release);
+        assert!(
+            wrapped.exit_unexpected(),
+            "置位后必须经 AuditSession→TransferWrapped 两层转发为 true"
+        );
+        assert!(inner.exit_unexpected());
+    }
+
+    // ---------- mark_exited 触发状态机 ----------
+
+    /// 定时器不推进时 job 停在退避等待（gpui 测试时钟确定性），不会发起
+    /// 真实连接——断言窗口稳定。
+    #[gpui::test]
+    fn unexpected_exit_enters_reconnect_state(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            let (session, unexpected) = stub_ssh_session();
+            let pane_id = view.attach_pane("ops@web".into(), session, window, cx);
+            if let Some(pane) = view.panes.iter_mut().find(|pane| pane.id == pane_id) {
+                pane.ssh_link = Some(test_link());
+            }
+            unexpected.store(true, Ordering::Release);
+            view.mark_exited(pane_id, window, cx);
+            let pane = view
+                .panes
+                .iter()
+                .find(|pane| pane.id == pane_id)
+                .expect("重连窗格不回收");
+            assert_eq!(pane.status, TabStatus::Exited);
+            let state = pane.reconnect.as_ref().expect("应进入重连态");
+            assert_eq!((state.attempt, state.max_attempts), (1, 3), "默认 3 次可配");
+            assert!(!state.abandoned);
+            assert_eq!(pane.title, "ops@web（重连中 1/3…）", "重连中后缀随次数更新");
+        });
+        close_sessions(&workspace, cx);
+    }
+
+    #[gpui::test]
+    fn normal_exit_and_disabled_setting_stay_exited(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            // 正常退出（unexpected=false）：不重连，落「（已退出）」
+            let (session, unexpected) = stub_ssh_session();
+            let pane_id = view.attach_pane("ops@web".into(), session, window, cx);
+            if let Some(pane) = view.panes.iter_mut().find(|pane| pane.id == pane_id) {
+                pane.ssh_link = Some(test_link());
+            }
+            view.mark_exited(pane_id, window, cx);
+            let pane = view.panes.iter().find(|pane| pane.id == pane_id).unwrap();
+            assert!(pane.reconnect.is_none(), "正常退出不得进入重连态");
+            assert_eq!(pane.title, "ops@web（已退出）");
+            let _ = unexpected;
+            // 设置关闭：即使非预期退出也不重连
+            view.settings.reconnect.enabled = false;
+            let (session, unexpected) = stub_ssh_session();
+            let pane_id2 = view.attach_pane("ops@db".into(), session, window, cx);
+            if let Some(pane) = view.panes.iter_mut().find(|pane| pane.id == pane_id2) {
+                pane.ssh_link = Some(test_link());
+            }
+            unexpected.store(true, Ordering::Release);
+            view.mark_exited(pane_id2, window, cx);
+            let pane = view.panes.iter().find(|pane| pane.id == pane_id2).unwrap();
+            assert!(pane.reconnect.is_none(), "设置关闭不得进入重连态");
+            assert_eq!(pane.title, "ops@db（已退出）");
+        });
+        close_sessions(&workspace, cx);
+    }
+
+    // ---------- 原位替换三件配套（评审 2 必须项） ----------
+
+    #[gpui::test]
+    fn reconnect_replacement_restores_full_lifecycle(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let pane_id = workspace.update_in(cx, |view, window, cx| {
+            let (session, _unexpected) = stub_ssh_session();
+            let pane_id = view.attach_pane("ops@web".into(), session, window, cx);
+            // 布置成「重连中」态（绕过 job，直接模拟第一次 attempt 失败后）
+            let pane = view
+                .panes
+                .iter_mut()
+                .find(|pane| pane.id == pane_id)
+                .unwrap();
+            pane.status = TabStatus::Exited;
+            pane.reconnect = Some(ReconnectState {
+                base_title: "ops@web".into(),
+                link: test_link(),
+                attempt: 2,
+                max_attempts: 3,
+                abandoned: false,
+            });
+            pane.title = "ops@web（重连中 2/3…）".into();
+            // 对照组：Exited 期 is_exited 门卫拒收 OSC 标题（返回 false 且标题不动）
+            assert!(
+                !view.set_pane_title(pane_id, "不应写入", cx),
+                "Exited 期门卫应拒收"
+            );
+            assert_eq!(
+                view.panes
+                    .iter()
+                    .find(|pane| pane.id == pane_id)
+                    .unwrap()
+                    .title,
+                "ops@web（重连中 2/3…）",
+                "拒收时标题不被改写"
+            );
+            pane_id
+        });
+        let (new_session, _new_feeder) = stub_ssh_session();
+        workspace.update_in(cx, |view, window, cx| {
+            view.apply_reconnect_success(pane_id, new_session, None, window, cx);
+            let pane = view
+                .panes
+                .iter()
+                .find(|pane| pane.id == pane_id)
+                .expect("原位替换不改窗格身份");
+            assert_eq!(pane.status, TabStatus::Running, "配套(c)：状态复位 Running");
+            assert!(pane.reconnect.is_none(), "替换即清重连态");
+            assert_eq!(
+                pane.title, "ops@web",
+                "复位清「重连中」后缀，标题交还新会话 OSC 接管"
+            );
+            // 配套(c) 下游：is_exited 门卫放行 OSC 标题。set_pane_title 的
+            // 返回值 = 「是否活动标签焦点窗格」（本测试窗格未挂标签，恒
+            // false），故以标题实际写入为准。
+            view.set_pane_title(pane_id, "新标题", cx);
+            assert_eq!(
+                view.panes
+                    .iter()
+                    .find(|pane| pane.id == pane_id)
+                    .unwrap()
+                    .title,
+                "新标题",
+                "复位 Running 后 OSC 标题必须可写入"
+            );
+            // 配套(b)：右键菜单可弹（订阅重挂生效）
+            view.open_tab_menu(view.tabs[0].id, Point::new(px(2.0), px(2.0)), cx);
+            assert!(view.tab_menu.is_some(), "右键菜单订阅必须已重挂");
+        });
+        // 配套(a)：新实体 TerminalExited 订阅已重挂——kill 后事件化退出，
+        // 不留僵尸 Running 窗格（漏挂订阅则本断言超时失败）。
+        workspace.update(cx, |view, _| {
+            let pane = view
+                .panes
+                .iter()
+                .find(|pane| pane.id == pane_id)
+                .expect("窗格存活");
+            pane.session.close();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            cx.run_until_parked();
+            let exited = workspace.read_with(cx, |view, _| {
+                view.panes
+                    .iter()
+                    .find(|pane| pane.id == pane_id)
+                    .is_some_and(|pane| pane.status == TabStatus::Exited)
+            });
+            if exited {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "替换后的新会话退出必须被订阅捕获（三件配套 a）"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        workspace.read_with(cx, |view, _| {
+            let pane = view.panes.iter().find(|pane| pane.id == pane_id).unwrap();
+            assert!(
+                pane.title.ends_with("（已退出）"),
+                "非预期退出标记为 false 时落常规退出后缀"
+            );
         });
         close_sessions(&workspace, cx);
     }

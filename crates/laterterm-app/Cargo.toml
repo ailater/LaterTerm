@@ -26,6 +26,9 @@ anyhow.workspace = true
 parking_lot.workspace = true
 flume.workspace = true
 notify = "8"
+# 触发器正则（regex::bytes 应对非 UTF-8 安全的 PTY 字节流）：workspace 已声明
+# （lock 已含 1.13.1），termview 同链入二进制，此处引用零新增 crate。
+regex.workspace = true
 laterterm-xshell.workspace = true
 shellexpand = "3.1.2"
 laterterm-transfer.workspace = true

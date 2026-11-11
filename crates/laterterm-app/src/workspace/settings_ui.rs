@@ -17,7 +17,10 @@
 //! （面板/命令/服务器/动态码编辑），不在设置面板内；本模块里的「编辑快捷键」
 //! 按钮只是弹窗入口，原样平移。
 
-use super::{BindingOwner, ButtonKind, ShortcutBinding, UiColors, WorkspaceView, ui_button};
+use super::{
+    BindingOwner, ButtonKind, ShortcutBinding, UiColors, WorkspaceView, dialog_error_line,
+    ui_button,
+};
 use crate::onboarding::FONT_PRESETS;
 use crate::update_check::{self, Outcome};
 use gpui::{
@@ -25,8 +28,8 @@ use gpui::{
     SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px, rgb, rgba,
 };
-use laterterm_config::Appearance;
 use laterterm_config::theme::ThemeColors;
+use laterterm_config::{Appearance, ReconnectSettings, TriggerRule};
 
 // ---------------------------------------------------------------------------
 // Tokyo Night 色板收敛（评审硬伤5：逐处替换、只动本模块，不按色值全局替换
@@ -417,8 +420,8 @@ pub(crate) fn settings_content(
             SettingsSection::Font => settings_font_body(&appearance, cx),
             SettingsSection::Scrolling => settings_scrolling_body(workspace, &appearance, cx),
             SettingsSection::Shortcuts => settings_shortcuts_body(workspace, cx),
-            SettingsSection::Terminal => settings_terminal_body(),
-            SettingsSection::Servers => settings_servers_body(),
+            SettingsSection::Terminal => settings_terminal_body(workspace, &appearance, cx),
+            SettingsSection::Servers => settings_servers_body(&workspace.settings.reconnect, cx),
             SettingsSection::About => settings_about_body(cx),
             SettingsSection::UpdateCheck => settings_update_body(workspace, cx),
         };
@@ -879,24 +882,298 @@ fn theme_preview_card(preview: &PalettePreview) -> Div {
         )
 }
 
-/// 「终端」节：只读信息卡（语义不变，随单页平移）。
-fn settings_terminal_body() -> Vec<Div> {
+/// 「终端」节：只读信息卡（语义不变，随单页平移）+ 会话日志卡
+/// （全局默认开关 + 打开日志目录按钮）+ 触发器卡（CRUD）。
+fn settings_terminal_body(
+    workspace: &WorkspaceView,
+    appearance: &Appearance,
+    cx: &mut Context<WorkspaceView>,
+) -> Vec<Div> {
+    // 目录行如实显示解析结果（定位失败给提示而非假路径）；目录本体由审计
+    // 工作线程在真正开启日志时惰性创建。
+    let dir_text = crate::audit::logs_dir()
+        .map(|dir| dir.display().to_string())
+        .unwrap_or_else(|| "（无法定位状态目录）".into());
     vec![
         setting_card()
             .child(info_row("Shell", "$SHELL / bash"))
             .child(info_row("TERM", "xterm-256color"))
             .child(info_row("COLORTERM", "truecolor"))
             .child(info_row("滚动", "自然滚动，支持历史回看")),
+        // 会话日志卡：全局默认只约束「新会话初值」，运行中窗格在标签右键
+        // 菜单逐标签热开/热关。默认关——PTY 输出含潜在敏感内容（回显型
+        // 密码提示仍可能入盘），安全优先（change_setting 即时落盘生效）。
+        setting_card()
+            .child(setting_row(
+                "会话日志",
+                value_chip("新会话默认"),
+                toggle_controls(
+                    cx,
+                    ("开", true),
+                    ("关", false),
+                    appearance.session_logging,
+                    |s: &mut Appearance, value| s.session_logging = value,
+                ),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_2()
+                    .py_1()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(COLOR_TEXT_SECONDARY))
+                                    .child("逐会话开关：标签右键 → 会话日志"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(COLOR_TEXT_MUTED))
+                                    .child(dir_text),
+                            ),
+                    )
+                    .child(setting_button(
+                        "打开日志目录",
+                        false,
+                        // 后台线程文件管理器进程，失败只 eprintln 不阻塞 UI
+                        |_, _, _| crate::audit::open_logs_dir(),
+                    )),
+            ),
+        trigger_card(workspace, cx),
     ]
 }
 
-/// 「服务器」节：只读信息卡（语义不变，随单页平移）。
-fn settings_servers_body() -> Vec<Div> {
+/// 触发器卡：规则行（名称/模式/动作/启用开关/删除，点名称进编辑）+
+/// 「新增」弹窗入口。保存/启停/删除即时落盘并热替换审计规则集。
+fn trigger_card(workspace: &WorkspaceView, cx: &mut Context<WorkspaceView>) -> Div {
+    let mut card = setting_card().child(
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .py_1()
+            .child(
+                div()
+                    .text_color(rgb(COLOR_TEXT_SECONDARY))
+                    .child("输出触发器"),
+            )
+            .child(setting_button(
+                "新增",
+                false,
+                cx.listener(|this, _event, window, cx| {
+                    this.begin_trigger_edit(None, window, cx);
+                }),
+            )),
+    );
+    for rule in &workspace.settings.triggers {
+        card = card.child(trigger_row(workspace, rule, cx));
+    }
+    if workspace.settings.triggers.is_empty() {
+        card = card.child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(COLOR_TEXT_MUTED))
+                .child("暂无规则：输出命中正则时可发桌面通知或点亮标签"),
+        );
+    }
+    // 卡级错误行：启停/删除失败的落盘错误（弹窗打开时错误在弹窗内显示，
+    // 不在此重复）；command_error 先例的就地可见口径
+    card.when(workspace.trigger_dialog.is_none(), |card| {
+        card.when_some(workspace.trigger_error.clone(), |card, error| {
+            card.child(dialog_error_line(error))
+        })
+    })
+}
+
+/// 一条触发器规则行：名称（点击进编辑弹窗，CRUD 的 Update 入口）/ 模式 /
+/// 动作 / 启用开关 / 删除（二次确认，命令删除同款）。
+fn trigger_row(
+    workspace: &WorkspaceView,
+    rule: &TriggerRule,
+    cx: &mut Context<WorkspaceView>,
+) -> Div {
+    let name = rule.name.clone();
+    let pattern = rule.pattern.clone();
+    let action_label = rule.action.label();
+    let draft = rule.clone(); // 监听器要求 'static：带原规则克隆进编辑弹窗
+    let confirming = workspace.trigger_delete_confirm.as_deref() == Some(rule.name.as_str());
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .py_1()
+        // 名称：点击编辑（begin_trigger_edit 带原规则进弹窗）
+        .child(
+            div()
+                .flex_shrink_0()
+                .max_w(px(96.0))
+                .overflow_hidden()
+                .text_color(rgb(COLOR_TEXT))
+                .cursor_pointer()
+                .hover(|style| style.text_color(rgb(COLOR_ACCENT)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _event, window, cx| {
+                        this.begin_trigger_edit(Some(&draft), window, cx);
+                    }),
+                )
+                .child(name),
+        )
+        // 模式：代码展示（截断防撑爆行）
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_size(px(11.0))
+                .text_color(rgb(COLOR_TEXT_SECONDARY))
+                .child(pattern),
+        )
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(11.0))
+                .text_color(rgb(COLOR_TEXT_MUTED))
+                .child(action_label),
+        )
+        // 启用开关：启停即落盘 + 规则集热替换（toggle_trigger）
+        .child({
+            let name = rule.name.clone();
+            setting_button(
+                if rule.enabled {
+                    "已启用"
+                } else {
+                    "已停用"
+                },
+                rule.enabled,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.toggle_trigger(&name, cx);
+                }),
+            )
+        })
+        // 删除：二次确认（command_delete_confirm 同款，首击变「确认删除」）
+        .child({
+            let name = rule.name.clone();
+            setting_button(
+                if confirming { "确认删除" } else { "删除" },
+                false,
+                cx.listener(move |this, _event, _window, cx| {
+                    this.delete_trigger(&name, cx);
+                }),
+            )
+        })
+}
+
+/// 「服务器」节：SSH 自动重连卡（开关 + 次数 stepper）+ 只读信息卡
+/// （语义不变，随单页平移）。
+fn settings_servers_body(
+    reconnect: &ReconnectSettings,
+    cx: &mut Context<WorkspaceView>,
+) -> Vec<Div> {
     vec![
+        // 自动重连卡：断线自动重拨（指数退避 1s/2s/4s…）；密钥环命中免补输，
+        // 缺失走既有补输对话框。改设置只影响后续新触发的重连。
+        setting_card()
+            .child(setting_row(
+                "自动重连",
+                value_chip("SSH 断线"),
+                reconnect_toggle_controls(
+                    cx,
+                    ("开", true),
+                    ("关", false),
+                    reconnect.enabled,
+                    |s: &mut ReconnectSettings, value| s.enabled = value,
+                ),
+            ))
+            .child(setting_row(
+                "重试次数",
+                value_chip(&reconnect.max_attempts.to_string()),
+                reconnect_stepper_controls(cx, reconnect.max_attempts),
+            ))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .child("0 = 断线后只提示不自动重试；重连中窗格标题显示进度"),
+            ),
         setting_card()
             .child(info_row("本地 Shell", "已内置"))
             .child(info_row("SSH", "远程模块接入后可用")),
     ]
+}
+
+/// ReconnectSettings 二值开关控件：与 `toggle_controls` 同形，落点换
+/// ReconnectSettings（change_reconnect_setting 分路，quake_toggle_controls 先例）。
+fn reconnect_toggle_controls(
+    cx: &mut Context<WorkspaceView>,
+    on: (&'static str, bool),
+    off: (&'static str, bool),
+    current: bool,
+    apply: impl Fn(&mut ReconnectSettings, bool) + Clone + 'static,
+) -> Div {
+    div()
+        .flex()
+        .gap_1()
+        .children(
+            [(on, true), (off, false)]
+                .into_iter()
+                .map(|((label, value), _)| {
+                    let selected = value == current;
+                    let apply = apply.clone();
+                    setting_button(
+                        label,
+                        selected,
+                        cx.listener(move |this, event, window, cx| {
+                            this.change_reconnect_setting(event, window, cx, |s| apply(s, value));
+                        }),
+                    )
+                }),
+        )
+}
+
+/// 重试次数步进控件（−/+）：与 stepper_controls 同规格（icon_button），
+/// 落点换 ReconnectSettings；上限由载入期 sanitize（0..=10）双保险。
+fn reconnect_stepper_controls(cx: &mut Context<WorkspaceView>, current: u32) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(super::icon_button(
+            "reconnect-attempts-decrease",
+            "icons/minus.svg",
+            panel_ui(),
+            cx.listener(|this, event, window, cx| {
+                this.change_reconnect_setting(event, window, cx, |s| {
+                    s.max_attempts = s.max_attempts.saturating_sub(1);
+                });
+            }),
+        ))
+        .child(super::icon_button(
+            "reconnect-attempts-increase",
+            "icons/plus.svg",
+            panel_ui(),
+            cx.listener(|this, event, window, cx| {
+                this.change_reconnect_setting(event, window, cx, |s| {
+                    s.max_attempts = s.max_attempts.saturating_add(1).min(10);
+                });
+            }),
+        ))
+        .child(
+            div()
+                .min_w(px(24.0))
+                .text_size(px(12.0))
+                .text_color(rgb(COLOR_TEXT))
+                .child(format!("{current} 次")),
+        )
 }
 
 /// 「关于」节：品牌卡（40px logo + 名称 + 版本芯片 + 一句话简介）与
