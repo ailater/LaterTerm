@@ -1251,7 +1251,12 @@ impl TerminalView {
                         .as_ref()
                         .is_some_and(|search| search.search_pending)
                     {
+                        // 防抖窗口内先出结果（落首命中）；Shift+Enter 再从
+                        // 首命中循环往上（wrap 到末条）——方向语义不丢。
                         self.run_pending_search(cx);
+                        if keystroke.modifiers.shift {
+                            self.search_select_prev(cx);
+                        }
                     } else if keystroke.modifiers.shift {
                         self.search_select_prev(cx);
                     } else {
@@ -1259,6 +1264,9 @@ impl TerminalView {
                     }
                 }
                 "backspace" => self.search_backspace(cx),
+                // ↑/↓ 始终在既有（可能滞后的）matches 上跳，随后防抖刷新
+                // 重置回首命中——150ms 窗口的瞬态取舍，与 Enter 的 flush
+                // 语义（先出结果）不同，刻意不为方向键做同步搜索。
                 "up" => self.search_select_prev(cx),
                 "down" => self.search_select_next(cx),
                 "c" if keystroke.modifiers.alt => {
