@@ -24,8 +24,8 @@ pub use importers::{
     load_xshell_sessions,
 };
 pub use servers::{
-    ServerAuthKind, ServerEntry, ServersFile, clear_broken_jump_refs, normalize_group,
-    resolve_jump_chain, servers_referencing_jump,
+    ServerAuthKind, ServerEntry, ServerTunnel, ServersFile, TunnelKind, clear_broken_jump_refs,
+    normalize_group, resolve_jump_chain, servers_referencing_jump,
 };
 pub use theme::{DEFAULT_THEME, Theme, ThemeRegistry, themes_dir};
 pub use totp::{TotpAlgorithm, TotpConfig, TotpEntry, generate_code, parse_secret_input};
@@ -440,6 +440,8 @@ impl Settings {
             server.note = server.note.trim().to_string();
             // 分组宽容归一化：坏分组降级 None，绝不因分组丢条目
             server.group = servers::normalize_group(server.group.as_deref());
+            // 隧道值级归一化：坏隧道具名 eprintln 丢弃，条目保留
+            servers::normalize_tunnels(server);
             if let Some(key_path) = &server.key_path {
                 let trimmed = key_path.trim().to_string();
                 server.key_path = (!trimmed.is_empty()).then_some(trimmed);
