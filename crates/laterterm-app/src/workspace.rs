@@ -28,6 +28,7 @@ use laterterm_config::{
 use laterterm_core::{ProcessSnapshot, TerminalSession};
 use laterterm_local::{LocalOptions, LocalSession};
 use laterterm_secrets::{SecretStore, default_store, totp_account};
+use laterterm_ssh::{PortForwardEvent, TunnelSpec, TunnelState};
 use laterterm_termview::view::ScrollSummary;
 use laterterm_termview::{ColorPalette, TerminalConfig, TerminalView};
 use notify::Watcher;
@@ -519,6 +520,8 @@ struct PendingReconnect {
     pane: PaneId,
     session: Arc<dyn TerminalSession>,
     warning: Option<String>,
+    /// 新会话的 typed 句柄（隧道事件 watcher 重启用；None = SFTP/无隧道）。
+    tunnel_session: Option<Arc<laterterm_ssh::SshSession>>,
 }
 
 impl SessionControl {
@@ -571,6 +574,19 @@ enum TotpDialog {
         generated_at: SystemTime,
         period: u64,
     },
+}
+
+/// 服务器编辑弹窗的单条隧道草稿：kind/enabled 按钮态 + 4 个输入框实体。
+/// 文本值保存时读回 `ServerTunnel`，合法性由 `validate()`（validate_tunnels）
+/// 严格把关，报错留在弹窗内。
+#[derive(Clone)]
+struct TunnelDraft {
+    kind: laterterm_config::TunnelKind,
+    enabled: bool,
+    bind_host: Entity<CommandTextField>,
+    bind_port: Entity<CommandTextField>,
+    target_host: Entity<CommandTextField>,
+    target_port: Entity<CommandTextField>,
 }
 
 /// 触发器规则编辑弹窗（设置页「终端」节触发器卡的新增入口）。
@@ -998,6 +1014,13 @@ struct Pane {
     ssh_link: Option<SshLink>,
     /// SSH 重连进行态（None = 不在重连流程；成功替换即清）。
     reconnect: Option<ReconnectState>,
+    /// SSH 会话 typed 句柄（装饰器包装层不透出该类型，仅 SSH 且带结果随行
+    /// 时 Some）：隧道事件 watcher 持同款 Arc 拉事件，重连替换后旧 watcher
+    /// 经 ptr_eq 失配自动退出。
+    tunnel_session: Option<Arc<laterterm_ssh::SshSession>>,
+    /// 隧道状态快照（spec → state）：watcher 从事件流收敛，server_entry_row
+    /// 渲染活跃/失败 chip；render 不碰会话锁。
+    tunnel_states: Vec<(TunnelSpec, TunnelState)>,
     status: TabStatus,
 }
 
@@ -1243,6 +1266,9 @@ pub struct WorkspaceView {
     server_field_subscriptions: Vec<gpui::Subscription>,
     server_save: Option<Arc<AtomicBool>>,
     server_meta_draft: ServerEntry,
+    /// 编辑弹窗隧道区草稿（Edit 弹窗随开随建，保存时读回 meta.tunnels；
+    /// None 语义不需要——空表 = 无隧道行）。
+    server_tunnel_drafts: Vec<TunnelDraft>,
     server_delete_confirm: Option<String>,
     server_error: Option<String>,
     /// 服务器区的一次性提示（导入/导出结果等），下次操作时清除。
@@ -1418,6 +1444,7 @@ impl WorkspaceView {
             totp_generating: false,
             right_panel_tab: RightPanelTab::Commands,
             server_dialog: None,
+            server_tunnel_drafts: Vec::new(),
             server_fields: Vec::new(),
             server_field_subscriptions: Vec::new(),
             server_save: None,
@@ -1485,6 +1512,8 @@ impl WorkspaceView {
                 highlighted: false,
                 ssh_link: None,
                 reconnect: None,
+                tunnel_session: None,
+                tunnel_states: Vec::new(),
                 status: TabStatus::Running,
             }],
             tabs: vec![WorkspaceTab {
@@ -2276,6 +2305,8 @@ impl WorkspaceView {
             highlighted: false,
             ssh_link: None,
             reconnect: None,
+            tunnel_session: None,
+            tunnel_states: Vec::new(),
             status: TabStatus::Running,
         });
         pane_id
@@ -4570,6 +4601,26 @@ impl WorkspaceView {
         );
         self.server_fields.clear();
         self.server_field_subscriptions.clear();
+        // 隧道编辑区草稿随弹窗重建（随开随建；新建时给一行默认 L 隧道，
+        // 让用户少打一次「添加」——bind 缺省 127.0.0.1）
+        self.server_tunnel_drafts = self
+            .server_meta_draft
+            .tunnels
+            .iter()
+            .map(|tunnel| TunnelDraft {
+                kind: tunnel.kind,
+                enabled: tunnel.enabled,
+                bind_host: cx
+                    .new(|cx| CommandTextField::new(tunnel.bind_host.clone(), "监听地址", cx)),
+                bind_port: cx
+                    .new(|cx| CommandTextField::new(tunnel.bind_port.to_string(), "监听端口", cx)),
+                target_host: cx
+                    .new(|cx| CommandTextField::new(tunnel.target_host.clone(), "目标主机", cx)),
+                target_port: cx.new(|cx| {
+                    CommandTextField::new(tunnel.target_port.to_string(), "目标端口", cx)
+                }),
+            })
+            .collect();
         let meta = self.server_meta_draft.clone();
         // 编辑时凭据框留空表示不改动；凭据本体只进密钥环
         let secret_placeholder = if entry.is_some() {
@@ -4627,6 +4678,55 @@ impl WorkspaceView {
         self.server_error = None;
         focus_first_field(&self.server_fields, window, cx);
         cx.notify();
+    }
+
+    /// 编辑弹窗隧道区：新增一行默认 L 隧道（bind 缺省 127.0.0.1）；条数
+    /// 封顶 MAX_TUNNELS_PER_SERVER，超出置 server_error 提示。
+    fn add_server_tunnel(&mut self, cx: &mut Context<Self>) {
+        if self.server_tunnel_drafts.len() >= laterterm_config::servers::MAX_TUNNELS_PER_SERVER {
+            self.server_error = Some(format!(
+                "隧道数量超过上限（最多 {} 条）",
+                laterterm_config::servers::MAX_TUNNELS_PER_SERVER
+            ));
+            cx.notify();
+            return;
+        }
+        let tunnel = laterterm_config::ServerTunnel::default();
+        self.server_tunnel_drafts.push(TunnelDraft {
+            kind: tunnel.kind,
+            enabled: tunnel.enabled,
+            bind_host: cx.new(|cx| CommandTextField::new(tunnel.bind_host, "监听地址", cx)),
+            bind_port: cx
+                .new(|cx| CommandTextField::new(tunnel.bind_port.to_string(), "监听端口", cx)),
+            target_host: cx.new(|cx| CommandTextField::new(tunnel.target_host, "目标主机", cx)),
+            target_port: cx
+                .new(|cx| CommandTextField::new(tunnel.target_port.to_string(), "目标端口", cx)),
+        });
+        cx.notify();
+    }
+
+    fn remove_server_tunnel(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.server_tunnel_drafts.remove(index);
+        cx.notify();
+    }
+
+    fn set_server_tunnel_kind(
+        &mut self,
+        index: usize,
+        kind: laterterm_config::TunnelKind,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(draft) = self.server_tunnel_drafts.get_mut(index) {
+            draft.kind = kind;
+            cx.notify();
+        }
+    }
+
+    fn toggle_server_tunnel(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(draft) = self.server_tunnel_drafts.get_mut(index) {
+            draft.enabled = !draft.enabled;
+            cx.notify();
+        }
     }
 
     /// 保存服务器：校验与凭据写入（改名迁移）都在后台线程，避免密钥环 DBus 阻塞。
@@ -4690,6 +4790,27 @@ impl WorkspaceView {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
         meta.shortcut = self.shortcut_value(cx);
+        // 隧道编辑区读回：文本 trim，端口 parse 失败按 0 落草稿——由
+        // validate_tunnels 报「端口不能为 0」，错误留在弹窗内（与编码字段的
+        // 前置早退不同，隧道校验统一走 validate()，一处口径）
+        meta.tunnels = self
+            .server_tunnel_drafts
+            .iter()
+            .map(|draft| laterterm_config::ServerTunnel {
+                kind: draft.kind,
+                enabled: draft.enabled,
+                bind_host: draft.bind_host.read(cx).value().trim().to_string(),
+                bind_port: draft.bind_port.read(cx).value().trim().parse().unwrap_or(0),
+                target_host: draft.target_host.read(cx).value().trim().to_string(),
+                target_port: draft
+                    .target_port
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .parse()
+                    .unwrap_or(0),
+            })
+            .collect();
         let secret = values.get("凭据").cloned().unwrap_or_default();
         if let Some(conflict) = self.check_shortcut_conflict(
             meta.shortcut.as_deref(),
@@ -5645,7 +5766,11 @@ impl WorkspaceView {
             .map(|request| request.jump.clone())
             .unwrap_or_default();
         match result {
-            Ok(ConnectionOutcome::Connected { session, warning }) => {
+            Ok(ConnectionOutcome::Connected {
+                session,
+                warning,
+                tunnel_session,
+            }) => {
                 self.ssh_request = None;
                 self.server_dialog = None;
                 self.server_fields.clear();
@@ -5660,6 +5785,11 @@ impl WorkspaceView {
                         entry: entry.clone(),
                         jump: request_jump,
                     });
+                    pane.tunnel_session = tunnel_session.clone();
+                }
+                // 隧道事件 watcher：每秒 drain 转发事件收敛进 pane.tunnel_states
+                if let Some(typed) = tunnel_session {
+                    self.start_tunnel_watcher(pane_id, typed, cx);
                 }
                 let tab_id = TabId(self.next_tab_id);
                 self.next_tab_id += 1;
@@ -7124,8 +7254,17 @@ impl WorkspaceView {
                 pane.reconnect = Some(state.clone());
                 pane.title = state.display_title();
                 start_reconnect = Some(state);
-            } else if !pane.title.ends_with("（已退出）") {
-                pane.title.push_str("（已退出）");
+            } else {
+                // 意外断开且不走重连：server_notice 兜底不留无提示死窗格
+                // （标题仍有「（已退出）」后缀，双通道冗余是有意的）
+                if unexpected
+                    && let Some(name) = pane.ssh_link.as_ref().map(|link| link.entry.name.clone())
+                {
+                    self.server_notice = Some(format!("「{name}」连接意外断开（已退出）"));
+                }
+                if !pane.title.ends_with("（已退出）") {
+                    pane.title.push_str("（已退出）");
+                }
             }
             cx.notify();
         }
@@ -7196,7 +7335,11 @@ impl WorkspaceView {
                 };
                 let attempt = state.attempt;
                 match result {
-                    Ok(ConnectionOutcome::Connected { session, warning }) => {
+                    Ok(ConnectionOutcome::Connected {
+                        session,
+                        warning,
+                        tunnel_session,
+                    }) => {
                         // 成功交给 render 头部替换（订阅重挂需要 window）；
                         // 实体已亡/重连态被改则丢弃会话，不留游魂连接。
                         let pending = Arc::clone(&session);
@@ -7216,6 +7359,7 @@ impl WorkspaceView {
                                 pane: pane_id,
                                 session: pending,
                                 warning,
+                                tunnel_session,
                             });
                             cx.notify();
                         });
@@ -7291,6 +7435,7 @@ impl WorkspaceView {
         pane_id: PaneId,
         session: Arc<dyn TerminalSession>,
         warning: Option<String>,
+        tunnel_session: Option<Arc<laterterm_ssh::SshSession>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -7347,6 +7492,13 @@ impl WorkspaceView {
         pane.highlighted = false; // 新会话从干净状态开始
         pane.reconnect = None;
         pane.title = state.base_title; // 清后缀，新会话标题经 OSC 接管
+        // 隧道状态指向旧会话必须清零：新会话的隧道由新 watcher 重新收敛
+        // （评审风险 7：替换会话实体时不重启 watcher/清状态会让 chip 失真）
+        pane.tunnel_states.clear();
+        pane.tunnel_session = tunnel_session.clone();
+        if let Some(typed) = tunnel_session {
+            self.start_tunnel_watcher(pane_id, typed, cx);
+        }
         if warning.is_some() {
             self.server_notice = warning; // 非致命警告如实提示（与手动连接同通道）
         }
@@ -7361,8 +7513,101 @@ impl WorkspaceView {
     /// 重连在途结果落地（render 头部，process_ssh_results 同款位置）。
     fn process_reconnect_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         for result in std::mem::take(&mut self.pending_reconnect_results) {
-            self.apply_reconnect_success(result.pane, result.session, result.warning, window, cx);
+            self.apply_reconnect_success(
+                result.pane,
+                result.session,
+                result.warning,
+                result.tunnel_session,
+                window,
+                cx,
+            );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // SSH 端口转发（隧道）事件 watcher：每秒 drain 会话事件流，收敛成
+    // pane.tunnel_states 供 server_entry_row 渲染 chip；render 不碰会话锁。
+    // ------------------------------------------------------------------
+
+    /// 启动窗格隧道事件 watcher（gpui timer 1s）。退出条件（任一）：
+    /// 实体已亡 / 窗格已关 / 会话被替换（重连成功换 typed 句柄 → ptr_eq
+    /// 失配退出；apply_reconnect_success 会为新句柄重启 watcher）。
+    fn start_tunnel_watcher(
+        &mut self,
+        pane_id: PaneId,
+        session: Arc<laterterm_ssh::SshSession>,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                // update 返回 Ok(false) = 继续轮询；Ok(true) = 有事件已收敛；
+                // Err/None = 实体亡、窗格关或会话替换 → watcher 退出
+                let alive = this.update(cx, |ws, cx| {
+                    let pane = ws.panes.iter().find(|pane| pane.id == pane_id)?;
+                    // 重连替换会话后旧 watcher 立即退（新 watcher 由
+                    // apply_reconnect_success 启动），状态快照不串会话
+                    let typed = pane.tunnel_session.as_ref()?;
+                    if !Arc::ptr_eq(typed, &session) {
+                        return None;
+                    }
+                    let events = session.take_port_forward_events();
+                    if events.is_empty() {
+                        return Some(());
+                    }
+                    ws.merge_tunnel_events(pane_id, events, cx);
+                    Some(())
+                });
+                if alive.is_err() || matches!(alive, Ok(None)) {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 事件收敛：Active 刷新（无则插入）对应隧道状态；Failed 置红态；
+    /// Stopped 摘除。有变化才 notify。
+    fn merge_tunnel_events(
+        &mut self,
+        pane_id: PaneId,
+        events: Vec<PortForwardEvent>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) else {
+            return;
+        };
+        for event in events {
+            match event {
+                PortForwardEvent::Active { spec, connections } => {
+                    let state = (spec, TunnelState::Active { connections });
+                    match pane
+                        .tunnel_states
+                        .iter_mut()
+                        .find(|(existing, _)| existing == &state.0)
+                    {
+                        Some(slot) => slot.1 = state.1,
+                        None => pane.tunnel_states.push(state),
+                    }
+                }
+                PortForwardEvent::Failed { spec, message } => {
+                    match pane
+                        .tunnel_states
+                        .iter_mut()
+                        .find(|(existing, _)| existing == &spec)
+                    {
+                        Some(slot) => slot.1 = TunnelState::Failed(message),
+                        None => pane
+                            .tunnel_states
+                            .push((spec, TunnelState::Failed(message))),
+                    }
+                }
+                PortForwardEvent::Stopped { spec } => {
+                    pane.tunnel_states.retain(|(existing, _)| existing != &spec);
+                }
+            }
+        }
+        cx.notify();
     }
 }
 
@@ -9505,6 +9750,7 @@ fn server_edit_modal(
                 .map(|(name, field)| dialog_field_row(&name, field)),
         )
         .when_some(workspace.shortcut_editor.as_ref(), |body, editor| body.child(shortcut_editor_row(editor.recorder.clone())))
+        .child(server_tunnel_editor(workspace, cx))
         .child(
             div()
                 .pt_2()
@@ -9605,6 +9851,119 @@ fn server_edit_modal(
         body,
         dismiss_listener(cx, WorkspaceView::dismiss_server),
     )
+}
+
+/// 服务器编辑弹窗的隧道编辑区：每行 kind/enabled 切换 + 4 个紧凑输入框。
+/// 文本合法性统一由保存时的 validate_tunnels 把关（报错留在弹窗内）；
+/// SOCKS5 动态转发 defer 说明随卡片展示（v1 只落 local/remote）。
+fn server_tunnel_editor(workspace: &WorkspaceView, cx: &mut Context<WorkspaceView>) -> gpui::Div {
+    let drafts = workspace.server_tunnel_drafts.clone();
+    div()
+        .pt_3()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().text_color(rgb(0x7D829F)).child("端口转发隧道"))
+                .child(div().flex_1())
+                .child(setting_button(
+                    "+ 添加隧道",
+                    false,
+                    cx.listener(|this, _, _, cx| this.add_server_tunnel(cx)),
+                )),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(0x7D829F))
+                .child("本地 = 本机端口转发到远端（ssh -L）；远程 = 远端端口转回本机（ssh -R）。远程监听地址建议填 IP 字面量。SOCKS5 动态转发规划在后续版本。"),
+        )
+        .children(
+            drafts
+                .into_iter()
+                .enumerate()
+                .map(|(index, draft)| server_tunnel_draft_row(index, draft, cx)),
+        )
+}
+
+/// 单条隧道草稿行：上排方向/启停/删除按钮，下排 2×2 紧凑输入框。
+fn server_tunnel_draft_row(
+    index: usize,
+    draft: TunnelDraft,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    use laterterm_config::TunnelKind;
+    let kind = draft.kind;
+    let enabled = draft.enabled;
+    let field = |label: &'static str, field: Entity<CommandTextField>| {
+        div()
+            .flex_1()
+            .min_w(px(0.0))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(rgb(0x7D829F))
+                    .child(label),
+            )
+            .child(field)
+    };
+    div()
+        .mt_2()
+        .p_2()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(0x292D40))
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(setting_button(
+                    "本地",
+                    kind == TunnelKind::Local,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_server_tunnel_kind(index, TunnelKind::Local, cx)
+                    }),
+                ))
+                .child(setting_button(
+                    "远程",
+                    kind == TunnelKind::Remote,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_server_tunnel_kind(index, TunnelKind::Remote, cx)
+                    }),
+                ))
+                .child(div().flex_1())
+                .child(setting_button(
+                    if enabled { "已启用" } else { "已停用" },
+                    enabled,
+                    cx.listener(move |this, _, _, cx| this.toggle_server_tunnel(index, cx)),
+                ))
+                .child(setting_button(
+                    "删除",
+                    false,
+                    cx.listener(move |this, _, _, cx| this.remove_server_tunnel(index, cx)),
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_2()
+                .child(field("监听地址", draft.bind_host))
+                .child(field("监听端口", draft.bind_port)),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_2()
+                .child(field("目标主机", draft.target_host))
+                .child(field("目标端口", draft.target_port)),
+        )
 }
 
 /// 批量改组弹窗：单个「分组名」输入框（预填旧组名）；清空保存 = 解散，
@@ -10019,6 +10378,7 @@ fn render_server_section(
                         server_entry_row(
                             entry,
                             delete_confirm.as_deref() == Some(entry.name.as_str()),
+                            server_tunnel_chip(&workspace.panes, entry),
                             ui,
                             cx,
                         )
@@ -10044,6 +10404,7 @@ fn render_server_section(
                                 server_entry_row(
                                     entry,
                                     delete_confirm.as_deref() == Some(entry.name.as_str()),
+                                    server_tunnel_chip(&workspace.panes, entry),
                                     ui,
                                     cx,
                                 )
@@ -10054,6 +10415,50 @@ fn render_server_section(
                     .collect::<Vec<_>>()
             }
         })
+}
+
+/// 服务器条目行内的隧道状态 chip 视图（None = 不渲染：条目未配启用的隧道，
+/// 或无对应窗格——不常驻占位防列表噪声）。数据来自窗格 watcher 收敛的
+/// pane.tunnel_states，render 只读快照，不碰会话锁。
+enum TunnelChip {
+    /// 活跃：N 条隧道在泵（含 0 = 建立成功尚无连接）。
+    Active(usize),
+    /// 任一隧道故障（红）。
+    Failed,
+    /// 窗格已退出（红：隧道随会话断开）。
+    Disconnected,
+}
+
+/// 按服务器名聚合窗格隧道状态：优先取 Running 窗格，无 Running 但有残留
+/// 窗格（Exited）时给断开红态。
+fn server_tunnel_chip(panes: &[Pane], entry: &ServerEntry) -> Option<TunnelChip> {
+    if !entry.tunnels.iter().any(|tunnel| tunnel.enabled) {
+        return None;
+    }
+    let matching: Vec<&Pane> = panes
+        .iter()
+        .filter(|pane| {
+            pane.ssh_link
+                .as_ref()
+                .is_some_and(|link| link.entry.name == entry.name)
+        })
+        .collect();
+    let pane = matching
+        .iter()
+        .find(|pane| pane.status == TabStatus::Running)
+        .or_else(|| matching.first())?;
+    if pane.status != TabStatus::Running {
+        return Some(TunnelChip::Disconnected);
+    }
+    let mut active = 0usize;
+    for (_, state) in &pane.tunnel_states {
+        match state {
+            TunnelState::Active { .. } => active += 1,
+            TunnelState::Failed(_) => return Some(TunnelChip::Failed),
+            TunnelState::Stopped => {}
+        }
+    }
+    Some(TunnelChip::Active(active))
 }
 
 /// 分组组头行：▸/▾ + 组名 + 计数；点整行切换折叠。命名组附带「重命名/解散」
@@ -10158,9 +10563,11 @@ fn server_group_header(
 
 /// 服务器条目三行结构：名称+连接 / 地址·认证 / 快捷键·编辑·删除。
 /// 卡片带 `server-card-<名称>` 选择器（分组折叠冒烟测试按名定位成员）。
+/// `tunnel_chip` 为 Some 时第一行附隧道状态 chip（活跃绿 / 异常·断开红）。
 fn server_entry_row(
     entry: &ServerEntry,
     pending_delete: bool,
+    tunnel_chip: Option<TunnelChip>,
     ui: UiColors,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
@@ -10173,7 +10580,7 @@ fn server_entry_row(
     let name = entry.name.clone();
     server_list_item(ui)
         .debug_selector(move || format!("server-card-{name}"))
-        // 第一行：名称 + 连接
+        // 第一行：名称 + 隧道 chip + 连接
         .child(
             div()
                 .flex()
@@ -10187,6 +10594,31 @@ fn server_entry_row(
                         .text_color(rgb(ui.text))
                         .child(entry.name.clone()),
                 )
+                .when_some(tunnel_chip, |row, chip| {
+                    let (label, color) = match chip {
+                        TunnelChip::Active(count) => {
+                            let label = if count > 0 {
+                                format!("隧道 ×{count}")
+                            } else {
+                                "隧道".to_string()
+                            };
+                            (label, ui.success)
+                        }
+                        TunnelChip::Failed => ("隧道异常".to_string(), ui.danger),
+                        TunnelChip::Disconnected => ("隧道已断开".to_string(), ui.danger),
+                    };
+                    row.child(
+                        div()
+                            .debug_selector(|| "server-tunnel-chip".into())
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .text_size(px(11.0))
+                            .text_color(rgb(color))
+                            .bg(rgb(ui.card_bg))
+                            .child(label),
+                    )
+                })
                 .child(
                     div()
                         .px_2()
@@ -11857,6 +12289,7 @@ mod exit_regression_tests {
                 Ok(super::ConnectionOutcome::Connected {
                     session: session.clone(),
                     warning: None,
+                    tunnel_session: None,
                 }),
                 window,
                 cx,
@@ -14685,7 +15118,7 @@ mod reconnect_tests {
         });
         let (new_session, _new_feeder) = stub_ssh_session();
         workspace.update_in(cx, |view, window, cx| {
-            view.apply_reconnect_success(pane_id, new_session, None, window, cx);
+            view.apply_reconnect_success(pane_id, new_session, None, None, window, cx);
             let pane = view
                 .panes
                 .iter()

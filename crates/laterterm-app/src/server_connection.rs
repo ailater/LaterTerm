@@ -8,11 +8,11 @@ use laterterm_secrets::{SecretStore, ssh_account, ssh_passphrase_account};
 use laterterm_ssh::sftp::SftpHandle;
 use laterterm_ssh::{
     AuthMethod, HostKeyPolicy, PrivateKeyPassphraseRequired, SessionEncoding, SshAuth, SshEndpoint,
-    SshOptions, SshSession, prepare_private_key,
+    SshOptions, SshSession, TunnelSpec, prepare_private_key,
 };
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -43,6 +43,10 @@ pub(crate) enum ConnectionOutcome {
     Connected {
         session: Arc<dyn TerminalSession>,
         warning: Option<String>,
+        /// SSH 会话的 typed 句柄（SFTP 路径恒 None）：窗格 watcher 据此拉取
+        /// 端口转发事件流（take_port_forward_events）。装饰器包装层不透出
+        /// 该类型，只能在这里随行带出。
+        tunnel_session: Option<Arc<SshSession>>,
     },
     Prompt {
         kind: CredentialKind,
@@ -97,7 +101,12 @@ pub(crate) fn connect(
     store: Arc<dyn SecretStore>,
     active: Arc<AtomicBool>,
 ) -> Result<ConnectionOutcome> {
-    connect_with(
+    // typed 句柄暂存槽：establish 闭包在 connect_with 内部构造 SshSession，
+    // 无法经 `Arc<dyn TerminalSession>` 透出具体类型——闭包把 typed Arc 存
+    // 槽，Connected 返回时随行（窗格 watcher 据此拉隧道事件流）。
+    let typed_slot: Arc<Mutex<Option<Arc<SshSession>>>> = Arc::default();
+    let slot = Arc::clone(&typed_slot);
+    let outcome = connect_with(
         entry,
         jump_entries,
         supplied,
@@ -109,12 +118,47 @@ pub(crate) fn connect(
             let options = SshOptions {
                 endpoint: endpoint_for_entry(entry, auth)?,
                 jump: hops,
+                // 隧道只取 enabled 项（停用的仅保留配置）；SFTP 路径不带隧道
+                tunnels: tunnel_specs(entry),
                 cols: 110,
                 rows: 30,
             };
-            Ok(Arc::new(SshSession::spawn(options)?) as Arc<dyn TerminalSession>)
+            let session = Arc::new(SshSession::spawn(options)?);
+            *slot.lock().unwrap() = Some(Arc::clone(&session));
+            Ok(Arc::clone(&session) as Arc<dyn TerminalSession>)
         },
-    )
+    )?;
+    let tunnel_session = typed_slot.lock().unwrap().take();
+    Ok(match outcome {
+        ConnectionOutcome::Connected {
+            session, warning, ..
+        } => ConnectionOutcome::Connected {
+            session,
+            warning,
+            tunnel_session,
+        },
+        // Prompt 等形态原样透出（此时尚未构造会话，槽必为空）
+        outcome => outcome,
+    })
+}
+
+/// 条目隧道配置 → 连接期规格：只取 enabled 项（停用的仅保留配置不参与连接）。
+fn tunnel_specs(entry: &ServerEntry) -> Vec<TunnelSpec> {
+    entry
+        .tunnels
+        .iter()
+        .filter(|tunnel| tunnel.enabled)
+        .map(|tunnel| TunnelSpec {
+            kind: match tunnel.kind {
+                laterterm_config::TunnelKind::Local => laterterm_ssh::TunnelKind::Local,
+                laterterm_config::TunnelKind::Remote => laterterm_ssh::TunnelKind::Remote,
+            },
+            bind_host: tunnel.bind_host.clone(),
+            bind_port: tunnel.bind_port,
+            target_host: tunnel.target_host.clone(),
+            target_port: tunnel.target_port,
+        })
+        .collect()
 }
 
 /// SFTP 连接（阻塞，仅后台线程）：凭据解析与 shell 同一套（含补输重试
@@ -411,7 +455,12 @@ where
         session.kill();
         bail!("连接已取消");
     }
-    Ok(ConnectionOutcome::Connected { session, warning })
+    // tunnel_session 由公开 connect() 的 typed 槽回填（测试注入路径恒 None）
+    Ok(ConnectionOutcome::Connected {
+        session,
+        warning,
+        tunnel_session: None,
+    })
 }
 
 /// prepare_candidates / prepare_key_auth 内部产出的 Prompt 形态转换。

@@ -1107,7 +1107,12 @@ fn settings_servers_body(
             ),
         setting_card()
             .child(info_row("本地 Shell", "已内置"))
-            .child(info_row("SSH", "已接入（断线自动重连，见上方设置）")),
+            .child(info_row("SSH", "已接入（断线自动重连，见上方设置）"))
+            // SOCKS5 动态转发 defer 说明（v1 只落本地/远程两类隧道）
+            .child(info_row(
+                "端口转发",
+                "服务器编辑弹窗内配置本地/远程隧道，随连接建立；SOCKS5 动态转发规划在后续版本",
+            )),
     ]
 }
 

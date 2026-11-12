@@ -16,9 +16,12 @@
 //! take_streams 返回的 reader/writer 装饰器上是既定演进位。
 
 pub mod encoding;
+pub mod forward;
 pub mod sftp;
 
 pub use encoding::SessionEncoding;
+use forward::RemoteForwardRouter;
+pub use forward::{PortForwardEvent, TunnelKind, TunnelSpec, TunnelState};
 use laterterm_core::{BackendKind, SessionStreams, TerminalSession};
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, decode_secret_key};
 use std::io;
@@ -426,6 +429,9 @@ pub struct SshOptions {
     /// 跳板链（ProxyJump 语义，`ssh -J` 顺序）：从外到内，第 0 项最先直连；
     /// 空 = 直连。链上任一中间跳的 Handle 都必须保活到会话结束（drop 即断流）。
     pub jump: Vec<SshEndpoint>,
+    /// 端口转发隧道（enabled 项；L/R 都打在目标机 Handle 上，跳板穿透自动
+    /// 成立）。连接期任一条失败 = 整连硬失败（与 `ssh -L` 一致）。
+    pub tunnels: Vec<TunnelSpec>,
     /// 初始列数。
     pub cols: u16,
     /// 初始行数。
@@ -445,14 +451,39 @@ impl SshOptions {
 }
 
 /// 连接超时秒数：基础 15s，每多一跳 +10s（多跳握手逐跳串行）。
-/// spawn 侧 `recv_timeout` 必须用同一公式再 +1s，两处联动否则多跳必超时假失败。
+/// 语义是「建连+认证+PTY/shell」——隧道建立不在此段（独立预算见
+/// [`tunnel_budget_secs`]，新阶段独立定价，不动本公式与既有测试）。
+/// spawn 侧 `recv_timeout` 必须用「本公式 + 隧道段 + 1s」，两处联动否则
+/// 多跳必超时假失败。
 fn connect_timeout_secs(jump_hops: usize) -> u64 {
     15 + 10 * jump_hops as u64
 }
 
+/// 隧道建立预算：5s 起步盖 L 本地 bind 开销（毫秒级），每条 +2s——R 每条
+/// 1 次全局请求往返，对 1s RTT 链路留 2 倍余量。spawn 侧总预算 =
+/// [`connect_timeout_secs`] + 本公式 + 1s，漏改任一侧会让长隧道配置下
+/// spawn 先超时、网络线程真实原因（隧道建立超时）被吞。
+fn tunnel_budget_secs(tunnels: usize) -> u64 {
+    5 + 2 * tunnels as u64
+}
+
+/// spawn 侧总预算（含收尾 +1s 让网络线程先报真实原因）：
+/// 连接段按跳数缩放；**仅当配置了隧道才加隧道段**——无隧道时与旧公式
+/// 逐秒一致（无隧道不进入隧道建立阶段，自然不该多付 5s 起步价）。
+fn spawn_timeout_secs(jump_hops: usize, tunnels: usize) -> u64 {
+    let tunnel_stage = (tunnels > 0).then(|| tunnel_budget_secs(tunnels));
+    connect_timeout_secs(jump_hops) + tunnel_stage.unwrap_or(0) + 1
+}
+
 /// 网络线程内的控制指令（tokio 无界通道，同步侧 send 永不阻塞）。
 enum SessionCmd {
-    Resize { cols: u32, rows: u32 },
+    Resize {
+        cols: u32,
+        rows: u32,
+    },
+    /// 已连接会话内启停隧道（hub 按 spec 差异增删；v1 UI 未接入运行时编辑，
+    /// 改动默认下次连接生效——本指令是运行时启停的既有入口，见 roadmap）。
+    SetTunnels(Vec<TunnelSpec>),
     Shutdown,
 }
 
@@ -470,6 +501,9 @@ pub struct SshSession {
     /// window_change 失败），供上层断线自动重连判别（`exit_unexpected`）。
     /// 用户 exit（Eof|Close）与用户关闭（Shutdown）不置位。
     unexpected_exit: Arc<AtomicBool>,
+    /// 端口转发事件缓冲：网络线程的 ForwardHub 投递，UI 侧每秒 drain
+    /// （`take_port_forward_events`，take_streams 同款一次性语义）。
+    port_forward_events: Arc<Mutex<Vec<PortForwardEvent>>>,
 }
 
 /// 网络线程就绪后移交给 `spawn` 侧的三件套：写桥发送端、控制桥发送端、
@@ -489,34 +523,52 @@ impl SshSession {
         let title = options.title();
         // 编码在 options move 进网络线程前取出（UTF-8 直通零开销）
         let encoding = options.endpoint.encoding;
-        // 超时按跳数缩放；spawn 侧比网络侧多留 1s，让网络线程先报真实原因
-        let timeout_secs = connect_timeout_secs(options.jump.len());
+        // 超时预算（单一事实源 spawn_timeout_secs：连接段 + 隧道段 + 1s）；
+        // 无隧道时不加隧道段，与旧公式逐秒一致。两段公式与网络线程内独立
+        // timeout 块联动；+1s 让网络线程先报真实原因（「SSH 连接超时」vs
+        // 「隧道建立超时」）
+        let timeout_secs = spawn_timeout_secs(options.jump.len(), options.tunnels.len());
+        let tunnel_count = options.tunnels.len();
         let (ready_tx, ready_rx) = std_mpsc::channel::<SessionHandles>();
         // 非预期退出标记：spawn 侧持有、clone 进网络线程（两处连接层死亡
         // break 前置位），SshSession 构造后经 exit_unexpected 读出
         let unexpected_exit = Arc::new(AtomicBool::new(false));
+        // 隧道事件缓冲：spawn 侧创建、clone 进网络线程的 ForwardHub 投递
+        let port_forward_events: Arc<Mutex<Vec<PortForwardEvent>>> = Arc::default();
 
         let network = std::thread::Builder::new()
             .name("laterterm-ssh".into())
             .spawn({
                 let unexpected_exit = Arc::clone(&unexpected_exit);
+                let port_forward_events = Arc::clone(&port_forward_events);
                 move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                         .expect("构建 tokio runtime 失败");
-                    runtime.block_on(network_main(options, ready_tx, unexpected_exit));
+                    runtime.block_on(network_main(
+                        options,
+                        ready_tx,
+                        unexpected_exit,
+                        port_forward_events,
+                    ));
                 }
             })
             .map_err(io::Error::other)?;
 
         let _ = network; // 线程自行退出，不需要 join
         let (writer_tx, cmd_tx, data_rx) = ready_rx
-            .recv_timeout(std::time::Duration::from_secs(timeout_secs + 1))
+            .recv_timeout(std::time::Duration::from_secs(timeout_secs))
             .map_err(|_| {
+                // 有隧道时总预算含隧道段，如实标注防误判成建连慢
+                let label = if tunnel_count > 0 {
+                    "（含隧道建立）"
+                } else {
+                    ""
+                };
                 io::Error::new(
                     ErrorKind::TimedOut,
-                    format!("SSH 连接超时（{}s）", timeout_secs + 1),
+                    format!("SSH 连接超时（{timeout_secs}s）{label}"),
                 )
             })??;
 
@@ -533,7 +585,26 @@ impl SshSession {
             title,
             closing: AtomicBool::new(false),
             unexpected_exit,
+            port_forward_events,
         })
+    }
+
+    /// 已连接会话内启停隧道（v1 UI 未接入运行时编辑：改动默认下次连接生效，
+    /// 本入口供后续版本/调试使用）。diff 的多次往返在 select 臂 spawn 执行，
+    /// 不阻塞会话消息循环。
+    pub fn set_tunnels(&self, tunnels: Vec<TunnelSpec>) -> io::Result<()> {
+        if self.closing.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.cmd_tx
+            .send(SessionCmd::SetTunnels(tunnels))
+            .map_err(|_| io::Error::other("SSH 会话已结束"))
+    }
+
+    /// 一次性取走全部端口转发事件（take_streams 同款语义）：窗格 watcher
+    /// 每秒调用，hub 侧只追加不读。
+    pub fn take_port_forward_events(&self) -> Vec<PortForwardEvent> {
+        std::mem::take(&mut self.port_forward_events.lock().unwrap())
     }
 }
 
@@ -640,11 +711,14 @@ impl io::Write for ChannelWriter {
     }
 }
 
-/// 最小客户端 Handler：实现主机密钥策略。
+/// 最小客户端 Handler：实现主机密钥策略 + R 转发路由。
 struct ClientHandler {
     host_key_policy: HostKeyPolicy,
     host: String,
     port: u16,
+    /// R 转发路由（仅目标机连接注入，跳板机 None）：服务端连入监听端口时
+    /// 主动开 forwarded-tcpip 通道，据此把通道接到本机目标。
+    router: Option<Arc<RemoteForwardRouter>>,
 }
 
 impl russh::client::Handler for ClientHandler {
@@ -676,6 +750,43 @@ impl russh::client::Handler for ClientHandler {
             )
             .map_err(Into::into),
         }
+    }
+
+    /// R 转发连入：russh 在**会话消息循环内联 await** 本回调（russh 0.65
+    /// encrypted.rs:925-936 `.await?` 实锤）——并发纪律写死：回调只做
+    /// 路由查表 + accept + `tokio::spawn` 泵任务 + 立即返回 Ok；在这里连接
+    /// 本机目标或等待双向泵会冻结整个会话（shell 数据流/resize/其他隧道
+    /// 全堵）。未命中路由 → 丢弃 reply（russh 语义 = 自动拒绝通道）。
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: russh::client::ChannelOpenHandle,
+        _session: &mut russh::client::Session,
+    ) -> Result<(), Self::Error> {
+        let Some(router) = self.router.as_ref() else {
+            return Ok(()); // 未注入路由（跳板机）：拒绝连入
+        };
+        let Some(spec) = router.accept_incoming(connected_address, connected_port) else {
+            eprintln!("远程转发连入未命中路由，已拒绝: {connected_address}:{connected_port}");
+            return Ok(()); // reply drop → 拒绝
+        };
+        reply.accept().await;
+        let router = Arc::clone(router);
+        let key = (connected_address.to_string(), connected_port);
+        tokio::spawn(async move {
+            let connect =
+                tokio::net::TcpStream::connect((spec.target_host.as_str(), spec.target_port)).await;
+            match connect {
+                Ok(tcp) => forward::pump(channel.into_stream(), tcp).await,
+                Err(error) => eprintln!("隧道 {} 本机目标连接失败: {error}", spec.label()),
+            }
+            router.connection_closed(&key.0, key.1);
+        });
+        Ok(())
     }
 }
 
@@ -720,13 +831,17 @@ fn client_config() -> std::sync::Arc<russh::client::Config> {
 }
 
 /// 连接并认证一个端点（直连 TCP；跳板机与目标机的第一跳共用）。
+/// `router` 仅目标机连接注入（直连会话的第一跳即目标机；有跳板链时第一跳
+/// 是外层跳板，传 None）。
 async fn connect_and_auth(
     endpoint: &SshEndpoint,
+    router: Option<Arc<RemoteForwardRouter>>,
 ) -> io::Result<russh::client::Handle<ClientHandler>> {
     let handler = ClientHandler {
         host_key_policy: endpoint.host_key_policy.clone(),
         host: endpoint.host.clone(),
         port: endpoint.port(),
+        router,
     };
     let mut handle = russh::client::connect(
         client_config(),
@@ -752,6 +867,7 @@ async fn open_through(
     prev: &russh::client::Handle<ClientHandler>,
     prev_label: &str,
     endpoint: &SshEndpoint,
+    router: Option<Arc<RemoteForwardRouter>>,
 ) -> io::Result<russh::client::Handle<ClientHandler>> {
     let forward = prev
         .channel_open_direct_tcpip(
@@ -772,6 +888,7 @@ async fn open_through(
         host_key_policy: endpoint.host_key_policy.clone(),
         host: endpoint.host.clone(),
         port: endpoint.port(),
+        router,
     };
     let mut handle = russh::client::connect_stream(client_config(), stream, handler)
         .await
@@ -924,15 +1041,23 @@ async fn network_main(
     options: SshOptions,
     ready_tx: std_mpsc::Sender<SessionHandles>,
     unexpected_exit: Arc<AtomicBool>,
+    port_forward_events: forward::EventSink,
 ) {
+    // R 转发路由：仅当配置了隧道才存在；经跳板链时 R 的 forwarded-tcpip 回调
+    // 打在目标机连接的 Handler 上（链上中间跳一律 None）
+    let router = (!options.tunnels.is_empty()).then(|| {
+        Arc::new(forward::RemoteForwardRouter::new(Arc::clone(
+            &port_forward_events,
+        )))
+    });
     let connect_result: io::Result<()> = async {
         let (handle, mut channel, tunnels) = tokio::time::timeout(
             std::time::Duration::from_secs(connect_timeout_secs(options.jump.len())),
             async {
-                // 第一跳：外层跳板直连；无跳板链时第一跳就是目标机
+                // 第一跳：外层跳板直连；无跳板链时第一跳就是目标机（注入路由）
                 let mut handle = match options.jump.first() {
-                    Some(first) => connect_and_auth(first).await?,
-                    None => connect_and_auth(&options.endpoint).await?,
+                    Some(first) => connect_and_auth(first, None).await?,
+                    None => connect_and_auth(&options.endpoint, router.clone()).await?,
                 };
                 // 后续跳：跳板链剩余跳 + 目标机，都经上一跳的 direct-tcpip 穿透；
                 // 中间跳 Handle 存入 tunnels 保活（drop 即断流）。
@@ -947,7 +1072,10 @@ async fn network_main(
                         // 正在穿过的机器是第 index+1 跳（1 起），如「跳板[1/2] ops@x」
                         let through = &options.jump[index];
                         let label = format!("跳板[{}/{}] {}", index + 1, total, through.title());
-                        let next = open_through(&handle, &label, endpoint).await?;
+                        // 最后一项是目标机：注入 R 转发路由
+                        let target_router =
+                            (index == chain.len() - 1).then(|| router.clone()).flatten();
+                        let next = open_through(&handle, &label, endpoint, target_router).await?;
                         tunnels.push(handle);
                         handle = next;
                     }
@@ -1007,6 +1135,47 @@ async fn network_main(
         let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<SessionCmd>();
         let (data_tx, data_rx) = std_mpsc::channel::<Vec<u8>>();
 
+        // 目标机 Handle 包 Arc：ForwardHub 的常驻泵任务需要 'static 共享句柄
+        // （russh Handle 不可 Clone——receiver/join 独占——但全部公开方法走
+        // &self，Arc 共享所有权即可，Drop 本就 no-op）。
+        let handle = Arc::new(handle);
+
+        // 隧道建立（评审意见 5：挪出既有 timeout 块，独立预算——既有公式语义
+        // 是「建连+认证+PTY/shell」，塞入 16 条隧道往返会误报）。放在
+        // PTY/shell 就绪之后、ready 之前：任一隧道 bind/R 失败 = 连接期硬失败
+        // （与 ssh -L 一致），错误文案点名隧道（如「端口被占用」）。
+        let hub = if options.tunnels.is_empty() {
+            None
+        } else {
+            let budget_secs = tunnel_budget_secs(options.tunnels.len());
+            let hub = Arc::new(forward::ForwardHub::new(
+                Arc::clone(&handle),
+                Arc::clone(&port_forward_events),
+                router.expect("有隧道必有路由（上方 then 分支）"),
+            ));
+            let established = tokio::time::timeout(
+                std::time::Duration::from_secs(budget_secs),
+                hub.establish(options.tunnels.clone()),
+            )
+            .await;
+            match established {
+                Ok(Ok(())) => Some(hub),
+                Ok(Err(error)) => return Err(error), // establish 内部已撤已完成部分
+                Err(_) => {
+                    // 建立超时：先撤本地已登记部分（L 监听/R cancel）再硬失败；
+                    // 网络侧残留随整连失败自行消亡
+                    hub.shutdown().await;
+                    return Err(io::Error::new(
+                        ErrorKind::TimedOut,
+                        format!(
+                            "隧道建立超时（{} 条，{budget_secs}s）",
+                            options.tunnels.len()
+                        ),
+                    ));
+                }
+            }
+        };
+
         let mut ssh_writer = channel.make_writer();
         tokio::spawn(async move {
             use tokio::io::AsyncWriteExt;
@@ -1021,6 +1190,9 @@ async fn network_main(
         // spawn 侧就绪：取走三条桥的句柄
         if ready_tx.send(Ok((writer_tx, cmd_tx, data_rx))).is_err() {
             // 调用方已超时或取消，释放连接，不能留下无人持有的 shell。
+            if let Some(hub) = &hub {
+                hub.shutdown().await;
+            }
             let _ = handle
                 .disconnect(russh::Disconnect::ByApplication, "connect cancelled", "en")
                 .await;
@@ -1060,12 +1232,25 @@ async fn network_main(
                             break;
                         }
                     }
+                    Some(SessionCmd::SetTunnels(specs)) => {
+                        // 并发纪律：diff 是多次 tcpip_forward/cancel 全局请求
+                        // 往返，绝不内联 await——select 臂只投递指令，diff 在
+                        // 独立任务执行（16 条 × 高 RTT 内联展开必卡 Shutdown）；
+                        // 失败只发 Failed 事件（运行期软失败，不杀 shell）。
+                        if let Some(hub) = &hub {
+                            let hub = Arc::clone(hub);
+                            tokio::spawn(async move { hub.apply_diff(specs).await; });
+                        }
+                    }
                     Some(SessionCmd::Shutdown) | None => break,
                 },
             }
         }
-        // 退出路径统一：先断目标机，再按建立顺序逆序断跳板链（尽力而为），
-        // drop data_tx 让视图读端收 EOF
+        // 退出路径统一：先撤隧道（cancel R → 停 L），再断目标机，最后按建立
+        // 顺序逆序断跳板链（尽力而为），drop data_tx 让视图读端收 EOF
+        if let Some(hub) = &hub {
+            hub.shutdown().await;
+        }
         let _ = handle
             .disconnect(russh::Disconnect::ByApplication, "session closed", "en")
             .await;
@@ -1116,6 +1301,7 @@ mod tests {
         SshOptions {
             endpoint: sample_endpoint("bastion.example.com"),
             jump: Vec::new(),
+            tunnels: Vec::new(),
             cols: 110,
             rows: 30,
         }
@@ -1305,6 +1491,26 @@ mod tests {
         assert_eq!(connect_timeout_secs(3), 45);
     }
 
+    /// 隧道预算独立定价：5s 起步 + 每条 2s（不动既有连接公式，既有测试
+    /// connect_timeout_scales_with_jump_hops 逐值不变）。
+    #[test]
+    fn tunnel_budget_is_priced_per_tunnel() {
+        assert_eq!(tunnel_budget_secs(0), 5);
+        assert_eq!(tunnel_budget_secs(1), 7);
+        assert_eq!(tunnel_budget_secs(16), 37);
+    }
+
+    /// spawn 侧总预算公式 = 连接段 + 隧道段 + 1s（评审意见 5 联动：网络侧
+    /// 两段 timeout 与本公式必须同 diff 改，漏改任一侧会让长隧道配置下
+    /// spawn 先超时、网络线程真实原因被吞）。直接调用 spawn_timeout_secs
+    /// （单一事实源），不复刻公式——无隧道时不得计隧道段起步价。
+    #[test]
+    fn spawn_budget_sums_connect_and_tunnel_stages() {
+        assert_eq!(spawn_timeout_secs(0, 0), 16);
+        assert_eq!(spawn_timeout_secs(1, 0), 26, "无隧道时与旧公式一致");
+        assert_eq!(spawn_timeout_secs(1, 16), 26 + 37, "跳段与隧道段相加");
+    }
+
     /// 读桥契约：分块送达 + 发送端全退后 EOF（termview 的 Exit 触发源）。
     #[test]
     fn reader_bridge_concatenates_chunks_then_eof() {
@@ -1401,6 +1607,7 @@ mod tests {
         let session = SshSession::spawn(SshOptions {
             endpoint: parse(&spec),
             jump,
+            tunnels: Vec::new(),
             cols: 80,
             rows: 24,
         })
