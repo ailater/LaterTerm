@@ -7,7 +7,8 @@
 
 use laterterm_core::{BackendKind, TerminalSession};
 use laterterm_ssh::{
-    AuthMethod, HostKeyPolicy, SessionEncoding, SshAuth, SshEndpoint, SshOptions, SshSession,
+    AuthMethod, HostKeyPolicy, PortForwardEvent, SessionEncoding, SshAuth, SshEndpoint, SshOptions,
+    SshSession, TunnelKind, TunnelSpec,
 };
 use russh::keys::{Algorithm, PrivateKey, ssh_key::LineEnding};
 use russh::server::Server as _;
@@ -35,9 +36,23 @@ use laterterm_ssh::sftp::{CancelFlag, ProgressFn, SftpHandle};
 /// 已接受的转发通道记录在 `forwarded_channels`：隧道原始字节绝不回显，
 /// 否则 "Got " 前缀会污染经隧道转发的 SSH 握手流。
 ///
+/// `remote_forwarding` 为 `Some` 时实现 R 转发（tcpip_forward，等价 sshd 的
+/// GatewayPorts/AllowTcpForwarding 远向开启）：hook 内 bind 真实 listener
+/// （echoserver.rs:127-138 范式扩展），accept 到「连入远端端口的用户连接」
+/// 后经 `session.handle().channel_open_forwarded_tcpip` 主动开通道并双向泵；
+/// 对每次接受的 tcpip_forward 计数。为 `None` 时返回 Ok(false) 拒绝，
+/// 供「R 被拒硬失败」负例使用。`remote_bind_requests` 记录每次请求的
+/// (bind_host, port)（断言客户端按 127.0.0.1 原样请求）；
+/// `remote_listeners` 持有 accept 循环任务，cancel_tcpip_forward 时 abort。
+///
 /// `sftp_root` 为 `Some` 时支持 `sftp` 子系统：channel_open_session 把
 /// Channel 暂存进共享 map，subsystem_request("sftp") 时取出并交给
 /// russh-sftp 的 server::run，文件系统 Handler 以该目录扮演远端 fs。
+/// mock 侧 R 转发 listener 任务表：键 = (bind_host, port)。
+type RemoteListeners = Arc<Mutex<HashMap<(String, u32), tokio::task::JoinHandle<()>>>>;
+/// mock 侧 R 转发 bind 请求记录（断言客户端按 127.0.0.1 原样请求）。
+type RemoteBindRequests = Arc<Mutex<Vec<(String, u32)>>>;
+
 #[derive(Clone)]
 struct MockHandler {
     accepted_key: Option<russh::keys::PublicKey>,
@@ -48,6 +63,9 @@ struct MockHandler {
     /// 也不得走 data() 回调的 "Got data:" 回显路径。
     sftp_channels: Arc<Mutex<HashSet<russh::ChannelId>>>,
     sftp_root: Option<Arc<std::path::Path>>,
+    remote_forwarding: Option<Arc<AtomicUsize>>,
+    remote_listeners: RemoteListeners,
+    remote_bind_requests: RemoteBindRequests,
 }
 
 impl russh::server::Server for MockHandler {
@@ -172,6 +190,88 @@ impl russh::server::Handler for MockHandler {
         Ok(())
     }
 
+    /// R 转发（tcpip_forward）：hook 内 bind 真实 listener，accept 到「连入
+    /// 远端端口的用户连接」后经 session.handle() 主动开 forwarded-tcpip 通道
+    /// 并双向泵字节。关闭时返回 Ok(false)，客户端收到 RequestDenied 硬失败。
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        session: &mut russh::server::Session,
+    ) -> Result<bool, Self::Error> {
+        let Some(counter) = &self.remote_forwarding else {
+            eprintln!("[mock] 远程转发已关闭，拒绝 tcpip_forward {address}:{port}");
+            return Ok(false);
+        };
+        counter.fetch_add(1, Ordering::SeqCst);
+        self.remote_bind_requests
+            .lock()
+            .unwrap()
+            .push((address.to_string(), *port));
+        let handle = session.handle();
+        let address = address.to_string();
+        let port = *port;
+        let listeners = Arc::clone(&self.remote_listeners);
+        let bind_key = (address.clone(), port);
+        // accept 循环独立成任务，句柄入表供 cancel_tcpip_forward abort
+        let task = tokio::spawn(async move {
+            let listener = match TcpListener::bind((address.as_str(), port as u16)).await {
+                Ok(listener) => listener,
+                Err(error) => {
+                    eprintln!("[mock] tcpip_forward bind {address}:{port} 失败: {error}");
+                    return;
+                }
+            };
+            loop {
+                let Ok((tcp, peer)) = listener.accept().await else {
+                    break;
+                };
+                let channel = match handle
+                    .channel_open_forwarded_tcpip(
+                        address.as_str(),
+                        port,
+                        peer.ip().to_string(),
+                        peer.port() as u32,
+                    )
+                    .await
+                {
+                    Ok(channel) => channel,
+                    Err(error) => {
+                        eprintln!("[mock] 开 forwarded-tcpip 到客户端失败: {error}");
+                        break;
+                    }
+                };
+                let mut tcp = tcp;
+                let _ = tokio::io::copy_bidirectional(&mut channel.into_stream(), &mut tcp).await;
+                eprintln!("[mock] R 转发 {address}:{port} 一路连接结束");
+            }
+        });
+        listeners.lock().unwrap().insert(bind_key, task);
+        Ok(true)
+    }
+
+    /// 撤销 R 转发：abort accept 循环（drop 即关 listener）；未登记返回
+    /// false（客户端按 RequestDenied 处理，与 sshd 行为一致）。
+    async fn cancel_tcpip_forward(
+        &mut self,
+        address: &str,
+        port: u32,
+        _session: &mut russh::server::Session,
+    ) -> Result<bool, Self::Error> {
+        let task = self
+            .remote_listeners
+            .lock()
+            .unwrap()
+            .remove(&(address.to_string(), port));
+        match task {
+            Some(task) => {
+                task.abort();
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     async fn pty_request(
         &mut self,
         channel: russh::ChannelId,
@@ -269,6 +369,9 @@ impl MockServer {
                 open_channels: Arc::new(Mutex::new(HashMap::new())),
                 sftp_channels: Arc::new(Mutex::new(HashSet::new())),
                 sftp_root: None,
+                remote_forwarding: None,
+                remote_listeners: Arc::new(Mutex::new(HashMap::new())),
+                remote_bind_requests: Arc::new(Mutex::new(Vec::new())),
             },
         )
     }
@@ -290,6 +393,9 @@ impl MockServer {
                 open_channels: Arc::new(Mutex::new(HashMap::new())),
                 sftp_channels: Arc::new(Mutex::new(HashSet::new())),
                 sftp_root: None,
+                remote_forwarding: None,
+                remote_listeners: Arc::new(Mutex::new(HashMap::new())),
+                remote_bind_requests: Arc::new(Mutex::new(Vec::new())),
             },
         );
         (server, counter)
@@ -317,9 +423,39 @@ impl MockServer {
                 open_channels: Arc::new(Mutex::new(HashMap::new())),
                 sftp_channels: Arc::new(Mutex::new(HashSet::new())),
                 sftp_root: Some(Arc::clone(&root)),
+                remote_forwarding: None,
+                remote_listeners: Arc::new(Mutex::new(HashMap::new())),
+                remote_bind_requests: Arc::new(Mutex::new(Vec::new())),
             },
         );
         (server, root)
+    }
+
+    /// 起一台允许 R 转发（tcpip_forward）的 mock：返回接受计数与 bind 请求
+    /// 记录（断言「绑定 127.0.0.1」用）。
+    fn start_remote_forwarding(port: u16) -> (Self, Arc<AtomicUsize>, RemoteBindRequests) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let binds = Arc::new(Mutex::new(Vec::new()));
+        let server = Self {
+            runtime: None,
+            port: 0,
+            sftp_dir: None,
+        }
+        .into_started(
+            port,
+            MockHandler {
+                accepted_key: None,
+                forwarded: None,
+                forwarded_channels: Arc::new(Mutex::new(HashSet::new())),
+                open_channels: Arc::new(Mutex::new(HashMap::new())),
+                sftp_channels: Arc::new(Mutex::new(HashSet::new())),
+                sftp_root: None,
+                remote_forwarding: Some(Arc::clone(&counter)),
+                remote_listeners: Arc::new(Mutex::new(HashMap::new())),
+                remote_bind_requests: Arc::clone(&binds),
+            },
+        );
+        (server, counter, binds)
     }
 
     /// 把自身从占位结构补全为已启动服务器（保留 sftp_dir 的持有权）。
@@ -642,6 +778,7 @@ fn options_for(port: u16, auth: SshAuth, dir: &std::path::Path) -> SshOptions {
             encoding: SessionEncoding::Utf8,
         },
         jump: Vec::new(),
+        tunnels: Vec::new(),
         cols: 110,
         rows: 30,
     }
@@ -1265,4 +1402,388 @@ fn sftp_via_jump_rejected_forwarding_fails_actionably() {
         message.contains(&format!("tester@127.0.0.1:{}", target.port)),
         "错误应含目标端点名: {message}"
     );
+}
+
+// ---------- 端口转发（隧道）回环 ----------
+
+/// 隧道测试的目标端 echo 服务：独立线程收什么回什么；返回端口与停止标记
+/// （测试持有 `_echo` 即存活，drop 后线程退出）。
+fn spawn_echo_server() -> (u16, Arc<AtomicBool>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("echo bind");
+    let port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_flag = Arc::clone(&stop);
+    std::thread::spawn(move || {
+        listener.set_nonblocking(true).expect("echo 非阻塞");
+        while !stop_flag.load(Ordering::Acquire) {
+            match listener.accept() {
+                Ok((mut socket, _)) => {
+                    std::thread::spawn(move || {
+                        socket
+                            .set_read_timeout(Some(Duration::from_secs(10)))
+                            .expect("echo 读超时");
+                        let mut buffer = [0u8; 4096];
+                        loop {
+                            match socket.read(&mut buffer) {
+                                Ok(0) | Err(_) => break,
+                                Ok(read) => {
+                                    if socket.write_all(&buffer[..read]).is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    (port, stop)
+}
+
+/// 探测一个空闲 TCP 端口（bind(0) 后立即释放；理论竞争窗口由连接重试兜底，
+/// 与 MockServer::start 的重试先例同口径）。
+fn free_tcp_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("探测空闲端口")
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn local_spec(bind_port: u16, target_port: u16) -> TunnelSpec {
+    TunnelSpec {
+        kind: TunnelKind::Local,
+        bind_host: "127.0.0.1".into(),
+        bind_port,
+        target_host: "127.0.0.1".into(),
+        target_port,
+    }
+}
+
+fn remote_spec(bind_port: u16, target_port: u16) -> TunnelSpec {
+    TunnelSpec {
+        kind: TunnelKind::Remote,
+        bind_host: "127.0.0.1".into(),
+        bind_port,
+        target_host: "127.0.0.1".into(),
+        target_port,
+    }
+}
+
+/// 连接隧道本地监听口（R 转发的 mock listener 在 tcpip_forward 往返后才
+/// 绑定，轮询至多 5s 防 bind 未完成的竞态）。
+fn connect_tunnel_port(port: u16) -> std::net::TcpStream {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(socket) => return socket,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => panic!("连隧道端口 {port} 失败: {error}"),
+        }
+    }
+}
+
+/// 经隧道写一笔并读回（echo 目标端语义：收什么回什么）。
+fn tunnel_roundtrip(socket: &mut std::net::TcpStream, payload: &[u8]) {
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("读超时");
+    socket.write_all(payload).expect("写隧道");
+    let mut buffer = vec![0u8; payload.len()];
+    let mut filled = 0;
+    while filled < buffer.len() {
+        let read = socket.read(&mut buffer[filled..]).expect("读隧道回显");
+        assert!(read > 0, "隧道对端提前关闭");
+        filled += read;
+    }
+    assert_eq!(buffer, payload, "隧道回显应逐字节一致");
+}
+
+/// L 直连回环：本地监听 → 目标机 direct-tcpip → echo 目标端，字节级往返；
+/// shell 通道不受隧道影响。
+#[test]
+fn local_forward_direct_loopback_pumps_bytes() {
+    let (server, _direct_count) = MockServer::start_forwarding(0);
+    let (echo_port, _echo) = spawn_echo_server();
+    let known_hosts = temp_known_hosts("l-direct");
+    let bind_port = free_tcp_port();
+
+    let mut options = options_for(
+        server.port,
+        SshAuth::Password("secret".into()),
+        known_hosts.path(),
+    );
+    options.tunnels = vec![local_spec(bind_port, echo_port)];
+
+    let session = SshSession::spawn(options).expect("带 L 隧道连接 mock 服务器");
+    let mut streams = session.take_streams().expect("take_streams");
+    streams.writer.write_all(b"shell-alive\n").expect("写入");
+    read_until(&mut streams, "Got data: shell-alive");
+
+    let mut tunnel = connect_tunnel_port(bind_port);
+    tunnel_roundtrip(&mut tunnel, b"ping-through-l");
+
+    session.kill();
+    wait_eof(&mut streams);
+}
+
+/// L 单跳穿透：隧道 direct-tcpip 打在目标机 Handle 上——跳板仅会话穿透的
+/// 1 次（恰 1，不因隧道多开转发），目标机恰好为隧道开 1 次 direct-tcpip。
+#[test]
+fn local_forward_via_jump_rides_target_handle() {
+    let (target, target_count) = MockServer::start_forwarding(0);
+    let (bastion, bastion_count) = MockServer::start_forwarding(0);
+    let (echo_port, _echo) = spawn_echo_server();
+    let known_hosts = temp_known_hosts("l-jump");
+    let bind_port = free_tcp_port();
+
+    let mut options = options_for(
+        target.port,
+        SshAuth::Password("secret".into()),
+        known_hosts.path(),
+    );
+    options.jump = vec![endpoint_for(bastion.port, known_hosts.path())];
+    options.tunnels = vec![local_spec(bind_port, echo_port)];
+
+    let session = SshSession::spawn(options).expect("经跳板带 L 隧道连接");
+    let mut streams = session.take_streams().expect("take_streams");
+    streams.writer.write_all(b"via-jump-shell\n").expect("写入");
+    read_until(&mut streams, "Got data: via-jump-shell");
+
+    assert_eq!(
+        bastion_count.load(Ordering::SeqCst),
+        1,
+        "跳板应恰好 1 次转发（会话穿透；L 隧道打在目标机 Handle 上）"
+    );
+
+    let mut tunnel = connect_tunnel_port(bind_port);
+    tunnel_roundtrip(&mut tunnel, b"ping-through-jump");
+
+    // direct-tcpip 是惰性通道（客户端连隧道端口才发起）——计数断言必须
+    // 在隧道往返之后，此刻通道必然已建立且字节已走通
+    assert_eq!(
+        target_count.load(Ordering::SeqCst),
+        1,
+        "目标机应为 L 隧道恰好开 1 次 direct-tcpip"
+    );
+
+    session.kill();
+    wait_eof(&mut streams);
+}
+
+/// R 回环：目标机侧监听 127.0.0.1:N（bind 请求原样到达 mock），连入连接经
+/// forwarded-tcpip 通道回到本机 echo 目标端；bind 请求按 127.0.0.1 断言。
+#[test]
+fn remote_forward_loopback_reaches_local_target() {
+    let (server, remote_count, bind_requests) = MockServer::start_remote_forwarding(0);
+    let (echo_port, _echo) = spawn_echo_server();
+    let known_hosts = temp_known_hosts("r-loop");
+    let bind_port = free_tcp_port();
+
+    let mut options = options_for(
+        server.port,
+        SshAuth::Password("secret".into()),
+        known_hosts.path(),
+    );
+    options.tunnels = vec![remote_spec(bind_port, echo_port)];
+
+    let session = SshSession::spawn(options).expect("带 R 隧道连接 mock 服务器");
+    let mut streams = session.take_streams().expect("take_streams");
+
+    let mut tunnel = connect_tunnel_port(bind_port);
+    tunnel_roundtrip(&mut tunnel, b"ping-through-r");
+
+    assert_eq!(
+        *bind_requests.lock().unwrap(),
+        vec![("127.0.0.1".into(), bind_port as u32)],
+        "tcpip_forward 应按配置的 127.0.0.1 原样请求"
+    );
+    assert_eq!(
+        remote_count.load(Ordering::SeqCst),
+        1,
+        "应恰好 1 次 tcpip_forward"
+    );
+
+    session.kill();
+    wait_eof(&mut streams);
+}
+
+/// 负例（连接期硬失败语义）：L 隧道 bind 端口被占用 → 整连失败，文案点名
+/// 隧道与「端口被占用」。
+#[test]
+fn local_forward_bind_conflict_fails_whole_connection() {
+    let server = MockServer::start(0);
+    let (echo_port, _echo) = spawn_echo_server();
+    let known_hosts = temp_known_hosts("l-conflict");
+    let occupied = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("占位 listener");
+    let bind_port = occupied.local_addr().unwrap().port();
+
+    let mut options = options_for(
+        server.port,
+        SshAuth::Password("secret".into()),
+        known_hosts.path(),
+    );
+    options.tunnels = vec![local_spec(bind_port, echo_port)];
+
+    let error = SshSession::spawn(options)
+        .err()
+        .expect("端口占用必须硬失败");
+    let message = error.to_string();
+    assert!(message.contains("端口被占用"), "{message}");
+    assert!(
+        message.contains(&format!("L 127.0.0.1:{bind_port}")),
+        "错误应点名隧道: {message}"
+    );
+}
+
+/// 负例（连接期硬失败语义）：目标机拒绝 tcpip_forward → 整连失败，
+/// 文案区分于端口占用。
+#[test]
+fn remote_forward_rejected_fails_whole_connection() {
+    let server = MockServer::start(0); // remote_forwarding: None → 拒绝
+    let (echo_port, _echo) = spawn_echo_server();
+    let known_hosts = temp_known_hosts("r-reject");
+    let bind_port = free_tcp_port();
+
+    let mut options = options_for(
+        server.port,
+        SshAuth::Password("secret".into()),
+        known_hosts.path(),
+    );
+    options.tunnels = vec![remote_spec(bind_port, echo_port)];
+
+    let error = SshSession::spawn(options).err().expect("R 被拒必须硬失败");
+    let message = error.to_string();
+    assert!(message.contains("远端拒绝"), "{message}");
+    assert!(
+        message.contains(&format!("R 127.0.0.1:{bind_port}")),
+        "错误应点名隧道: {message}"
+    );
+}
+
+/// 并发回归（钉住「R 回调内 spawn」约束）：≥3 条连接同时泵期间，shell 通道
+/// 回显不阻塞——若回归成回调内联泵，本用例的 shell 往返必然超时假红。
+#[test]
+fn remote_forward_concurrent_pumps_keep_shell_responsive() {
+    let (server, _count, _binds) = MockServer::start_remote_forwarding(0);
+    let (echo_port, _echo) = spawn_echo_server();
+    let known_hosts = temp_known_hosts("r-concurrent");
+    let bind_port = free_tcp_port();
+
+    let mut options = options_for(
+        server.port,
+        SshAuth::Password("secret".into()),
+        known_hosts.path(),
+    );
+    options.tunnels = vec![remote_spec(bind_port, echo_port)];
+
+    let session = SshSession::spawn(options).expect("带 R 隧道连接 mock 服务器");
+    let mut streams = session.take_streams().expect("take_streams");
+
+    // 3 条并发连入各自独立线程回显（mock 端 accept → forwarded-tcpip →
+    // 客户端回调 spawn 泵，全程无串行点）
+    let writers: Vec<_> = (0..3)
+        .map(|index| {
+            let payload = format!("并发-{index}");
+            std::thread::spawn(move || {
+                let mut tunnel = connect_tunnel_port(bind_port);
+                tunnel_roundtrip(&mut tunnel, payload.as_bytes());
+            })
+        })
+        .collect();
+
+    // 并发泵期间 shell 回显保持响应（内联泵实现会卡死在这里）
+    for round in 0..5 {
+        let probe = format!("shell-{round}");
+        streams.writer.write_all(probe.as_bytes()).expect("写入");
+        read_until(&mut streams, &format!("Got data: {probe}"));
+    }
+
+    for writer in writers {
+        writer.join().expect("并发隧道连接应完成");
+    }
+
+    session.kill();
+    wait_eof(&mut streams);
+}
+
+/// diff 撤销回归（钉住 stop_tunnel 本地分支的锁纪律）：set_tunnels([]) 撤销
+/// 已建立的 L 隧道——Stopped 事件可达、监听口关闭、shell 通道不冻结、kill
+/// 后 EOF 可达。修复前 stop_tunnel 在同一 let 表达式内二次加锁 self.inner
+/// （MutexGuard 语句级临时存活到分号），apply_diff 任务在此自死锁：Stopped
+/// 永不到达、后续 shutdown 卡死、wait_eof 撞死线——本用例即该路径的哨兵。
+#[test]
+fn set_tunnels_revokes_local_tunnel_and_shell_survives() {
+    let (server, _count) = MockServer::start_forwarding(0);
+    let (echo_port, _echo) = spawn_echo_server();
+    let known_hosts = temp_known_hosts("l-revoke");
+    let bind_port = free_tcp_port();
+
+    let mut options = options_for(
+        server.port,
+        SshAuth::Password("secret".into()),
+        known_hosts.path(),
+    );
+    options.tunnels = vec![local_spec(bind_port, echo_port)];
+
+    let session = SshSession::spawn(options).expect("带 L 隧道连接 mock 服务器");
+    let mut streams = session.take_streams().expect("take_streams");
+
+    // 建立期：shell 与隧道都通
+    streams.writer.write_all(b"before-revoke\n").expect("写入");
+    read_until(&mut streams, "Got data: before-revoke");
+    let mut tunnel = connect_tunnel_port(bind_port);
+    tunnel_roundtrip(&mut tunnel, b"alive-before-revoke");
+    drop(tunnel);
+
+    // 撤销全部隧道（触发 apply_diff → stop_tunnel 本地分支）
+    session.set_tunnels(Vec::new()).expect("发送 SetTunnels");
+
+    // Stopped 事件可达（死锁路径下该事件永远不出现）
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let stopped = loop {
+        let events = session.take_port_forward_events();
+        if events
+            .iter()
+            .any(|event| matches!(event, PortForwardEvent::Stopped { .. }))
+        {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        stopped,
+        "5s 内未收到隧道 Stopped 事件（stop_tunnel 疑似死锁）"
+    );
+
+    // 监听口应随 accept 任务 abort 而关闭（轮询至多 5s：socket 关闭有延迟）
+    let closed = loop {
+        match std::net::TcpStream::connect(("127.0.0.1", bind_port)) {
+            Err(_) => break true,
+            Ok(socket) => drop(socket),
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(closed, "撤销后监听口仍可连入（accept 任务未被 abort）");
+
+    // 会话未冻结：撤销后 shell 回显照常
+    streams.writer.write_all(b"after-revoke\n").expect("写入");
+    read_until(&mut streams, "Got data: after-revoke");
+
+    // kill 走 hub.shutdown（同样要拿 self.inner 锁）——死锁残留会卡死 EOF
+    session.kill();
+    wait_eof(&mut streams);
 }

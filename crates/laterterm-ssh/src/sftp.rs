@@ -295,9 +295,10 @@ async fn open_sftp(
     Vec<Handle<ClientHandler>>,
 )> {
     // 第一跳：外层跳板直连；无跳板链时第一跳就是目标机
+    // SFTP 面板不带隧道（per-server 隧道与每传输专属连接语义含混，见 roadmap）
     let mut handle = match jump.first() {
-        Some(first) => connect_and_auth(first).await?,
-        None => connect_and_auth(endpoint).await?,
+        Some(first) => connect_and_auth(first, None).await?,
+        None => connect_and_auth(endpoint, None).await?,
     };
     // 后续跳：跳板链剩余跳 + 目标机，都经上一跳的 direct-tcpip 穿透
     let mut tunnels: Vec<Handle<ClientHandler>> = Vec::new();
@@ -309,7 +310,7 @@ async fn open_sftp(
             // 正在穿过的机器是第 index+1 跳（1 起），如「跳板[1/2] ops@x」
             let through = &jump[index];
             let label = format!("跳板[{}/{}] {}", index + 1, total, through.title());
-            let next = open_through(&handle, &label, next_endpoint).await?;
+            let next = open_through(&handle, &label, next_endpoint, None).await?;
             tunnels.push(handle);
             handle = next;
         }

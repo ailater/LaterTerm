@@ -1933,6 +1933,7 @@ mod tests {
         let options = SshOptions {
             endpoint: endpoint.clone(),
             jump: vec![jump],
+            tunnels: Vec::new(),
             cols: 1,
             rows: 1,
         };

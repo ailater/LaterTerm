@@ -12,6 +12,10 @@ laterterm-core.workspace = true
 # ring 后端避开 aws-lc-rs 的 cmake 依赖；rsa 保留老服务器 ssh-rsa 主机密钥兼容
 russh = { version = "0.65", default-features = false, features = ["ring", "rsa"] }
 russh-sftp = "3.0.1"
+# 隧道双向泵用 tokio::io::copy_bidirectional（io-util feature）：
+# 该函数在 tokio 本体而非 tokio-util（实测两处 grep：tokio-util 0.7.15/0.7.19/
+# 0.7.20 全树零命中；tokio-1.54.1 src/io/util/copy_bidirectional.rs 在案），
+# io-util 已在依赖表内，无需新增直接依赖
 tokio = { version = "1", features = ["rt", "sync", "time", "net", "io-util", "fs"] }
 
 [dev-dependencies]

@@ -249,6 +249,35 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 > SshEndpoint.encoding 仅 shell 消费，GBK 老服务器 SFTP 名字不做转码）；真机（含跳板链）
 > 传中文文件名与中途取消验收待实机。
 
+> SSH 端口转发（隧道）首版（2026-11-12，M3 任务 1 扩展）：ServerEntry 内嵌 `tunnels`
+> （`[[servers.tunnels]]`，local/remote 两类；SOCKS5 动态转发 defer——russh 侧零增量，
+> 真正成本是本地 SOCKS5 握手协议实现 + settings.toml 无版本守卫的序列化边界，先钉稳
+> 两类的持久化口径）。laterterm-ssh 新增 forward.rs：L=本机 listener→目标机
+> channel_open_direct_tcpip→copy_bidirectional 泵（tokio::io 既有 io-util feature），
+> R=目标机 tcpip_forward 全局请求+RemoteForwardRouter 覆写 forwarded-tcpip 回调。
+> 跳板链穿透口径：L 的 direct-tcpip 与 R 的 tcpip_forward 都打在**目标机** Handle 上，
+> 跳板仅承担会话穿透（回环断言跳板转发计数恰 1），穿透自动成立；SFTP 面板不带隧道
+> （per-server 隧道与每传输专属连接语义含混）。并发纪律写死：R 回调只 accept+spawn
+> （russh 0.65 encrypted.rs:925-936 内联 await 实锤，回调内泵会冻结整个会话），
+> SetTunnels diff 同样 spawn——回环并发回归（R ≥3 连接泵期间 shell 回显不阻塞）钉住
+> 该约束。路由键=(connected_address, connected_port) 二元组（仅端口单键会把
+> 127.0.0.1:8080 与 0.0.0.0:8080 串线）；R 的 bind_host 建议配 IP 字面量——服务器回传
+> 的 connected_address 是其记录的请求串，主机名形式可能不逐字回传，未命中=通道被拒
+> （可预期不串线）。隧道建立挪出既有连接 timeout 块改独立预算（5s+2s×条数：L 本地
+> bind 毫秒级，R 每条 1 次全局请求往返对 1s RTT 留 2 倍余量），超时文案「隧道建立
+> 超时（N 条，Xs）」与「SSH 连接超时（Xs）」可区分；spawn 侧 recv_timeout=两段+1s
+> 联动（单测钉住公式）。失败语义=连接期硬（任一隧道 bind/R 失败整连失败，文案点名
+> 隧道，与 ssh -L 一致）、运行期软（SetTunnels 增量失败只发 Failed 事件+chip 红态）。
+> **已知限制：R 转发吊销不可感知**——russh 0.65 Handler 无转发撤销回调，remote 隧道
+> 被 sshd 侧掐掉后本地无从得知，仅新建连入连接失败有感知，不做假状态。UI=服务器编辑
+> 弹窗内嵌隧道编辑区（本地/远程切换、启停、增删、4 字段紧凑输入），server_entry_row
+> 活跃/断开 chip（数据来自每窗格 1s watcher 收敛的 pane.tunnel_states，render 不碰
+> 会话锁；重连成功清状态并重启 watcher），意外断开 server_notice+chip 变红。导出兼容：
+> CURRENT_VERSION 保持 1，serde 默认忽略未知字段——旧版导入新版导出仅静默丢隧道。
+> 测试：回环 6 新用例（L 直连/L 单跳穿透/R 回环/端口占用硬失败/R 被拒硬失败/并发回归），
+> 该集成目标不在门禁 `cargo test --workspace --lib --bins` 内，须另跑
+> `cargo test -p laterterm-ssh --test loopback`。
+
 > 启动光标错位修复（2026-11-04）：PTY/网格初始尺寸改为按窗口内容区估算（cell 7.83×19.2 @13px 实测系数），
 > 消除「启动后 resize → bash readline 发 \r 把光标拉回提示符行首」的错位；隔离实测估算 193×42 与
 > 首帧实测一致（零 resize）。reader 数据链增加 GPUI 定时器保活轮询（100ms，独立于 flume 唤醒通道），
