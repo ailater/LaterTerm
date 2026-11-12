@@ -254,6 +254,12 @@ impl ForwardHub {
                 .collect()
         };
         for spec in &specs {
+            // 入口检查与 start 之间有 TOCTOU 窗口：shutdown 可能在 diff 展开
+            // 期间发生（swap closed 后 take inner），每条启动前重查，不给
+            // 已回收的 inner 推进新监听（撤方向 stop 幂等，无需同款守卫）。
+            if self.closed.load(Ordering::Acquire) {
+                return;
+            }
             if current.iter().any(|active| active == spec) {
                 continue;
             }

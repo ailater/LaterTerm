@@ -4601,8 +4601,8 @@ impl WorkspaceView {
         );
         self.server_fields.clear();
         self.server_field_subscriptions.clear();
-        // 隧道编辑区草稿随弹窗重建（随开随建；新建时给一行默认 L 隧道，
-        // 让用户少打一次「添加」——bind 缺省 127.0.0.1）
+        // 隧道编辑区草稿随弹窗重建（随开随建）：编辑条目按已存 tunnels 逐行
+        // 回填；新建弹窗为空列表，用户经「添加」起步（bind 缺省 127.0.0.1）
         self.server_tunnel_drafts = self
             .server_meta_draft
             .tunnels
