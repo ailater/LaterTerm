@@ -40,6 +40,7 @@ pub fn xshell_to_server(session: &XshellSession) -> Option<ServerEntry> {
         encoding: normalize_encoding(session.encoding.as_deref()),
         jump: None,
         tab_color: None,
+        tunnels: Vec::new(),
     })
 }
 

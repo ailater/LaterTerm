@@ -6,6 +6,116 @@ use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// 单台服务器允许配置的最大隧道数（防手改配置炸出无界列表）。
+pub const MAX_TUNNELS_PER_SERVER: usize = 16;
+
+/// SSH 端口转发方向。
+///
+/// v1 只落 `local` / `remote` 两类：SOCKS5 动态转发 defer（russh 侧零增量，
+/// 真正成本是本地 SOCKS5 握手协议实现 + settings.toml 无版本守卫的序列化
+/// 边界，先钉稳两类的持久化口径，见 docs/roadmap.md 注记）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TunnelKind {
+    /// 本地转发（`ssh -L`）：本机监听 bind，经目标机连 target。
+    #[default]
+    Local,
+    /// 远程转发（`ssh -R`）：目标机侧监听 bind，回连本机侧 target。
+    Remote,
+}
+
+/// 一条 SSH 端口转发隧道（`[[servers.tunnels]]`）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerTunnel {
+    /// 转发方向（kebab-case：`local` / `remote`）。
+    pub kind: TunnelKind,
+    /// 监听侧地址；载入/导入期缺省补 `127.0.0.1`。
+    /// 远程转发建议配 IP 字面量：服务器回传的 connected_address 是其记录的
+    /// 请求串，主机名形式可能不逐字回传导致路由未命中（通道被拒，不串线）。
+    pub bind_host: String,
+    /// 监听侧端口（1..=65535；0 在校验/归一化中视为坏值）。
+    pub bind_port: u16,
+    /// 目标主机（local = 目标机侧看到的目标；remote = 本机侧目标）。
+    pub target_host: String,
+    /// 目标端口（1..=65535）。
+    pub target_port: u16,
+    /// 是否随连接建立（停用的隧道仅保留配置不参与连接）。
+    pub enabled: bool,
+}
+
+impl Default for ServerTunnel {
+    fn default() -> Self {
+        Self {
+            kind: TunnelKind::Local,
+            bind_host: "127.0.0.1".into(),
+            bind_port: 0,
+            target_host: String::new(),
+            target_port: 0,
+            enabled: true,
+        }
+    }
+}
+
+/// 类型级宽容解析：按 `toml::Value` 逐项解析，形状坏/未知 kind 的项直接丢弃。
+///
+/// 防手改 `kind = "dynamic"`（未来版本变体）或字段类型写错让**整份**
+/// settings.toml 解析失败——`Settings::load` 解析失败即全量回默认，比丢
+/// 条目更糟；这里宁可静默丢隧道也不炸文件。值级问题（空主机/坏端口）由
+/// `normalize_tunnels` 具名回报。
+fn lenient_tunnels<'de, D>(deserializer: D) -> Result<Vec<ServerTunnel>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<toml::Value>::deserialize(deserializer)?;
+    let mut tunnels = Vec::with_capacity(raw.len());
+    let mut dropped = 0usize;
+    for item in raw {
+        match ServerTunnel::deserialize(item) {
+            Ok(tunnel) => tunnels.push(tunnel),
+            Err(_) => dropped += 1,
+        }
+    }
+    if dropped > 0 {
+        eprintln!("无效隧道已忽略 {dropped}（类型或 kind 未知，请检查配置）");
+    }
+    Ok(tunnels)
+}
+
+/// 隧道值级归一化（幂等）：载入（`Settings::load`→`sanitize_servers`）与
+/// 导入（`ServerEntry::sanitized`，全部导入源唯一合并入口）双点挂载，两点
+/// 重复执行无副作用。trim 各字段；bind_host trim 后为空补默认 `127.0.0.1`；
+/// 空 target_host / 0 端口 / 含空白或控制字符的主机按具名 eprintln 丢弃——
+/// **只丢隧道，绝不丢条目**（与 jump「宁断链不丢条目」同构，隧道字段绝不
+/// 进 `validate_connection` 的丢弃路径）。
+pub(crate) fn normalize_tunnels(server: &mut ServerEntry) {
+    let name = server.name.clone();
+    server.tunnels.retain_mut(|tunnel| {
+        tunnel.bind_host = tunnel.bind_host.trim().to_string();
+        tunnel.target_host = tunnel.target_host.trim().to_string();
+        // 监听地址缺省：本地转发绑回环是最常见形态
+        if tunnel.bind_host.is_empty() {
+            tunnel.bind_host = "127.0.0.1".into();
+        }
+        let hosts_ok = [tunnel.bind_host.as_str(), tunnel.target_host.as_str()]
+            .into_iter()
+            .all(|host| {
+                !host.is_empty()
+                    && host.chars().count() <= 253
+                    && !host.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+            });
+        let ports_ok = tunnel.bind_port != 0 && tunnel.target_port != 0;
+        if !hosts_ok || !ports_ok {
+            eprintln!(
+                "服务器 {:?} 的无效隧道已忽略（{}:{}→{}:{}）",
+                name, tunnel.bind_host, tunnel.bind_port, tunnel.target_host, tunnel.target_port
+            );
+            return false;
+        }
+        true
+    });
+}
+
 /// 认证方式元数据；密码/交互口令使用 `laterterm_secrets::ssh_account(name)`，
 /// 私钥 passphrase 使用独立的 `laterterm_secrets::ssh_passphrase_account(name)`。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +163,11 @@ pub struct ServerEntry {
     /// 使用时经 `parse_hex_color` 解析，坏值按 None 忽略（不落主题语义）。
     #[serde(default)]
     pub tab_color: Option<String>,
+    /// 端口转发隧道（`[[servers.tunnels]]`）。旧文件无此字段 → serde(default)
+    /// 免迁移；类型级坏项经 lenient 解析丢弃，值级坏项载入/导入期归一化丢弃，
+    /// 两层都绝不丢条目。
+    #[serde(default, deserialize_with = "lenient_tunnels")]
+    pub tunnels: Vec<ServerTunnel>,
 }
 
 impl Default for ServerEntry {
@@ -70,6 +185,7 @@ impl Default for ServerEntry {
             encoding: None,
             jump: None,
             tab_color: None,
+            tunnels: Vec::new(),
         }
     }
 }
@@ -93,6 +209,51 @@ impl ServerEntry {
         // 分组走严格校验（与宽容归一化 normalize_group 成对，见其文档）
         if let Some(group) = &self.group {
             validate_group(group).context("分组不合法")?;
+        }
+        self.validate_tunnels()?;
+        Ok(())
+    }
+
+    /// 隧道严格校验（UI 保存路径，报错留在弹窗内）：端口 1..=65535、主机
+    /// 非空无空白/控制字符、条数封顶、(kind, bind_host, bind_port) 组内查重
+    /// ——同条目内两条隧道抢同一监听位是配置错误；跨条目冲突只能连接期报
+    /// （后连者失败），错误文案点名隧道定位。
+    fn validate_tunnels(&self) -> Result<()> {
+        if self.tunnels.len() > MAX_TUNNELS_PER_SERVER {
+            bail!("隧道数量超过上限（最多 {MAX_TUNNELS_PER_SERVER} 条）");
+        }
+        let mut seen: Vec<(TunnelKind, &str, u16)> = Vec::new();
+        for tunnel in &self.tunnels {
+            if tunnel.bind_port == 0 || tunnel.target_port == 0 {
+                bail!("隧道端口不能为 0（1..=65535）");
+            }
+            for (role, host) in [
+                ("监听", tunnel.bind_host.as_str()),
+                ("目标", tunnel.target_host.as_str()),
+            ] {
+                if host.is_empty() {
+                    bail!("隧道{role}主机不能为空");
+                }
+                if host.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+                    bail!("隧道{role}主机不能包含空白或控制字符");
+                }
+                if host.chars().count() > 253 {
+                    bail!("隧道{role}主机过长");
+                }
+            }
+            let key = (tunnel.kind, tunnel.bind_host.as_str(), tunnel.bind_port);
+            if seen.contains(&key) {
+                bail!(
+                    "隧道监听位重复（{} {}:{}）",
+                    match tunnel.kind {
+                        TunnelKind::Local => "本地",
+                        TunnelKind::Remote => "远程",
+                    },
+                    tunnel.bind_host,
+                    tunnel.bind_port
+                );
+            }
+            seen.push(key);
         }
         Ok(())
     }
@@ -149,6 +310,10 @@ impl ServerEntry {
     /// 跳板引用格式非法（含 `/`、控制字符、超长）时置 `None` 而不是丢弃条目——
     /// 与载入期「宁断链不丢条目」同一口径；悬空/成环的全表检查由
     /// [`clear_broken_jump_refs`] 在合并完成后做。
+    ///
+    /// 隧道值级归一化在此挂载（normalize_tunnels 具名 eprintln 丢弃坏隧道，
+    /// 不丢条目）：`sanitized` 是 LaterTerm/Deepin/Xshell 三导入源经
+    /// `merge_entries_into` 的唯一合并入口，坏隧道不能存活到连接期才报错。
     pub fn sanitized(mut self) -> Option<Self> {
         self.name = self.name.trim().to_string();
         self.host = self.host.trim().to_string();
@@ -161,6 +326,7 @@ impl ServerEntry {
             .map(|name| name.trim().to_string())
             .filter(|name| !name.is_empty() && validate_ref_name(name).is_ok());
         self.group = normalize_group(self.group.as_deref());
+        normalize_tunnels(&mut self);
         if self.validate_connection().is_ok() {
             self.warn_invalid_shortcut();
             Some(self)
@@ -763,6 +929,7 @@ group = "坏\n组"
             encoding: None,
             jump: None,
             tab_color: None,
+            tunnels: Vec::new(),
         }]);
         file.save_to(&path).unwrap();
         let loaded = ServersFile::load_from(&path).unwrap();
@@ -1113,6 +1280,207 @@ username = "ops"
         assert_eq!(settings.servers.len(), 2, "悬空引用不能丢条目");
         assert_eq!(settings.servers[0].jump, None, "悬空引用载入期即断链");
         assert_eq!(settings.servers[0].name, "内网机");
+    }
+
+    // ---------- 端口转发隧道（local/remote）序列化与宽容口径 ----------
+
+    fn tunnel(
+        kind: TunnelKind,
+        bind_host: &str,
+        bind_port: u16,
+        target: &str,
+        target_port: u16,
+    ) -> ServerTunnel {
+        ServerTunnel {
+            kind,
+            bind_host: bind_host.into(),
+            bind_port,
+            target_host: target.into(),
+            target_port,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn tunnels_toml_roundtrip_keeps_kind_and_fields() {
+        let mut server = entry("内网机", "10.0.0.1");
+        server.tunnels = vec![
+            tunnel(TunnelKind::Local, "127.0.0.1", 8080, "db.internal", 5432),
+            tunnel(TunnelKind::Remote, "0.0.0.0", 8443, "127.0.0.1", 443),
+        ];
+        let text = toml::to_string_pretty(&server).unwrap();
+        assert!(text.contains("[[tunnels]]"), "{text}");
+        assert!(text.contains("kind = \"local\""), "{text}");
+        assert!(text.contains("kind = \"remote\""), "{text}");
+        let back: ServerEntry = toml::from_str(&text).unwrap();
+        assert_eq!(back.tunnels, server.tunnels);
+    }
+
+    #[test]
+    fn legacy_files_without_tunnels_load_with_empty_list() {
+        // 旧版 settings.toml 无 [[servers.tunnels]] → serde(default) 空表，不拒载
+        let legacy: Settings =
+            toml::from_str("[[servers]]\nname = 'x'\nhost = 'h'\nusername = 'u'\n").unwrap();
+        assert!(legacy.servers[0].tunnels.is_empty());
+        assert!(legacy.servers[0].validate().is_ok());
+    }
+
+    #[test]
+    fn lenient_tunnels_drops_bad_items_instead_of_failing_the_file() {
+        // 手改出未知 kind（未来版本变体）必须只丢该隧道，绝不能让整份
+        // settings.toml 解析失败触发全量回默认
+        let raw = r#"
+[[servers]]
+name = "内网机"
+host = "10.0.0.1"
+username = "ops"
+
+[[servers.tunnels]]
+kind = "local"
+bind_host = "127.0.0.1"
+bind_port = 8080
+target_host = "db"
+target_port = 5432
+
+[[servers.tunnels]]
+kind = "dynamic"
+bind_host = "127.0.0.1"
+bind_port = 1080
+"#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        assert_eq!(settings.servers.len(), 1, "坏隧道不丢条目");
+        assert_eq!(
+            settings.servers[0].tunnels.len(),
+            1,
+            "未知 kind 的隧道被丢弃"
+        );
+        assert_eq!(settings.servers[0].tunnels[0].target_host, "db");
+    }
+
+    #[test]
+    fn normalize_tunnels_trims_fills_default_bind_and_drops_bad_values() {
+        let mut server = entry("内网机", "10.0.0.1");
+        server.tunnels = vec![
+            // 空监听地址 → 补 127.0.0.1；首尾空白 trim
+            ServerTunnel {
+                bind_host: "  ".into(),
+                bind_port: 8080,
+                target_host: " db ".into(),
+                target_port: 5432,
+                ..Default::default()
+            },
+            // 空 target_host → 丢
+            tunnel(TunnelKind::Local, "127.0.0.1", 8081, "  ", 5433),
+            // 0 端口 → 丢
+            tunnel(TunnelKind::Local, "127.0.0.1", 0, "db", 5434),
+            // 含空白的主机 → 丢
+            tunnel(TunnelKind::Local, "127.0.0.1", 8082, "bad host", 5435),
+        ];
+        normalize_tunnels(&mut server);
+        assert_eq!(server.tunnels.len(), 1, "只丢坏隧道，不丢条目");
+        assert_eq!(
+            server.tunnels[0].bind_host, "127.0.0.1",
+            "空 bind_host 补默认"
+        );
+        assert_eq!(server.tunnels[0].target_host, "db", "target_host 应 trim");
+        assert!(server.validate_connection().is_ok(), "隧道问题绝不丢条目");
+        // 幂等：归一化结果再跑一遍不变
+        let once = server.tunnels.clone();
+        normalize_tunnels(&mut server);
+        assert_eq!(server.tunnels, once);
+    }
+
+    #[test]
+    fn sanitized_import_path_normalizes_tunnels_without_dropping_entry() {
+        // 导入路径（sanitized → merge_entries_into 的唯一合并入口）同样只丢隧道
+        let mut server = entry(" 内网机 ", "10.0.0.1");
+        server.tunnels = vec![
+            tunnel(TunnelKind::Local, "127.0.0.1", 8080, "db", 5432),
+            tunnel(TunnelKind::Remote, "0.0.0.0", 9999, "", 80),
+        ];
+        let sanitized = server.sanitized().expect("条目本身合法必须保留");
+        assert_eq!(sanitized.name, "内网机");
+        assert_eq!(sanitized.tunnels.len(), 1, "坏隧道导入期即丢弃");
+        assert_eq!(sanitized.tunnels[0].target_host, "db");
+    }
+
+    #[test]
+    fn validate_tunnels_rejects_bad_ports_hosts_duplicates_and_overflow() {
+        let mut server = entry("内网机", "10.0.0.1");
+        // 0 端口
+        server.tunnels = vec![tunnel(TunnelKind::Local, "127.0.0.1", 0, "db", 5432)];
+        assert!(server.validate().is_err());
+        // 空/带空白目标主机
+        for bad_target in ["", "bad host", "坏\n主机"] {
+            server.tunnels = vec![tunnel(
+                TunnelKind::Local,
+                "127.0.0.1",
+                8080,
+                bad_target,
+                5432,
+            )];
+            assert!(server.validate().is_err(), "{bad_target:?} 应报错");
+        }
+        // 同 (kind, bind_host, bind_port) 查重
+        server.tunnels = vec![
+            tunnel(TunnelKind::Local, "127.0.0.1", 8080, "db", 5432),
+            tunnel(TunnelKind::Local, "127.0.0.1", 8080, "web", 80),
+        ];
+        assert!(server.validate().is_err(), "同监听位重复应报错");
+        // 同端口不同 kind / 不同 bind_host 合法共存
+        server.tunnels = vec![
+            tunnel(TunnelKind::Local, "127.0.0.1", 8080, "db", 5432),
+            tunnel(TunnelKind::Remote, "127.0.0.1", 8080, "web", 80),
+            tunnel(TunnelKind::Local, "0.0.0.0", 8080, "db", 5433),
+        ];
+        assert!(server.validate().is_ok());
+        // 条数封顶
+        server.tunnels = (0..=MAX_TUNNELS_PER_SERVER)
+            .map(|index| {
+                tunnel(
+                    TunnelKind::Local,
+                    "127.0.0.1",
+                    9000 + index as u16,
+                    "db",
+                    5432,
+                )
+            })
+            .collect();
+        assert!(
+            server.validate().is_err(),
+            "超过 {MAX_TUNNELS_PER_SERVER} 条应报错"
+        );
+    }
+
+    #[test]
+    fn load_drops_bad_tunnels_and_keeps_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[servers]]
+name = "内网机"
+host = "10.0.0.1"
+username = "ops"
+
+[[servers.tunnels]]
+bind_port = 8080
+target_host = "db"
+target_port = 5432
+
+[[servers.tunnels]]
+bind_port = 0
+target_host = "坏"
+target_port = 1
+"#,
+        )
+        .unwrap();
+        let settings = Settings::load(&path).unwrap();
+        assert_eq!(settings.servers.len(), 1, "坏隧道不丢条目");
+        // bind_host 缺省补 127.0.0.1；0 端口坏值载入期被归一化丢弃
+        assert_eq!(settings.servers[0].tunnels.len(), 1);
+        assert_eq!(settings.servers[0].tunnels[0].bind_host, "127.0.0.1");
     }
 
     #[test]
