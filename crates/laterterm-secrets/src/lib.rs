@@ -87,6 +87,12 @@ pub fn ssh_passphrase_account(name: &str) -> Result<String> {
     namespaced_account("ssh-passphrase", name)
 }
 
+/// WebDAV 配置同步密码的密钥环账户名。v1 单条目：url/username 是明文同步
+/// 元数据（settings.toml [sync] 段），密码本体只存密钥环，绝不落盘。
+pub fn webdav_account() -> Result<String> {
+    namespaced_account("webdav", "password")
+}
+
 fn namespaced_account(namespace: &str, name: &str) -> Result<String> {
     let name = name.trim();
     if name.is_empty() {
@@ -230,5 +236,34 @@ mod tests {
         assert!(ssh_account("").is_err());
         assert!(ssh_account("a/b").is_err());
         assert!(ssh_account("a\nb").is_err());
+    }
+
+    /// WebDAV 同步密码走独立命名空间：与 ssh/totp 同名条目互不覆盖、互不误删
+    /// （ssh_passphrase 命名空间隔离同款口径）。
+    #[test]
+    fn webdav_account_namespaces_and_does_not_collide_with_other_namespaces() {
+        assert_eq!(webdav_account().unwrap(), "webdav/password");
+        assert_ne!(webdav_account().unwrap(), ssh_account("password").unwrap());
+        assert_ne!(
+            webdav_account().unwrap(),
+            ssh_passphrase_account("password").unwrap()
+        );
+        assert_ne!(webdav_account().unwrap(), totp_account("password").unwrap());
+
+        let store = MemoryStore::new();
+        store.set(&webdav_account().unwrap(), "webdav密码").unwrap();
+        store
+            .set(&ssh_account("password").unwrap(), "ssh密码")
+            .unwrap();
+        assert_eq!(
+            store.get(&webdav_account().unwrap()).unwrap().as_deref(),
+            Some("webdav密码")
+        );
+        store.delete(&ssh_account("password").unwrap()).unwrap();
+        // 删 ssh 条目不得波及 webdav 命名空间
+        assert_eq!(
+            store.get(&webdav_account().unwrap()).unwrap().as_deref(),
+            Some("webdav密码")
+        );
     }
 }

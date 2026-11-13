@@ -14,6 +14,7 @@ pub mod commands;
 pub mod importers;
 pub mod servers;
 pub mod session;
+pub mod sync;
 pub mod theme;
 pub mod totp;
 pub mod triggers;
@@ -27,6 +28,8 @@ pub use servers::{
     ServerAuthKind, ServerEntry, ServerTunnel, ServersFile, TunnelKind, clear_broken_jump_refs,
     normalize_group, resolve_jump_chain, servers_referencing_jump,
 };
+// WebDAV 同步元数据类型最常用，随手 re-export；其余走 sync:: 路径。
+pub use sync::WebdavSyncSettings;
 pub use theme::{DEFAULT_THEME, Theme, ThemeRegistry, themes_dir};
 pub use totp::{TotpAlgorithm, TotpConfig, TotpEntry, generate_code, parse_secret_input};
 pub use triggers::{TriggerAction, TriggerRule};
@@ -72,6 +75,10 @@ pub struct Settings {
     /// 用户日后改登录 shell 应用自动跟随）。首启引导可将其固化为具体路径。
     #[serde(default)]
     pub shell: Option<String>,
+    /// WebDAV 配置同步账户元数据（地址 + 账号）。密码只进系统密钥环，
+    /// 本段是明文同步元数据，合并期恒取本地（sync::LOCAL_ONLY_PATHS）。
+    #[serde(default)]
+    pub sync: sync::WebdavSyncSettings,
 }
 
 /// Quake 下拉模式设置（设置→快捷键页「系统级热键」卡片）。

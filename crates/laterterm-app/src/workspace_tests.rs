@@ -457,3 +457,279 @@ fn window_background_appearance_three_state_mapping() {
         gpui::WindowBackgroundAppearance::Transparent
     ));
 }
+
+/// WebDAV 合并应用链路（gpui 测试）：MockWebDav 备好远端快照，按生产
+/// run_webdav_task 的两段式（后台 merge_from_remote → 主线程
+/// finish_webdav_merge）驱动整条链，钉住「落盘 + 同轨应用 + 回声等值吸收 +
+/// local-only 恒本地 + 主题补齐/备份」。
+mod webdav_merge_chain {
+    use crate::quake::QuakeInput;
+    use crate::webdav_sync::{
+        MockWebDav, SNAPSHOT_MAIN, WebDavAuth, build_upload_snapshot, merge_from_remote,
+        themes_dir_for,
+    };
+    use crate::workspace::WorkspaceView;
+    use gpui::TestAppContext;
+    use laterterm_config::sync::ConfigSnapshot;
+    use laterterm_secrets::{SecretStore, totp_account, webdav_account};
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    /// 密钥环内存实现（laterterm-secrets MemoryStore 同款口径）。
+    struct MemorySecrets(Mutex<BTreeMap<String, String>>);
+
+    impl SecretStore for MemorySecrets {
+        fn get(&self, account: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.0.lock().unwrap().get(account).cloned())
+        }
+        fn set(&self, account: &str, secret: &str) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(account.to_string(), secret.to_string());
+            Ok(())
+        }
+        fn delete(&self, account: &str) -> anyhow::Result<()> {
+            self.0.lock().unwrap().remove(account);
+            Ok(())
+        }
+    }
+
+    /// 构造前注入默认 StartupSettings：直连构造会回退读真实
+    /// ~/.config/laterterm/settings.toml，本机残留令默认值断言机器态假红
+    /// （workspace.rs inject_default_startup_settings 先例同款）。
+    fn inject_default_startup_settings(cx: &mut TestAppContext) {
+        cx.set_global(crate::StartupSettings(laterterm_config::Settings::default()));
+    }
+
+    /// 临时目录（进程号隔离；断言完成后整体清理）。
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "laterterm-workspace-webdav-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 本机 A 的 settings.toml：local-only 四类取本机值，quake 本机开启
+    /// （合并后远程将关闭它，验证 quake 联动）。注意 TOML 语法：顶层键
+    /// （shell）必须写在任何 [表] 头之前。
+    const LOCAL_SETTINGS: &str = "shell = \"/usr/bin/fish\"\n\n[appearance]\nfont_size = 13.0\ndownloads_dir = \"/home/a/Downloads\"\n\n[sync]\nurl = \"https://dav-a.example.com/dav\"\nusername = \"alice\"\n\n[quake]\nenabled = true\nauto_hide_on_blur = true\n";
+    const LOCAL_SOLARIZED: &str = "[colors]\nbackground = \"#002B36\"\n";
+    const LOCAL_ONLY_THEME: &str = "[colors]\nbackground = \"#111111\"\n";
+    const REMOTE_NEW_THEME: &str = "[colors]\nbackground = \"#ABCDEF\"\n";
+    const REMOTE_SOLARIZED: &str = "[colors]\nbackground = \"#654321\"\n";
+
+    /// 合并全链路主测试：远端快照（字号冲突远程胜 + restore_session 远端新增
+    /// + quake 远程关闭 + [sync]/shell/downloads_dir 与本机不同）+ 远端主题
+    /// （一个新增、一个同名覆盖）。
+    #[gpui::test]
+    fn webdav_merge_applies_chain_and_absorbs_echo(cx: &mut TestAppContext) {
+        let dir = temp_dir("chain");
+        let settings_path = dir.join("settings.toml");
+        let themes_dir = themes_dir_for(&settings_path);
+        std::fs::create_dir_all(&themes_dir).unwrap();
+        std::fs::write(&settings_path, LOCAL_SETTINGS).unwrap();
+        std::fs::write(themes_dir.join("solarized.toml"), LOCAL_SOLARIZED).unwrap();
+        std::fs::write(themes_dir.join("local-only.toml"), LOCAL_ONLY_THEME).unwrap();
+
+        // 密钥环样例密钥（WebDAV 密码 + TOTP 种子）：只进密钥环，此后任何
+        // 快照/落盘产物都不得出现
+        let secrets = Arc::new(MemorySecrets(Mutex::new(BTreeMap::from([
+            (webdav_account().unwrap(), "webdav密码SECRET42".to_string()),
+            (
+                totp_account("跳板机").unwrap(),
+                "JBSWY3DPEHPK3PXP".to_string(),
+            ),
+        ]))));
+
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        // 合并前本机内存态：落盘路径指向临时目录、开着主题预览、quake 已启用
+        // （内存态直改 + 状态机 SetEnabled，不 spawn portal worker）
+        workspace.update_in(cx, |view, _window, _cx| {
+            view.test_set_settings_save_path(settings_path.clone());
+            view.test_set_secret_store(secrets.clone());
+            view.test_set_theme_preview(Some("solarized".into()));
+            view.test_settings_mut().quake.enabled = true;
+            view.test_quake_machine_mut()
+                .handle(QuakeInput::SetEnabled(true));
+        });
+        assert!(
+            workspace.read_with(cx, |view, _| view.test_quake_machine().is_enabled()),
+            "前置：quake 状态机应已启用"
+        );
+        let version_before = workspace.read_with(cx, |view, _| view.test_settings_version());
+
+        // 后台段：GET 快照 → 双备份 → 合并 → 主题补齐（MockWebDav 无网络）
+        let snapshot = ConfigSnapshot::build(
+            "restore_session = true\n\n[appearance]\nfont_size = 15.5\n\n[quake]\nenabled = false\nauto_hide_on_blur = true\n\n[sync]\nurl = \"https://dav-b.example.com/dav\"\nusername = \"bob\"\n".into(),
+            vec![
+                ("new-theme".into(), REMOTE_NEW_THEME.into()),
+                ("solarized".into(), REMOTE_SOLARIZED.into()),
+            ],
+            "0.3.0",
+            1_700_000_000,
+        );
+        let dav = MockWebDav::new().with_file(SNAPSHOT_MAIN, &snapshot.to_toml_string().unwrap());
+        let auth = WebDavAuth {
+            username: "alice".into(),
+            password: secrets.get(&webdav_account().unwrap()).unwrap().unwrap(),
+        };
+        let (merged, report) =
+            merge_from_remote(&dav, &auth, &settings_path, &themes_dir, "20231114T221320Z")
+                .unwrap();
+
+        // 主线程段：合并收尾（先落盘再同轨应用）。用 update（非窗口更新）
+        // 对齐生产 this.update 回写上下文——apply_appearance 走 None 分支
+        // （handle.update），与后台任务回写路径一致。
+        workspace.update(cx, |view, cx| {
+            view.finish_webdav_merge(merged, report, cx);
+        });
+
+        workspace.read_with(cx, |view, _| {
+            // 1. settings_version 推进（persist + apply 各一次）
+            assert!(
+                view.test_settings_version() > version_before,
+                "合并后 settings_version 必须推进"
+            );
+            // 2a. 合并设置已进内存：远程胜 + 远端新增
+            assert_eq!(view.test_settings().appearance.font_size, 15.5);
+            assert!(view.test_settings().restore_session);
+            // 2b. local-only 恒本地（[sync]/shell/downloads_dir 与远端不同仍取本机）
+            assert_eq!(
+                view.test_settings().sync.url,
+                "https://dav-a.example.com/dav"
+            );
+            assert_eq!(view.test_settings().shell.as_deref(), Some("/usr/bin/fish"));
+            assert_eq!(
+                view.test_settings().appearance.downloads_dir,
+                "/home/a/Downloads"
+            );
+            // 3. 开着主题预览点合并 → 预览作废
+            assert_eq!(view.test_theme_preview(), None, "合并后旧主题预览必须作废");
+            // 4. quake 开关变更触发 sync_quake_worker：远程关闭 → 状态机停用
+            //（非 Linux 的 sync_quake_worker 为空实现，断言仅在 Linux 有义）
+            #[cfg(target_os = "linux")]
+            assert!(
+                !view.test_quake_machine().is_enabled(),
+                "远程关闭 quake 必须联动状态机停用"
+            );
+        });
+
+        // 5. settings 与 themes 落盘均在 tempdir（注入路径，绝不碰真实配置）
+        let saved = std::fs::read_to_string(&settings_path).unwrap();
+        assert!(saved.contains("font_size = 15.5"), "{saved}");
+        assert!(saved.contains("dav-a.example.com"), "{saved}");
+        assert!(saved.contains("/usr/bin/fish"), "{saved}");
+        assert!(saved.contains("/home/a/Downloads"), "{saved}");
+        assert!(saved.contains("restore_session = true"), "{saved}");
+        assert_eq!(
+            std::fs::read_to_string(themes_dir.join("new-theme.toml")).unwrap(),
+            REMOTE_NEW_THEME,
+            "远端新增主题已落盘"
+        );
+        assert_eq!(
+            std::fs::read_to_string(themes_dir.join("solarized.toml")).unwrap(),
+            REMOTE_SOLARIZED,
+            "同名不同内容主题远程胜覆盖"
+        );
+        assert_eq!(
+            std::fs::read_to_string(themes_dir.join("local-only.toml")).unwrap(),
+            LOCAL_ONLY_THEME,
+            "本地独有主题一律不动"
+        );
+        // 双备份：settings.toml.bak-<ts> 与 themes.bak-<ts>/ 均为合并前内容
+        assert_eq!(
+            std::fs::read_to_string(dir.join("settings.toml.bak-20231114T221320Z")).unwrap(),
+            LOCAL_SETTINGS
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("themes.bak-20231114T221320Z/solarized.toml"))
+                .unwrap(),
+            LOCAL_SOLARIZED
+        );
+
+        // 6. watcher 回声等值吸收：合并落盘触发的 reload 重读同一份内容，
+        // 等值比较吸收，不得再推进版本（TOML roundtrip 无损的回归钉）
+        let version_after_merge = workspace.read_with(cx, |view, _| view.test_settings_version());
+        workspace.update(cx, |view, cx| view.test_reload_from_disk(cx));
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(
+                view.test_settings_version(),
+                version_after_merge,
+                "回声 reload 必须被等值比较吸收"
+            );
+            assert_eq!(view.test_theme_preview(), None);
+        });
+
+        // 7. 密钥环样例密钥不出现在快照与落盘产物
+        let snapshot_body = build_upload_snapshot(&settings_path, &themes_dir).unwrap();
+        for secret in ["webdav密码SECRET42", "JBSWY3DPEHPK3PXP"] {
+            assert!(!snapshot_body.contains(secret), "快照泄漏样例密钥 {secret}");
+            assert!(
+                !saved.contains(secret),
+                "落盘 settings 泄漏样例密钥 {secret}"
+            );
+        }
+        for entry in std::fs::read_dir(&themes_dir).unwrap().flatten() {
+            let body = std::fs::read_to_string(entry.path()).unwrap();
+            for secret in ["webdav密码SECRET42", "JBSWY3DPEHPK3PXP"] {
+                assert!(!body.contains(secret), "主题落盘产物泄漏样例密钥 {secret}");
+            }
+        }
+
+        // 会话泄漏会让测试进程收尾告警（workspace.rs 测试同款口径）
+        workspace.read_with(cx, |view, _| view.test_close_sessions());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// 合并报错路径不触碰工作区状态：401 时 finish_webdav_merge 不被调用
+    /// （run_webdav_task 的 match 只在 Ok(MergeApplied) 才应用），这里直接
+    /// 钉 merge_from_remote 的 401 文案与工作区零副作用。
+    #[gpui::test]
+    fn webdav_merge_error_leaves_workspace_untouched(cx: &mut TestAppContext) {
+        let dir = temp_dir("chain-error");
+        let settings_path = dir.join("settings.toml");
+        let themes_dir = themes_dir_for(&settings_path);
+        std::fs::write(&settings_path, LOCAL_SETTINGS).unwrap();
+
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, _window, _cx| {
+            view.test_set_settings_save_path(settings_path.clone());
+        });
+        let version_before = workspace.read_with(cx, |view, _| view.test_settings_version());
+
+        let dav = MockWebDav::new().with_error(
+            &format!("GET {SNAPSHOT_MAIN}"),
+            crate::webdav_sync::WebDavError::Auth,
+        );
+        let error = merge_from_remote(
+            &dav,
+            &WebDavAuth {
+                username: "alice".into(),
+                password: "wrong".into(),
+            },
+            &settings_path,
+            &themes_dir,
+            "20231114T221320Z",
+        )
+        .unwrap_err();
+        assert_eq!(error, "认证失败（账号或密码错误）");
+        assert!(!error.contains("wrong"), "错误文案不得携带密码");
+
+        // 错误路径无合并载荷可应用：内存设置与版本均未动（调用方只回写
+        // webdav_result，见 run_webdav_task 的 match 分支）
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(view.test_settings().appearance.font_size, 13.0);
+            assert_eq!(view.test_settings_version(), version_before);
+        });
+
+        workspace.read_with(cx, |view, _| view.test_close_sessions());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

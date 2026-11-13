@@ -34,6 +34,13 @@ shellexpand = "3.1.2"
 laterterm-transfer.workspace = true
 serde_json.workspace = true
 ureq.workspace = true
+# WebDAV Basic 授权头（base64("user:pass")）：workspace 已声明（lock 与 ureq 同源
+# 0.23），app crate 此前零命中，此处引用零新增 crate。http 不直接声明——任意
+# 方法请求经 ureq::http re-export（见 webdav_sync.rs 模块注记）。
+base64.workspace = true
+# 合并回退底稿（本地 settings.toml 缺失时序列化默认设置）：workspace 已声明
+# （laterterm-config 同链），零新增 crate。
+toml.workspace = true
 
 # Quake 全局热键（portal worker）仅 Linux：ashpd feature 并集由 workspace 声明补齐
 # （default-features=false + async-std，与 gpui 一致），async-io 供独立线程 block_on。

@@ -11,6 +11,7 @@ use crate::sftp_panel::{
 };
 use crate::shortcut_recorder::{ShortcutChanged, ShortcutRecorder};
 use crate::update_check::{self, UpdateCheck};
+use crate::webdav_sync::{SyncOutcome, WebDavTaskKind, WebDavTaskState};
 use gpui::{
     App, AppContext, AsyncApp, Bounds, Context, CursorStyle, DispatchPhase, Div, Edges, Entity,
     FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
@@ -55,6 +56,19 @@ pub(crate) use self::settings_ui::{PalettePreview, palette_preview};
 
 const TITLEBAR_HEIGHT: f32 = 34.0;
 const PANEL_WIDTH: f32 = 240.0;
+
+/// WebDAV 同步任务结果（展示模型，workspace.webdav_result 的载荷）。
+/// 与 webdav_sync::SyncOutcome 一一对应；合并载荷中的 Settings 已被应用链路
+/// 消费，展示只留差异报告（UI 差异明细渲染的数据源）。
+#[derive(Clone, Debug)]
+enum WebDavOutcome {
+    /// 测试连接成功。
+    ProbeSucceeded,
+    /// 备份完成；`archive` = 时间戳保留档名（首次备份 None）。
+    BackupDone { archive: Option<String> },
+    /// 合并完成（已落盘并应用）。
+    MergeApplied(crate::webdav_sync::MergeReport),
+}
 
 /// 边栏语义色：从当前主题 [`laterterm_config::theme::ThemeColors`] 派生，
 /// 替代边栏写死的 Tokyo Night 色值（主题切换时边栏同步换肤）。
@@ -1226,6 +1240,12 @@ pub struct WorkspaceView {
     /// 手动检查更新状态机（update_check.rs；结果落实体字段，面板关闭不取消
     /// 在途任务，下次打开显示）。
     update_check: UpdateCheck,
+    /// WebDAV 配置同步：三输入框（地址/账号/密码，懒建于分区首帧渲染，
+    /// totp_fields 同构）与任务状态机（非 Idle 兼按钮幂等门）。
+    webdav_fields: Vec<(String, Entity<CommandTextField>)>,
+    webdav_task: WebDavTaskState,
+    /// 最近一次同步结果（None = 未执行过；面板关闭不取消在途任务）。
+    webdav_result: Option<Result<WebDavOutcome, String>>,
     shortcut_editor: Option<ShortcutEditor>,
     panel_shortcut_dialog: Option<BindingOwner>,
     shortcut_error: Option<String>,
@@ -1503,6 +1523,9 @@ impl WorkspaceView {
             settings_jump: None,
             settings_scroll: ScrollHandle::new(),
             update_check: UpdateCheck::default(),
+            webdav_fields: Vec::new(),
+            webdav_task: WebDavTaskState::Idle,
+            webdav_result: None,
             shortcut_editor: None,
             panel_shortcut_dialog: None,
             shortcut_error: None,
@@ -3511,6 +3534,243 @@ impl WorkspaceView {
         .detach();
     }
 
+    // ------------------------------------------------------------------
+    // WebDAV 配置同步（手动触发；设置面板「配置同步」分区）
+    // ------------------------------------------------------------------
+
+    /// WebDAV 三按钮共用入口：读输入框 → [sync] 段落盘（密码绝不落盘）→
+    /// 后台跑任务（同步 ureq 请求 + 密钥环读写）→ 主线程回写结果。收发
+    /// 形态与 check_for_update 同款；幂等门挡连点（任一任务在途即忽略）。
+    fn run_webdav_task(&mut self, kind: WebDavTaskKind, cx: &mut Context<Self>) {
+        // 幂等门：测试/备份/合并共用一条在途判定，并发任务会让配置文件
+        // 与远端快照双双处于中间态
+        if self.webdav_task.busy() {
+            return;
+        }
+        let (url, username, password_input) = self.webdav_field_values(cx);
+        let mut sync = self.settings.sync.clone();
+        sync.url = url;
+        sync.username = username;
+        sync.normalize();
+        if !sync.is_configured() {
+            self.webdav_result = Some(Err("请先填写服务器地址与账号".into()));
+            cx.notify();
+            return;
+        }
+        // 地址/账号是明文元数据，落盘 [sync] 段（尊重测试注入路径）；密码
+        // 只进密钥环（后台线程经 run_task 注入）
+        self.settings.sync = sync.clone();
+        if let Err(error) = self.persist_settings() {
+            self.webdav_result = Some(Err(format!("保存同步配置失败：{error:#}")));
+            cx.notify();
+            return;
+        }
+        let Some(settings_path) = self
+            .settings_save_path
+            .clone()
+            .or_else(Settings::default_path)
+        else {
+            self.webdav_result = Some(Err("无法定位设置文件路径".into()));
+            cx.notify();
+            return;
+        };
+        let themes_path = crate::webdav_sync::themes_dir_for(&settings_path);
+        self.webdav_task = match kind {
+            WebDavTaskKind::Test => WebDavTaskState::Testing,
+            WebDavTaskKind::Upload => WebDavTaskState::Uploading,
+            WebDavTaskKind::Merge => WebDavTaskState::Merging,
+        };
+        self.webdav_result = None;
+        cx.notify();
+        let store = self.secret_store.clone();
+        cx.spawn(async move |this, cx| {
+            // 同步网络 + 密钥环 DBus 调用必须包进 background_executor：直接
+            // await 会在主线程求值，15s 超时内 UI 整体卡死（check_for_update
+            // 同款注记）。
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::webdav_sync::run_task(
+                        kind,
+                        &sync.url,
+                        &sync.username,
+                        &password_input,
+                        store,
+                        &settings_path,
+                        &themes_path,
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |workspace, cx| {
+                workspace.webdav_task = WebDavTaskState::Idle;
+                match result {
+                    // 合并成功：走落盘 + 同轨应用链路（finish 内回写结果）
+                    Ok(SyncOutcome::MergeApplied { settings, report }) => {
+                        workspace.finish_webdav_merge(*settings, report, cx);
+                    }
+                    Ok(outcome) => {
+                        workspace.webdav_result = Some(Ok(match outcome {
+                            SyncOutcome::ProbeOk => WebDavOutcome::ProbeSucceeded,
+                            SyncOutcome::BackupOk { archive } => {
+                                WebDavOutcome::BackupDone { archive }
+                            }
+                            SyncOutcome::MergeApplied { .. } => unreachable!("上一分支已消费"),
+                        }));
+                    }
+                    Err(message) => workspace.webdav_result = Some(Err(message)),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 合并收尾（主线程）：合并结果**先落盘**，再与热加载同轨应用
+    /// （apply_loaded_settings：版本推进/审计规则/预览作废/quake 联动/外观）。
+    /// 落盘直接序列化合并结果而不先赋 self.settings——apply_loaded_settings
+    /// 内部以「传入新值 vs 当前旧值」判 quake 联动，提前赋值会吞掉联动。
+    /// 落盘触发的 watcher 回声由 reload_from_disk 等值比较吸收。
+    /// workspace_tests 从这里驱动合并应用链路（异步入口的同步等价物）。
+    pub(crate) fn finish_webdav_merge(
+        &mut self,
+        merged: Settings,
+        report: crate::webdav_sync::MergeReport,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self
+            .settings_save_path
+            .clone()
+            .or_else(Settings::default_path);
+        let persist_error = match path {
+            Some(path) => merged.save_to(&path).err(),
+            None => Some(anyhow::anyhow!("无法定位设置文件路径")),
+        };
+        self.apply_loaded_settings(merged, ThemeRegistry::load(), cx);
+        self.webdav_result = Some(Ok(WebDavOutcome::MergeApplied(report)));
+        // 落盘失败保留内存合并态（用户所见即所合并），如实报错；下次任意
+        // 保存会重写盘（口径同主题保存）。报错追加在合并成功明细之后。
+        if let Some(error) = persist_error {
+            self.webdav_result = Some(Err(format!("合并已应用，但落盘失败：{error:#}")));
+        }
+    }
+
+    /// 读三输入框当前值（地址/账号/密码）。密码不 trim——语义上可含首尾空白。
+    fn webdav_field_values(&self, cx: &Context<Self>) -> (String, String, String) {
+        let read = |label: &str| {
+            self.webdav_fields
+                .iter()
+                .find(|(name, _)| name == label)
+                .map(|(_, field)| field.read(cx).value().to_string())
+                .unwrap_or_default()
+        };
+        (read("地址"), read("账号"), read("密码"))
+    }
+
+    // ------------------------------------------------------------------
+    // 测试专用通道（仅 cfg(test)）：workspace_tests.rs 是 crate 根的平级
+    // 模块，看不见本模块私有字段；合并应用链路测试经这些窄口注入/观测，
+    // 生产构建零符号。
+    // ------------------------------------------------------------------
+
+    /// 注入落盘路径（合并链路测试用；生产路径恒 None）。
+    #[cfg(test)]
+    pub(crate) fn test_set_settings_save_path(&mut self, path: PathBuf) {
+        self.settings_save_path = Some(path);
+    }
+
+    /// 注入密钥环实现（密钥环样例密钥泄漏断言用）。
+    #[cfg(test)]
+    pub(crate) fn test_set_secret_store(&mut self, store: Arc<dyn SecretStore>) {
+        self.secret_store = store;
+    }
+
+    /// 当前设置（只读）。
+    #[cfg(test)]
+    pub(crate) fn test_settings(&self) -> &Settings {
+        &self.settings
+    }
+
+    /// 当前设置（可变，模拟合并前的本机内存态）。
+    #[cfg(test)]
+    pub(crate) fn test_settings_mut(&mut self) -> &mut Settings {
+        &mut self.settings
+    }
+
+    /// 关闭全部窗格会话（测试收尾防泄漏告警；panes 字段私有不可直达，
+    /// workspace.rs 内测试模块同款口径）。
+    #[cfg(test)]
+    pub(crate) fn test_close_sessions(&self) {
+        for pane in &self.panes {
+            pane.session.close();
+        }
+    }
+
+    /// 设置数据版本（合并落盘与应用链路推进观测）。
+    #[cfg(test)]
+    pub(crate) fn test_settings_version(&self) -> u64 {
+        self.settings_version
+    }
+
+    /// 主题预览态（合并后预览作废断言）。
+    #[cfg(test)]
+    pub(crate) fn test_theme_preview(&self) -> Option<&str> {
+        self.theme_preview.as_deref()
+    }
+
+    /// 直改主题预览态（模拟用户在面板点开预览后触发合并）。
+    #[cfg(test)]
+    pub(crate) fn test_set_theme_preview(&mut self, name: Option<String>) {
+        self.theme_preview = name;
+    }
+
+    /// Quake 状态机只读（quake 开关联动断言：is_enabled 翻转观测）。
+    #[cfg(test)]
+    pub(crate) fn test_quake_machine(&self) -> &crate::quake::QuakeMachine {
+        &self.quake
+    }
+
+    /// Quake 状态机可变（测试预置启用态，不 spawn portal worker）。
+    #[cfg(test)]
+    pub(crate) fn test_quake_machine_mut(&mut self) -> &mut crate::quake::QuakeMachine {
+        &mut self.quake
+    }
+
+    /// 热加载入口（watcher 回声等值吸收断言用；与生产 watcher 泵同一调用）。
+    #[cfg(test)]
+    pub(crate) fn test_reload_from_disk(&mut self, cx: &mut Context<Self>) {
+        self.reload_from_disk(cx);
+    }
+
+    /// 设置整份应用（热加载与 WebDAV 合并收尾共用）：赋值 + 版本推进 +
+    /// 审计规则热替换 + 旧主题预览作废 + quake 变更联动 + 主题注册表替换 +
+    /// 外观应用。两处清单必须同轨——漏一项就漂移。`settings`/`themes` 由
+    /// 调用方备好，与「当前值」的等值判断在此统一（watcher 回声吸收点）。
+    fn apply_loaded_settings(
+        &mut self,
+        settings: Settings,
+        themes: ThemeRegistry,
+        cx: &mut Context<Self>,
+    ) {
+        let quake_changed = settings.quake != self.settings.quake;
+        self.settings = settings;
+        // 热加载/合并整份替换设置：同步推进版本（快捷键派生缓存失效）
+        self.settings_version += 1;
+        // 触发器规则集随设置热替换（坏正则在编译期休眠 + eprintln 告警）
+        self.audit_hub.swap_rules(&self.settings.triggers);
+        self.themes = themes;
+        // 外部/远程改动后旧预览作废：不清的话关面板时预览会覆盖新主题
+        // （apply_appearance 在块尾统一执行，读已保存值天然正确）。
+        self.theme_preview = None;
+        // 改 quake 开关也要联动 worker 生命周期；回声 reload 走等值比较
+        // 幂等吸收，不会重复 spawn/stop。
+        if quake_changed {
+            self.sync_quake_worker(cx);
+        }
+        // 两类调用方都跑在异步上下文（热加载泵/后台任务回写），窗口未被
+        // take：None 走 handle.update 生效（apply_appearance 注记之一）。
+        self.apply_appearance(None, cx);
+    }
+
     fn change_setting(
         &mut self,
         _event: &MouseDownEvent,
@@ -3675,33 +3935,21 @@ impl WorkspaceView {
 
     /// 配置目录被外部修改后的热加载入口：重读设置与主题注册表，
     /// 有实际变化才重应用（自身保存触发的回声事件在这里被等值比较吸收）。
+    /// 读取路径与 persist_settings 同源：测试注入 settings_save_path 时读
+    /// 临时目录（生产恒 None → 用户默认路径，行为不变），否则 WebDAV 合并
+    /// 回声吸收测试无从谈起。
     fn reload_from_disk(&mut self, cx: &mut Context<Self>) {
         // 编辑中途的半截文件解析失败时保持现状，等下一次事件重试
-        let settings = Settings::default_path()
+        let settings = self
+            .settings_save_path
+            .clone()
+            .or_else(Settings::default_path)
             .and_then(|path| Settings::load(&path).ok())
             .unwrap_or_else(|| self.settings.clone());
         let themes = ThemeRegistry::load();
         if settings != self.settings || themes != self.themes {
-            let quake_changed = settings.quake != self.settings.quake;
-            self.settings = settings;
-            // 热加载整份替换设置：同步推进版本（快捷键派生缓存失效）
-            self.settings_version += 1;
-            // 触发器规则集随设置热替换（外部手改 settings.toml 的 [[triggers]]
-            // 立即生效；坏正则在编译期休眠 + eprintln 告警）
-            self.audit_hub.swap_rules(&self.settings.triggers);
-            self.themes = themes;
-            // 外部改文件后旧预览作废：不清的话关面板时预览会覆盖用户在文件里
-            // 选的主题（apply_appearance 在块尾统一执行，读已保存值天然正确）。
-            self.theme_preview = None;
-            // 外部编辑 settings.toml 改 quake 开关也要联动 worker 生命周期，
-            // 否则面板开关与 portal 实际状态漂移（评审缺口5）。自身保存触发的
-            // 回声 reload 走等值比较幂等吸收，不会重复 spawn/stop。
-            if quake_changed {
-                self.sync_quake_worker(cx);
-            }
-            // 本函数跑在热加载泵（异步上下文），窗口未被 take：None 走
-            // handle.update 生效（apply_appearance 注记的两条路径之一）。
-            self.apply_appearance(None, cx);
+            // 应用清单与合并收尾同轨（apply_loaded_settings 唯一实现）
+            self.apply_loaded_settings(settings, themes, cx);
         }
     }
 

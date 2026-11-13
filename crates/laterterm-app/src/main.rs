@@ -11,6 +11,7 @@ mod server_connection;
 mod sftp_panel;
 mod shortcut_recorder;
 mod update_check;
+mod webdav_sync;
 mod workspace;
 #[cfg(test)]
 mod workspace_tests;

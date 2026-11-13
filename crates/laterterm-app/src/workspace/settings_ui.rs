@@ -8,23 +8,25 @@
 //! 看到祖先模块的私有项，`main.rs` 顶层平级模块做不到。
 //!
 //! 结构：右内容 = 单一滚动容器，直接子元素恰好等于 `SettingsSection::ALL`
-//! 六个分区块（gpui 把 child_bounds 按直接子元素记录，多包一层或多插尾部
+//! 个分区块（gpui 把 child_bounds 按直接子元素记录，多包一层或多插尾部
 //! 元素都会让 scroll_to_top_of_item 与 scroll-spy 整体错位一节）。「恢复默认」
 //! 按钮挂在「滚动与主题」分区块内部（原外观页最后一个子元素），因此不会
-//! 成为第七个直接子元素。
+//! 多出滚动容器的直接子元素。
 //!
 //! 快捷键录制链路不动：录制控件 shortcut_editor_row 只渲染于窗口级模态弹窗
 //! （面板/命令/服务器/动态码编辑），不在设置面板内；本模块里的「编辑快捷键」
 //! 按钮只是弹窗入口，原样平移。
 
 use super::{
-    BindingOwner, ButtonKind, ShortcutBinding, UiColors, WorkspaceView, dialog_error_line,
-    ui_button,
+    BindingOwner, ButtonKind, ShortcutBinding, UiColors, WebDavOutcome, WorkspaceView,
+    dialog_error_line, ui_button,
 };
+use crate::command_text_field::CommandTextField;
 use crate::onboarding::FONT_PRESETS;
 use crate::update_check::{self, Outcome};
+use crate::webdav_sync::{WebDavTaskKind, WebDavTaskState};
 use gpui::{
-    App, Context, Div, InteractiveElement, MouseButton, MouseDownEvent, ParentElement,
+    App, AppContext, Context, Div, InteractiveElement, MouseButton, MouseDownEvent, ParentElement,
     SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px, rgb, rgba,
 };
@@ -54,6 +56,8 @@ const COLOR_TEXT_SECONDARY: u32 = 0xA9B1D6;
 const COLOR_TEXT_MUTED: u32 = 0x565A78;
 /// 危险 / 冲突。
 const COLOR_DANGER: u32 = 0xF7768E;
+/// 危险横幅底：danger 半透明 tint（alpha 同 COLOR_ACCENT_TINT 口径，≈10%）。
+const COLOR_DANGER_TINT: u32 = 0xF7768E26;
 /// 选中态 accent 半透明 tint（gpui::rgba 低 8 位是 alpha，26/255 ≈ 10%）。
 /// 注：LaterScreen 暗色模式用「中性提亮」（压暗的红在暗底上发闷）；这里
 /// 有意保留品牌色选中态——Tokyo Night 的蓝在深底上不闷，红/蓝气质不同。
@@ -92,6 +96,8 @@ pub(crate) enum SettingsSection {
     Terminal,
     /// 服务器。
     Servers,
+    /// 配置同步（WebDAV 手动备份/合并，见 webdav_sync.rs）。
+    ConfigSync,
     /// 关于（品牌卡 + 仓库/许可信息）。
     About,
     /// 检查更新（手动触发，见 update_check.rs）。
@@ -101,13 +107,14 @@ pub(crate) enum SettingsSection {
 impl SettingsSection {
     /// 导航/内容顺序即滚动容器直接子元素顺序；label / anchor_title /
     /// debug_key 的 match 均不带通配分支，新增变体漏加任一处都会编译失败。
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Appearance,
         Self::Font,
         Self::Scrolling,
         Self::Shortcuts,
         Self::Terminal,
         Self::Servers,
+        Self::ConfigSync,
         Self::About,
         Self::UpdateCheck,
     ];
@@ -121,6 +128,7 @@ impl SettingsSection {
             Self::Shortcuts => "快捷键",
             Self::Terminal => "终端",
             Self::Servers => "服务器",
+            Self::ConfigSync => "同步",
             Self::About => "关于",
             Self::UpdateCheck => "更新",
         }
@@ -135,6 +143,7 @@ impl SettingsSection {
             Self::Shortcuts => "快捷键",
             Self::Terminal => "终端",
             Self::Servers => "服务器",
+            Self::ConfigSync => "配置同步",
             Self::About => "关于",
             Self::UpdateCheck => "检查更新",
         }
@@ -149,6 +158,7 @@ impl SettingsSection {
             Self::Shortcuts => "shortcuts",
             Self::Terminal => "terminal",
             Self::Servers => "servers",
+            Self::ConfigSync => "config-sync",
             Self::About => "about",
             Self::UpdateCheck => "update",
         }
@@ -422,6 +432,7 @@ pub(crate) fn settings_content(
             SettingsSection::Shortcuts => settings_shortcuts_body(workspace, cx),
             SettingsSection::Terminal => settings_terminal_body(workspace, &appearance, cx),
             SettingsSection::Servers => settings_servers_body(&workspace.settings.reconnect, cx),
+            SettingsSection::ConfigSync => settings_config_sync_body(workspace, cx),
             SettingsSection::About => settings_about_body(cx),
             SettingsSection::UpdateCheck => settings_update_body(workspace, cx),
         };
@@ -1403,6 +1414,252 @@ fn settings_update_body(workspace: &WorkspaceView, cx: &mut Context<WorkspaceVie
         _ => {}
     }
     vec![card.child(row)]
+}
+
+/// 「配置同步」节：WebDAV 三输入框 + 非 https 明文警示 + 三按钮 +
+/// 状态行/合并差异明细。全程手动触发（零自动同步，静默外连是黑盒行为）；
+/// 网络与密钥环在后台执行器（workspace.rs run_webdav_task），失败原文呈现。
+/// 密码框只写不读（永不从密钥环回显，留空 = 保持已存密码，TOTP 密钥框同款）。
+fn settings_config_sync_body(
+    workspace: &mut WorkspaceView,
+    cx: &mut Context<WorkspaceView>,
+) -> Vec<Div> {
+    // 输入框懒建（分区首帧按当前 [sync] 值初始化；totp_fields 同构）
+    if workspace.webdav_fields.is_empty() {
+        let url = cx.new(|cx| {
+            CommandTextField::new(
+                workspace.settings.sync.url.clone(),
+                "https://dav.example.com/dav",
+                cx,
+            )
+        });
+        let username = cx
+            .new(|cx| CommandTextField::new(workspace.settings.sync.username.clone(), "账号", cx));
+        let password =
+            cx.new(|cx| CommandTextField::new(String::new(), "留空保持已存密码", cx).masked());
+        workspace.webdav_fields = vec![
+            ("地址".into(), url),
+            ("账号".into(), username),
+            ("密码".into(), password),
+        ];
+    }
+    let fields = workspace.webdav_fields.clone();
+    // 警示行跟随地址输入实时变化：读输入框现值而非已保存值
+    let url_now = fields
+        .iter()
+        .find(|(name, _)| name == "地址")
+        .map(|(_, field)| field.read(cx).value().trim().to_string())
+        .unwrap_or_default();
+    let task = workspace.webdav_task;
+    let mut card = setting_card()
+        // 固定说明行：合并语义的四类 local-only 特判（方案红线，恒本地）
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(COLOR_TEXT_MUTED))
+                .child("本机专属项不参与合并：WebDAV 账户配置、shell、接收目录"),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(rgb(COLOR_TEXT_MUTED))
+                .child("备份在 WebDAV 目录累积保留档（laterterm-config-snapshot-<时间>.toml），可手动清理"),
+        )
+        .children(fields.into_iter().map(|(name, field)| {
+            div()
+                .pt_2()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .child(name),
+                )
+                .child(field)
+        }));
+    // 非 https 前缀：Basic 凭据明文过网，常驻警示（横幅样式同
+    // update-newer-banner，色用 danger；空地址不打扰）
+    if !url_now.is_empty() && !url_now.starts_with("https://") {
+        card = card.child(
+            div()
+                .debug_selector(|| "config-sync-plain-http-banner".into())
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .bg(rgba(COLOR_DANGER_TINT))
+                .border_1()
+                .border_color(rgb(COLOR_DANGER))
+                .rounded_sm()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(12.0))
+                        .text_color(rgb(COLOR_DANGER))
+                        .child("地址未使用 https://：账号与密码将明文传输，存在被截获风险"),
+                ),
+        );
+    }
+    // 三按钮：在途时整排 muted + 当前任务换进度文案（幂等门兜底连点；
+    // 不给 setting_button 扩禁用签名，检查更新按钮同款口径）
+    let mut buttons = div().flex().flex_wrap().gap_1().pt_2();
+    for (kind, idle_label) in [
+        (WebDavTaskKind::Test, "测试连接"),
+        (WebDavTaskKind::Upload, "备份到远程"),
+        (WebDavTaskKind::Merge, "从远程合并"),
+    ] {
+        let active = task.busy() && webdav_task_matches(task, kind);
+        let mut button = setting_button(
+            if active {
+                task.busy_label()
+            } else {
+                idle_label
+            },
+            false,
+            cx.listener(move |this, _event, _window, cx| this.run_webdav_task(kind, cx)),
+        )
+        .debug_selector(move || {
+            format!(
+                "config-sync-{}-btn",
+                match kind {
+                    WebDavTaskKind::Test => "test",
+                    WebDavTaskKind::Upload => "upload",
+                    WebDavTaskKind::Merge => "merge",
+                }
+            )
+        });
+        if task.busy() {
+            button = button.text_color(rgb(COLOR_TEXT_MUTED));
+        }
+        buttons = buttons.child(button);
+    }
+    let mut card = card.child(buttons);
+    // 状态行三态 + 合并差异明细（更新状态行同款三态口径）
+    let mut status = div()
+        .debug_selector(|| "config-sync-status".into())
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .pt_1();
+    match workspace.webdav_result.as_ref() {
+        None if !task.busy() => {
+            status = status.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .child("尚未同步：备份会把本机设置与自定义主题打包为单文件快照上传"),
+            );
+        }
+        Some(Ok(WebDavOutcome::ProbeSucceeded)) => {
+            status = status.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(COLOR_TEXT_SECONDARY))
+                    .child("连接成功：服务器与凭据可用"),
+            );
+        }
+        Some(Ok(WebDavOutcome::BackupDone { archive })) => {
+            let text = match archive {
+                Some(name) => format!("已备份到远程（上一份已存为保留档 {name}）"),
+                None => "已备份到远程（首次备份，无保留档）".to_string(),
+            };
+            status = status.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(COLOR_TEXT_SECONDARY))
+                    .child(text),
+            );
+        }
+        Some(Ok(WebDavOutcome::MergeApplied(report))) => {
+            status = status
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(rgb(COLOR_TEXT))
+                        .child("合并完成（已落盘并生效）"),
+                )
+                .children(
+                    [
+                        (!report.added.is_empty())
+                            .then(|| format!("远端新增：{}", report.added.join("、"))),
+                        (!report.overridden.is_empty()).then(|| {
+                            format!(
+                                "远程覆盖：{}（服务器/命令等列表整体以远程为准）",
+                                report.overridden.join("、")
+                            )
+                        }),
+                        (!report.themes_added.is_empty()).then(|| {
+                            format!(
+                                "远端新增主题：{}",
+                                report
+                                    .themes_added
+                                    .iter()
+                                    .map(|n| format!("{n}.toml"))
+                                    .collect::<Vec<_>>()
+                                    .join("、")
+                            )
+                        }),
+                        (!report.themes_overwritten.is_empty()).then(|| {
+                            let backup = report
+                                .themes_backup_dir
+                                .as_deref()
+                                .map(|dir| format!("，已备份于 {dir}/"))
+                                .unwrap_or_default();
+                            format!(
+                                "远端覆盖主题：{}{}",
+                                report
+                                    .themes_overwritten
+                                    .iter()
+                                    .map(|n| format!("{n}.toml"))
+                                    .collect::<Vec<_>>()
+                                    .join("、"),
+                                backup
+                            )
+                        }),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(|line| {
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(COLOR_TEXT_MUTED))
+                            .child(line)
+                    }),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgb(COLOR_TEXT_MUTED))
+                        .child(match report.settings_backup.as_deref() {
+                            Some(name) => format!("已备份：{name}；本机独有主题未改动"),
+                            None => "本机独有主题未改动（本机此前无配置文件）".to_string(),
+                        }),
+                );
+        }
+        Some(Err(message)) => {
+            status = status.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(rgb(COLOR_DANGER))
+                    .child(format!("同步失败：{message}")),
+            );
+        }
+        // 在途：按钮进度文案已表达，不重复
+        _ => {}
+    }
+    card = card.child(status);
+    vec![card]
+}
+
+/// 任务状态机与动作种类的对位（在途按钮的进度文案归属）。
+fn webdav_task_matches(state: WebDavTaskState, kind: WebDavTaskKind) -> bool {
+    matches!(
+        (state, kind),
+        (WebDavTaskState::Testing, WebDavTaskKind::Test)
+            | (WebDavTaskState::Uploading, WebDavTaskKind::Upload)
+            | (WebDavTaskState::Merging, WebDavTaskKind::Merge)
+    )
 }
 
 /// 「快捷键」节：全量绑定总览（内置 + 命令 + 服务器 + 动态码），冲突标红。
