@@ -70,8 +70,9 @@ zsh / fish 不自动注入（kitty 式 rc 接管不在 v1 范围）。zsh 可在
 
 ```sh
 # 每次显示提示符前：报上一命令退出码（D）+ 提示符开始（A）+ cwd（OSC 7）
-# 追加式挂载（precmd_functions），不覆盖 powerlevel10k 等已有钩子
-precmd_functions+=(laterterm_precmd)
+# laterterm_precmd 必须排最前（数组头部插入）：zsh 函数链顺序执行、$? 在函数
+# 间传递，排在 powerlevel10k 等之后会把它们的返回值当命令退出码，失败红点失灵
+precmd_functions=(laterterm_precmd $precmd_functions)
 laterterm_precmd() { printf '\e]133;D;%s\a' "$?"; printf '\e]133;A\a'; printf '\e]7;file://%s\a' "$PWD"; }
 # 命令开始（回车后、执行前）：命令开始（C）
 preexec_functions+=(laterterm_preexec)
