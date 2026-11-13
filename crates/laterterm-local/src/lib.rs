@@ -82,7 +82,8 @@ pub struct LocalOptions {
     pub env: Vec<(String, String)>,
     /// 子进程初始工作目录（新标签/分屏继承焦点窗格 cwd 的通道，来源为
     /// OSC 7 上报）；None = 沿用 portable-pty 默认（继承父进程 cwd）。
-    /// 目录不存在时 spawn 直接报错——调用方应传真实存在的目录。
+    /// 目录不存在时 portable-pty 0.9 静默回退 $HOME（不报错，行为良性）——
+    /// 调用方仍应传真实存在的目录，别依赖回退。
     pub cwd: Option<PathBuf>,
     /// 初始列数。
     pub cols: u16,

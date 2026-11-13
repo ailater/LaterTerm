@@ -130,10 +130,10 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
         return Some(bytes);
     }
 
-    // Handle special keys first. 功能键无修饰走原有序列；带 ctrl/alt
-    // 不能提前返回而丢掉修饰——kitty 已协商时上面的 disambiguate 层负责
-    // 补 legacy 修饰形式，未协商时继续落到末尾返回 None（历史行为）。
-    let modified_function_key = keystroke.modifiers.control || keystroke.modifiers.alt;
+    // Handle special keys first. 功能键臂不带修饰守卫：协议未协商（默认）
+    // 时带 ctrl/alt 也送去修饰的 legacy 序列（与协议引入前逐字节一致——
+    // tmux/vim 的 alt+方向依赖它）；kitty 已协商时上面的 disambiguate 层
+    // 已按协议编码返回，到不了这里。
     match keystroke.key.as_str() {
         // Basic control characters
         "space" => {
@@ -154,25 +154,25 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
         }
 
         // Arrow keys - check APP_CURSOR mode
-        "up" if !modified_function_key => {
+        "up" => {
             if mode.contains(TermMode::APP_CURSOR) {
                 return Some(b"\x1bOA".to_vec());
             }
             return Some(b"\x1b[A".to_vec());
         }
-        "down" if !modified_function_key => {
+        "down" => {
             if mode.contains(TermMode::APP_CURSOR) {
                 return Some(b"\x1bOB".to_vec());
             }
             return Some(b"\x1b[B".to_vec());
         }
-        "right" if !modified_function_key => {
+        "right" => {
             if mode.contains(TermMode::APP_CURSOR) {
                 return Some(b"\x1bOC".to_vec());
             }
             return Some(b"\x1b[C".to_vec());
         }
-        "left" if !modified_function_key => {
+        "left" => {
             if mode.contains(TermMode::APP_CURSOR) {
                 return Some(b"\x1bOD".to_vec());
             }
@@ -180,26 +180,26 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
         }
 
         // Navigation keys
-        "home" if !modified_function_key => return Some(b"\x1b[H".to_vec()),
-        "end" if !modified_function_key => return Some(b"\x1b[F".to_vec()),
-        "pageup" if !modified_function_key => return Some(b"\x1b[5~".to_vec()),
-        "pagedown" if !modified_function_key => return Some(b"\x1b[6~".to_vec()),
-        "insert" if !modified_function_key => return Some(b"\x1b[2~".to_vec()),
-        "delete" if !modified_function_key => return Some(b"\x1b[3~".to_vec()),
+        "home" => return Some(b"\x1b[H".to_vec()),
+        "end" => return Some(b"\x1b[F".to_vec()),
+        "pageup" => return Some(b"\x1b[5~".to_vec()),
+        "pagedown" => return Some(b"\x1b[6~".to_vec()),
+        "insert" => return Some(b"\x1b[2~".to_vec()),
+        "delete" => return Some(b"\x1b[3~".to_vec()),
 
         // Function keys
-        "f1" if !modified_function_key => return Some(b"\x1bOP".to_vec()),
-        "f2" if !modified_function_key => return Some(b"\x1bOQ".to_vec()),
-        "f3" if !modified_function_key => return Some(b"\x1bOR".to_vec()),
-        "f4" if !modified_function_key => return Some(b"\x1bOS".to_vec()),
-        "f5" if !modified_function_key => return Some(b"\x1b[15~".to_vec()),
-        "f6" if !modified_function_key => return Some(b"\x1b[17~".to_vec()),
-        "f7" if !modified_function_key => return Some(b"\x1b[18~".to_vec()),
-        "f8" if !modified_function_key => return Some(b"\x1b[19~".to_vec()),
-        "f9" if !modified_function_key => return Some(b"\x1b[20~".to_vec()),
-        "f10" if !modified_function_key => return Some(b"\x1b[21~".to_vec()),
-        "f11" if !modified_function_key => return Some(b"\x1b[23~".to_vec()),
-        "f12" if !modified_function_key => return Some(b"\x1b[24~".to_vec()),
+        "f1" => return Some(b"\x1bOP".to_vec()),
+        "f2" => return Some(b"\x1bOQ".to_vec()),
+        "f3" => return Some(b"\x1bOR".to_vec()),
+        "f4" => return Some(b"\x1bOS".to_vec()),
+        "f5" => return Some(b"\x1b[15~".to_vec()),
+        "f6" => return Some(b"\x1b[17~".to_vec()),
+        "f7" => return Some(b"\x1b[18~".to_vec()),
+        "f8" => return Some(b"\x1b[19~".to_vec()),
+        "f9" => return Some(b"\x1b[20~".to_vec()),
+        "f10" => return Some(b"\x1b[21~".to_vec()),
+        "f11" => return Some(b"\x1b[23~".to_vec()),
+        "f12" => return Some(b"\x1b[24~".to_vec()),
 
         _ => {}
     }
@@ -701,12 +701,13 @@ mod tests {
 
     #[test]
     fn kitty_off_keeps_zero_behavior_change() {
-        // 协议未协商（默认）：一切走 legacy——ctrl+方向 仍被丢弃（现状），
-        // alt+a 仍是 ESC 前缀形态；与 input.rs 历史行为逐字节一致
+        // 协议未协商（默认）：一切走 legacy——alt/ctrl+方向 送去修饰序列
+        // （协议引入前的既有行为，tmux/vim 依赖），alt+a 仍是 ESC 前缀形态；
+        // 与 input.rs 历史行为逐字节一致
         let mode = TermMode::empty();
         assert_eq!(
-            keystroke_to_bytes(&Keystroke::parse("ctrl-left").unwrap(), mode),
-            None
+            keystroke_to_bytes(&Keystroke::parse("alt-left").unwrap(), mode),
+            Some(b"\x1b[D".to_vec())
         );
         assert_eq!(
             keystroke_to_bytes(&Keystroke::parse("alt-a").unwrap(), mode),

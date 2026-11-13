@@ -712,6 +712,9 @@ impl TerminalState {
 
     /// Update the scrollback history capacity of the active grid.
     pub fn set_scrollback(&mut self, scrollback: usize) {
+        // 同步回写本端缓存：update_term_config 用它重建 Config，漏写的话
+        // 之后的 kitty 开关切换会让滚动上限静默回落旧值并截断历史
+        self.scrollback = scrollback;
         let mut term = self.term.lock();
         let history_before = term.grid().history_size();
         term.grid_mut().update_history(scrollback);

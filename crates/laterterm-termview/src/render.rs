@@ -1241,9 +1241,10 @@ impl TerminalRenderer {
                             window.paint_quad(quad(
                                 rect_bounds,
                                 px(0.0),
-                                run.underline_color
-                                    .unwrap_or(run.fg_color)
-                                    .opacity(self.background_opacity),
+                                // 不乘 background_opacity：与直线/波浪字形线、
+                                // URL 悬停下划线同口径（下划线是内容的一部分，
+                                // 不随窗口透明度变淡）
+                                run.underline_color.unwrap_or(run.fg_color),
                                 Edges::<Pixels>::default(),
                                 transparent_black(),
                                 Default::default(),
