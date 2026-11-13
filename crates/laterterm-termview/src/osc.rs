@@ -23,9 +23,11 @@
 //!
 //! # 行号锚定与滚动淘汰
 //!
-//! 标记在受理瞬间定格为「历史 + 屏幕」自顶向下的绝对行号（0 = 最老一行，
-//! 与 [`SearchMatch`](crate::terminal::SearchMatch)::line 同口径）：
-//! `total_lines() - 1 - (bottommost_line() - cursor.line)`。
+//! 标记在 chunk 喂完瞬间定格为「历史 + 屏幕」自顶向下的绝对行号（0 = 最老
+//! 一行，与 [`SearchMatch`](crate::terminal::SearchMatch)::line 同口径）：
+//! `total_lines() - 1 - (bottommost_line() - cursor.line)`——锚点取块尾光标，
+//! 标准 bash/zsh 流（A 与提示符文本同 chunk 且无换行）不受影响；第三方集成
+//! 若 A 与含换行输出同 chunk，锚点会偏移到块尾。
 //!
 //! 淘汰修正依赖滚动计数：喂入前后 `topmost_line()`（= `Line(-history)`）差值
 //! 累进 [`PromptTracker`]。**已知边界**：topmost_line 是 total_lines 的派生量
