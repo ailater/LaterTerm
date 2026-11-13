@@ -59,7 +59,7 @@ use alacritty_terminal::vte::ansi::{ClearMode, Handler as AnsiHandler};
 use gpui::{
     Edges, ElementInputHandler, EntityInputHandler, UTF16Selection, prelude::FluentBuilder, *,
 };
-use laterterm_core::TerminalSession;
+use laterterm_core::{BackendKind, TerminalSession};
 use std::io::{Read, Write};
 use std::ops::Range;
 use std::sync::Arc;
@@ -235,6 +235,13 @@ pub struct TerminalConfig {
     /// 终端 bell 时发送系统桌面通知。默认关闭（bell 走视觉提示，测试环境不外发）。
     pub bell_notification: bool,
 
+    /// kitty keyboard protocol 支持开关（默认 false）。开启后允许应用经
+    /// `CSI > 1u` / `CSI ? u` 协商启用 disambiguate 层编码（Esc 与修饰文本键
+    /// 转 CSI u，见 input.rs）。默认关闭：本端编码表是手写风险面，未经真实
+    /// 应用（fish/tmux）验证前不默认开启——对齐 alacritty_terminal Config
+    /// 的默认（term/mod.rs `kitty_keyboard: Default::default()` = false）。
+    pub kitty_keyboard: bool,
+
     /// 终端背景不透明度（0.15~1.0）。1.0 = 完全不透明（历史行为，default
     /// 底色满幅绘制）；<1.0 时整幅 default 底色跳绘、单元格背景 quad 按
     /// alpha 缩放，窗口底色由宿主层（如 LaterTerm 工作区根容器）承载。
@@ -259,6 +266,7 @@ impl Default for TerminalConfig {
             smooth_scrolling: true,
             copy_on_select: true,
             bell_notification: false,
+            kitty_keyboard: false,
             background_opacity: 1.0,
         }
     }
@@ -517,6 +525,11 @@ pub type ExitCallback = Box<dyn Fn(&mut Window, &mut Context<TerminalView>)>;
 pub struct TerminalView {
     /// The terminal state managing the grid and VTE parser
     state: TerminalState,
+
+    /// 会话后端类别（构造时从 `session.backend()` 定格）：cwd 继承只对本地
+    /// 会话有意义——SSH 会话即便远端 shell 上报 OSC 7，路径也属远端，
+    /// 不能喂给本地 spawn（见 [`Self::cwd`]）。
+    backend: BackendKind,
 
     /// The renderer for drawing terminal content
     renderer: TerminalRenderer,
@@ -789,6 +802,8 @@ impl TerminalView {
         let streams = session.take_streams().expect("会话字节流已被取走");
         let stdin_writer: Box<dyn Write + Send> = streams.writer;
         let stdout_reader = streams.reader;
+        // 后端类别构造时定格（cwd 继承的本地/远端判别依据）
+        let backend = session.backend();
 
         // Create event channel for terminal events
         let (event_tx, event_rx) = mpsc::channel();
@@ -797,10 +812,18 @@ impl TerminalView {
         let exit_event_tx = event_tx.clone();
 
         // Create event proxy for alacritty
-        let event_proxy = GpuiEventProxy::new(event_tx);
+        let event_proxy = GpuiEventProxy::new(event_tx.clone());
 
         // Create terminal state
-        let state = TerminalState::new(config.cols, config.rows, config.scrollback, event_proxy);
+        let mut state = TerminalState::new(
+            config.cols,
+            config.rows,
+            config.scrollback,
+            config.kitty_keyboard,
+            event_proxy,
+        );
+        // 注入桌面通知通道：OSC 9/777 经 TerminalState 直发 DesktopNotice
+        state.set_notice_tx(event_tx);
 
         // Create renderer with font settings and color palette
         let mut renderer = TerminalRenderer::new(
@@ -949,6 +972,7 @@ impl TerminalView {
 
         Self {
             state,
+            backend,
             renderer,
             font_trace_changed: false,
             focus_handle,
@@ -1242,6 +1266,29 @@ impl TerminalView {
             return;
         }
 
+        // 提示符跳转（OSC 133 标记）：Alt+Shift+Up/Down（iTerm2 同款）。
+        // 避让既有占用：窗格导航 Ctrl+方向（workspace）、搜索栏 Alt+C/R/W；
+        // 无论命中与否都消费按键——未命中标记时也不把组合键透传 PTY，
+        // 防止多余的 ESC 序列泄进 shell。
+        if keystroke.modifiers.alt
+            && keystroke.modifiers.shift
+            && !keystroke.modifiers.control
+            && !keystroke.modifiers.platform
+            && !keystroke.modifiers.function
+        {
+            match keystroke.key.as_str() {
+                "up" => {
+                    self.jump_prompt_previous(cx);
+                    return;
+                }
+                "down" => {
+                    self.jump_prompt_next(cx);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         // 搜索打开时拦截所有按键，一律不透传 PTY
         if self.search.is_some() {
             match keystroke.key.as_str() {
@@ -1448,7 +1495,8 @@ impl TerminalView {
             );
             let row = cell.line.0.max(0) as usize;
             let col = cell.column.0;
-            if let Some(url) = self.state.extract_url_at(row, col) {
+            // OSC 8 显式超链接优先，回落 URL 文本自动检测
+            if let Some(url) = self.resolve_url_at(row, col) {
                 open_url(&url);
                 return;
             }
@@ -1583,6 +1631,25 @@ impl TerminalView {
         }
     }
 
+    /// 当前格的 URL 解析统一口径：OSC 8 显式超链接优先（应用声明语义，
+    /// 展示文本可以不是 URL 形态），回落 URL 文本自动检测。Ctrl+点击 /
+    /// 悬停 / 右键三条入口共用，保证跳转、下划线与右键菜单同一目标。
+    ///
+    /// 有意不做：超链接段非悬停时常显下划线——需要 layout_row 按超链接
+    /// 分 run 渲染（run 碎片化，代价大于收益），悬停态下划线已覆盖发现路径。
+    fn resolve_url_at(&self, row: usize, col: usize) -> Option<String> {
+        self.state
+            .hyperlink_span_at(row, col)
+            .or_else(|| self.state.extract_url_at(row, col))
+    }
+
+    /// 同 [`Self::resolve_url_at`] 但附带段列范围（悬停下划线绘制用）。
+    fn resolve_url_span_at(&self, row: usize, col: usize) -> Option<(String, usize, usize)> {
+        self.state
+            .hyperlink_span_extent_at(row, col)
+            .or_else(|| self.state.extract_url_span_at(row, col))
+    }
+
     /// 更新 URL 悬停状态：命中时记录范围并切小手光标 + 重绘下划线；离开清空。
     fn update_url_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
         let span = self.last_content_origin.and_then(|origin| {
@@ -1593,8 +1660,9 @@ impl TerminalView {
                 self.renderer.cell_height,
             );
             let row = cell.line.0.max(0) as usize;
-            self.state
-                .extract_url_span_at(row, cell.column.0)
+            // OSC 8 显式超链接优先，回落 URL 文本自动检测（悬停下划线
+            // 覆盖层与小手光标管道原样复用）
+            self.resolve_url_span_at(row, cell.column.0)
                 .map(|(url, start, end)| (url, row, start, end))
         });
         // 比较位置元组（String 不参与比较）；同格重复 move 不重绘
@@ -1626,7 +1694,8 @@ impl TerminalView {
                 self.renderer.cell_height,
             );
             let row = cell.line.0.max(0) as usize;
-            self.state.extract_url_at(row, cell.column.0)
+            // OSC 8 显式超链接优先，回落 URL 文本自动检测
+            self.resolve_url_at(row, cell.column.0)
         });
         cx.emit(TerminalMenuRequested {
             position: event.position,
@@ -1792,6 +1861,25 @@ impl TerminalView {
                     if let Some(callback) = self.exit_callback.take() {
                         // 兼容旧回调接口，不能在 render 中直接修改父布局。
                         cx.defer_in(window, move |_, window, cx| callback(window, cx));
+                    }
+                }
+                TerminalEvent::PtyWrite(text) => {
+                    // 应用侧查询应答（kitty ?u / DECRQM / DA）直接写回本端
+                    // PTY。刻意不走 commit_input：后者会触发 input_callback
+                    // 把字节广播给其他窗格，协议应答不是用户输入，不该扩散。
+                    self.write_input(text.as_bytes());
+                }
+                TerminalEvent::DesktopNotice { title, body } => {
+                    // OSC 9/777 桌面通知：沿用 bell_notification 门控（显式开启
+                    // 才外发，默认静默——应用输出不可信，通知频率与 bell 同水位，
+                    // v1 不节流；若后续需要可加 1s 合并窗口）。
+                    if self.config.bell_notification {
+                        let title = if title.is_empty() {
+                            "LaterTerm".to_owned()
+                        } else {
+                            title
+                        };
+                        send_desktop_notification(&title, &body);
                     }
                 }
             }
@@ -2001,7 +2089,65 @@ impl TerminalView {
     /// 重置终端状态（颜色、样式、终端模式全部恢复默认）。
     pub fn reset_terminal(&mut self, cx: &mut Context<Self>) {
         self.state.with_term_mut(|term| term.reset_state());
+        // reset_state 会 grid.reset() 清掉全部历史内容：绝对行号所指内容
+        // 不复存在，提示符标记一并作废（与 resize 作废同一失效类别）。
+        self.state.invalidate_prompt_marks();
         cx.notify();
+    }
+
+    /// 跳到上一条提示符标记（OSC 133；Alt+Shift+Up / 右键菜单）。
+    /// 返回是否成跳（无标记 / 备用屏时为 false）。
+    pub fn jump_prompt_previous(&mut self, cx: &mut Context<Self>) -> bool {
+        let jumped = self
+            .state
+            .jump_prompt(crate::osc::PromptDirection::Previous);
+        if jumped {
+            cx.notify();
+        }
+        jumped
+    }
+
+    /// 跳到下一条提示符标记（OSC 133；Alt+Shift+Down / 右键菜单）。
+    pub fn jump_prompt_next(&mut self, cx: &mut Context<Self>) -> bool {
+        let jumped = self.state.jump_prompt(crate::osc::PromptDirection::Next);
+        if jumped {
+            cx.notify();
+        }
+        jumped
+    }
+
+    /// 提示符标记快照（滚动淘汰修正后；右键菜单可用性判定等宿主侧消费）。
+    pub fn prompt_marks(&self) -> Vec<crate::osc::PromptMark> {
+        self.state.prompt_marks()
+    }
+
+    /// 最近一条已结束命令是否失败（OSC 133;D exit≠0；标签栏红点数据源）。
+    pub fn last_command_failed(&self) -> bool {
+        self.state.last_command_failed()
+    }
+
+    /// 当前是否有命令运行中（OSC 133;C 与 D 之间窗态；v1 只暴露数据）。
+    pub fn command_running(&self) -> bool {
+        self.state.command_running()
+    }
+
+    /// 当前目录（OSC 7 上报，percent 解码后的绝对路径）。
+    ///
+    /// 仅本地会话返回：SSH 会话即使远端 shell 上报了 OSC 7，路径也属远端
+    /// 文件系统，不能用于本地会话的 cwd 继承——非 Local 一律 None。
+    pub fn cwd(&self) -> Option<String> {
+        // TODO: SSH 远端 cwd 待 laterterm-ssh 接管后另行暴露（远端路径的
+        // 转义/映射语义与本地不同，不塞进本入口）。
+        if self.backend != BackendKind::Local {
+            return None;
+        }
+        self.state.cwd().map(str::to_owned)
+    }
+
+    /// 最近一次 OSC 9;4 进度上报（ConEmu；state=0 移除后为 None）。
+    /// v1 仅暴露数据——进度 UI 暂不呈现（设计阶段随 osc133 角标统一决定）。
+    pub fn progress(&self) -> Option<crate::osc::ProgressState> {
+        self.state.progress()
     }
 
     /// 搜索查询追加分本（来自 InputHandler 提交或按键）。
@@ -2201,6 +2347,11 @@ impl TerminalView {
         }
         if config.scrollback != self.config.scrollback {
             self.state.set_scrollback(config.scrollback);
+        }
+        if config.kitty_keyboard != self.config.kitty_keyboard {
+            // kitty 协议开关运行期切换：Term::set_options 会清空协议模式栈
+            // 并摘除 KITTY_KEYBOARD_PROTOCOL 位（alacritty 权威语义）
+            self.state.update_term_config(config.kitty_keyboard);
         }
         // 光标闪烁开关变化时立即恢复常显，避免停留在熄灭相位。
         if config.cursor_blink != self.config.cursor_blink && config.cursor_blink {
@@ -2648,6 +2799,13 @@ impl Render for TerminalView {
                                 x: bounds.origin.x + padding.left,
                                 y: bounds.origin.y + padding.top,
                             });
+                            if needs_resize {
+                                // canvas 直连 Term::resize 的第二条 resize 路径：
+                                // 列变化 reflow 重排历史行、绝对行号整体失效，
+                                // 提示符标记整体作废（与 TerminalState::resize
+                                // 同一决策，见 crate::osc 模块注记）
+                                view.state.invalidate_prompt_marks();
+                            }
                         });
                         renderer.paint_frame(
                             bounds,
@@ -2830,9 +2988,16 @@ pub fn open_url(url: &str) {
 
 /// 发送系统桌面通知（终端 bell → 通知，长命令跑完提醒）。
 ///
-/// 触发器（audit.rs 泵）复用同一出口：spawn 后台进程即返回，不阻塞调用线程。
+/// 触发器（audit.rs 泵）与 OSC 9/777 桌面通知复用同一出口：spawn 后台进程
+/// 即返回，不阻塞调用线程。文本属不可信输入：先截断再按目标解释器的引号
+/// 语法转义（osascript 双引号串 / PowerShell 单引号串），防参数注入。
 pub fn send_desktop_notification(title: &str, body: &str) {
+    let title = truncate_notification_text(title);
+    let body = truncate_notification_text(body);
     let (program, args): (&str, Vec<String>) = if cfg!(target_os = "macos") {
+        // AppleScript 双引号字符串：\ 与 " 逐字转义（先 \ 后 "，顺序不能反）
+        let title = escape_applescript_string(&title);
+        let body = escape_applescript_string(&body);
         (
             "osascript",
             vec![
@@ -2841,6 +3006,10 @@ pub fn send_desktop_notification(title: &str, body: &str) {
             ],
         )
     } else if cfg!(target_os = "windows") {
+        // PowerShell 单引号字符串：' 翻倍（''）——漏转义可被
+        // `'); 命令; ('` 逃逸成任意命令执行
+        let title = title.replace('\'', "''");
+        let body = body.replace('\'', "''");
         (
             "powershell",
             vec![
@@ -2849,6 +3018,7 @@ pub fn send_desktop_notification(title: &str, body: &str) {
             ],
         )
     } else {
+        // notify-send 走参数数组不经 shell，引号无特殊语义，无需转义
         (
             "notify-send",
             vec![
@@ -2860,6 +3030,22 @@ pub fn send_desktop_notification(title: &str, body: &str) {
         )
     };
     let _ = std::process::Command::new(program).args(args).spawn();
+}
+
+/// 通知文本截断 + 换行拍平（128 字符上限：桌面通知是单行短文案，
+/// OSC 9/777 的正文是应用输出，长度不受我方控制）。
+fn truncate_notification_text(text: &str) -> String {
+    const MAX_CHARS: usize = 128;
+    text.chars()
+        .take(MAX_CHARS)
+        .map(|ch| if ch == '\n' || ch == '\r' { ' ' } else { ch })
+        .collect()
+}
+
+/// AppleScript 双引号字符串转义：`\` → `\\`、`"` → `\"`（必须先转义
+/// 反斜杠，否则会先给转义符再加引号产生 `\"` 歧义序列）。
+fn escape_applescript_string(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// 粘贴快捷键判定：Ctrl+Shift+V 或 Shift+Insert。
@@ -2882,6 +3068,7 @@ pub fn paste_shortcut_matches(keystroke: &Keystroke) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{TerminalConfig, TerminalExited, TerminalSession, TerminalView};
+    use alacritty_terminal::grid::Dimensions;
     use gpui::{AppContext, MouseButton, MouseDownEvent, TestAppContext};
     use laterterm_core::{BackendKind, SessionStreams};
     use std::sync::Arc;
@@ -2891,6 +3078,27 @@ mod tests {
     impl TerminalSession for FinishedSession {
         fn backend(&self) -> BackendKind {
             BackendKind::Local
+        }
+        fn title(&self) -> String {
+            String::new()
+        }
+        fn take_streams(&self) -> std::io::Result<SessionStreams> {
+            Ok(SessionStreams {
+                reader: Box::new(std::io::empty()),
+                writer: Box::new(std::io::sink()),
+            })
+        }
+        fn resize(&self, _: u16, _: u16) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn kill(&self) {}
+    }
+
+    /// SSH 后端测试替身：cwd 继承的本地/远端判别依赖 backend() 定格。
+    struct SshSession;
+    impl TerminalSession for SshSession {
+        fn backend(&self) -> BackendKind {
+            BackendKind::Ssh
         }
         fn title(&self) -> String {
             String::new()
@@ -3743,6 +3951,154 @@ mod tests {
             );
             assert!(terminal.search.is_some(), "精确 Ctrl+Shift+F 必须打开搜索");
         });
+    }
+
+    /// 提示符跳转（OSC 133）：Alt+Shift+Up/Down 键绑定与直调同效；
+    /// 额外修饰键不触发（精确匹配口径）。视口位置经 display_offset 断言。
+    #[gpui::test]
+    fn prompt_jump_shortcuts_scroll_between_marks(cx: &mut TestAppContext) {
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update_in(cx, |terminal, window, cx| {
+            // 两条提示符标记：测试窗口会在首帧布局后 resize（默认窗口下
+            // 可远大于配置 24 行），行数按实际网格取，确保首标记滚进历史。
+            terminal.state.process_bytes(b"\x1b]133;A\x07");
+            let output_lines = terminal.state.with_term(|term| term.grid().screen_lines()) + 8;
+            for line in 0..output_lines {
+                terminal
+                    .state
+                    .process_bytes(format!("row-{line}\r\n").as_bytes());
+            }
+            terminal.state.process_bytes(b"\x1b]133;A\x07");
+            assert_eq!(
+                terminal
+                    .state
+                    .with_term(|term| term.grid().display_offset()),
+                0,
+                "新输出后视口应钉在底部"
+            );
+
+            // Alt+Shift+Up → 上一条提示符（视口离开底部）
+            press_key(terminal, "alt-shift-up", window, cx);
+            let up_offset = terminal
+                .state
+                .with_term(|term| term.grid().display_offset());
+            assert!(up_offset > 0, "Alt+Shift+Up 应滚回上一提示符");
+
+            // Alt+Shift+Down → 下一条提示符（滚回底部）
+            press_key(terminal, "alt-shift-down", window, cx);
+            let down_offset = terminal
+                .state
+                .with_term(|term| term.grid().display_offset());
+            assert!(down_offset < up_offset, "Alt+Shift+Down 应回到底部");
+
+            // 带额外修饰键不触发（也不透传 PTY，视口不动）
+            press_key(terminal, "ctrl-alt-shift-up", window, cx);
+            assert_eq!(
+                terminal
+                    .state
+                    .with_term(|term| term.grid().display_offset()),
+                down_offset,
+                "额外修饰键不触发跳转"
+            );
+        });
+    }
+
+    /// cwd 继承判别：本地会话记录并经视图暴露（OSC 7 percent 解码口径）；
+    /// SSH 会话即便远端 shell 上报 OSC 7，`TerminalView::cwd` 也恒 None
+    ///（远端路径不能喂本地 spawn，TODO 留给 laterterm-ssh）。
+    #[gpui::test]
+    fn cwd_reported_only_for_local_backend(cx: &mut TestAppContext) {
+        // 本地会话：OSC 7 → 视图 cwd（含 percent 解码的中文与空格路径）
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update_in(cx, |terminal, _, _| {
+            assert!(terminal.cwd().is_none(), "未上报时 cwd 为 None");
+            terminal.state.process_bytes(
+                "\x1b]7;file://myhost/home/u/%E4%B8%AD%E6%96%87%20dir\x07".as_bytes(),
+            );
+            assert_eq!(
+                terminal.cwd().as_deref(),
+                Some("/home/u/中文 dir"),
+                "本地会话 cwd 应记录解码后的路径"
+            );
+        });
+
+        // SSH 会话：状态层照单记录，视图层按后端门控不暴露
+        let (remote, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(SshSession), TerminalConfig::default(), cx)
+        });
+        remote.update_in(cx, |terminal, _, _| {
+            terminal.state.process_bytes(b"\x1b]7;file:///srv/www\x07");
+            assert!(terminal.cwd().is_none(), "SSH 会话不对外暴露 cwd");
+        });
+    }
+
+    /// URL 解析优先级（OSC 8 项）：显式超链接优先于文本自动检测，无
+    /// 超链接时回落自动检测。三条入口共用 resolve_url_at，此处钉其口径。
+    #[gpui::test]
+    fn url_resolution_prefers_osc8_hyperlink_then_falls_back(cx: &mut TestAppContext) {
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update_in(cx, |terminal, _, _| {
+            // 第一行：OSC 8 段「click」（列 0-4，展示文本无 URL 特征）+
+            // 空格（列 5）+ 纯文本 URL（列 6 起，无 OSC 8 包裹）
+            terminal.state.process_bytes(
+                b"\x1b]8;;https://hyper.example\x1b\\click\x1b]8;;\x1b\\ https://text.example",
+            );
+            // 段内：展示文本不是 URL 形态 → 仅超链接命中
+            assert_eq!(
+                terminal.resolve_url_at(0, 0).as_deref(),
+                Some("https://hyper.example"),
+                "OSC 8 段内优先返回声明 URI"
+            );
+            assert_eq!(
+                terminal.resolve_url_at(0, 4).as_deref(),
+                Some("https://hyper.example"),
+                "段内任意列命中同一段"
+            );
+            // 段外：纯文本 URL → 回落文本自动检测
+            assert_eq!(
+                terminal.resolve_url_at(0, 8).as_deref(),
+                Some("https://text.example"),
+                "段外回落文本自动检测"
+            );
+            assert_eq!(terminal.resolve_url_at(0, 5), None, "空格列两者皆不命中");
+
+            // 第二行（并存优先级）：URL 样文本「https://fake.example」被
+            // OSC 8 包住但声明 URI 不同 → 超链接胜出（文本检测返回 fake，
+            // resolve 返回 real——分层由 state 层测试钉，此处钉 view 取用序）
+            terminal.state.process_bytes(
+                b"\r\n\x1b]8;;https://real.example\x07https://fake.example\x1b]8;;\x07",
+            );
+            assert_eq!(
+                terminal.resolve_url_at(1, 0).as_deref(),
+                Some("https://real.example"),
+                "并存时超链接声明优先"
+            );
+        });
+    }
+
+    /// 通知文本助手：AppleScript 转义（\ 与 "）、截断与换行拍平。
+    /// PowerShell 分支的 ' 翻倍在 send_desktop_notification 内联，
+    /// 同一转义口径由本测试钉 AppleScript 侧的顺序敏感性。
+    #[test]
+    fn notification_text_helpers_escape_and_truncate() {
+        use super::{escape_applescript_string, truncate_notification_text};
+        // \ → \\ 与 " → \"，且反斜杠先转义（顺序反了会产生歧义序列）
+        assert_eq!(escape_applescript_string("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(escape_applescript_string("plain"), "plain");
+        // 截断 + 换行拍平（桌面通知单行短文案口径）
+        assert_eq!(truncate_notification_text("中文"), "中文");
+        assert_eq!(truncate_notification_text("a\nb\rc"), "a b c");
+        assert_eq!(
+            truncate_notification_text(&"x".repeat(200)),
+            "x".repeat(128),
+            "超长正文截到 128 字符"
+        );
     }
 
     /// 计数三分支 + 非法正则红字替代（纯函数，无需 GPUI 上下文）。

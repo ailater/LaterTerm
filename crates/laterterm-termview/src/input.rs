@@ -114,7 +114,26 @@ use gpui::Keystroke;
 /// assert_eq!(bytes, Some(b"\r".to_vec()));
 /// ```
 pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
-    // Handle special keys first
+    // kitty keyboard protocol disambiguate 层：应用经 `CSI > 1u` 协商启用后
+    // （TermMode::DISAMBIGUATE_ESC_CODES 置位）优先走本端编码；未覆盖的键
+    // 返回 None 落回 legacy 路径。规范：https://sw.kovidgoyal.net/kitty/keyboard-protocol/
+    //
+    // 已知不完整支持（代码与 roadmap 双处标注）：应用置更高 flags
+    // （REPORT_ALL_KEYS_AS_ESC / REPORT_EVENT_TYPES / REPORT_ASSOCIATED_TEXT /
+    // REPORT_ALTERNATE_KEYS）时，Term 端照收置位，但本端编码仍停留在
+    // disambiguate 层语义——全键上报 / 事件类型 / 关联文本 / 备选键不做；
+    // 不因更高 flags 而回退纯 legacy（disambiguate 形态对更高 flags 的应用
+    // 而言仍比丢弃修饰的 legacy 形态更接近预期）。
+    if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES)
+        && let Some(bytes) = kitty_disambiguate_bytes(keystroke)
+    {
+        return Some(bytes);
+    }
+
+    // Handle special keys first. 功能键无修饰走原有序列；带 ctrl/alt
+    // 不能提前返回而丢掉修饰——kitty 已协商时上面的 disambiguate 层负责
+    // 补 legacy 修饰形式，未协商时继续落到末尾返回 None（历史行为）。
+    let modified_function_key = keystroke.modifiers.control || keystroke.modifiers.alt;
     match keystroke.key.as_str() {
         // Basic control characters
         "space" => {
@@ -135,25 +154,25 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
         }
 
         // Arrow keys - check APP_CURSOR mode
-        "up" => {
+        "up" if !modified_function_key => {
             if mode.contains(TermMode::APP_CURSOR) {
                 return Some(b"\x1bOA".to_vec());
             }
             return Some(b"\x1b[A".to_vec());
         }
-        "down" => {
+        "down" if !modified_function_key => {
             if mode.contains(TermMode::APP_CURSOR) {
                 return Some(b"\x1bOB".to_vec());
             }
             return Some(b"\x1b[B".to_vec());
         }
-        "right" => {
+        "right" if !modified_function_key => {
             if mode.contains(TermMode::APP_CURSOR) {
                 return Some(b"\x1bOC".to_vec());
             }
             return Some(b"\x1b[C".to_vec());
         }
-        "left" => {
+        "left" if !modified_function_key => {
             if mode.contains(TermMode::APP_CURSOR) {
                 return Some(b"\x1bOD".to_vec());
             }
@@ -161,26 +180,26 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
         }
 
         // Navigation keys
-        "home" => return Some(b"\x1b[H".to_vec()),
-        "end" => return Some(b"\x1b[F".to_vec()),
-        "pageup" => return Some(b"\x1b[5~".to_vec()),
-        "pagedown" => return Some(b"\x1b[6~".to_vec()),
-        "insert" => return Some(b"\x1b[2~".to_vec()),
-        "delete" => return Some(b"\x1b[3~".to_vec()),
+        "home" if !modified_function_key => return Some(b"\x1b[H".to_vec()),
+        "end" if !modified_function_key => return Some(b"\x1b[F".to_vec()),
+        "pageup" if !modified_function_key => return Some(b"\x1b[5~".to_vec()),
+        "pagedown" if !modified_function_key => return Some(b"\x1b[6~".to_vec()),
+        "insert" if !modified_function_key => return Some(b"\x1b[2~".to_vec()),
+        "delete" if !modified_function_key => return Some(b"\x1b[3~".to_vec()),
 
         // Function keys
-        "f1" => return Some(b"\x1bOP".to_vec()),
-        "f2" => return Some(b"\x1bOQ".to_vec()),
-        "f3" => return Some(b"\x1bOR".to_vec()),
-        "f4" => return Some(b"\x1bOS".to_vec()),
-        "f5" => return Some(b"\x1b[15~".to_vec()),
-        "f6" => return Some(b"\x1b[17~".to_vec()),
-        "f7" => return Some(b"\x1b[18~".to_vec()),
-        "f8" => return Some(b"\x1b[19~".to_vec()),
-        "f9" => return Some(b"\x1b[20~".to_vec()),
-        "f10" => return Some(b"\x1b[21~".to_vec()),
-        "f11" => return Some(b"\x1b[23~".to_vec()),
-        "f12" => return Some(b"\x1b[24~".to_vec()),
+        "f1" if !modified_function_key => return Some(b"\x1bOP".to_vec()),
+        "f2" if !modified_function_key => return Some(b"\x1bOQ".to_vec()),
+        "f3" if !modified_function_key => return Some(b"\x1bOR".to_vec()),
+        "f4" if !modified_function_key => return Some(b"\x1bOS".to_vec()),
+        "f5" if !modified_function_key => return Some(b"\x1b[15~".to_vec()),
+        "f6" if !modified_function_key => return Some(b"\x1b[17~".to_vec()),
+        "f7" if !modified_function_key => return Some(b"\x1b[18~".to_vec()),
+        "f8" if !modified_function_key => return Some(b"\x1b[19~".to_vec()),
+        "f9" if !modified_function_key => return Some(b"\x1b[20~".to_vec()),
+        "f10" if !modified_function_key => return Some(b"\x1b[21~".to_vec()),
+        "f11" if !modified_function_key => return Some(b"\x1b[23~".to_vec()),
+        "f12" if !modified_function_key => return Some(b"\x1b[24~".to_vec()),
 
         _ => {}
     }
@@ -256,6 +275,109 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
 
     // If we get here, the keystroke doesn't produce any output
     None
+}
+
+/// kitty keyboard protocol **disambiguate 层**编码（协议 v1 子集）。
+///
+/// 范围严格按规范钉死（修订 1，依据规范原文）：
+///
+/// - **(a) 安全阀例外**：Enter/Tab/Backspace 恒走 legacy 字节 `\r`/`\t`/`\x7f`，
+///   任何修饰组合都不转 CSI u——规范原文 "The only exceptions are the
+///   Enter, Tab and Backspace keys which still generate the same bytes as
+///   in legacy mode"（目的：应用崩溃后仍可敲 `reset` 自救）。返回 `None`
+///   落回 legacy 路径（含 Shift+Tab 的 `\x1b[Z`）。
+/// - **(b) 文本键**：仅规范 disambiguate 列举的四组合（alt+key / ctrl+key /
+///   ctrl+alt+key / shift+alt+key）转 `CSI <codepoint>;<mods>u`——纯 alt
+///   去 ESC 前缀歧义是本层存在的首要动机。mods 位 shift=1/alt=2/ctrl=4，
+///   参数值 = 位掩码 + 1（kitty/xterm 同式），无修饰省略参数。Esc 视为
+///   codepoint 27 的文本键且不受组合限定（disambiguate 的本义即消歧孤
+///   ESC：`CSI 27u`）。ctrl+shift 与三修饰组合不在规范列举内 → legacy。
+///   无修饰文本键不走本函数（维持 key_char/UTF-8 现路径）。
+/// - **(c) 功能键**：带 ctrl/alt 走 **legacy 修饰形式**而非 CSI u——
+///   方向/Home/End/F1-F4 → `CSI 1;<mods><A|B|C|D|H|F|P|Q|R|S>`，
+///   PgUp/PgDn/Insert/Delete/F5-F12 → `CSI <n>;<mods>~`（规范原文：功能键
+///   带修饰走 "CSI 1; modifier [~ABCDEFHPQS]" legacy 形式）。属能力补全
+///   （现状对这些键丢弃修饰）而非 CSI u 化。无修饰或仅 shift → `None`
+///   （维持现有 legacy 序列，含 APP_CURSOR 的 SS3 形态；带修饰按 xterm
+///   惯例恒为 CSI 形态）。
+///
+/// 返回 `None` = 本层无编码，由 legacy 路径处理。
+fn kitty_disambiguate_bytes(keystroke: &Keystroke) -> Option<Vec<u8>> {
+    let modifiers = &keystroke.modifiers;
+    let key = keystroke.key.as_str();
+
+    // (a) 安全阀：Enter/Tab/Backspace 任何模式下不转 CSI u
+    if matches!(key, "enter" | "tab" | "backspace") {
+        return None;
+    }
+
+    // kitty 修饰位掩码：shift=1 / alt=2 / ctrl=4；CSI 参数值 = 掩码 + 1
+    let mods = u8::from(modifiers.shift)
+        | (u8::from(modifiers.alt) << 1)
+        | (u8::from(modifiers.control) << 2);
+
+    // (c) 功能键带 ctrl/alt → legacy 修饰形式（非功能键落空，继续走文本键）
+    if modifiers.control || modifiers.alt {
+        // 参数值 = 掩码 + 1，恒 ≥ 3（ctrl=5 / alt=3 / ctrl+alt=7 / …）
+        let modifier = format!(";{}", mods + 1);
+        let sequence: Option<String> = match key {
+            "up" => Some(format!("\x1b[1{modifier}A")),
+            "down" => Some(format!("\x1b[1{modifier}B")),
+            "right" => Some(format!("\x1b[1{modifier}C")),
+            "left" => Some(format!("\x1b[1{modifier}D")),
+            "home" => Some(format!("\x1b[1{modifier}H")),
+            "end" => Some(format!("\x1b[1{modifier}F")),
+            "f1" => Some(format!("\x1b[1{modifier}P")),
+            "f2" => Some(format!("\x1b[1{modifier}Q")),
+            "f3" => Some(format!("\x1b[1{modifier}R")),
+            "f4" => Some(format!("\x1b[1{modifier}S")),
+            "pageup" => Some(format!("\x1b[5{modifier}~")),
+            "pagedown" => Some(format!("\x1b[6{modifier}~")),
+            "insert" => Some(format!("\x1b[2{modifier}~")),
+            "delete" => Some(format!("\x1b[3{modifier}~")),
+            "f5" => Some(format!("\x1b[15{modifier}~")),
+            "f6" => Some(format!("\x1b[17{modifier}~")),
+            "f7" => Some(format!("\x1b[18{modifier}~")),
+            "f8" => Some(format!("\x1b[19{modifier}~")),
+            "f9" => Some(format!("\x1b[20{modifier}~")),
+            "f10" => Some(format!("\x1b[21{modifier}~")),
+            "f11" => Some(format!("\x1b[23{modifier}~")),
+            "f12" => Some(format!("\x1b[24{modifier}~")),
+            _ => None, // 非功能键：继续走 (b) 文本键判定
+        };
+        if let Some(sequence) = sequence {
+            return Some(sequence.into_bytes());
+        }
+    }
+
+    // (b) 文本键：规范列举的四组合 → CSI u（Esc 不受组合限定，恒 CSI 27u）
+    let listed_combo = matches!(
+        (modifiers.shift, modifiers.alt, modifiers.control),
+        (false, true, false) | (false, false, true) | (false, true, true) | (true, true, false)
+    );
+    if !listed_combo && key != "escape" {
+        return None;
+    }
+    let codepoint: u32 = match key {
+        "escape" => 27,
+        "space" => 32,
+        _ => {
+            // 仅接受单字符键名（字母/数字/标点）；GPUI 的 key 对文本键
+            // 恒为布局层小写字符，shift 进 mods 不进码点（shift+alt+a →
+            // CSI 97;4u 而非 65）
+            let mut chars = key.chars();
+            match (chars.next(), chars.next()) {
+                (Some(ch), None) => u32::from(ch),
+                _ => return None, // 多字符键名不在文本键编码范围
+            }
+        }
+    };
+    let sequence = if mods == 0 {
+        format!("\x1b[{codepoint}u")
+    } else {
+        format!("\x1b[{codepoint};{}u", mods + 1)
+    };
+    Some(sequence.into_bytes())
 }
 
 #[cfg(test)]
@@ -428,5 +550,180 @@ mod tests {
 
         let space = Keystroke::parse("space").unwrap();
         assert_eq!(keystroke_to_bytes(&space, mode), Some(b" ".to_vec()));
+    }
+
+    // ───────── kitty keyboard protocol（disambiguate 层） ─────────
+    //
+    // 断言一律精确等值：等值断言即「反向断言」——把 legacy 字节钉死，
+    // 防止 CSI u 化的过度实现（Enter=CSI 13u / 方向=CSI u）被钉进测试。
+
+    #[test]
+    fn kitty_enter_tab_backspace_stay_legacy_in_any_mode() {
+        // 规范安全阀：三种键在任何修饰组合下都保持 legacy 字节
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        let enter = Keystroke::parse("enter").unwrap();
+        let bytes = keystroke_to_bytes(&enter, mode);
+        assert_eq!(bytes, Some(b"\r".to_vec()));
+        // 反 CSI u 断言：绝不是 CSI 13;u 形态
+        assert_ne!(bytes, Some(b"\x1b[13u".to_vec()));
+
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("tab").unwrap(), mode),
+            Some(b"\t".to_vec())
+        );
+        assert_ne!(
+            keystroke_to_bytes(&Keystroke::parse("tab").unwrap(), mode),
+            Some(b"\x1b[9u".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("backspace").unwrap(), mode),
+            Some(b"\x7f".to_vec())
+        );
+        assert_ne!(
+            keystroke_to_bytes(&Keystroke::parse("backspace").unwrap(), mode),
+            Some(b"\x1b[127u".to_vec())
+        );
+
+        // 带修饰同样不转：ctrl+enter / shift+tab 都维持 legacy 形态
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("ctrl-enter").unwrap(), mode),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("shift-tab").unwrap(), mode),
+            Some(b"\x1b[Z".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_disambiguate_esc_and_modified_text_keys() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        // Esc：孤 ESC 的消歧是本层本义（无修饰也转 CSI 27u）
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("escape").unwrap(), mode),
+            Some(b"\x1b[27u".to_vec())
+        );
+        // 规范列举的四组合（mods 位 shift=1/alt=2/ctrl=4，参数 = 掩码+1）
+        let cases = [
+            ("alt-a", &b"\x1b[97;3u"[..]),
+            ("ctrl-a", &b"\x1b[97;5u"[..]),
+            ("ctrl-alt-a", &b"\x1b[97;7u"[..]),
+            ("shift-alt-a", &b"\x1b[97;4u"[..]),
+            ("ctrl-1", &b"\x1b[49;5u"[..]),
+            // space 是文本键（codepoint 32）：ctrl+space 不再是 legacy NUL
+            ("ctrl-space", &b"\x1b[32;5u"[..]),
+            ("alt-space", &b"\x1b[32;3u"[..]),
+        ];
+        for (key, expected) in cases {
+            let keystroke = Keystroke::parse(key).unwrap();
+            assert_eq!(
+                keystroke_to_bytes(&keystroke, mode),
+                Some(expected.to_vec()),
+                "{key} 应按 disambiguate 编码"
+            );
+        }
+        // 码点取布局层小写键（shift 进 mods 不进码点），钉死不过度 CSI u 化
+        assert_ne!(
+            keystroke_to_bytes(&Keystroke::parse("shift-alt-a").unwrap(), mode),
+            Some(b"\x1b[65;4u".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_function_keys_use_legacy_modifier_form() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        // 带 ctrl/alt 的功能键走 legacy 修饰形式（非 CSI u 化）
+        let cases = [
+            ("ctrl-left", &b"\x1b[1;5D"[..]),
+            ("ctrl-shift-left", &b"\x1b[1;6D"[..]),
+            ("alt-up", &b"\x1b[1;3A"[..]),
+            ("ctrl-right", &b"\x1b[1;5C"[..]),
+            ("ctrl-home", &b"\x1b[1;5H"[..]),
+            ("alt-end", &b"\x1b[1;3F"[..]),
+            ("ctrl-delete", &b"\x1b[3;5~"[..]),
+            ("ctrl-pageup", &b"\x1b[5;5~"[..]),
+            ("ctrl-f5", &b"\x1b[15;5~"[..]),
+            ("alt-f1", &b"\x1b[1;3P"[..]),
+            ("ctrl-f12", &b"\x1b[24;5~"[..]),
+        ];
+        for (key, expected) in cases {
+            let keystroke = Keystroke::parse(key).unwrap();
+            assert_eq!(
+                keystroke_to_bytes(&keystroke, mode),
+                Some(expected.to_vec()),
+                "{key} 应走 legacy 修饰形式"
+            );
+        }
+        // 反 CSI u 断言：ctrl+Left 绝不是「左方向码点 CSI u」形态
+        let ctrl_left = keystroke_to_bytes(&Keystroke::parse("ctrl-left").unwrap(), mode);
+        assert_eq!(ctrl_left, Some(b"\x1b[1;5D".to_vec()));
+        assert_ne!(ctrl_left, Some(b"\x1b[109;5D".to_vec()));
+        assert_ne!(ctrl_left, Some(b"\x1b[109;5u".to_vec()));
+    }
+
+    #[test]
+    fn kitty_disambiguate_unlisted_combos_stay_legacy() {
+        let mode = TermMode::DISAMBIGUATE_ESC_CODES;
+
+        // 无修饰键维持现路径（legacy / key_char）
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("a").unwrap(), mode),
+            Some(b"a".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("up").unwrap(), mode),
+            Some(b"\x1b[A".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("f5").unwrap(), mode),
+            Some(b"\x1b[15~".to_vec())
+        );
+        // APP_CURSOR 的 SS3 形态不被 kitty 层劫持
+        let app_mode = mode | TermMode::APP_CURSOR;
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("up").unwrap(), app_mode),
+            Some(b"\x1bOA".to_vec())
+        );
+        // ctrl+shift 与三修饰组合不在规范列举内 → legacy 字节
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("ctrl-shift-a").unwrap(), mode),
+            Some(vec![0x01])
+        );
+        // 仅 shift 不触发功能键修饰形式（口径：带 ctrl/alt 才走）
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("shift-up").unwrap(), mode),
+            Some(b"\x1b[A".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_off_keeps_zero_behavior_change() {
+        // 协议未协商（默认）：一切走 legacy——ctrl+方向 仍被丢弃（现状），
+        // alt+a 仍是 ESC 前缀形态；与 input.rs 历史行为逐字节一致
+        let mode = TermMode::empty();
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("ctrl-left").unwrap(), mode),
+            None
+        );
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("alt-a").unwrap(), mode),
+            Some(b"\x1ba".to_vec())
+        );
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("escape").unwrap(), mode),
+            Some(b"\x1b".to_vec())
+        );
+        // 更高 flags 置位：本端仍按 disambiguate 层语义编码（已知不完整
+        // 支持，见 kitty_disambiguate_bytes 注记），不回退纯 legacy
+        let higher = TermMode::DISAMBIGUATE_ESC_CODES
+            | TermMode::REPORT_ALL_KEYS_AS_ESC
+            | TermMode::REPORT_EVENT_TYPES;
+        assert_eq!(
+            keystroke_to_bytes(&Keystroke::parse("ctrl-left").unwrap(), higher),
+            Some(b"\x1b[1;5D".to_vec())
+        );
     }
 }

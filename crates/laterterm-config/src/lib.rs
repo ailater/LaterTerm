@@ -232,6 +232,21 @@ pub struct Appearance {
     #[serde(default)]
     pub session_logging: bool,
 
+    /// kitty keyboard protocol 支持开关（CSI > 1u / CSI ? u 协商）。默认
+    /// 关闭：本端编码表是手写风险面，未经真实应用（fish/tmux）验证前不
+    /// 默认开启；开启后应用经查询自动启用 disambiguate 层编码（Esc 与
+    /// 修饰文本键转 CSI u）。
+    #[serde(default)]
+    pub kitty_keyboard: bool,
+
+    /// Shell 集成（OSC 133 提示符标记 + OSC 7 cwd）：对本地 bash 会话经环境
+    /// 变量注入 PROMPT_COMMAND/PS0 钩子（laterterm-local
+    /// `shell_integration_env`）。默认开启——只影响 LaterTerm 内新开的本地
+    /// bash 会话，零 rc 文件改动；best-effort：用户 ~/.bashrc 重赋值这两个
+    /// 变量即静默失效（设置面板有提示文案，README 有 zsh/fish 自装片段）。
+    #[serde(default = "default_true")]
+    pub shell_integration: bool,
+
     /// 右侧工具面板是否图钉固定。默认固定（占布局宽度常驻）；
     /// 取消固定后转为悬浮自动隐藏（点终端收起，快捷键/标题栏按钮唤出）。
     #[serde(default = "default_true")]
@@ -281,6 +296,8 @@ impl Default for Appearance {
             confirm_close_running: true,
             bell_notification: false,
             session_logging: false,
+            kitty_keyboard: false,
+            shell_integration: true,
             right_panel_pinned: true,
             background_opacity: 1.0,
             background_blur: false,
@@ -788,6 +805,22 @@ mod tests {
             normalize_shortcut("  Ctrl + Shift + Z  ").unwrap(),
             "ctrl+shift+z"
         );
+    }
+
+    /// shell_integration：旧配置缺字段自动得 true（serde default），显式
+    /// false 保存往返不丢。
+    #[test]
+    fn shell_integration_defaults_on_and_roundtrips() {
+        let settings: Settings = toml::from_str("[appearance]\nfont_size = 14.0\n").unwrap();
+        assert!(
+            settings.appearance.shell_integration,
+            "旧配置缺字段 = 默认开"
+        );
+        let settings: Settings =
+            toml::from_str("[appearance]\nshell_integration = false\n").unwrap();
+        assert!(!settings.appearance.shell_integration);
+        let saved = toml::to_string_pretty(&settings).unwrap();
+        assert_eq!(toml::from_str::<Settings>(&saved).unwrap(), settings);
     }
 
     #[test]

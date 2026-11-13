@@ -684,6 +684,56 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
                     |s: &mut Appearance, value| s.bell_notification = value,
                 ),
             ))
+            .child(setting_row(
+                // bash 提示符集成（OSC 133/7）：经环境注入 PROMPT_COMMAND/PS0，
+                // 只对新开的本地 bash 会话生效；best-effort——用户 .bashrc
+                // 重赋值这两个变量即静默失效（zsh/fish 自装片段见 README）
+                "Shell 集成",
+                div(),
+                // 开关旁提示文案（行内追加，不占独立行）
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(toggle_controls(
+                        cx,
+                        ("开", true),
+                        ("关", false),
+                        appearance.shell_integration,
+                        |s: &mut Appearance, value| s.shell_integration = value,
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(COLOR_TEXT_MUTED))
+                            .child("仅 bash（提示符跳转/失败标记）"),
+                    ),
+            ))
+            .child(setting_row(
+                // kitty keyboard protocol（CSI > 1u / CSI ? u 协商）：默认关
+                // ——手写编码面未经真实应用验证前不默认开启
+                "kitty 键盘协议",
+                div(),
+                // 开关旁提示文案：开启只是「允许」应用协商，应用经 ?u 查询
+                // 自动启用（fish 4+/tmux 等会主动查）
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(toggle_controls(
+                        cx,
+                        ("开", true),
+                        ("关", false),
+                        appearance.kitty_keyboard,
+                        |s: &mut Appearance, value| s.kitty_keyboard = value,
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(COLOR_TEXT_MUTED))
+                            .child("开启后应用经 ?u 查询自动启用"),
+                    ),
+            ))
             .child(
                 div()
                     .flex()

@@ -109,6 +109,21 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 > 收掉预览还原已保存主题——LaterScreen discard 语义移植，其余设置仍即时保存。门禁：
 > app bins 137 通过 1 ignored（+5：色板纯函数 1 测 + 应用-恢复/提交落盘/缺失回退/
 > 恢复默认早退 4 测）。
+> 终端协议批次（feat/terminal-protocols 分支）：OSC 133 提示符标记（跳转/失败红点）、
+> OSC 7 cwd 继承、OSC 9·777 通知与 ConEmu 9;4 进度经 vte 旁路解析器落地；同批修复
+> `Event::PtyWrite` 静默丢弃——DECRQM/DECRPM/DA 等能力查询应答首次可达应用（Term
+> 权威生成应答，验收时开关开启后跑一次 vim/htop 确认无异常）。kitty keyboard
+> protocol v1 只做 disambiguate 层编码（Enter/Tab/Backspace 恒 legacy 安全阀、
+> Esc 与四组合修饰文本键 CSI u、功能键带 ctrl/alt 补 legacy 修饰形式），**更高
+> flags（REPORT_ALL_KEYS_AS_ESC/REPORT_EVENT_TYPES/REPORT_ASSOCIATED_TEXT/
+> REPORT_ALTERNATE_KEYS）已知不完整支持**：Term 端照收置位、本端编码仍停留
+> disambiguate 语义，全键上报/事件类型/关联文本/备选键不做（input.rs
+> kitty_disambiguate_bytes 注记同源）；编码表为唯一手写风险面，未经真实应用
+> （fish/tmux）验证前 kitty_keyboard 默认 false，设置面板显式开启。
+> SGR 4:0~4:5 下划线与 58/59 彩色下划线渲染：直线/波浪走字形路径，双线/
+> 点线/虚线按 run 画 quad，颜色缺省回退前景色（render.rs）。像素层不自动化，
+> 手动验收 `printf '\e[4:1m单线 \e[4:2m双线 \e[4:3m波浪 \e[4:4m点线 \e[4:5m虚线\e[4:0m\n'`
+> 与 `printf '\e[4:3;58;2;255;0;0m红色波浪 \e[59m前景色波浪\e[4:0m\n'` 待实机。
 
 **验收**：拔掉原终端用一整天无不适；IME/搜索/分屏在 4K 缩放下不糊不跳。
 

@@ -351,6 +351,86 @@ pub fn cursor_rect(
     }
 }
 
+/// 特殊下划线（双线/点线/虚线）的 quad 矩形序列（纯函数，无窗口依赖可测）。
+///
+/// - 线厚统一取 `t = (cell_height * 0.07).max(px(1.0))`（比例先例同
+///   `cursor_rect`：随字体度量缩放，1px 兜底不失真不可见）；
+/// - Double：两条 t 厚横线，中间留 t 间隙（贴行底）；
+/// - Dotted：点段按 cell 宽切分——每格两个点（点/空各 cell 宽的 1/4，
+///   不小于 t 兜底），按 run 宽度截尾；
+/// - Dashed：长段与空比 2:1（段 cell 宽的 1/2、空 1/4），按 run 宽度截尾。
+///
+/// `x`/`width` 为 run 的水平范围，`row_bottom` 为行底 y（覆盖层向上生长）。
+pub fn special_underline_quads(
+    kind: UnderlineKind,
+    x: Pixels,
+    row_bottom: Pixels,
+    width: Pixels,
+    cell_width: Pixels,
+    cell_height: Pixels,
+) -> Vec<Bounds<Pixels>> {
+    let t = (cell_height * 0.07).max(px(1.0));
+    // 点/段的水平切分以 cell 宽为参照（每格两点/一段的节奏），1px 兜底
+    let dot = (cell_width * 0.25).max(t);
+    let dash = (cell_width * 0.5).max(t * 2.0);
+    let mut rects = Vec::new();
+    match kind {
+        UnderlineKind::Double => {
+            // 两条 t 厚横线：上线 [bottom-3t, bottom-2t]、下线 [bottom-t, bottom]
+            for offset in [2.0, 0.0] {
+                rects.push(Bounds {
+                    origin: Point {
+                        x,
+                        y: row_bottom - t * offset - t,
+                    },
+                    size: Size { width, height: t },
+                });
+            }
+        }
+        UnderlineKind::Dotted => {
+            // 点/空各 dot 宽交替，按 run 宽度截尾
+            let mut cursor = x;
+            let end = x + width;
+            while cursor < end {
+                let dot_width = (end - cursor).min(dot);
+                rects.push(Bounds {
+                    origin: Point {
+                        x: cursor,
+                        y: row_bottom - t,
+                    },
+                    size: Size {
+                        width: dot_width,
+                        height: t,
+                    },
+                });
+                cursor = cursor + dot + dot;
+            }
+        }
+        UnderlineKind::Dashed => {
+            // 段 dash、空 dash/2（2:1），按 run 宽度截尾
+            let mut cursor = x;
+            let end = x + width;
+            while cursor < end {
+                let dash_width = (end - cursor).min(dash);
+                rects.push(Bounds {
+                    origin: Point {
+                        x: cursor,
+                        y: row_bottom - t,
+                    },
+                    size: Size {
+                        width: dash_width,
+                        height: t,
+                    },
+                });
+                cursor = cursor + dash + dash / 2.0;
+            }
+        }
+        // 直线/波浪/无：不走 quad 路径
+        UnderlineKind::None | UnderlineKind::Straight | UnderlineKind::Wavy => {}
+    }
+    rects
+}
+
 /// A batched run of text with consistent styling.
 ///
 /// This struct groups adjacent terminal cells with identical visual attributes
@@ -381,8 +461,32 @@ pub struct BatchedTextRun {
     /// Italic flag
     pub italic: bool,
 
-    /// Underline flag
-    pub underline: bool,
+    /// 下划线样式（SGR 4:0~4:5，含彩色下划线颜色）
+    pub underline: UnderlineKind,
+
+    /// 下划线颜色（SGR 58 指定；None = 回退前景色）
+    pub underline_color: Option<Hsla>,
+}
+
+/// 下划线样式（SGR 4:0~4:5）。渲染路径分两档：
+/// - Straight/Wavy：gpui `TextRun.underline` 字形下划线（GPU Underline
+///   primitive 原生渲染，wavy 开波浪），零额外 quad；
+/// - Double/Dotted/Dashed：gpui 无原生样式，走逐帧 quad 覆盖层
+///   （quad 数与 run 数成正比而非逐格，正常 TUI 输出 4:x 罕见）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnderlineKind {
+    /// 无下划线（SGR 4:0 / 未设置）。
+    None,
+    /// 单直线（SGR 4:1）。
+    Straight,
+    /// 双线（SGR 4:2）。
+    Double,
+    /// 波浪线（SGR 4:3）。
+    Wavy,
+    /// 点线（SGR 4:4）。
+    Dotted,
+    /// 虚线（SGR 4:5，2:1 长段）。
+    Dashed,
 }
 
 /// Background rectangle to paint.
@@ -677,7 +781,26 @@ impl TerminalRenderer {
             let bg_color = self.palette.resolve(cell.bg, colors);
             let bold = cell.flags.contains(Flags::BOLD);
             let italic = cell.flags.contains(Flags::ITALIC);
-            let underline = cell.flags.contains(Flags::UNDERLINE);
+            // SGR 4:0~4:5 五种下划线形态（bitflags 并存时按直线优先的固定
+            // 序取首个；SGR 语义一次只置一种）
+            let underline = if cell.flags.contains(Flags::UNDERLINE) {
+                UnderlineKind::Straight
+            } else if cell.flags.contains(Flags::DOUBLE_UNDERLINE) {
+                UnderlineKind::Double
+            } else if cell.flags.contains(Flags::UNDERCURL) {
+                UnderlineKind::Wavy
+            } else if cell.flags.contains(Flags::DOTTED_UNDERLINE) {
+                UnderlineKind::Dotted
+            } else if cell.flags.contains(Flags::DASHED_UNDERLINE) {
+                UnderlineKind::Dashed
+            } else {
+                UnderlineKind::None
+            };
+            // 彩色下划线（SGR 58）：resolve 进主题色板；None = 回退前景色
+            //（由绘制侧 unwrap_or(fg_color) 兜底，同 xterm 口径）
+            let underline_color = cell
+                .underline_color()
+                .map(|color| self.palette.resolve(color, colors));
 
             // Get the character (or space if empty)
             let ch = if cell.c == ' ' || cell.c == '\0' {
@@ -733,6 +856,7 @@ impl TerminalRenderer {
                     && run.bold == bold
                     && run.italic == italic
                     && run.underline == underline
+                    && run.underline_color == underline_color
                     && run.end_col == col
                 {
                     // Extend current run
@@ -751,6 +875,7 @@ impl TerminalRenderer {
                         bold,
                         italic,
                         underline,
+                        underline_color,
                     });
                 }
             } else {
@@ -765,6 +890,7 @@ impl TerminalRenderer {
                     bold,
                     italic,
                     underline,
+                    underline_color,
                 });
             }
         }
@@ -1062,20 +1188,27 @@ impl TerminalRenderer {
             // This avoids one rustybuzz/cosmic-text shaping call per cell per pane.
             for run in text_runs {
                 let font = self.font_for(run.bold, run.italic);
+                // 直线/波浪走字形下划线（gpui Underline primitive 原生 GPU
+                // 渲染）；颜色回退前景色（SGR 59 未指定时的 xterm 同款口径）。
+                // Double/Dotted/Dashed 传 None（无原生样式），由下方 quad
+                // 覆盖层绘制，避免字形层再画一条错样式的直线。
+                let underline = match run.underline {
+                    UnderlineKind::Straight | UnderlineKind::Wavy => Some(UnderlineStyle {
+                        thickness: px(1.0),
+                        color: Some(run.underline_color.unwrap_or(run.fg_color)),
+                        wavy: run.underline == UnderlineKind::Wavy,
+                    }),
+                    UnderlineKind::None
+                    | UnderlineKind::Double
+                    | UnderlineKind::Dotted
+                    | UnderlineKind::Dashed => None,
+                };
                 let text_run = TextRun {
                     len: run.text.len(),
                     font,
                     color: run.fg_color,
                     background_color: None,
-                    underline: if run.underline {
-                        Some(UnderlineStyle {
-                            thickness: px(1.0),
-                            color: Some(run.fg_color),
-                            wavy: false,
-                        })
-                    } else {
-                        None
-                    },
+                    underline,
                     strikethrough: None,
                 };
                 let text: SharedString = run.text.into();
@@ -1086,6 +1219,39 @@ impl TerminalRenderer {
                 let x = origin.x + self.cell_width * run.start_col as f32;
                 let y = y_base + vertical_offset;
                 let _ = shaped_line.paint(Point { x, y }, self.cell_height, window, _cx);
+
+                // 双线/点线/虚线：逐帧 quad 覆盖层（与 run 数成正比而非逐格，
+                // 正常 TUI 输出 4:2/4:4/4:5 罕见，性能可控）。不透明度单点
+                // 与背景层同口径。
+                match run.underline {
+                    UnderlineKind::Double | UnderlineKind::Dotted | UnderlineKind::Dashed => {
+                        let run_x = origin.x + self.cell_width * (run.start_col as f32);
+                        let width = self.cell_width * ((run.end_col - run.start_col) as f32);
+                        // 行底（含滚动偏移）：与背景层同一 y 口径
+                        let row_bottom =
+                            origin.y + self.cell_height * (line_idx as f32 + scroll_offset + 1.0);
+                        for rect_bounds in special_underline_quads(
+                            run.underline,
+                            run_x,
+                            row_bottom,
+                            width,
+                            self.cell_width,
+                            self.cell_height,
+                        ) {
+                            window.paint_quad(quad(
+                                rect_bounds,
+                                px(0.0),
+                                run.underline_color
+                                    .unwrap_or(run.fg_color)
+                                    .opacity(self.background_opacity),
+                                Edges::<Pixels>::default(),
+                                transparent_black(),
+                                Default::default(),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
 
@@ -1263,7 +1429,7 @@ mod tests {
         use std::sync::mpsc::channel;
 
         let (tx, _rx) = channel();
-        let mut terminal = TerminalState::new(20, 4, 32, GpuiEventProxy::new(tx));
+        let mut terminal = TerminalState::new(20, 4, 32, false, GpuiEventProxy::new(tx));
         // OSC 4 调色板覆盖（colors 非默认）+ 宽字符行 + SGR 加粗红样式行
         terminal.process_bytes(b"\x1b]4;1;rgb:ff/00/00\x1b\\");
         terminal.process_bytes("首行中文\r\n".as_bytes());
@@ -1558,6 +1724,171 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].start_col, 0);
         assert_eq!(merged[0].end_col, 10);
+    }
+
+    // ───────── 下划线（SGR 4:0~4:5 + 彩色下划线） ─────────
+
+    /// 构造带指定样式的一行 cells（便于 layout_row 分 run 断言）。
+    fn underline_cells(specs: &[(usize, char, Flags)]) -> Vec<Cell> {
+        let mut cells = vec![Cell::default(); 12];
+        for &(col, ch, flags) in specs {
+            cells[col].c = ch;
+            cells[col].flags = flags;
+        }
+        cells
+    }
+
+    #[test]
+    fn layout_row_splits_runs_by_underline_style() {
+        let renderer = TerminalRenderer::new(
+            "monospace".to_string(),
+            px(14.0),
+            1.0,
+            ColorPalette::default(),
+            true,
+            Vec::new(),
+            CursorStyle::Block,
+        );
+        let colors = Colors::default();
+        let default_bg = renderer.palette.resolve(
+            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background),
+            &colors,
+        );
+
+        // 同色三段：直线 → 点线 → 无下划线。样式变化必须分裂 run
+        //（点线走 quad 覆盖层、直线走字形路径，混入同一 run 会错样式）
+        let cells = underline_cells(&[
+            (0, 'a', Flags::UNDERLINE),
+            (1, 'b', Flags::UNDERLINE),
+            (2, 'c', Flags::DOTTED_UNDERLINE),
+            (3, 'd', Flags::DOTTED_UNDERLINE),
+            (4, 'e', Flags::empty()),
+            (5, 'f', Flags::empty()),
+        ]);
+        let (_, runs) = renderer.layout_row(0, cells.iter().enumerate(), &colors, default_bg);
+        assert_eq!(runs.len(), 3, "样式三段应分裂为三个 run: {runs:?}");
+        assert_eq!(runs[0].underline, UnderlineKind::Straight);
+        assert_eq!(runs[0].start_col, 0);
+        assert_eq!(runs[0].end_col, 2);
+        assert_eq!(runs[1].underline, UnderlineKind::Dotted);
+        assert_eq!(runs[1].start_col, 2);
+        assert_eq!(runs[1].end_col, 4);
+        assert_eq!(runs[2].underline, UnderlineKind::None);
+        assert_eq!(runs[2].start_col, 4);
+        assert_eq!(runs[2].end_col, 6);
+
+        // 双线/波浪/虚线各自成段（键覆盖全部 UnderlineKind）
+        let cells = underline_cells(&[
+            (0, 'a', Flags::DOUBLE_UNDERLINE),
+            (1, 'b', Flags::UNDERCURL),
+            (2, 'c', Flags::DASHED_UNDERLINE),
+        ]);
+        let (_, runs) = renderer.layout_row(0, cells.iter().enumerate(), &colors, default_bg);
+        assert_eq!(runs.len(), 3, "三异样式应三 run: {runs:?}");
+        assert_eq!(runs[0].underline, UnderlineKind::Double);
+        assert_eq!(runs[1].underline, UnderlineKind::Wavy);
+        assert_eq!(runs[2].underline, UnderlineKind::Dashed);
+    }
+
+    #[test]
+    fn layout_row_splits_runs_by_underline_color() {
+        let renderer = TerminalRenderer::new(
+            "monospace".to_string(),
+            px(14.0),
+            1.0,
+            ColorPalette::default(),
+            true,
+            Vec::new(),
+            CursorStyle::Block,
+        );
+        let colors = Colors::default();
+        let default_bg = renderer.palette.resolve(
+            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background),
+            &colors,
+        );
+
+        // 同为直线但 SGR 58 颜色从红变蓝：颜色变化必须分裂 run
+        let mut cells = vec![Cell::default(); 4];
+        cells[0].c = 'a';
+        cells[0].flags = Flags::UNDERLINE;
+        cells[0].set_underline_color(Some(Color::Named(
+            alacritty_terminal::vte::ansi::NamedColor::Red,
+        )));
+        cells[1].c = 'b';
+        cells[1].flags = Flags::UNDERLINE;
+        cells[1].set_underline_color(Some(Color::Named(
+            alacritty_terminal::vte::ansi::NamedColor::Red,
+        )));
+        cells[2].c = 'c';
+        cells[2].flags = Flags::UNDERLINE;
+        cells[2].set_underline_color(Some(Color::Named(
+            alacritty_terminal::vte::ansi::NamedColor::Blue,
+        )));
+        cells[3].c = 'd';
+        cells[3].flags = Flags::UNDERLINE;
+        let (_, runs) = renderer.layout_row(0, cells.iter().enumerate(), &colors, default_bg);
+        assert_eq!(runs.len(), 3, "颜色红/蓝/回退三段应三 run: {runs:?}");
+        assert_eq!(runs[0].underline, UnderlineKind::Straight);
+        assert!(runs[0].underline_color.is_some(), "红段带 SGR 58 色");
+        assert_eq!(runs[0].end_col, 2);
+        // 蓝段：颜色变化分裂出的第二段（列 2..3）
+        assert_eq!(runs[1].start_col, 2);
+        assert_ne!(
+            runs[1].underline_color, runs[0].underline_color,
+            "颜色变化必须分裂 run"
+        );
+        // 未指定 SGR 58 的段：None = 绘制侧回退前景色
+        assert_eq!(runs[2].start_col, 3);
+        assert!(runs[2].underline_color.is_none(), "未指定色回退前景色");
+    }
+
+    #[test]
+    fn special_underline_quads_geometry() {
+        let cw = px(10.0);
+        let ch = px(20.0);
+        let x = px(100.0);
+        let bottom = px(50.0);
+        let width = px(30.0); // 3 个 cell
+
+        // 直线/波浪/无：不走 quad 路径（字形路径负责）
+        assert!(special_underline_quads(UnderlineKind::None, x, bottom, width, cw, ch).is_empty());
+        assert!(
+            special_underline_quads(UnderlineKind::Straight, x, bottom, width, cw, ch).is_empty()
+        );
+        assert!(special_underline_quads(UnderlineKind::Wavy, x, bottom, width, cw, ch).is_empty());
+
+        // 双线：恰好两个横条，厚 = (20*0.07).max(1px) = 1.4px，带间隙
+        let double = special_underline_quads(UnderlineKind::Double, x, bottom, width, cw, ch);
+        assert_eq!(double.len(), 2);
+        let t = px(1.4);
+        for rect in &double {
+            assert_eq!(rect.size.width, width, "双线横条横跨整个 run");
+            assert_eq!(rect.size.height, t);
+        }
+        // 上线 [bottom-3t, bottom-2t]、下线 [bottom-t, bottom]，间隙 t
+        assert_eq!(double[0].origin.y, bottom - t * 3.0);
+        assert_eq!(double[1].origin.y, bottom - t);
+
+        // 点线：每格两点（点/空各 cell 宽 1/4 = 2.5px），3 格宽 30px →
+        // 点在 0/5/10/15/20/25 → 6 个点（最后一点截到 run 尾）
+        let dotted = special_underline_quads(UnderlineKind::Dotted, x, bottom, width, cw, ch);
+        assert_eq!(dotted.len(), 6, "3 格宽 30px 应有 6 个点: {dotted:?}");
+        assert_eq!(dotted[0].origin.x, x);
+        assert_eq!(dotted[1].origin.x, x + px(5.0));
+        assert_eq!(dotted[0].size.width, px(2.5));
+        assert_eq!(dotted[0].size.height, t, "点高 = 线厚");
+
+        // 虚线：段 cell 宽 1/2（5px）、空 1/4（2.5px），2:1 比例，
+        // 30px = 4 个完整周期 → 段 0/7.5/15/22.5，末段完整 5px（格节奏
+        // 优先于贴尾：尾随 2.5px 空隙属正常点线/虚线观感）
+        let dashed = special_underline_quads(UnderlineKind::Dashed, x, bottom, width, cw, ch);
+        assert_eq!(dashed.len(), 4, "3 格宽 30px 应有 4 个长段: {dashed:?}");
+        assert_eq!(dashed[0].origin.x, x);
+        assert_eq!(dashed[1].origin.x, x + px(7.5));
+        assert_eq!(dashed[0].size.width, px(5.0));
+        let last = dashed.last().unwrap();
+        assert_eq!(last.origin.x, x + px(22.5));
+        assert_eq!(last.size.width, px(5.0));
     }
 
     #[test]
