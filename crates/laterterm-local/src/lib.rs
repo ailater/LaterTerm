@@ -91,13 +91,23 @@ pub struct LocalOptions {
     pub rows: u16,
 }
 
-/// bash 提示符集成钩子（OSC 133 D/A + OSC 7 cwd），追加进 `PROMPT_COMMAND`：
+/// bash 提示符集成钩子（OSC 133 D/A + OSC 7 cwd），前置进 `PROMPT_COMMAND`：
 /// 每次显示提示符前依次发送——上一命令退出码（D）、新提示符开始（A）、
 /// 当前目录（OSC 7，`file://` + `$PWD`，空 host + 绝对路径）。
-/// `$?`/`$PWD` 保持字面：环境变量赋值不经展开，执行时才由 bash 求值。
-const BASH_PROMPT_COMMAND_HOOK: &str = "printf '\\033]133;D;%s\\007' \"$?\"; \
+///
+/// `$?` 必须由串内**第一条命令**捕获进 `__laterterm_exit`：PROMPT_COMMAND
+/// 按顺序执行，排在钩子前面的任何命令（用户父钩子/其他集成）都会把 `$?`
+/// 覆盖成自己的退出码，D 就会恒报 0、失败红点静默失灵。因此 D 引用捕获值
+/// 而非直接读 `$?`；末条 `(exit "$__laterterm_exit")` 把用户命令的退出码
+/// 恢复给排在钩子后面的父命令（starship/bash-preexec 类同样依赖 `$?`，
+/// 前置不得破坏它们的语境），钩子独占时也让提示符后的 `$?` 反映上一命令
+/// 而非 printf 的 0。`$PWD` 保持字面：环境变量赋值不经展开，执行时才由
+/// bash 求值。
+const BASH_PROMPT_COMMAND_HOOK: &str = "__laterterm_exit=$?; \
+     printf '\\033]133;D;%s\\007' \"$__laterterm_exit\"; \
      printf '\\033]133;A\\007'; \
-     printf '\\033]7;file://%s\\007' \"$PWD\"";
+     printf '\\033]7;file://%s\\007' \"$PWD\"; \
+     (exit \"$__laterterm_exit\")";
 
 /// 命令开始钩子（OSC 133 C）：bash 在读入命令、执行之前对 `PS0` 做 prompt
 /// 展开——环境继承的 `PS0` 按普通变量取初值，正好用来在输出开始前发 C。
@@ -112,7 +122,9 @@ const BASH_PS0_HOOK: &str = "\\e]133;C\\a";
 /// 自行安装片段见 README）。
 ///
 /// `parent_prompt_command` 为父进程已有的 `PROMPT_COMMAND`：非空时字面拼接
-/// 保底（`原值; 钩子`——bash 以分号顺序执行字符串中的多条命令）。
+/// 保底（`钩子; 原值`——钩子必须在前，串内 `$?` 只对第一条命令有效，见
+/// [`BASH_PROMPT_COMMAND_HOOK`] 注记；钩子末条已恢复退出码现场，父命令
+/// 仍读到用户命令的 `$?`）。
 /// 非 bash 返回空表。
 pub fn shell_integration_env(
     shell: &str,
@@ -122,7 +134,9 @@ pub fn shell_integration_env(
         return Vec::new();
     }
     let prompt_command = match parent_prompt_command.map(str::trim) {
-        Some(parent) if !parent.is_empty() => format!("{parent}; {BASH_PROMPT_COMMAND_HOOK}"),
+        Some(parent) if !parent.is_empty() => {
+            format!("{BASH_PROMPT_COMMAND_HOOK}; {parent}")
+        }
         _ => BASH_PROMPT_COMMAND_HOOK.to_string(),
     };
     vec![
@@ -521,21 +535,30 @@ mod tests {
         assert_eq!(env[1].0, "PS0");
     }
 
-    /// 钩子字符串逐字钉死：$?/$PWD 必须字面保留（执行时才由 bash 求值）、
-    /// PS0 是纯 prompt 转义形态、D/A/C 顺序覆盖 OSC 133 主流程 + OSC 7 cwd。
+    /// 钩子字符串逐字钉死：首条必须捕获 `$?`（串内 `$?` 只对第一条命令
+    /// 有效，见 [`BASH_PROMPT_COMMAND_HOOK`] 注记）、末条恢复现场、$PWD
+    /// 字面保留（执行时才由 bash 求值）、PS0 是纯 prompt 转义形态。
     #[test]
     fn shell_integration_env_hook_strings_are_exact() {
         let env = shell_integration_env("/bin/bash", None);
         assert_eq!(
             env[0].1,
-            "printf '\\033]133;D;%s\\007' \"$?\"; \
+            "__laterterm_exit=$?; \
+             printf '\\033]133;D;%s\\007' \"$__laterterm_exit\"; \
              printf '\\033]133;A\\007'; \
-             printf '\\033]7;file://%s\\007' \"$PWD\""
+             printf '\\033]7;file://%s\\007' \"$PWD\"; \
+             (exit \"$__laterterm_exit\")"
         );
-        // $ 转义边界：注入值里只有字面 $，无任何被展开/转义掉的痕迹
+        // $ 转义边界：捕获必须是第一条命令；D 引用捕获值而非被污染的 $?；
+        // 末条恢复现场，排在钩子后的父命令仍读到用户命令的退出码
         assert!(
-            env[0].1.contains("\"$?\""),
-            "退出码必须是执行期求值: {}",
+            env[0].1.starts_with("__laterterm_exit=$?; "),
+            "退出码捕获必须是第一条命令: {}",
+            env[0].1
+        );
+        assert!(
+            env[0].1.ends_with("(exit \"$__laterterm_exit\")"),
+            "钩子末条必须恢复退出码现场: {}",
             env[0].1
         );
         assert!(
@@ -546,14 +569,19 @@ mod tests {
         assert_eq!(env[1].1, "\\e]133;C\\a", "PS0 走 prompt 转义形态");
     }
 
-    /// 父进程已有 PROMPT_COMMAND 时字面拼接保底（`原值; 钩子`）；空/纯空白
-    /// 父值视同无值，不产生 `; ;` 空命令。
+    /// 父进程已有 PROMPT_COMMAND 时字面拼接保底（`钩子; 原值`——钩子在前
+    /// 才能首条捕获 `$?`）；空/纯空白父值视同无值，不产生 `; ;` 空命令。
     #[test]
     fn shell_integration_env_concatenates_parent_prompt_command() {
         let env = shell_integration_env("/bin/bash", Some("echo before"));
         assert!(
-            env[0].1.starts_with("echo before; "),
-            "父值在前、钩子在后: {}",
+            env[0].1.starts_with("__laterterm_exit=$?; "),
+            "钩子必须在前、首条捕获 $?: {}",
+            env[0].1
+        );
+        assert!(
+            env[0].1.ends_with("; echo before"),
+            "父值在钩子之后（钩子末条已恢复现场）: {}",
             env[0].1
         );
         assert!(env[0].1.contains("133;D"), "钩子本体保留: {}", env[0].1);
@@ -562,11 +590,67 @@ mod tests {
         for parent in ["", "   "] {
             let env = shell_integration_env("/bin/bash", Some(parent));
             assert!(
-                env[0].1.starts_with("printf"),
+                env[0].1.starts_with("__laterterm_exit=$?; "),
                 "空白父值不拼接: {}",
                 env[0].1
             );
         }
+    }
+
+    /// 端到端回归（复审高危）：父 PROMPT_COMMAND 在前时，钩子里的 `$?` 被
+    /// 父命令清零——`false` 之后 D 仍上报 0，失败红点静默失灵。真实交互
+    /// bash + 父值 `true >/dev/null` 钉死「失败命令必须报 D;1」：钩子前置
+    /// + 首条捕获 `$?` 是本测试的存在理由（旧拼接 `父值; 钩子` 在此必红）。
+    #[cfg(unix)]
+    #[test]
+    fn prompt_hook_reports_failed_exit_code_with_parent_prompt_command() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        let session = LocalSession::spawn(LocalOptions {
+            shell: "/bin/bash".into(),
+            // --norc：隔绝用户 rc 重赋值 PROMPT_COMMAND（那是文档写明的
+            // 静默失效边界，不属于本测试）；-i：PROMPT_COMMAND 只在交互
+            // 模式执行
+            args: vec!["--norc".into(), "-i".into()],
+            env: shell_integration_env("/bin/bash", Some("true >/dev/null")),
+            cwd: None,
+            cols: 80,
+            rows: 24,
+        })
+        .expect("spawn 失败");
+        let mut streams = session.take_streams().expect("take_streams");
+        // PTY 缓冲输入：bash 启动完成前写入也不会丢，逐条读入执行
+        streams.writer.write_all(b"false\r").expect("写入 false");
+        streams.writer.write_all(b"exit\r").expect("写入 exit");
+
+        // 轮询读输出直到出现失败退出码或 EOF/超时（时序敏感路径不做固定 sleep）
+        let mut output = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let read = streams.reader.read(&mut chunk).expect("读 PTY");
+            if read == 0 {
+                // EOF：shell 已退出，交给末尾断言裁决
+                break;
+            }
+            output.extend_from_slice(&chunk[..read]);
+            if String::from_utf8_lossy(&output).contains("133;D;1") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "未等到 D;1，实际输出: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("133;D;1"),
+            "`false` 后必须上报 D;1（父值不得污染 $?），实际输出: {text}"
+        );
+
+        session.kill();
     }
 
     #[cfg(unix)]
