@@ -9,7 +9,7 @@ use laterterm_core::{
 };
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -80,10 +80,62 @@ pub struct LocalOptions {
     pub args: Vec<String>,
     /// 额外环境变量（TERM/COLORTERM 由本 crate 注入默认值）。
     pub env: Vec<(String, String)>,
+    /// 子进程初始工作目录（新标签/分屏继承焦点窗格 cwd 的通道，来源为
+    /// OSC 7 上报）；None = 沿用 portable-pty 默认（继承父进程 cwd）。
+    /// 目录不存在时 spawn 直接报错——调用方应传真实存在的目录。
+    pub cwd: Option<PathBuf>,
     /// 初始列数。
     pub cols: u16,
     /// 初始行数。
     pub rows: u16,
+}
+
+/// bash 提示符集成钩子（OSC 133 D/A + OSC 7 cwd），追加进 `PROMPT_COMMAND`：
+/// 每次显示提示符前依次发送——上一命令退出码（D）、新提示符开始（A）、
+/// 当前目录（OSC 7，`file://` + `$PWD`，空 host + 绝对路径）。
+/// `$?`/`$PWD` 保持字面：环境变量赋值不经展开，执行时才由 bash 求值。
+const BASH_PROMPT_COMMAND_HOOK: &str = "printf '\\033]133;D;%s\\007' \"$?\"; \
+     printf '\\033]133;A\\007'; \
+     printf '\\033]7;file://%s\\007' \"$PWD\"";
+
+/// 命令开始钩子（OSC 133 C）：bash 在读入命令、执行之前对 `PS0` 做 prompt
+/// 展开——环境继承的 `PS0` 按普通变量取初值，正好用来在输出开始前发 C。
+const BASH_PS0_HOOK: &str = "\\e]133;C\\a";
+
+/// bash 发起端最小注入（v1，best-effort）。
+///
+/// 经 `LocalOptions.env` 注入 `PROMPT_COMMAND`/`PS0`：bash 对环境继承的这两个
+/// 变量按普通变量取初值，零 rc 文件改动、随 PTY 子进程生灭无残留。**边界**：
+/// 用户 `~/.bashrc` 自行重赋值 `PROMPT_COMMAND`/`PS0` 会覆盖注入，功能静默
+/// 失效；zsh/fish 不注入（kitty 式 ZDOTDIR/XDG_DATA_DIRS 接管属 v1 过度设计，
+/// 自行安装片段见 README）。
+///
+/// `parent_prompt_command` 为父进程已有的 `PROMPT_COMMAND`：非空时字面拼接
+/// 保底（`原值; 钩子`——bash 以分号顺序执行字符串中的多条命令）。
+/// 非 bash 返回空表。
+pub fn shell_integration_env(
+    shell: &str,
+    parent_prompt_command: Option<&str>,
+) -> Vec<(String, String)> {
+    if !is_bash(shell) {
+        return Vec::new();
+    }
+    let prompt_command = match parent_prompt_command.map(str::trim) {
+        Some(parent) if !parent.is_empty() => format!("{parent}; {BASH_PROMPT_COMMAND_HOOK}"),
+        _ => BASH_PROMPT_COMMAND_HOOK.to_string(),
+    };
+    vec![
+        ("PROMPT_COMMAND".to_owned(), prompt_command),
+        ("PS0".to_owned(), BASH_PS0_HOOK.to_owned()),
+    ]
+}
+
+/// bash 判定：取路径最后一段与 `bash` 精确比较（覆盖 /bin/bash、
+/// /usr/local/bin/bash 等安装位置；`resolve_shell` 已保证无引号/控制字符）。
+fn is_bash(shell: &str) -> bool {
+    Path::new(shell)
+        .file_name()
+        .is_some_and(|name| name == "bash")
 }
 
 /// 本地 PTY 会话。
@@ -122,6 +174,11 @@ impl LocalSession {
         command.env("COLORTERM", "truecolor");
         for (key, value) in &options.env {
             command.env(key, value);
+        }
+        if let Some(dir) = &options.cwd {
+            // 初始工作目录（cwd 继承）：portable-pty 会在 spawn 期 chdir，
+            // 目录不存在时 spawn_command 直接报错
+            command.cwd(dir);
         }
         let mut child = pair
             .slave
@@ -445,6 +502,72 @@ mod tests {
         );
     }
 
+    // ───────── shell 集成环境注入（v1 bash best-effort） ─────────
+
+    /// 非 bash 不注入（zsh/fish/sh/dash 全部落空；kitty 式接管属 v1 过度设计）。
+    #[test]
+    fn shell_integration_env_only_targets_bash() {
+        for shell in ["/usr/bin/zsh", "/bin/sh", "/bin/dash", "/usr/bin/fish", ""] {
+            assert!(
+                shell_integration_env(shell, None).is_empty(),
+                "{shell} 不应注入"
+            );
+        }
+        // 任意安装位置的 bash 都认（按文件名最后一段判定）
+        let env = shell_integration_env("/usr/local/bin/bash", None);
+        assert_eq!(env.len(), 2);
+        assert_eq!(env[0].0, "PROMPT_COMMAND");
+        assert_eq!(env[1].0, "PS0");
+    }
+
+    /// 钩子字符串逐字钉死：$?/$PWD 必须字面保留（执行时才由 bash 求值）、
+    /// PS0 是纯 prompt 转义形态、D/A/C 顺序覆盖 OSC 133 主流程 + OSC 7 cwd。
+    #[test]
+    fn shell_integration_env_hook_strings_are_exact() {
+        let env = shell_integration_env("/bin/bash", None);
+        assert_eq!(
+            env[0].1,
+            "printf '\\033]133;D;%s\\007' \"$?\"; \
+             printf '\\033]133;A\\007'; \
+             printf '\\033]7;file://%s\\007' \"$PWD\""
+        );
+        // $ 转义边界：注入值里只有字面 $，无任何被展开/转义掉的痕迹
+        assert!(
+            env[0].1.contains("\"$?\""),
+            "退出码必须是执行期求值: {}",
+            env[0].1
+        );
+        assert!(
+            env[0].1.contains("\"$PWD\""),
+            "cwd 必须是执行期求值: {}",
+            env[0].1
+        );
+        assert_eq!(env[1].1, "\\e]133;C\\a", "PS0 走 prompt 转义形态");
+    }
+
+    /// 父进程已有 PROMPT_COMMAND 时字面拼接保底（`原值; 钩子`）；空/纯空白
+    /// 父值视同无值，不产生 `; ;` 空命令。
+    #[test]
+    fn shell_integration_env_concatenates_parent_prompt_command() {
+        let env = shell_integration_env("/bin/bash", Some("echo before"));
+        assert!(
+            env[0].1.starts_with("echo before; "),
+            "父值在前、钩子在后: {}",
+            env[0].1
+        );
+        assert!(env[0].1.contains("133;D"), "钩子本体保留: {}", env[0].1);
+        assert_eq!(env[1].1, "\\e]133;C\\a", "PS0 不受父值影响");
+
+        for parent in ["", "   "] {
+            let env = shell_integration_env("/bin/bash", Some(parent));
+            assert!(
+                env[0].1.starts_with("printf"),
+                "空白父值不拼接: {}",
+                env[0].1
+            );
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn default_shell_rejects_invalid_values() {
@@ -478,6 +601,7 @@ mod tests {
             shell: shell_path(),
             args: shell_args(echo_command()),
             env: vec![],
+            cwd: None,
             cols: 20,
             rows: 5,
         })
@@ -501,6 +625,7 @@ mod tests {
             shell: shell_path(),
             args: shell_args(long_command()),
             env: vec![],
+            cwd: None,
             cols: 20,
             rows: 5,
         })
@@ -512,6 +637,48 @@ mod tests {
 
         session.kill();
         session.kill(); // 幂等：二次调用不应 panic
+    }
+
+    /// cwd 字段生效：spawn 传入初始目录，shell 的 `pwd` 应落在该目录
+    ///（新标签/分屏继承焦点窗格 cwd 的通道）。目录名带空格与中文，
+    /// 钉「路径原样透传、不经 shell 再解析」的口径。
+    #[cfg(unix)]
+    #[test]
+    fn cwd_option_sets_initial_working_directory() {
+        // 无 tempfile 依赖：temp_dir 下按 pid 建唯一子目录，测试尾清理。
+        // canonicalize 对齐内核 chdir 后的物理路径（temp_dir 可能含符号链接，
+        // shell pwd 打印的是 getcwd 的规范路径）
+        let dir = std::env::temp_dir().join(format!(
+            "laterterm-cwd-test-{}-{}",
+            std::process::id(),
+            "中文 目录"
+        ));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let dir = std::fs::canonicalize(&dir).expect("规范化临时目录");
+        let session = LocalSession::spawn(LocalOptions {
+            shell: shell_path(),
+            args: shell_args("pwd"),
+            env: vec![],
+            cwd: Some(dir.clone()),
+            cols: 20,
+            rows: 5,
+        })
+        .expect("spawn 失败");
+
+        let mut streams = session.take_streams().expect("take_streams");
+        let mut output = String::new();
+        streams
+            .reader
+            .read_to_string(&mut output)
+            .expect("读到 EOF");
+        assert_eq!(
+            output.trim_end(),
+            dir.to_str().expect("临时目录应为 UTF-8"),
+            "pwd 应落在传入的初始目录（含空格与中文）"
+        );
+
+        session.kill();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 关闭确认探测（三级判据）。真实 PTY 时序敏感（shell exec 完成前后
@@ -570,6 +737,7 @@ mod tests {
                 shell: "/bin/sh".into(),
                 args: args.iter().map(|a| (*a).to_string()).collect(),
                 env: vec![],
+                cwd: None,
                 cols: 20,
                 rows: 5,
             })

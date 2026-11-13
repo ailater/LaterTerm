@@ -24,8 +24,9 @@
 //! | `Event::Exit` | `Exit` | Terminal exited |
 //! | `Event::ChildExit(_)` | `Exit` | Child process exited |
 //! | `Event::ResetTitle` | `Title("")` | Reset to empty title |
+//! | `Event::PtyWrite(_)` | `PtyWrite(String)` | 应用侧查询应答（kitty ?u / DECRQM / DA），视图写回 PTY |
 //!
-//! Events like `MouseCursorDirty`, `PtyWrite`, and `CursorBlinkingChange` are
+//! Events like `MouseCursorDirty` and `CursorBlinkingChange` are
 //! ignored as they're handled internally or not needed for GPUI integration.
 //!
 //! # Example
@@ -69,6 +70,21 @@ pub enum TerminalEvent {
 
     /// The terminal process has exited.
     Exit,
+
+    /// 桌面通知请求（OSC 9 / OSC 777）。由旁路解析器产出，经 TerminalState
+    /// 注入此通道；process_events 按 bell_notification 门控外发。
+    DesktopNotice {
+        /// 通知标题（OSC 777 携带；OSC 9 无标题时用空串，展示层填默认）。
+        title: String,
+        /// 通知正文（不可信输入，发送前需引号转义 + 长度截断）。
+        body: String,
+    },
+
+    /// 应用发往终端（宿主）的应答写入（alacritty `Event::PtyWrite` 转发）：
+    /// kitty 协议 `?u` 查询应答、DECRQM/DECRPM、DA 等终端能力查询的结果。
+    /// 此前被静默丢弃，这一整类查询无人应答；应答文本由 Term 权威生成，
+    /// 视图收到后直接写回本端 PTY（不经 commit_input，避免混入广播）。
+    PtyWrite(String),
 }
 
 /// An event proxy that implements alacritty's EventListener trait.
@@ -144,8 +160,11 @@ impl EventListener for GpuiEventProxy {
             }
             // Ignore events we don't care about
             Event::MouseCursorDirty => {}
-            Event::PtyWrite(ref _data) => {
-                // This is handled internally by alacritty
+            Event::PtyWrite(ref data) => {
+                // PTY 写回应答（kitty ?u 查询 / DECRQM/DECRPM / DA 等）：
+                // 注释「handled internally by alacritty」对本集成不成立——
+                // 应答文本 Term 权威生成，但写回 PTY 必须由宿主完成
+                self.send(TerminalEvent::PtyWrite(data.clone()));
             }
             Event::ColorRequest(ref _index, ref _format) => {
                 // Color requests are not commonly used
@@ -298,5 +317,20 @@ mod tests {
 
         // Sending should not panic even though the channel is disconnected
         proxy.send_event(Event::Wakeup);
+    }
+
+    /// PtyWrite 不再静默丢弃：kitty ?u 查询应答 / DECRQM / DA 等由 Term
+    /// 权威生成、经本通道转发给视图写回 PTY。
+    #[test]
+    fn test_pty_write_forwarded() {
+        let (tx, rx) = channel();
+        let proxy = GpuiEventProxy::new(tx);
+
+        proxy.send_event(Event::PtyWrite("\x1b[?1u".to_owned()));
+
+        assert!(matches!(
+            rx.recv().unwrap(),
+            TerminalEvent::PtyWrite(text) if text == "\x1b[?1u"
+        ));
     }
 }

@@ -1403,6 +1403,9 @@ impl WorkspaceView {
             initial_cols,
             initial_rows,
             resolve_shell(settings.shell.as_deref()),
+            // 首窗格无焦点窗格可继承（工作区刚建、panes 为空），恒 None；
+            // 后续新入口（如 quake 独立窗）可在此传来源窗格 cwd
+            None,
             // 审计 label 与下方 Pane.title 同源同值
             "本地终端",
         );
@@ -2312,10 +2315,32 @@ impl WorkspaceView {
         pane_id
     }
 
+    /// 焦点窗格的当前目录（OSC 7 上报，仅本地会话有值——SSH 会话的
+    /// `TerminalView::cwd` 恒 None，天然不继承远端路径）：新标签/分屏的
+    /// 初始 cwd 继承源。窗格已回收或尚未收到上报 → None（回退为不继承）。
+    fn focused_pane_cwd(&self, cx: &Context<Self>) -> Option<PathBuf> {
+        // 不能走 focused_pane_id()：补位路径（最后窗格退出 → remove_pane_at
+        // → tabs 清空后 spawn_tab）会带着空 tabs 进来，active_tab() 的
+        // 直接索引会越界。此处改为遍历查找——空态/焦点窗格已回收 → None，
+        // cwd 继承本就是 best-effort，回落为不继承。
+        let focused = self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == self.active_tab)
+            .map(|tab| tab.focused_pane)?;
+        self.pane(focused)
+            .and_then(|pane| pane.terminal.read(cx).cwd())
+            .map(PathBuf::from)
+    }
+
     /// 新建标签：一个标签一个全新窗格与分屏树根。
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let title = format!("终端 {}", self.next_pane_id);
-        let session = spawn_local_session(self.settings.shell.as_deref());
+        let session = spawn_local_session(
+            self.settings.shell.as_deref(),
+            self.settings.appearance.shell_integration,
+            self.focused_pane_cwd(cx),
+        );
         let pane_id = self.attach_pane(title, session, window, cx);
         let tab_id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
@@ -2344,7 +2369,11 @@ impl WorkspaceView {
         self.tabs[tab_index].zoomed = false;
         let old = self.focused_pane_id();
         let title = format!("终端 {}", self.next_pane_id);
-        let session = spawn_local_session(self.settings.shell.as_deref());
+        let session = spawn_local_session(
+            self.settings.shell.as_deref(),
+            self.settings.appearance.shell_integration,
+            self.focused_pane_cwd(cx),
+        );
         let pane_id = self.attach_pane(title, session, window, cx);
         let tab_index = self.active_tab_index();
         let split_id = self.next_split_id;
@@ -2994,6 +3023,9 @@ impl WorkspaceView {
     ) -> impl IntoElement {
         let pane = self.pane(menu.pane_id);
         let has_selection = pane.is_some_and(|pane| pane.terminal.read(cx).has_selection());
+        // OSC 133 提示符标记存在才可跳转（无标记/备用屏时置灰，点了也不动作）
+        let has_prompt_marks =
+            pane.is_some_and(|pane| !pane.terminal.read(cx).prompt_marks().is_empty());
         let single_pane = self.tabs[self.active_tab_index()].layout.leaf_count() <= 1;
         let menu_pane = menu.pane_id;
 
@@ -3087,6 +3119,33 @@ impl WorkspaceView {
                 if let Some(pane) = this.pane(menu_pane) {
                     let terminal = pane.terminal.clone();
                     terminal.update(cx, |view, cx| view.open_search(cx));
+                }
+            }),
+        ));
+        // 提示符跳转（OSC 133 标记；快捷键 Alt+Shift+Up/Down 同语义）
+        items.push(item(
+            cx,
+            "上一提示符",
+            has_prompt_marks,
+            Box::new(move |this, _, cx| {
+                if let Some(pane) = this.pane(menu_pane) {
+                    let terminal = pane.terminal.clone();
+                    terminal.update(cx, |view, cx| {
+                        view.jump_prompt_previous(cx);
+                    });
+                }
+            }),
+        ));
+        items.push(item(
+            cx,
+            "下一提示符",
+            has_prompt_marks,
+            Box::new(move |this, _, cx| {
+                if let Some(pane) = this.pane(menu_pane) {
+                    let terminal = pane.terminal.clone();
+                    terminal.update(cx, |view, cx| {
+                        view.jump_prompt_next(cx);
+                    });
                 }
             }),
         ));
@@ -3592,6 +3651,7 @@ impl WorkspaceView {
                 config.font_fallbacks = appearance.font_fallbacks.clone();
                 config.copy_on_select = appearance.copy_on_select;
                 config.bell_notification = appearance.bell_notification;
+                config.kitty_keyboard = appearance.kitty_keyboard;
                 config.background_opacity = appearance.background_opacity;
                 terminal.update_config(config, cx);
             });
@@ -7646,7 +7706,9 @@ impl Render for WorkspaceView {
         let geometry_layout = active_layout.clone();
         let geometry_rects = pane_rects.clone();
         let focused_pane = self.active_tab().focused_pane;
-        // 每个标签 = (id, 标题[自定义 > 焦点窗格], 窗格数, 自定义色, 高亮)
+        // 每个标签 = (id, 标题[自定义 > 焦点窗格], 窗格数, 自定义色, 高亮, 命令失败)
+        // 命令失败读 OSC 133 状态（termview TerminalState，tracker 锁，读侧廉价）
+        let app: &gpui::App = cx;
         let tab_labels = self
             .tabs
             .iter()
@@ -7661,7 +7723,13 @@ impl Render for WorkspaceView {
                         .iter()
                         .any(|pane| pane.id == *id && pane.highlighted)
                 });
-                (tab.id, title, count, tab.color, highlighted)
+                // 命令失败红点：任一叶窗格最近一条 OSC 133;D 退出码非 0
+                let command_failed = leaves.iter().any(|id| {
+                    self.panes
+                        .iter()
+                        .any(|pane| pane.id == *id && pane.terminal.read(app).last_command_failed())
+                });
+                (tab.id, title, count, tab.color, highlighted, command_failed)
             })
             .collect::<Vec<_>>();
         let left_panel = self.left_panel;
@@ -7767,10 +7835,11 @@ impl Render for WorkspaceView {
                             .overflow_x_hidden()
                             .when(!left_panel, |bar| {
                                 bar.children(tab_labels.iter().map(
-                                    |(id, title, count, color, highlighted)| {
+                                    |(id, title, count, color, highlighted, command_failed)| {
                                         let id = *id;
                                         let color = *color;
                                         let highlighted = *highlighted;
+                                        let command_failed = *command_failed;
                                         let is_active = id == active_tab_id;
                                         // 超长标题截断：活跃标签可稍宽；计数后缀不参与截断
                                         let title = truncate_tab_title(
@@ -7832,6 +7901,17 @@ impl Render for WorkspaceView {
                                                         .size(px(6.0))
                                                         .rounded_full()
                                                         .bg(rgb(ui.accent)),
+                                                )
+                                            })
+                                            // 命令失败红点：OSC 133;D exit≠0（复用
+                                            // 高亮圆点管道加红色一档；0xF7768E =
+                                            // Tokyo Night red，与搜索报错同源）
+                                            .when(command_failed, |tab| {
+                                                tab.child(
+                                                    div()
+                                                        .size(px(6.0))
+                                                        .rounded_full()
+                                                        .bg(rgb(0xF7768E)),
                                                 )
                                             })
                                             // 底部 2px 色条：自定义标签色优先并替代
@@ -8568,10 +8648,15 @@ fn render_layout(
     }
 }
 
+/// 标签栏行数据：(id, 标题[自定义 > 焦点窗格], 窗格数, 自定义色,
+/// 触发器高亮, 命令失败红点)。类型别名压住 clippy::type_complexity
+/// （第 6 个字段入列后元组越过阈值）。
+type TabLabelRow = (TabId, String, usize, Option<u32>, bool, bool);
+
 /// 标签列表采用固定标题和独立滚动区域，长标题不挤占关闭按钮。
 /// 颜色全部走 `ui`（主题派生），不再写死 Tokyo Night 色值。
 fn left_sidebar(
-    tab_labels: &[(TabId, String, usize, Option<u32>, bool)],
+    tab_labels: &[TabLabelRow],
     active_tab_id: TabId,
     scroll: &ScrollHandle,
     ui: UiColors,
@@ -8623,146 +8708,155 @@ fn left_sidebar(
                 .track_scroll(scroll)
                 .px_2()
                 .pb_2()
-                .children(
-                    tab_labels
-                        .iter()
-                        .map(|(id, title, count, color, highlighted)| {
-                            let id = *id;
-                            let color = *color;
-                            let highlighted = *highlighted;
-                            let selected = id == active_tab_id;
-                            // 与标题栏同口径的超长截断（活跃标签可稍宽）
-                            let label = truncate_tab_title(
-                                title,
+                .children(tab_labels.iter().map(
+                    |(id, title, count, color, highlighted, command_failed)| {
+                        let id = *id;
+                        let color = *color;
+                        let highlighted = *highlighted;
+                        let command_failed = *command_failed;
+                        let selected = id == active_tab_id;
+                        // 与标题栏同口径的超长截断（活跃标签可稍宽）
+                        let label = truncate_tab_title(
+                            title,
+                            if selected {
+                                ACTIVE_TAB_TITLE_MAX_CHARS
+                            } else {
+                                TAB_TITLE_MAX_CHARS
+                            },
+                        );
+                        let count = *count;
+                        div()
+                            .debug_selector(move || {
                                 if selected {
-                                    ACTIVE_TAB_TITLE_MAX_CHARS
+                                    "sidebar-active-tab".into()
                                 } else {
-                                    TAB_TITLE_MAX_CHARS
+                                    "sidebar-other-tab".into()
+                                }
+                            })
+                            .group("session-row")
+                            .h(px(38.0))
+                            .mb_1()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded_md()
+                            .bg(if selected {
+                                rgb(ui.selected_bg)
+                            } else {
+                                rgb(ui.panel_bg)
+                            })
+                            .text_color(if selected {
+                                rgb(ui.text)
+                            } else {
+                                rgb(ui.text_secondary)
+                            })
+                            .hover(|style| {
+                                style.bg(if selected {
+                                    rgb(ui.hover_bg)
+                                } else {
+                                    rgb(ui.border)
+                                })
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                    // 记下拖拽起点（纵拖超阈值重排，松开即清）
+                                    this.start_tab_drag(id, event.position);
+                                    if event.click_count >= 2 {
+                                        this.start_tab_rename(id, window, cx);
+                                    } else {
+                                        this.activate_tab(id, event, window, cx);
+                                    }
+                                }),
+                            )
+                            // 拖拽排序：hover 到本条目且位移超阈值时交换
+                            .on_mouse_move(cx.listener(
+                                move |this, event: &MouseMoveEvent, _, cx| {
+                                    this.update_tab_drag(id, event.position, cx);
                                 },
-                            );
-                            let count = *count;
-                            div()
-                                .debug_selector(move || {
-                                    if selected {
-                                        "sidebar-active-tab".into()
+                            ))
+                            // 右键弹标签菜单；拦截冒泡防误触终端菜单
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.open_tab_menu(id, event.position, cx);
+                                }),
+                            )
+                            // 左侧竖色条：自定义标签色优先（3px）；无色回落
+                            // 活跃 accent / 透明占位，保持行内对齐
+                            .child(match color {
+                                Some(color) => {
+                                    div().w(px(3.0)).h(px(18.0)).rounded_full().bg(rgb(color))
+                                }
+                                None => {
+                                    div().w(px(2.0)).h(px(18.0)).rounded_full().bg(if selected {
+                                        rgb(ui.accent)
                                     } else {
-                                        "sidebar-other-tab".into()
-                                    }
-                                })
-                                .group("session-row")
-                                .h(px(38.0))
-                                .mb_1()
-                                .px_2()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .rounded_md()
-                                .bg(if selected {
-                                    rgb(ui.selected_bg)
-                                } else {
-                                    rgb(ui.panel_bg)
-                                })
-                                .text_color(if selected {
-                                    rgb(ui.text)
-                                } else {
-                                    rgb(ui.text_secondary)
-                                })
-                                .hover(|style| {
-                                    style.bg(if selected {
-                                        rgb(ui.hover_bg)
-                                    } else {
-                                        rgb(ui.border)
+                                        rgb(ui.panel_bg)
                                     })
-                                })
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                        // 记下拖拽起点（纵拖超阈值重排，松开即清）
-                                        this.start_tab_drag(id, event.position);
-                                        if event.click_count >= 2 {
-                                            this.start_tab_rename(id, window, cx);
-                                        } else {
-                                            this.activate_tab(id, event, window, cx);
-                                        }
-                                    }),
-                                )
-                                // 拖拽排序：hover 到本条目且位移超阈值时交换
-                                .on_mouse_move(cx.listener(
-                                    move |this, event: &MouseMoveEvent, _, cx| {
-                                        this.update_tab_drag(id, event.position, cx);
-                                    },
-                                ))
-                                // 右键弹标签菜单；拦截冒泡防误触终端菜单
-                                .on_mouse_down(
-                                    MouseButton::Right,
-                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                        cx.stop_propagation();
-                                        this.open_tab_menu(id, event.position, cx);
-                                    }),
-                                )
-                                // 左侧竖色条：自定义标签色优先（3px）；无色回落
-                                // 活跃 accent / 透明占位，保持行内对齐
-                                .child(match color {
-                                    Some(color) => {
-                                        div().w(px(3.0)).h(px(18.0)).rounded_full().bg(rgb(color))
-                                    }
-                                    None => div().w(px(2.0)).h(px(18.0)).rounded_full().bg(
-                                        if selected {
-                                            rgb(ui.accent)
-                                        } else {
-                                            rgb(ui.panel_bg)
-                                        },
-                                    ),
-                                })
-                                .child(
+                                }
+                            })
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(ui.accent))
+                                    .child("›_"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(13.0))
+                                    .child(label),
+                            )
+                            .when(count > 1, |row| {
+                                row.child(
                                     div()
-                                        .text_size(px(13.0))
-                                        .text_color(rgb(ui.accent))
-                                        .child("›_"),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .truncate()
-                                        .text_size(px(13.0))
-                                        .child(label),
-                                )
-                                .when(count > 1, |row| {
-                                    row.child(
-                                        div()
-                                            .text_size(px(11.0))
-                                            .text_color(rgb(ui.text_secondary))
-                                            .child(count.to_string()),
-                                    )
-                                })
-                                // 触发器高亮圆点：与标题栏标签同语义（命中锁存指示）
-                                .when(highlighted, |row| {
-                                    row.child(
-                                        div()
-                                            .size(px(6.0))
-                                            .rounded_full()
-                                            .flex_shrink_0()
-                                            .bg(rgb(ui.accent)),
-                                    )
-                                })
-                                .child(
-                                    div()
-                                        .px_1()
-                                        .opacity(0.0)
-                                        .group_hover("session-row", |style| style.opacity(1.0))
+                                        .text_size(px(11.0))
                                         .text_color(rgb(ui.text_secondary))
-                                        .hover(|style| style.text_color(rgb(ui.danger)))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(move |this, _, window, cx| {
-                                                this.request_close_tab(id, window, cx)
-                                            }),
-                                        )
-                                        .child("×"),
+                                        .child(count.to_string()),
                                 )
-                        }),
-                ),
+                            })
+                            // 触发器高亮圆点：与标题栏标签同语义（命中锁存指示）
+                            .when(highlighted, |row| {
+                                row.child(
+                                    div()
+                                        .size(px(6.0))
+                                        .rounded_full()
+                                        .flex_shrink_0()
+                                        .bg(rgb(ui.accent)),
+                                )
+                            })
+                            // 命令失败红点：与标题栏同源（OSC 133;D exit≠0）
+                            .when(command_failed, |row| {
+                                row.child(
+                                    div()
+                                        .size(px(6.0))
+                                        .rounded_full()
+                                        .flex_shrink_0()
+                                        .bg(rgb(0xF7768E)),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .px_1()
+                                    .opacity(0.0)
+                                    .group_hover("session-row", |style| style.opacity(1.0))
+                                    .text_color(rgb(ui.text_secondary))
+                                    .hover(|style| style.text_color(rgb(ui.danger)))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.request_close_tab(id, window, cx)
+                                        }),
+                                    )
+                                    .child("×"),
+                            )
+                    },
+                )),
         )
 }
 
@@ -11050,16 +11144,20 @@ fn create_local_terminal(
     cols: usize,
     rows: usize,
     shell: String,
+    // 继承的初始工作目录（OSC 7 上报；首窗格无来源窗格传 None）。
+    cwd: Option<PathBuf>,
     label: &str,
 ) -> (Entity<TerminalView>, Arc<SessionControl>, Arc<TapControl>) {
     // 会话的开启/spawn/回收线程全部内聚在 LocalSession（laterterm-local）。
     // PTY 初始尺寸直接用窗口实际尺寸：避免启动后 resize 触发 bash readline
     // 的 \r 重画，把光标拉回提示符行首。
+    let env = local_session_env(&shell, settings.shell_integration);
     let session: Arc<dyn TerminalSession> = Arc::new(
         LocalSession::spawn(LocalOptions {
             shell,
             args: vec![],
-            env: vec![],
+            env,
+            cwd,
             cols: cols as u16,
             rows: rows as u16,
         })
@@ -11102,19 +11200,35 @@ where
 
 /// 开一个本地 shell 会话（attach_pane 之外仅差标题命名，故独立成函数）。
 /// shell 由调用方传入设置（None = 跟随平台默认）；已开窗格不随设置改动重启，
-/// 只对新标签/分屏生效。
-fn spawn_local_session(shell: Option<&str>) -> Arc<dyn TerminalSession> {
+/// 只对新标签/分屏生效。`shell_integration` 开启时按 laterterm-local 的
+/// bash 最小注入追加 OSC 133/7 钩子环境（best-effort，见该函数注记）；
+/// `cwd` 为继承的初始目录（焦点窗格 OSC 7 上报，None = 不继承）。
+fn spawn_local_session(
+    shell: Option<&str>,
+    shell_integration: bool,
+    cwd: Option<PathBuf>,
+) -> Arc<dyn TerminalSession> {
     let shell = resolve_shell(shell);
     Arc::new(
         LocalSession::spawn(LocalOptions {
+            env: local_session_env(&shell, shell_integration),
             shell,
             args: vec![],
-            env: vec![],
+            cwd,
             cols: 110,
             rows: 30,
         })
         .expect("启动本地会话失败"),
     )
+}
+
+/// 按设置的 Shell 集成开关构造本地会话启动环境：非 bash 或开关关闭返回空，
+/// 开启时注入 PROMPT_COMMAND/PS0（父进程已有 PROMPT_COMMAND 则字面拼接）。
+fn local_session_env(shell: &str, shell_integration: bool) -> Vec<(String, String)> {
+    if !shell_integration {
+        return Vec::new();
+    }
+    laterterm_local::shell_integration_env(shell, std::env::var("PROMPT_COMMAND").ok().as_deref())
 }
 
 /// 外观设置 → 终端视图配置（本地与 SSH 会话共用）。
@@ -11150,6 +11264,7 @@ fn terminal_config_for(
         smooth_scrolling: settings.smooth_scrolling,
         copy_on_select: settings.copy_on_select,
         bell_notification: settings.bell_notification,
+        kitty_keyboard: settings.kitty_keyboard,
         scrollback: settings.scrollback,
         line_height_multiplier: settings.line_height,
         padding: Edges::all(px(settings.padding)),

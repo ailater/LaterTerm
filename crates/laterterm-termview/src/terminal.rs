@@ -36,7 +36,7 @@
 //!
 //! let (tx, rx) = channel();
 //! let event_proxy = GpuiEventProxy::new(tx);
-//! let mut terminal = TerminalState::new(80, 24, 10_000, event_proxy);
+//! let mut terminal = TerminalState::new(80, 24, 10_000, false, event_proxy);
 //!
 //! // Process some output (e.g., colored text)
 //! terminal.process_bytes(b"\x1b[31mRed text\x1b[0m");
@@ -45,13 +45,15 @@
 //! [`process_bytes`]: TerminalState::process_bytes
 
 use crate::event::GpuiEventProxy;
-use alacritty_terminal::grid::{Dimensions, Grid};
+use crate::osc::{OscEvent, OscSink, PromptDirection, PromptMark, PromptTracker};
+use alacritty_terminal::grid::{Dimensions, Grid, Scroll};
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use parking_lot::Mutex;
 use regex::Regex;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// 回滚搜索命中。
@@ -346,6 +348,18 @@ fn search_grid(grid: &Grid<Cell>, needle: &[char], whole_word: bool) -> Vec<Sear
     matches
 }
 
+/// 旁路事件入队：容量封顶丢最老（无消费者的最坏情形下限内存，
+/// cwd/notify 天然只关心新值）。独立自由函数而非方法：process_bytes 持
+/// term 锁期间调用，方法调用会整体借 `self` 与锁守卫冲突（字段级分裂
+/// 借用才可行）。
+fn queue_osc_event(queue: &mut VecDeque<OscEvent>, event: OscEvent) {
+    const OSC_EVENT_QUEUE_CAP: usize = 1024;
+    if queue.len() >= OSC_EVENT_QUEUE_CAP {
+        queue.pop_front();
+    }
+    queue.push_back(event);
+}
+
 /// Simple dimensions implementation for terminal initialization.
 struct TermDimensions {
     columns: usize,
@@ -428,6 +442,36 @@ pub struct TerminalState {
     /// Number of rows (lines) in the terminal.
     rows: usize,
 
+    /// 回滚上限（new 传入，update_term_config 重建 alacritty Config 时回填，
+    /// 防 set_options 把滚动上限重置为默认）。
+    scrollback: usize,
+
+    /// OSC 旁路解析器（cwd/notify/提示符标记共用底座，见 [`crate::osc`]）。
+    /// 与主 parser 喂同一字节流，只认内置 Handler 不路由的 OSC。
+    osc_sink: OscSink,
+
+    /// 旁路解析出的非 133 事件（OSC 7/9/777），排队供上层
+    /// [`take_osc_events`](Self::take_osc_events) 消费（容量封顶丢最老）。
+    osc_events: VecDeque<OscEvent>,
+
+    /// 最近一次 OSC 7 上报的 cwd（file:// 校验 + percent 解码后的绝对路径，
+    /// 见 [`parse_osc7_cwd`](crate::osc)）。仅记录，不做本地性判定——
+    /// SSH 会话的对外口径由 [`TerminalView::cwd`](crate::view::TerminalView::
+    /// cwd) 按后端门控。新标签/分屏继承焦点窗格目录的数据源。
+    cwd: Option<String>,
+
+    /// 提示符标记 + 滚动淘汰计数 + 命令运行窗态。独立互斥体、不挂 Term
+    /// 互斥体内；锁序固定 **term → tracker**（process_bytes 持 term 锁期间
+    /// 末段取本锁；作废路径只取本锁），防交叉加锁死锁。
+    tracker: Mutex<PromptTracker>,
+
+    /// 最近一次 OSC 9;4 进度上报（ConEmu）。v1 仅暴露 getter，UI 不呈现。
+    progress: Option<crate::osc::ProgressState>,
+
+    /// 桌面通知发送通道（OSC 9/777 → DesktopNotice）。构造后由 TerminalView
+    /// 注入；测试场景（无视图）为 None，通知事件仅入 osc_events 队列。
+    notice_tx: Option<std::sync::mpsc::Sender<crate::event::TerminalEvent>>,
+
     /// 数据版本号：每次 process_bytes 自增。渲染侧用它判断「有新数据未上屏」，
     /// 作为 flume 异步唤醒丢失时的兜底刷新依据。
     data_epoch: std::sync::atomic::AtomicU64,
@@ -440,6 +484,7 @@ impl TerminalState {
     ///
     /// * `cols` - The number of columns (character width) of the terminal
     /// * `rows` - The number of rows (lines) of the terminal
+    /// * `kitty_keyboard` - kitty keyboard protocol 支持开关（默认 false）
     /// * `event_proxy` - The event proxy for forwarding terminal events to GPUI
     ///
     /// # Returns
@@ -455,12 +500,21 @@ impl TerminalState {
     ///
     /// let (tx, rx) = channel();
     /// let event_proxy = GpuiEventProxy::new(tx);
-    /// let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
+    /// let terminal = TerminalState::new(80, 24, 10_000, false, event_proxy);
     /// ```
-    pub fn new(cols: usize, rows: usize, scrollback: usize, event_proxy: GpuiEventProxy) -> Self {
+    pub fn new(
+        cols: usize,
+        rows: usize,
+        scrollback: usize,
+        kitty_keyboard: bool,
+        event_proxy: GpuiEventProxy,
+    ) -> Self {
         // Configure the history buffer before creating the terminal grids.
         let config = Config {
             scrolling_history: scrollback,
+            // kitty keyboard protocol 支持开关（默认 false；运行期切换走
+            // update_term_config → Term::set_options）
+            kitty_keyboard,
             ..Default::default()
         };
 
@@ -478,6 +532,13 @@ impl TerminalState {
             parser,
             cols,
             rows,
+            scrollback,
+            osc_sink: OscSink::new(),
+            osc_events: VecDeque::new(),
+            cwd: None,
+            tracker: Mutex::new(PromptTracker::new()),
+            progress: None,
+            notice_tx: None,
             data_epoch: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -504,17 +565,90 @@ impl TerminalState {
     /// # use gpui_terminal::terminal::TerminalState;
     /// # let (tx, rx) = channel();
     /// # let event_proxy = GpuiEventProxy::new(tx);
-    /// # let mut terminal = TerminalState::new(80, 24, 10_000, event_proxy);
+    /// # let mut terminal = TerminalState::new(80, 24, 10_000, false, event_proxy);
     /// // Process some output from the PTY
     /// terminal.process_bytes(b"Hello, world!\r\n");
     /// ```
     pub fn process_bytes(&mut self, bytes: &[u8]) {
         let mut term = self.term.lock();
+        // 滚动基准：喂入前后的 history（topmost_line = Line(-history)）与
+        // total 差值。预填充期 total 随 history 同步增长（新行补位、无挤出，
+        // 修正量为 0 = 逐行精确）；缓冲打满后 alacritty 环形复用行，挤出量
+        // 对外不可观测（Term 无滚动计数外泄），修正退化为下界——最老标记
+        // 可能滞留偏下，见 crate::osc 模块注记（v1 已知边界）。
+        let history_before = -term.topmost_line().0 as i64;
+        let total_before = term.total_lines() as i64;
         // The parser.advance method calls handler methods on the Term
         // The Term implements the Handler trait from the VTE crate
         self.parser.advance(&mut *term, bytes);
+        // OSC 旁路：同一字节流喂独立 vte 状态机（只认 OSC，见 crate::osc 模块注记）
+        self.osc_sink.feed(bytes);
+        let evicted_delta = ((-term.topmost_line().0 as i64 - history_before)
+            - (term.total_lines() as i64 - total_before))
+            .max(0) as u64;
+        // ALT_SCREEN 以喂入结束时的模式为准：期间 grid() 是备用屏
+        //（alacritty swap_alt 交换主备网格），主屏标记锚定必错位 → A/C 冻结
+        let alt_screen = term.mode().contains(TermMode::ALT_SCREEN);
+        let events = self.osc_sink.take_events();
         self.data_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // 无 OSC 事件且无滚动：不取 tracker 锁（字节热路径零额外锁开销）
+        if evicted_delta == 0 && events.is_empty() {
+            return;
+        }
+        // 锁序固定 term → tracker（见 tracker 字段注记）
+        let mut tracker = self.tracker.lock();
+        tracker.note_scroll(evicted_delta);
+        for event in events {
+            match event {
+                OscEvent::PromptStart => {
+                    // 受理行号 = total-1-(bottommost-cursor)（与 SearchMatch.line
+                    // 同口径，0 = 最老历史行）。ALT_SCREEN 期间 A 不入库。
+                    if !alt_screen {
+                        let grid = term.grid();
+                        let abs_line = grid.total_lines()
+                            - 1
+                            - (grid.bottommost_line().0 - grid.cursor.point.line.0) as usize;
+                        tracker.push_prompt(abs_line, grid.total_lines());
+                    }
+                }
+                // B 仅解析（v1 锚点取 A，多行提示符场景 A 行足够定位）
+                OscEvent::CommandInputStart => {}
+                OscEvent::CommandStart => tracker.note_command_start(alt_screen),
+                // D 的失败判定不依赖行号：ALT_SCREEN 期间照常更新（冻结例外）
+                OscEvent::CommandFinished { exit_code } => {
+                    tracker.note_command_finished(exit_code);
+                }
+                // OSC 7 cwd：记录供「新标签/分屏继承焦点窗格目录」（file://
+                // 校验与 percent 解码已在旁路解析收口）；事件照常入队
+                OscEvent::Cwd { path } => {
+                    self.cwd = Some(path.clone());
+                    queue_osc_event(&mut self.osc_events, OscEvent::Cwd { path });
+                }
+                // ConEmu 进度：存最近值（Remove 清除），事件不入队——进度
+                // 是状态而非通知，上层经 progress() getter 读，无桌面通知
+                OscEvent::Progress(state) => {
+                    self.progress = if state == crate::osc::ProgressState::Remove {
+                        None
+                    } else {
+                        Some(state)
+                    };
+                }
+                // 桌面通知：直发 TerminalEvent 通道（视图 process_events 消费），
+                // 同时入 osc_events 队列供上层经 take_osc_events 兜底
+                OscEvent::Notify { body } => {
+                    self.send_desktop_notice(String::new(), &body);
+                    queue_osc_event(&mut self.osc_events, OscEvent::Notify { body });
+                }
+                OscEvent::NotifyWithTitle { title, body } => {
+                    self.send_desktop_notice(title.clone(), &body);
+                    queue_osc_event(
+                        &mut self.osc_events,
+                        OscEvent::NotifyWithTitle { title, body },
+                    );
+                }
+            }
+        }
     }
 
     /// Resize the terminal to new dimensions.
@@ -535,13 +669,14 @@ impl TerminalState {
     /// # use gpui_terminal::terminal::TerminalState;
     /// # let (tx, rx) = channel();
     /// # let event_proxy = GpuiEventProxy::new(tx);
-    /// # let mut terminal = TerminalState::new(80, 24, 10_000, event_proxy);
+    /// # let mut terminal = TerminalState::new(80, 24, 10_000, false, event_proxy);
     /// // Resize to 120x30
     /// terminal.resize(120, 30);
     /// ```
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let cols = cols.max(1);
         let rows = rows.max(1);
+        let changed = self.cols != cols || self.rows != rows;
         self.cols = cols;
         self.rows = rows;
 
@@ -552,11 +687,39 @@ impl TerminalState {
 
         // Resize the terminal
         term.resize(dimensions);
+        if changed {
+            // 列变化 reflow 重排历史行、行变化在历史与视口间搬移——绝对行号
+            // 体系整体失效，重映射无稳定锚点（reflow 语义下不可恢复），整体
+            // 作废。缩放后需重新等一条命令才恢复标记，属可接受行为。
+            self.tracker.lock().invalidate();
+        }
+    }
+
+    /// 运行期更新 Term 级配置（目前仅 kitty keyboard protocol 开关）：
+    /// 走 `Term::set_options`，kitty 位变更时 alacritty 自动清空协议模式栈
+    /// 并摘除 KITTY_KEYBOARD_PROTOCOL 位（term/mod.rs set_options）。滚动
+    /// 上限回填 new() 时的值（set_options 整体重建 Config，漏填会重置回
+    /// 默认 10_000）。
+    pub fn update_term_config(&self, kitty_keyboard: bool) {
+        let mut term = self.term.lock();
+        let config = Config {
+            scrolling_history: self.scrollback,
+            kitty_keyboard,
+            ..Default::default()
+        };
+        term.set_options(config);
     }
 
     /// Update the scrollback history capacity of the active grid.
     pub fn set_scrollback(&mut self, scrollback: usize) {
-        self.term.lock().grid_mut().update_history(scrollback);
+        let mut term = self.term.lock();
+        let history_before = term.grid().history_size();
+        term.grid_mut().update_history(scrollback);
+        // 缩小滚动上限会把最老行挤出缓冲（shrink_lines），绝对行号整体前移
+        // → 作废；放大只抬高未来上限、不动既有行，标记仍有效。
+        if term.grid().history_size() < history_before {
+            self.tracker.lock().invalidate();
+        }
     }
 
     /// Get the current terminal mode.
@@ -576,7 +739,7 @@ impl TerminalState {
     /// # use gpui_terminal::terminal::TerminalState;
     /// # let (tx, rx) = channel();
     /// # let event_proxy = GpuiEventProxy::new(tx);
-    /// # let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
+    /// # let terminal = TerminalState::new(80, 24, 10_000, false, event_proxy);
     /// use alacritty_terminal::term::TermMode;
     ///
     /// let mode = terminal.mode();
@@ -603,6 +766,121 @@ impl TerminalState {
         })
     }
 
+    // ───────────── OSC 133 提示符标记 / 旁路 OSC 事件 ─────────────
+
+    /// 提示符标记快照（升序）。已按受理后滚动淘汰量修正绝对行号；
+    /// 出界标记在表内真删（见 [`PromptTracker::visible_marks`]）。
+    /// ALT_SCREEN 期间返回空（查询冻结与跳转拒绝同一口径：备用屏激活时
+    /// 主屏标记暂不可用，退出后原样恢复）。
+    pub fn prompt_marks(&self) -> Vec<PromptMark> {
+        let term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return Vec::new();
+        }
+        let total = term.grid().total_lines();
+        // 锁序 term → tracker
+        self.tracker.lock().visible_marks(total)
+    }
+
+    /// 上一/下一提示符跳转：滚到目标标记（对齐视口上部 1/3，与搜索跳转
+    /// 同式）。无可用标记或处于 ALT_SCREEN（备用屏无主屏标记）时返回
+    /// `false` 且不动视口。
+    pub fn jump_prompt(&self, direction: PromptDirection) -> bool {
+        let mut term = self.term.lock();
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            return false;
+        }
+        let (marks, history, screen, display_offset) = {
+            let grid = term.grid();
+            // 锁序 term → tracker
+            let marks = self.tracker.lock().visible_marks(grid.total_lines());
+            (
+                marks,
+                grid.history_size() as i64,
+                grid.screen_lines() as i64,
+                grid.display_offset() as i64,
+            )
+        };
+        // 参考位 = 视口顶行的绝对行号：Previous 取其上方最近的标记，
+        // Next 取视口底行（top + screen - 1）之下最近的标记——屏内标记不跳
+        let top_abs = history - display_offset;
+        let target = match direction {
+            PromptDirection::Previous => marks
+                .iter()
+                .rev()
+                .find(|mark| (mark.abs_line as i64) < top_abs)
+                .map(|mark| mark.abs_line),
+            PromptDirection::Next => marks
+                .iter()
+                .find(|mark| mark.abs_line as i64 > top_abs + screen - 1)
+                .map(|mark| mark.abs_line),
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        // 目标行放视口上部 1/3（与 view.rs scroll_to_current_match 同式钳位）
+        let desired = (history + screen / 3 - target as i64).clamp(0, history) as i32;
+        let delta = desired - display_offset as i32;
+        if delta != 0 {
+            term.scroll_display(Scroll::Delta(delta));
+        }
+        true
+    }
+
+    /// 最近一条已结束命令是否失败（OSC 133;D exit≠0；D 不带退出码不改判定）。
+    /// 失败红点（标签栏）与提示符跳转的上层数据源。
+    pub fn last_command_failed(&self) -> bool {
+        self.tracker.lock().last_command_failed()
+    }
+
+    /// 当前是否有命令运行中（OSC 133;C 与 D 之间的窗口态）。v1 只暴露数据，
+    /// 不驱动任何 UI。
+    pub fn command_running(&self) -> bool {
+        self.tracker.lock().command_running()
+    }
+
+    /// 作废全部提示符标记并重置滚动计数基准。两处 resize 路径（本结构
+    /// [`resize`](Self::resize) 与 view.rs canvas 直连 `Term::resize`）调用：
+    /// reflow 重排历史行、绝对行号整体失效，重映射不可行故选作废。
+    pub fn invalidate_prompt_marks(&self) {
+        self.tracker.lock().invalidate();
+    }
+
+    /// 取走旁路解析出的非 133 事件（OSC 7 cwd / OSC 9·777 notify），
+    /// 供后续子项消费；取走即清空。
+    pub fn take_osc_events(&mut self) -> Vec<OscEvent> {
+        self.osc_events.drain(..).collect()
+    }
+
+    /// 最近一次 OSC 7 上报的 cwd（percent 解码后的绝对路径）；从未上报为
+    /// None（窗格刚建立、非集成 shell 或 shell_integration 关闭时即此态，
+    /// 调用方回退为不继承）。
+    pub fn cwd(&self) -> Option<&str> {
+        self.cwd.as_deref()
+    }
+
+    /// 最近一次 OSC 9;4 进度上报（ConEmu）。v1 仅暴露 getter，UI 不呈现
+    ///（设计阶段随 osc133 角标统一决定）；Remove 上报清除为 None。
+    pub fn progress(&self) -> Option<crate::osc::ProgressState> {
+        self.progress
+    }
+
+    /// 注入桌面通知发送通道（TerminalView 构造后调用）。
+    pub fn set_notice_tx(&mut self, tx: std::sync::mpsc::Sender<crate::event::TerminalEvent>) {
+        self.notice_tx = Some(tx);
+    }
+
+    /// 向 TerminalEvent 通道发送桌面通知（OSC 9/777 → DesktopNotice）。
+    /// 无通道（测试）时静默丢弃，事件队列仍保留。
+    fn send_desktop_notice(&self, title: String, body: &str) {
+        if let Some(tx) = &self.notice_tx {
+            let _ = tx.send(crate::event::TerminalEvent::DesktopNotice {
+                title,
+                body: body.to_owned(),
+            });
+        }
+    }
+
     /// 大小写不敏感地搜索整个回滚缓冲与可见屏幕。
     ///
     /// 命中按从最老历史行到屏幕底行的顺序返回；`SearchMatch::line` 使用
@@ -617,7 +895,7 @@ impl TerminalState {
     /// # use gpui_terminal::terminal::TerminalState;
     /// # let (tx, rx) = channel();
     /// # let event_proxy = GpuiEventProxy::new(tx);
-    /// # let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+    /// # let mut terminal = TerminalState::new(20, 4, 32, false, event_proxy);
     /// terminal.process_bytes(b"hello world\r\n");
     /// let matches = terminal.search("WORLD");
     /// assert_eq!(matches.len(), 1);
@@ -737,6 +1015,79 @@ impl TerminalState {
         self.extract_url_span_at(row, col).map(|(url, _, _)| url)
     }
 
+    /// OSC 8 显式超链接：命中 `(row, col)` 所在超链接段并返回其 URI。
+    ///
+    /// 坐标换算与 [`Self::extract_url_span_at`] 同口径（`row` = 视口行，
+    /// 越界一律 `None`）。命中后按 `Hyperlink` 的值相等（PartialEq 按
+    /// id+uri，alacritty cell.rs）向两侧扩至段边界；段内宽字符的
+    /// WIDE_CHAR_SPACER 续列并入段（与文本检测跳过 spacer 列同口径，
+    /// 由首列宽字符代表）。注意：隐式换行把超链接折到多行时只走本行
+    /// ——与既有文本检测同为单行口径，跨行段 v1 不做。
+    pub fn hyperlink_span_at(&self, row: usize, col: usize) -> Option<String> {
+        self.hyperlink_span_extent_at(row, col)
+            .map(|(uri, _, _)| uri)
+    }
+
+    /// 同 [`Self::hyperlink_span_at`] 但附带段的列范围（悬停下划线覆盖层
+    /// 用；`(起始列, 结束列)` 结束列开区间，与 extract_url_span_at 同口径）。
+    pub fn hyperlink_span_extent_at(
+        &self,
+        row: usize,
+        col: usize,
+    ) -> Option<(String, usize, usize)> {
+        self.with_term(|term| {
+            let grid = term.grid();
+            let screen_lines = grid.screen_lines();
+            let columns = grid.columns();
+            if row >= screen_lines || col >= columns {
+                return None;
+            }
+            let display_offset = grid.display_offset() as i32;
+            let line = Line(row as i32 - display_offset);
+
+            // 命中判定：起点格带超链接；起点是段内宽字符的续列（spacer）
+            // 时，以其左邻宽字符的超链接为准（spacer 本体是否携带随
+            // alacritty 写入路径而定，两种情况都命中）
+            let mut target = grid[AlacPoint::new(line, Column(col))].hyperlink();
+            if target.is_none()
+                && col > 0
+                && grid[AlacPoint::new(line, Column(col))]
+                    .flags
+                    .contains(Flags::WIDE_CHAR_SPACER)
+            {
+                target = grid[AlacPoint::new(line, Column(col - 1))].hyperlink();
+            }
+            let target = target?;
+
+            // 向左扩：段内格逐个值相等（Hyperlink PartialEq 按 id+uri）
+            let mut start = col;
+            while start > 0
+                && grid[AlacPoint::new(line, Column(start - 1))]
+                    .hyperlink()
+                    .as_ref()
+                    == Some(&target)
+            {
+                start -= 1;
+            }
+            // 向右扩：值相等直入；宽字符续列 spacer 随其左邻并入段
+            let mut end = col + 1;
+            while end < columns {
+                let cell = &grid[AlacPoint::new(line, Column(end))];
+                let in_segment = cell.hyperlink().as_ref() == Some(&target)
+                    || (cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+                        && grid[AlacPoint::new(line, Column(end - 1))]
+                            .hyperlink()
+                            .as_ref()
+                            == Some(&target));
+                if !in_segment {
+                    break;
+                }
+                end += 1;
+            }
+            Some((target.uri().to_owned(), start, end))
+        })
+    }
+
     /// Execute a function with read access to the terminal.
     ///
     /// This method provides safe read access to the underlying `Term` structure.
@@ -758,7 +1109,7 @@ impl TerminalState {
     /// # use gpui_terminal::terminal::TerminalState;
     /// # let (tx, rx) = channel();
     /// # let event_proxy = GpuiEventProxy::new(tx);
-    /// # let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
+    /// # let terminal = TerminalState::new(80, 24, 10_000, false, event_proxy);
     /// let cursor_pos = terminal.with_term(|term| {
     ///     term.grid().cursor.point
     /// });
@@ -792,7 +1143,7 @@ impl TerminalState {
     /// # use gpui_terminal::terminal::TerminalState;
     /// # let (tx, rx) = channel();
     /// # let event_proxy = GpuiEventProxy::new(tx);
-    /// # let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
+    /// # let terminal = TerminalState::new(80, 24, 10_000, false, event_proxy);
     /// terminal.with_term_mut(|term| {
     ///     // Perform some mutation on the term
     ///     term.scroll_display(alacritty_terminal::grid::Scroll::Delta(5));
@@ -845,7 +1196,7 @@ mod tests {
     fn test_terminal_creation() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
+        let terminal = TerminalState::new(80, 24, 10_000, false, event_proxy);
 
         assert_eq!(terminal.cols(), 80);
         assert_eq!(terminal.rows(), 24);
@@ -855,7 +1206,7 @@ mod tests {
     fn test_process_bytes() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(80, 24, 10_000, event_proxy);
+        let mut terminal = TerminalState::new(80, 24, 10_000, false, event_proxy);
 
         // Process some text
         terminal.process_bytes(b"Hello, world!");
@@ -873,7 +1224,7 @@ mod tests {
     fn test_resize() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(80, 24, 10_000, event_proxy);
+        let mut terminal = TerminalState::new(80, 24, 10_000, false, event_proxy);
 
         terminal.resize(120, 30);
 
@@ -896,7 +1247,7 @@ mod tests {
         // 锚定 grid Line 坐标语义: Line 自顶向下为正, Line(0) = 屏幕顶行。
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(20, 4, 32, false, event_proxy);
 
         // 全新终端(未输出内容)的光标在顶行行首 —— 与真实终端一致。
         terminal.with_term(|term| {
@@ -951,7 +1302,7 @@ mod tests {
     #[test]
     fn shell_prompt_cursor_stays_after_prompt_when_rows_shrink() {
         let (tx, _rx) = channel();
-        let mut terminal = TerminalState::new(80, 30, 100, GpuiEventProxy::new(tx));
+        let mut terminal = TerminalState::new(80, 30, 100, false, GpuiEventProxy::new(tx));
         terminal.process_bytes(b"user@host:~$ ");
         terminal.resize(80, 20);
         terminal.with_term(|term| {
@@ -971,7 +1322,7 @@ mod tests {
     #[test]
     fn clear_screen_empties_visible_area() {
         let (tx, _rx) = channel();
-        let mut terminal = TerminalState::new(80, 24, 100, GpuiEventProxy::new(tx));
+        let mut terminal = TerminalState::new(80, 24, 100, false, GpuiEventProxy::new(tx));
         terminal.process_bytes(b"stale output before clear");
         use alacritty_terminal::vte::ansi::Handler as _;
         terminal.with_term_mut(|term| {
@@ -994,7 +1345,7 @@ mod tests {
     #[test]
     fn selection_stored_on_term_roundtrips_text() {
         let (tx, _rx) = channel();
-        let mut terminal = TerminalState::new(80, 24, 100, GpuiEventProxy::new(tx));
+        let mut terminal = TerminalState::new(80, 24, 100, false, GpuiEventProxy::new(tx));
         terminal.process_bytes(b"hello selection\r\n$ ");
         terminal.with_term_mut(|term| {
             use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
@@ -1016,7 +1367,7 @@ mod tests {
     fn test_scrollback_and_display_offset() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(20, 4, 32, false, event_proxy);
 
         for line in 0..40 {
             terminal.process_bytes(format!("line-{line}\r\n").as_bytes());
@@ -1043,7 +1394,7 @@ mod tests {
     #[test]
     fn extract_url_span_at_rejects_out_of_bounds_coordinates() {
         let (tx, _rx) = channel();
-        let mut terminal = TerminalState::new(80, 4, 100, GpuiEventProxy::new(tx));
+        let mut terminal = TerminalState::new(80, 4, 100, false, GpuiEventProxy::new(tx));
         terminal.process_bytes(b"$ curl https://example.com\r\n");
 
         // 鼠标滑出网格底缘/右缘：越界一律 None。
@@ -1069,7 +1420,7 @@ mod tests {
     fn test_ime_anchor_follows_cursor_and_clamps_when_scrolled() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(20, 4, 32, false, event_proxy);
         terminal.process_bytes(b"abc");
 
         // 光标停在第一行列 3
@@ -1096,7 +1447,7 @@ mod tests {
     fn test_extract_url_from_grid() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(60, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(60, 4, 32, false, event_proxy);
         terminal.process_bytes(b"See https://example.com/page\r\n");
 
         // 先验证 search 能找到 URL（确保文本在网格里）
@@ -1118,7 +1469,7 @@ mod tests {
     fn test_extract_url_trailing_punctuation() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(60, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(60, 4, 32, false, event_proxy);
         terminal.process_bytes(b"Link: https://example.com.,\r\n");
         let matches = terminal.search("https");
         assert!(!matches.is_empty());
@@ -1130,7 +1481,7 @@ mod tests {
     fn test_extract_url_www_prefix() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(60, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(60, 4, 32, false, event_proxy);
         terminal.process_bytes(b"Visit www.example.com today\r\n");
         let matches = terminal.search("www");
         assert!(!matches.is_empty());
@@ -1142,7 +1493,7 @@ mod tests {
     fn test_extract_url_none_in_plain_text() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(40, 4, 32, false, event_proxy);
         terminal.process_bytes("中文内容没有链接\r\nplain text line\r\n".as_bytes());
         assert!(terminal.extract_url_at(0, 2).is_none());
         assert!(terminal.extract_url_at(1, 5).is_none());
@@ -1152,7 +1503,7 @@ mod tests {
     fn test_search_visible_line_and_column() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(20, 4, 32, false, event_proxy);
         terminal.process_bytes(b"hello world\r\n");
 
         let matches = terminal.search("WORLD");
@@ -1169,7 +1520,7 @@ mod tests {
     fn test_search_scrollback_ordering() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(20, 4, 32, false, event_proxy);
         for line in 0..40 {
             terminal.process_bytes(format!("line-{line}\r\n").as_bytes());
         }
@@ -1206,7 +1557,7 @@ mod tests {
     fn test_search_cjk_text() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(40, 4, 32, false, event_proxy);
         terminal.process_bytes("中文搜索测试\r\n第二行 中文\n".as_bytes());
 
         let matches = terminal.search("中文");
@@ -1220,7 +1571,7 @@ mod tests {
     fn test_search_matches_on_same_line() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(40, 4, 32, false, event_proxy);
         terminal.process_bytes(b"ab ab ab\n");
 
         let matches = terminal.search("ab");
@@ -1245,7 +1596,7 @@ mod tests {
     fn test_search_regex_basic() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(40, 4, 32, false, event_proxy);
         terminal.process_bytes(b"foo=1 bar=22\n");
 
         let matches = terminal
@@ -1262,7 +1613,7 @@ mod tests {
     fn test_search_regex_cjk_column_width() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(40, 4, 32, false, event_proxy);
         terminal.process_bytes("第二行 中文\n".as_bytes());
 
         let matches = terminal
@@ -1279,7 +1630,7 @@ mod tests {
     fn test_search_regex_case_sensitivity() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(40, 4, 32, false, event_proxy);
         terminal.process_bytes(b"abc ABC\n");
 
         // 大小写不敏感（默认）：经 (?i) 前缀，两组都命中
@@ -1307,7 +1658,7 @@ mod tests {
     fn test_search_regex_invalid_returns_err() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(40, 4, 32, false, event_proxy);
         terminal.process_bytes(b"hello world\n");
 
         // 非法正则返回 Err（供搜索栏内联红字展示），绝不 panic
@@ -1336,7 +1687,7 @@ mod tests {
     fn test_search_whole_word_boundaries() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(40, 4, 32, false, event_proxy);
         terminal.process_bytes(b"ab ab ab\nxab abc\n");
         let options = SearchOptions {
             whole_word: true,
@@ -1360,7 +1711,7 @@ mod tests {
         // 全字 CJK：汉字属词字符（与正则 \b 一致），「中文」邻接「测试」
         // 不命中，行尾填充空格天然是边界
         let (tx, _rx) = channel();
-        let mut cjk_terminal = TerminalState::new(40, 4, 32, GpuiEventProxy::new(tx));
+        let mut cjk_terminal = TerminalState::new(40, 4, 32, false, GpuiEventProxy::new(tx));
         cjk_terminal.process_bytes("中文测试\n中文\n".as_bytes());
         let cjk = cjk_terminal.search_with_options("中文", options).unwrap();
         assert_eq!(cjk.len(), 1);
@@ -1371,7 +1722,7 @@ mod tests {
     fn test_search_regex_zero_width_matches_filtered() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(40, 4, 32, false, event_proxy);
         terminal.process_bytes(b"bab\n");
 
         // a* 会在位置 0/2/3 产生零宽空匹配，只保留非空命中「a」
@@ -1387,7 +1738,7 @@ mod tests {
     fn test_search_regex_order_and_options_default_compat() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(40, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(40, 4, 32, false, event_proxy);
         terminal.process_bytes(b"alpha one\nbeta two\nalpha three\n");
 
         // 正则路径与子串路径同 push 顺序：按 absolute line 升序，结果一致
@@ -1411,7 +1762,7 @@ mod tests {
     fn test_search_regex_end_anchor_ignores_cell_padding() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(20, 4, 32, false, event_proxy);
         // 20 列网格：「中文abc」后有 13 个填充空格，不裁剪时 c$ 失配
         terminal.process_bytes("中文abc\r\n".as_bytes());
 
@@ -1429,7 +1780,7 @@ mod tests {
     fn test_search_regex_digits_end_anchor() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(20, 4, 32, false, event_proxy);
         terminal.process_bytes(b"error=42\r\n");
 
         let matches = terminal
@@ -1445,7 +1796,7 @@ mod tests {
     fn test_search_regex_start_anchor_at_row_start() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(20, 4, 32, false, event_proxy);
         terminal.process_bytes("中文abc\r\n".as_bytes());
 
         let matches = terminal
@@ -1461,7 +1812,7 @@ mod tests {
     fn test_search_regex_start_anchor_hits_wrapped_continuation_row() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(20, 4, 32, false, event_proxy);
         // 22 个 a：软换行把后 2 个折到续行——续行是独立 grid row，
         // ^ 在续行列 0 亦命中（锚点语义契约）
         terminal.process_bytes(b"aaaaaaaaaaaaaaaaaaaaaa\r\n");
@@ -1482,7 +1833,7 @@ mod tests {
     fn test_search_regex_inline_flag_with_end_anchor() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let mut terminal = TerminalState::new(20, 4, 32, event_proxy);
+        let mut terminal = TerminalState::new(20, 4, 32, false, event_proxy);
         terminal.process_bytes("中文ABC\r\n".as_bytes());
 
         // (?i) 内联大小写开关 × $ 锚点组合：大小写敏感开启时内联标志仍生效
@@ -1498,7 +1849,7 @@ mod tests {
     fn test_mode() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
+        let terminal = TerminalState::new(80, 24, 10_000, false, event_proxy);
 
         let mode = terminal.mode();
         // Mode should be a valid TermMode value (just verify we can get it)
@@ -1509,7 +1860,7 @@ mod tests {
     fn test_with_term() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
+        let terminal = TerminalState::new(80, 24, 10_000, false, event_proxy);
 
         let cols = terminal.with_term(|term| term.grid().columns());
         assert_eq!(cols, 80);
@@ -1519,7 +1870,7 @@ mod tests {
     fn test_with_term_mut() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
+        let terminal = TerminalState::new(80, 24, 10_000, false, event_proxy);
 
         terminal.with_term_mut(|term| {
             // Just verify we can get mutable access
@@ -1531,12 +1882,379 @@ mod tests {
     fn test_term_arc() {
         let (tx, _rx) = channel();
         let event_proxy = GpuiEventProxy::new(tx);
-        let terminal = TerminalState::new(80, 24, 10_000, event_proxy);
+        let terminal = TerminalState::new(80, 24, 10_000, false, event_proxy);
 
         let arc1 = terminal.term_arc();
         let arc2 = terminal.term_arc();
 
         // Both Arcs should point to the same terminal
         assert!(Arc::ptr_eq(&arc1, &arc2));
+    }
+
+    // ───────── OSC 133 提示符标记（旁路解析 → 锚定 → 跳转 → 生命周期） ─────────
+
+    /// OSC 133;A 的完整字节（BEL 结尾）。
+    fn prompt_a() -> &'static [u8] {
+        b"\x1b]133;A\x07"
+    }
+
+    #[test]
+    fn osc133_prompt_mark_line_anchoring_with_scrollback() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(20, 4, 32, false, GpuiEventProxy::new(tx));
+
+        // 光标在初始顶行：第一个 A 锚在绝对行 0
+        terminal.process_bytes(prompt_a());
+        let marks = terminal.prompt_marks();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].abs_line, 0, "首个提示符应锚在绝对行 0");
+        assert_eq!(marks[0].total_at_receipt, 4, "受理时 total = 初始 4 行");
+        assert_eq!(marks[0].exit_code, None);
+
+        // 继续输出 4 行 + 新提示符：预填充期 total 增长、旧行不动，
+        // 旧标记绝对行号保持，新标记锚在受理时行（4 行内容后的新底行）
+        terminal.process_bytes(b"one\r\ntwo\r\nthree\r\nfour\r\n");
+        terminal.process_bytes(prompt_a());
+        let marks = terminal.prompt_marks();
+        assert_eq!(marks.len(), 2);
+        assert_eq!(marks[0].abs_line, 0, "滚动未满上限：旧行号不漂移");
+        assert_eq!(
+            marks[1].abs_line, 4,
+            "新提示符锚在受理时绝对行（4 行内容之后）"
+        );
+        assert_eq!(marks[1].total_at_receipt, 5);
+
+        // 大量输出打满回滚（cap=32 → total 上限 36）再出新提示符：
+        // 已知边界——打满后挤出量不可观测，标记保持受理值（不漂移也不误删）
+        for line in 0..40 {
+            terminal.process_bytes(format!("row-{line}\r\n").as_bytes());
+        }
+        terminal.process_bytes(prompt_a());
+        let marks = terminal.prompt_marks();
+        assert!(marks.len() >= 3);
+        let total_now = terminal.with_term(|term| term.grid().total_lines());
+        assert!(marks.iter().all(|mark| mark.abs_line < total_now));
+    }
+
+    #[test]
+    fn osc133_marks_invalidated_by_resize_and_kept_on_noop_resize() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(20, 4, 32, false, GpuiEventProxy::new(tx));
+        terminal.process_bytes(prompt_a());
+        assert_eq!(terminal.prompt_marks().len(), 1);
+
+        // 同尺寸 resize：grid 不 reflow，标记保留
+        terminal.resize(20, 4);
+        assert_eq!(terminal.prompt_marks().len(), 1, "同尺寸 resize 不作废");
+
+        // 实际尺寸变化：绝对行号体系整体失效 → 全部作废 + 计数基准重置
+        terminal.resize(20, 6);
+        assert!(terminal.prompt_marks().is_empty(), "resize 后标记应作废");
+        // 作废后重新受理，按新基准工作（6 行屏：x 在行 0、光标到行 1）
+        terminal.process_bytes(b"x\r\n");
+        terminal.process_bytes(prompt_a());
+        let marks = terminal.prompt_marks();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].abs_line, 1, "新提示符锚在 resize 后的受理行");
+    }
+
+    #[test]
+    fn osc133_alt_screen_freeze_with_d_exception() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(20, 4, 32, false, GpuiEventProxy::new(tx));
+        terminal.process_bytes(prompt_a());
+        assert_eq!(terminal.prompt_marks().len(), 1);
+
+        // 进备用屏（vim/less 形态）：grid() 换成备用屏，A/C 冻结（查询同口径返回空）
+        terminal.process_bytes(b"\x1b[?1049h");
+        terminal.process_bytes(prompt_a());
+        terminal.process_bytes(b"\x1b]133;C\x07");
+        assert!(
+            terminal.prompt_marks().is_empty(),
+            "ALT_SCREEN 期间查询冻结返回空"
+        );
+        assert!(!terminal.command_running(), "ALT_SCREEN 期间 C 冻结");
+
+        // D 例外：失败判定不依赖行号，照常更新
+        terminal.process_bytes(b"\x1b]133;D;1\x07");
+        assert!(terminal.last_command_failed(), "D 在备用屏也更新失败标记");
+        assert!(!terminal.command_running(), "D 收束运行窗不受冻结影响");
+
+        // 退备用屏：原标记原样恢复；随后再受理一条 A 只多一条
+        //（若备用屏内的 A 曾入库，这里会是 3 —— 以此钉死 A 冻结）
+        terminal.process_bytes(b"\x1b[?1049l");
+        assert_eq!(terminal.prompt_marks().len(), 1, "退出备用屏后原标记恢复");
+        terminal.process_bytes(b"next\r\n");
+        terminal.process_bytes(prompt_a());
+        assert_eq!(terminal.prompt_marks().len(), 2, "备用屏内的 A 未入库");
+        // 且退出码回填到备用屏前那条标记（最近未关闭）
+        let marks = terminal.prompt_marks();
+        assert_eq!(marks[0].exit_code, Some(1));
+    }
+
+    #[test]
+    fn osc133_jump_prompt_scrolls_and_refuses_in_alt_screen() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(20, 4, 32, false, GpuiEventProxy::new(tx));
+        terminal.process_bytes(prompt_a());
+        for line in 0..20 {
+            terminal.process_bytes(format!("row-{line}\r\n").as_bytes());
+        }
+        terminal.process_bytes(prompt_a());
+        assert!(terminal.with_term(|term| term.grid().display_offset() == 0));
+
+        // 上一条提示符：滚回旧标记，display_offset 离开底部
+        assert!(terminal.jump_prompt(PromptDirection::Previous));
+        let offset = terminal.with_term(|term| term.grid().display_offset());
+        assert!(offset > 0, "跳转应滚动视口，实际 offset={offset}");
+
+        // 视口已停在旧提示符上方：再往上一条无目标 → false 且视口不动
+        let offset = terminal.with_term(|term| term.grid().display_offset());
+        assert!(!terminal.jump_prompt(PromptDirection::Previous));
+        assert_eq!(
+            terminal.with_term(|term| term.grid().display_offset()),
+            offset
+        );
+
+        // 下一条：滚回新提示符
+        assert!(terminal.jump_prompt(PromptDirection::Next));
+        let next_offset = terminal.with_term(|term| term.grid().display_offset());
+        assert!(next_offset < offset, "Next 应向底部回滚");
+
+        // ALT_SCREEN：跳转直接 false（备用屏没有主屏标记）
+        terminal.process_bytes(b"\x1b[?1049h");
+        assert!(!terminal.jump_prompt(PromptDirection::Previous));
+        terminal.process_bytes(b"\x1b[?1049l");
+        assert!(terminal.jump_prompt(PromptDirection::Previous));
+    }
+
+    #[test]
+    fn osc133_exit_code_backfill_and_running_window() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(20, 4, 32, false, GpuiEventProxy::new(tx));
+
+        // 完整生命周期：A → C（运行窗开）→ D;127（失败）
+        terminal.process_bytes(prompt_a());
+        terminal.process_bytes(b"$ ");
+        terminal.process_bytes(b"\x1b]133;C\x07");
+        assert!(terminal.command_running(), "C 与 D 之间应为运行窗");
+        terminal.process_bytes(b"exit 127\r\n");
+        terminal.process_bytes(b"\x1b]133;D;127\x07");
+        assert!(!terminal.command_running());
+        assert!(terminal.last_command_failed());
+        let marks = terminal.prompt_marks();
+        assert_eq!(marks[0].exit_code, Some(127), "退出码回填到所属提示符");
+
+        // 下一条成功：失败态清零、新标记退出码 0、旧标记保持
+        terminal.process_bytes(b"\x1b]133;D;0\x07"); // 重复 D 只收束、置成功
+        terminal.process_bytes(prompt_a());
+        terminal.process_bytes(b"\x1b]133;C\x07");
+        terminal.process_bytes(b"\x1b]133;D;0\x07");
+        assert!(!terminal.last_command_failed());
+        let marks = terminal.prompt_marks();
+        assert_eq!(marks[0].exit_code, Some(127));
+        assert_eq!(marks[1].exit_code, Some(0));
+    }
+
+    #[test]
+    fn osc_bypass_events_queued_and_taken() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(20, 4, 32, false, GpuiEventProxy::new(tx));
+        // OSC 7（cwd）与 133 混在同一字节流：133 进标记、7 进事件队列 + cwd 记录
+        assert!(
+            terminal.cwd().is_none(),
+            "未上报时 cwd 为 None（回退不继承）"
+        );
+        terminal.process_bytes(b"\x1b]7;file:///home/u\x07");
+        terminal.process_bytes(prompt_a());
+        terminal.process_bytes("\x1b]9;完成\x07".as_bytes());
+        assert_eq!(terminal.prompt_marks().len(), 1, "133 不进事件队列");
+        assert_eq!(terminal.cwd(), Some("/home/u"), "OSC 7 记录解码后的路径");
+        assert_eq!(
+            terminal.take_osc_events(),
+            vec![
+                crate::osc::OscEvent::Cwd {
+                    path: "/home/u".into()
+                },
+                crate::osc::OscEvent::Notify {
+                    body: "完成".into()
+                },
+            ]
+        );
+        // take 走即清空；cwd 记录不受 take 影响（记录与队列分离）
+        assert!(terminal.take_osc_events().is_empty());
+        assert_eq!(terminal.cwd(), Some("/home/u"));
+        // 非法上报（非 file://）不产事件也不动既有 cwd
+        terminal.process_bytes(b"\x1b]7;kitty://x\x07");
+        assert!(terminal.take_osc_events().is_empty());
+        assert_eq!(terminal.cwd(), Some("/home/u"), "非法上报不覆盖既有值");
+        // 合法新上报覆盖旧值（跟手：cd 到哪记哪）
+        terminal.process_bytes(b"\x1b]7;file:///opt\x07");
+        assert_eq!(terminal.cwd(), Some("/opt"));
+    }
+
+    #[test]
+    fn osc_progress_state_stored_and_invalid_retained() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(20, 4, 32, false, GpuiEventProxy::new(tx));
+        assert!(terminal.progress().is_none(), "未上报时无进度");
+
+        terminal.process_bytes(b"\x1b]9;4;1;42\x07");
+        assert_eq!(
+            terminal.progress(),
+            Some(crate::osc::ProgressState::Set { percent: 42 })
+        );
+        // 非法序列回退：状态保持上一次值，不被垃圾序列清掉
+        terminal.process_bytes(b"\x1b]9;4;9;1\x07");
+        terminal.process_bytes(b"\x1b]9;4;1;250\x07");
+        assert_eq!(
+            terminal.progress(),
+            Some(crate::osc::ProgressState::Set { percent: 42 }),
+            "非法 state/progress 应回退保留旧值"
+        );
+        // 出错态 → Remove 清除
+        terminal.process_bytes(b"\x1b]9;4;2\x07");
+        assert_eq!(terminal.progress(), Some(crate::osc::ProgressState::Error));
+        terminal.process_bytes(b"\x1b]9;4;0;0\x07");
+        assert!(terminal.progress().is_none(), "Remove 清除进度");
+    }
+
+    #[test]
+    fn osc_notice_forwarded_to_desktop_channel() {
+        let (proxy_tx, _proxy_rx) = channel();
+        let (notice_tx, notice_rx) = channel();
+        let mut terminal = TerminalState::new(20, 4, 32, false, GpuiEventProxy::new(proxy_tx));
+        terminal.set_notice_tx(notice_tx);
+
+        terminal.process_bytes("\x1b]777;notify;构建;完成\x07".as_bytes());
+        terminal.process_bytes(b"\x1b]9;\xe6\x9e\x84\xe5\xbb\xba\xe5\xae\x8c\xe6\x88\x90\x07");
+        // 直发 DesktopNotice（OSC 9 无标题 → 空串，展示层填默认）
+        match notice_rx.recv() {
+            Ok(crate::event::TerminalEvent::DesktopNotice { title, body }) => {
+                assert_eq!(title, "构建");
+                assert_eq!(body, "完成");
+            }
+            other => panic!("期望 DesktopNotice，实际 {other:?}"),
+        }
+        match notice_rx.recv() {
+            Ok(crate::event::TerminalEvent::DesktopNotice { title, body }) => {
+                assert_eq!(title, "");
+                assert_eq!(body, "构建完成");
+            }
+            other => panic!("期望 DesktopNotice，实际 {other:?}"),
+        }
+        // 事件队列仍保留兜底副本（take 语义不变）
+        assert_eq!(terminal.take_osc_events().len(), 2);
+    }
+
+    // ───────── OSC 8 显式超链接（Cell 级 hyperlink 段行走） ─────────
+
+    #[test]
+    fn osc8_hyperlink_span_walks_and_respects_boundaries() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(40, 4, 32, false, GpuiEventProxy::new(tx));
+        // OSC 8 开 → 「link」 → 关；随后普通文本（不属于段）
+        terminal.process_bytes(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ tail");
+        // 段内任意列命中并返回 URI
+        assert_eq!(
+            terminal.hyperlink_span_at(0, 0).as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            terminal.hyperlink_span_at(0, 3).as_deref(),
+            Some("https://example.com")
+        );
+        // 段边界：关闭序列之后的文本不再命中
+        assert_eq!(terminal.hyperlink_span_at(0, 4), None, "段外不应命中");
+        assert_eq!(terminal.hyperlink_span_at(0, 8), None);
+        // 越界防御与 extract_url_span_at 同口径
+        assert_eq!(terminal.hyperlink_span_at(4, 0), None);
+        assert_eq!(terminal.hyperlink_span_at(0, 40), None);
+    }
+
+    #[test]
+    fn osc8_adjacent_segments_do_not_merge() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(40, 4, 32, false, GpuiEventProxy::new(tx));
+        // 相邻两个不同 URI：AA（列 0-1）与 BB（列 2-3），段按值相等不串
+        terminal.process_bytes(b"\x1b]8;;https://a\x1b\\AA\x1b]8;;https://b\x1b\\BB\x1b]8;;\x1b\\");
+        assert_eq!(
+            terminal.hyperlink_span_at(0, 0).as_deref(),
+            Some("https://a")
+        );
+        assert_eq!(
+            terminal.hyperlink_span_at(0, 1).as_deref(),
+            Some("https://a")
+        );
+        assert_eq!(
+            terminal.hyperlink_span_at(0, 2).as_deref(),
+            Some("https://b")
+        );
+        assert_eq!(
+            terminal.hyperlink_span_at(0, 3).as_deref(),
+            Some("https://b")
+        );
+        assert_eq!(terminal.hyperlink_span_at(0, 4), None);
+    }
+
+    #[test]
+    fn osc8_span_extent_covers_segment_columns() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(40, 4, 32, false, GpuiEventProxy::new(tx));
+        terminal.process_bytes(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\");
+        // 段列范围（结束列开区间）：段内任意列点击都拿到同一段
+        assert_eq!(
+            terminal.hyperlink_span_extent_at(0, 2),
+            Some(("https://example.com".to_owned(), 0, 4))
+        );
+        assert_eq!(
+            terminal.hyperlink_span_extent_at(0, 0),
+            Some(("https://example.com".to_owned(), 0, 4))
+        );
+    }
+
+    #[test]
+    fn osc8_wide_char_spacer_columns_hit_and_stay_in_segment() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(40, 4, 32, false, GpuiEventProxy::new(tx));
+        // 段内是两个宽字符「中文」（各占 2 列）：首列 + 续列都应命中，
+        // 且段范围覆盖全部 4 列（spacer 同口径并入段）
+        terminal.process_bytes("\x1b]8;;https://例.example\x1b\\中文\x1b]8;;\x1b\\".as_bytes());
+        for col in 0..4 {
+            assert_eq!(
+                terminal.hyperlink_span_at(0, col).as_deref(),
+                Some("https://例.example"),
+                "宽字符段内列 {col} 应命中（含 spacer 续列）"
+            );
+        }
+        assert_eq!(terminal.hyperlink_span_at(0, 4), None, "段外不应命中");
+    }
+
+    #[test]
+    fn osc8_text_detection_stays_independent_for_priority_layering() {
+        let (tx, _rx) = channel();
+        let mut terminal = TerminalState::new(40, 4, 32, false, GpuiEventProxy::new(tx));
+        // 并存用例：URL 样文本被 OSC 8 包住但指向不同 URI——hyperlink
+        // 返回声明 URI；文本自动检测仍返回字面文本（两者分层，view 侧
+        // resolve_url_at 以 hyperlink 优先取用）
+        terminal
+            .process_bytes(b"\x1b]8;;https://real.example\x1b\\https://fake.example\x1b]8;;\x1b\\");
+        assert_eq!(
+            terminal.hyperlink_span_at(0, 0).as_deref(),
+            Some("https://real.example"),
+            "OSC 8 段内应返回声明 URI"
+        );
+        assert_eq!(
+            terminal.extract_url_at(0, 0).as_deref(),
+            Some("https://fake.example"),
+            "文本自动检测保持独立口径（view 侧 hyperlink 优先）"
+        );
+        // 无 OSC 8 的纯文本 URL：hyperlink 不命中，文本检测照常（回落路径）
+        terminal.process_bytes(b"\r\nplain https://text.example tail");
+        assert_eq!(terminal.hyperlink_span_at(1, 6), None);
+        assert_eq!(
+            terminal.extract_url_at(1, 6).as_deref(),
+            Some("https://text.example")
+        );
     }
 }
