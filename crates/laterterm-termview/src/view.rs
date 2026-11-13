@@ -609,6 +609,10 @@ pub struct TerminalView {
 
     /// 上次上报的滚动摘要；与当前值不同才触发回调，防止 notify 风暴。
     last_scroll: Option<ScrollSummary>,
+    /// 上次上报时的命令失败旗标：翻转也要触发 scroll 回调——工作区侧的
+    /// 失败红点读本视图状态，而本视图变化只 notify 自己；回滚打满且钉底
+    /// 时 scroll_summary 恒定，不带这个条件红点要等无关重绘才亮。
+    last_failed: bool,
     /// 防抖在途标记：输出洪峰时合并为每 150ms 至多一次宿主刷新。
     scroll_report_scheduled: bool,
 
@@ -1008,6 +1012,7 @@ impl TerminalView {
             exit_callback: None,
             scroll_callback: None,
             last_scroll: None,
+            last_failed: false,
             scroll_report_scheduled: false,
             mouse_down_reported: None,
             last_motion_report: None,
@@ -1814,6 +1819,11 @@ impl TerminalView {
     /// and handles them appropriately. Note: bytes are processed in the
     /// async reader task, not here.
     fn process_events(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 命令失败旗标翻转（OSC 133;D 在字节消费路径置位）→ 走 scroll 回调
+        // 通知工作区点亮红点；不带这步，钉底静默会话的红点要等无关重绘。
+        if self.last_failed != self.last_command_failed() {
+            self.schedule_scroll_report(cx);
+        }
         // Process terminal events (from alacritty event proxy)
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
@@ -1867,6 +1877,9 @@ impl TerminalView {
                     // 应用侧查询应答（kitty ?u / DECRQM / DA）直接写回本端
                     // PTY。刻意不走 commit_input：后者会触发 input_callback
                     // 把字节广播给其他窗格，协议应答不是用户输入，不该扩散。
+                    // 已知取舍：本事件族只在 render 门控的 process_events 消费，
+                    // 非活跃窗格里应用的查询应答会滞留到该窗格被绘制——事件
+                    // 消费 render 门控是既有结构性约束，v1 不为它破例。
                     self.write_input(text.as_bytes());
                 }
                 TerminalEvent::DesktopNotice { title, body } => {
@@ -1961,8 +1974,10 @@ impl TerminalView {
             let _ = this.update(cx, |this, cx| {
                 this.scroll_report_scheduled = false;
                 let summary = this.scroll_summary();
-                if this.last_scroll != Some(summary) {
+                let failed = this.last_command_failed();
+                if this.last_scroll != Some(summary) || this.last_failed != failed {
                     this.last_scroll = Some(summary);
+                    this.last_failed = failed;
                     if let Some(callback) = &this.scroll_callback {
                         callback(cx);
                     }

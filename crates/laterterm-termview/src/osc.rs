@@ -28,10 +28,12 @@
 //! `total_lines() - 1 - (bottommost_line() - cursor.line)`。
 //!
 //! 淘汰修正依赖滚动计数：喂入前后 `topmost_line()`（= `Line(-history)`）差值
-//! 累进 [`PromptTracker`]。**已知边界**：滚动缓冲打满后 alacritty 环形复用行，
-//! 挤出量对外不可观测（`Term` 无滚动计数外泄），修正退化为下界——最老标记
-//! 可能滞留、跳转可能偏下；预填充期（默认 10 万行缓冲覆盖绝大多数会话期）
-//! 逐行精确。resize/reflow 使绝对行号整体失效，走整体作废而非重映射
+//! 累进 [`PromptTracker`]。**已知边界**：topmost_line 是 total_lines 的派生量
+//! （history 差 ≡ total 差），滚动缓冲打满后该修正量恒为 0——环形复用行不可
+//! 观测（`Term` 无滚动计数外泄），缓冲满期标记修正 de facto 失效，最老标记
+//! 滞留、跳转可能偏下且随会话时长增长；预填充期（默认 10 万行缓冲覆盖绝大
+//! 多数会话期）逐行精确。真修需 Term 外泄淘汰计数，恢复可观测时再做。
+//! resize/reflow 使绝对行号整体失效，走整体作废而非重映射
 //! （见 `TerminalState::invalidate_prompt_marks`）。
 
 use std::collections::VecDeque;
@@ -521,8 +523,8 @@ mod tests {
     #[test]
     fn osc7_cwd_percent_decodes_utf8_and_spaces() {
         let mut sink = OscSink::new();
-        // 中文 + 空格路径（bash 钩子对 $PWD 原样上报，含空格/中文的目录
-        // 由发起端 percent 编码）
+        // 中文 + 空格路径：bash 钩子对 $PWD 原样上报（不做 percent 编码），
+        // 解析端对 percent 编码与否都宽容——本测锁定编码形态也能正确解码
         assert_eq!(
             feed(
                 &mut sink,
