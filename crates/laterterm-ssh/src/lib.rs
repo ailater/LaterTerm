@@ -902,6 +902,33 @@ async fn open_through(
     Ok(handle)
 }
 
+/// 连接本机 ssh-agent（Unix = SSH_AUTH_SOCK 套接字；Windows = OpenSSH
+/// Authentication Agent 服务的命名管道 `\\.\pipe\openssh-ssh-agent`，
+/// 即 `Get-Service ssh-agent` 对应服务，需设为启动后才可连）。
+///
+/// russh 的 agent 客户端按传输类型参数化（UnixStream / NamedPipeClient），
+/// 认证流程对两者完全一致，故仅在此分派连接方式。
+#[cfg(unix)]
+async fn connect_agent()
+-> io::Result<russh::keys::agent::client::AgentClient<tokio::net::UnixStream>> {
+    russh::keys::agent::client::AgentClient::connect_env()
+        .await
+        .map_err(|error| io::Error::other(format!("连接 ssh-agent 失败: {error}")))
+}
+
+#[cfg(windows)]
+async fn connect_agent() -> io::Result<
+    russh::keys::agent::client::AgentClient<tokio::net::windows::named_pipe::NamedPipeClient>,
+> {
+    russh::keys::agent::client::AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent")
+        .await
+        .map_err(|error| {
+            io::Error::other(format!(
+                "连接 ssh-agent 失败: {error}（Windows 需启用 OpenSSH Authentication Agent 服务）"
+            ))
+        })
+}
+
 /// 认证阶段（三种方式，见 [`SshAuth`]）。
 async fn authenticate(
     handle: &mut russh::client::Handle<ClientHandler>,
@@ -975,10 +1002,8 @@ async fn authenticate(
             success || matches!(response, KeyboardInteractiveAuthResponse::Success)
         }
         SshAuth::Agent => {
-            // 连接 ssh-agent（SSH_AUTH_SOCK），逐身份尝试，成功即止
-            let mut agent = russh::keys::agent::client::AgentClient::connect_env()
-                .await
-                .map_err(|error| io::Error::other(format!("连接 ssh-agent 失败: {error}")))?;
+            // 连接本机 ssh-agent（平台传输见 connect_agent），逐身份尝试，成功即止
+            let mut agent = connect_agent().await?;
             let identities = agent
                 .request_identities()
                 .await
