@@ -191,8 +191,8 @@ impl LocalSession {
             command.env(key, value);
         }
         if let Some(dir) = &options.cwd {
-            // 初始工作目录（cwd 继承）：portable-pty 会在 spawn 期 chdir，
-            // 目录不存在时 spawn_command 直接报错
+            // 初始工作目录（cwd 继承）：portable-pty 0.9 as_command 对非目录
+            // 静默回退 $HOME（不报错），见 LocalOptions.cwd 字段文档
             command.cwd(dir);
         }
         let mut child = pair
