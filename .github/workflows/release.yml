@@ -105,11 +105,13 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64
+          # 用产品名前缀而非裸 *.AppImage：AppImage 步下载的 linuxdeploy.AppImage
+          # 构建工具躺工作区，裸后缀会把它当产物捞进 Release（v0.4.0 实发后手工剔除）
           path: |
-            *.tar.xz
-            *.deb
-            *.AppImage
-            *.sha256
+            laterterm-*.tar.xz
+            laterterm_*.deb
+            laterterm_*.AppImage
+            laterterm*.sha256
 
   # Windows msi 拆为后续任务（评审定级，2026-11-07）：zip 已可发（ssh agent
   # 认证 2026-11-14 平台分派修复：Unix socket / Windows 命名管道，全量编译
