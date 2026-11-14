@@ -66,6 +66,9 @@
 
 - runner 钉回 ubuntu-24.04（ubuntu-latest 镜像 DNS 故障）
 - security 源改指 azure 归档（绕行 DNS 故障）
+- macOS 构建修复：macos-14 被 GitHub 退役（报「配置不支持」，此前误判为配额），切换 macos-latest
+- Windows 构建解锁：ssh agent 认证平台分派（Unix socket / Windows OpenSSH 命名管道），
+  Windows 全量编译进 CI 门禁，本版起产出 Windows zip
 
 - **焦点窗格放大/还原**：默认 `Ctrl+Shift+Z` 切换「只布局焦点窗格」与完整分屏布局，
   再按一次还原（焦点切走后按 = 退出 zoom 显示完整布局，不是回到之前放大的窗格）；
