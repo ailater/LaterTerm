@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/laterterm-app", "crates/laterterm-config", "crates/laterterm-core", "crates/laterterm-deepin", "crates/laterterm-local", "crates/laterterm-secrets", "crates/laterterm-ssh", "crates/laterterm-termview", "crates/laterterm-transfer", "crates/laterterm-xshell"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["crazykun <jilikun@gmail.com>"]
