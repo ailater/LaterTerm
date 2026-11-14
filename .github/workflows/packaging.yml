@@ -56,7 +56,7 @@ jobs:
         run: cargo test -p laterterm-local --lib --target x86_64-pc-windows-msvc
 
   macos-release:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master

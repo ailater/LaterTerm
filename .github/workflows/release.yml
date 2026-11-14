@@ -111,16 +111,12 @@ jobs:
             *.AppImage
             *.sha256
 
-  # Windows msi 拆为后续任务（评审定级，2026-11-07）：硬阻塞在源码层——
-  # laterterm-ssh 在 Windows 下不可编译（crates/laterterm-ssh/src/lib.rs:841
-  # AgentClient::connect_env 仅 #[cfg(unix)]，本文件无平台守卫，MSVC 下 E0599；
-  # v0.2.0 release 的本 job 构建步已实跑失败、被 continue-on-error 吞掉），
-  # laterterm-app 对 laterterm-ssh 无条件依赖（crates/laterterm-app/Cargo.toml:24）。
-  # 前置 = Windows 下 laterterm-ssh 编过；届时接线 packaging/windows/laterterm.wxs
-  # （dotnet tool wix v4 钉版 + msvc-dev-cmd/GPUI_FXC_PATH 配方，见 wxs 头注释）
-  # 并去掉 continue-on-error。
-  # 现阶段保留 continue-on-error：源码修好前去守卫只会把整条发版链打成必红，
-  # 静默缺 Windows 包优于用户下载到残缺 Release（临时降级出口，见 roadmap M4-1 注记）。
+  # Windows msi 拆为后续任务（评审定级，2026-11-07）：zip 已可发（ssh agent
+  # 认证 2026-11-14 平台分派修复：Unix socket / Windows 命名管道，全量编译
+  # 已进 ci.yml windows-check 门禁）。msi 接线时启用 packaging/windows/laterterm.wxs
+  # （dotnet tool wix v4 钉版 + msvc-dev-cmd/GPUI_FXC_PATH 配方，见 wxs 头注释）。
+  # 保留 continue-on-error：Windows/macOS 首跑仍可能暴露新环境问题，静默缺包
+  # 优于整条发版链必红（Linux 产物始终可发）。
   build-windows:
     name: Windows x64 构建（尽力而为）
     runs-on: windows-latest
@@ -128,9 +124,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # GPUI Windows 构建期要 rc.exe + fxc.exe（配方同 packaging.yml，实跑验证过）
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.94"
+
+      - name: 定位 fxc
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rc.exe -ErrorAction SilentlyContinue)) { throw 'Windows SDK rc.exe unavailable' }
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe unavailable' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -160,7 +170,10 @@ jobs:
 
   build-macos:
     name: macOS dmg（尽力而为）
-    runs-on: macos-14
+    # macos-14 已被 GitHub 退役（标注 The configuration 'macos-14-arm64-us-default'
+    # is not supported，2026-11-14 实测）；双架构靠 rustup targets 交叉编译 +
+    # lipo 合一，runner 本机架构无所谓，跟 macos-latest 走。
+    runs-on: macos-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4

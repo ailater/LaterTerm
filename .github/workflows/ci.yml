@@ -118,6 +118,25 @@ jobs:
         with:
           key: ci-windows
 
-      # transfer 在 Windows 仅透明旁路；完整 GUI/SSH/MSVC release 由手动原生工作流验证。
-      - name: 编译检查（跨平台核心 crate）
-        run: cargo check -p laterterm-core -p laterterm-config -p laterterm-local -p laterterm-secrets -p laterterm-transfer
+      # GPUI Windows 构建期要 rc.exe（gpui.rc 资源）与 fxc.exe（shaders.hlsl）：
+      # msvc-dev-cmd 注入 VS/SDK 环境，fxc 逐 SDK 版本扫描取最新（build.rs 只认
+      # GPUI_FXC_PATH / PATH / 硬编码 26100，SDK 版本漂移会三连失败）。
+      # 配方同 packaging.yml windows-release（实跑验证过）。
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: 定位 fxc
+        shell: pwsh
+        run: |
+          if (-not (Get-Command rc.exe -ErrorAction SilentlyContinue)) { throw 'Windows SDK rc.exe unavailable' }
+          $fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\fxc.exe" -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe unavailable' }
+          "GPUI_FXC_PATH=$($fxc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # 全 workspace 编译检查：laterterm-ssh agent 认证已平台分派（Unix socket /
+      # Windows 命名管道），Windows 全量编译自此进门禁，发版 job 不再踩首次编译错。
+      # transfer 在 Windows 仅透明旁路（rzsz 未启用）。
+      - name: 编译检查（全 workspace）
+        run: cargo check --workspace
