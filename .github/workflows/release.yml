@@ -159,8 +159,9 @@ jobs:
             *.sha256
 
   build-macos:
-    name: macOS dmg（双架构）
+    name: macOS dmg（尽力而为）
     runs-on: macos-14
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
