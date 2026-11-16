@@ -214,8 +214,9 @@ impl WebDav for UreqWebDav {
     fn probe(&self, auth: &WebDavAuth) -> Result<(), WebDavError> {
         let response = self.send("PROPFIND", "", auth, Some(""), &[("Depth", "0".into())])?;
         let status = response.status().as_u16();
-        if status == 207 {
-            // 207 Multi-Status：目录存在且服务端支持 PROPFIND
+        if (200..300).contains(&status) {
+            // 207 Multi-Status 是规范应答；不合规范但可达的服务器可能返回
+            // 200/204——与 put/get/move 同口径放行 2xx，目录可达即视为成功
             return Ok(());
         }
         match status_to_error(status) {
@@ -493,42 +494,81 @@ pub(crate) fn merge_from_remote(
         themes_backup_dir: themes_backup_dir.clone(),
         ..MergeReport::default()
     };
-    // 主题补齐型写入（见函数头注记）
+    // 主题补齐型写入（见函数头注记）。与 settings 同纪律：绝不部分应用——
+    // 逐文件写入，任一失败即回滚本段已写盘的文件（新增删除、覆盖从备份恢复），
+    // 不留半截状态。
     if !snapshot.themes.is_empty() {
         let local_themes = read_local_themes(themes_path);
         std::fs::create_dir_all(themes_path)
             .map_err(|error| format!("创建主题目录失败：{error}"))?;
-        for theme in &snapshot.themes {
-            // 快照来自远程服务器，主题名要拼本地路径：不可信输入先过安全校验
-            if !is_safe_theme_name(&theme.name) {
-                eprintln!("快照中的主题名不安全，已跳过：{}", theme.name);
-                continue;
-            }
-            let file = themes_path.join(format!("{}.toml", theme.name));
-            match local_themes.iter().find(|(name, _)| *name == theme.name) {
-                // 本地无同名：远端新增
-                None => {
-                    std::fs::write(&file, &theme.body)
-                        .map_err(|error| format!("写入远端主题 {} 失败：{error}", theme.name))?;
-                    report.themes_added.push(theme.name.clone());
+        // 本段已写盘的 (路径, 是否覆盖既有文件)：失败回滚清单
+        let mut written: Vec<(std::path::PathBuf, bool)> = Vec::new();
+        let write_error: Result<(), String> = (|| {
+            for theme in &snapshot.themes {
+                // 快照来自远程服务器，主题名要拼本地路径：不可信输入先过安全校验。
+                // 拒绝分支的日志必须先净化——name 尚未过校验，可含换行/ANSI 转义，
+                // 原文打进启动终端的 stderr 是日志转义注入面。
+                if !is_safe_theme_name(&theme.name) {
+                    let sanitized: String = theme
+                        .name
+                        .chars()
+                        .map(|c| if c.is_control() { '?' } else { c })
+                        .take(60)
+                        .collect();
+                    eprintln!("快照中的主题名不安全，已跳过：{sanitized}");
+                    continue;
                 }
-                // 同名同字节：跳过
-                Some((_, body)) if body == &theme.body => {}
-                // 同名不同内容：远程胜覆盖（对齐「自定义主题同名覆盖内置」
-                // 约定下用户手写主题不可静默丢失——备份不可用时宁可跳过）
-                Some(_) => {
-                    if themes_backup_dir.is_none() {
-                        eprintln!(
-                            "主题 {} 与远程不一致，但本地备份目录不可用，已跳过覆盖",
-                            theme.name
-                        );
-                        continue;
+                let file = themes_path.join(format!("{}.toml", theme.name));
+                match local_themes.iter().find(|(name, _)| *name == theme.name) {
+                    // 本地无同名：远端新增
+                    None => {
+                        if let Err(error) = std::fs::write(&file, &theme.body) {
+                            return Err(format!("写入远端主题 {} 失败：{error}", theme.name));
+                        }
+                        written.push((file, false));
+                        report.themes_added.push(theme.name.clone());
                     }
-                    std::fs::write(&file, &theme.body)
-                        .map_err(|error| format!("覆盖本地主题 {} 失败：{error}", theme.name))?;
-                    report.themes_overwritten.push(theme.name.clone());
+                    // 同名同字节：跳过
+                    Some((_, body)) if body == &theme.body => {}
+                    // 同名不同内容：远程胜覆盖（对齐「自定义主题同名覆盖内置」
+                    // 约定下用户手写主题不可静默丢失——备份不可用时宁可跳过）
+                    Some(_) => {
+                        if themes_backup_dir.is_none() {
+                            eprintln!(
+                                "主题 {} 与远程不一致，但本地备份目录不可用，已跳过覆盖",
+                                theme.name
+                            );
+                            continue;
+                        }
+                        if let Err(error) = std::fs::write(&file, &theme.body) {
+                            return Err(format!("覆盖本地主题 {} 失败：{error}", theme.name));
+                        }
+                        written.push((file, true));
+                        report.themes_overwritten.push(theme.name.clone());
+                    }
                 }
             }
+            Ok(())
+        })();
+        if let Err(error) = write_error {
+            for (file, was_overwrite) in written {
+                let _ = if was_overwrite {
+                    themes_backup_dir
+                        .as_deref()
+                        .map(|backup| {
+                            std::fs::copy(
+                                std::path::Path::new(backup)
+                                    .join(file.file_name().expect("主题文件名已定型")),
+                                &file,
+                            )
+                            .map(|_| ())
+                        })
+                        .unwrap_or(Ok(()))
+                } else {
+                    std::fs::remove_file(&file)
+                };
+            }
+            return Err(error);
         }
     }
     Ok((outcome.settings, report))

@@ -3603,6 +3603,10 @@ impl WorkspaceView {
                 .await;
             let _ = this.update(cx, |workspace, cx| {
                 workspace.webdav_task = WebDavTaskState::Idle;
+                // 密码用完即弃（TOTP 对话框 totp_fields.clear 同款卫生口径）：
+                // 明文密码不随 masked 输入框实体驻留整个视图生命周期，重试时
+                // 用户重输（密码本体在密钥环，此处只是输入缓存）。
+                workspace.webdav_fields.clear();
                 match result {
                     // 合并成功：走落盘 + 同轨应用链路（finish 内回写结果）
                     Ok(SyncOutcome::MergeApplied { settings, report }) => {
@@ -3646,11 +3650,37 @@ impl WorkspaceView {
             None => Some(anyhow::anyhow!("无法定位设置文件路径")),
         };
         self.apply_loaded_settings(merged, ThemeRegistry::load(), cx);
-        self.webdav_result = Some(Ok(WebDavOutcome::MergeApplied(report)));
         // 落盘失败保留内存合并态（用户所见即所合并），如实报错；下次任意
-        // 保存会重写盘（口径同主题保存）。报错追加在合并成功明细之后。
+        // 保存会重写盘（口径同主题保存）。报错必须携带合并明细——直接以
+        // Err 替换 Ok 会让差异清单（远端新增/覆盖/主题）整体消失。
+        let detail = format!(
+            "远端新增：{}；远程覆盖：{}；新增主题：{}；覆盖主题：{}",
+            if report.added.is_empty() {
+                "无".into()
+            } else {
+                report.added.join("、")
+            },
+            if report.overridden.is_empty() {
+                "无".into()
+            } else {
+                report.overridden.join("、")
+            },
+            if report.themes_added.is_empty() {
+                "无".into()
+            } else {
+                report.themes_added.join("、")
+            },
+            if report.themes_overwritten.is_empty() {
+                "无".into()
+            } else {
+                report.themes_overwritten.join("、")
+            },
+        );
+        self.webdav_result = Some(Ok(WebDavOutcome::MergeApplied(report)));
         if let Some(error) = persist_error {
-            self.webdav_result = Some(Err(format!("合并已应用，但落盘失败：{error:#}")));
+            self.webdav_result = Some(Err(format!(
+                "合并已应用，但落盘失败：{error:#}（本次合并明细：{detail}）"
+            )));
         }
     }
 
