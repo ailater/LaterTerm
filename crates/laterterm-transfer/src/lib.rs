@@ -260,6 +260,16 @@ impl TransferReader {
 
         // 三触发扫描：取最早出现者；ZMODEM 从触发帧起全量导入，
         // trzsz S/R 吞掉整行触发串、从行尾起导入（触发行不是 # 帧）
+        // D/F 触发行（目录/拖拽上传）v1 不做：识别即吞行（本层无 PTY 写
+        // 句柄回 FAIL，远端 trz -d 会等 ACT 超时自退）；优先级低于 S/R——
+        // S/R 可路由时按 S/R 走，否则吞行放行后续内容。
+        let df_at = [
+            find_subslice(&window, trzsz::TRZSZ_D_TRIGGER),
+            find_subslice(&window, trzsz::TRZSZ_F_TRIGGER),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|pos| *pos);
         let zmodem_at = find_subslice(&window, ZMODEM_TRIGGER);
         let trzsz_s_at = find_subslice(&window, trzsz::TRZSZ_TRIGGER);
         let trzsz_r_at = find_subslice(&window, trzsz::TRZSZ_R_TRIGGER);
@@ -277,6 +287,31 @@ impl TransferReader {
             Zmodem,
             TrzszReceive,
             TrzszUpload,
+        }
+
+        // D/F 最早出现且行已到齐：吞整行（不路由不回帧），放行行尾之后
+        // 内容；行未到齐同 S/R 的扣留等待上限口径（超限放弃候选放行）。
+        if let Some(pos) = df_at
+            && route.as_ref().map(|(_, p)| pos < *p).unwrap_or(true)
+        {
+            match window[pos..].iter().position(|b| *b == b'\n') {
+                Some(nl) => {
+                    let rest = window[pos + nl + 1..].to_vec();
+                    let out_len = rest.len().min(buf.len());
+                    buf[..out_len].copy_from_slice(&rest[..out_len]);
+                    self.carry = rest[out_len..].to_vec();
+                    return Ok(out_len);
+                }
+                None => {
+                    if window.len() > CARRY_WAIT_LIMIT {
+                        return self.release_as_output(window, buf);
+                    }
+                    let out_len = pos.min(buf.len());
+                    buf[..out_len].copy_from_slice(&window[..out_len]);
+                    self.carry = window[out_len..].to_vec();
+                    return Ok(out_len);
+                }
+            }
         }
 
         if let Some((route, pos)) = route {

@@ -30,7 +30,7 @@
 //! SharedWriter 回写远端、download_dir 落盘与事件口。
 
 use crate::{SharedWriter, TransferDirection, TransferEvent, TransferFlavor, TransferOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -86,6 +86,13 @@ pub const TRZSZ_TRIGGER: &[u8] = b"::TRZSZ:TRANSFER:S:";
 /// 触发串（`R` = 远端要收文件，本端上传）。
 pub const TRZSZ_R_TRIGGER: &[u8] = b"::TRZSZ:TRANSFER:R:";
 
+/// 触发串（`D` = 目录传输）：v1 不做目录，lib 层识别即吞行（无写句柄回
+/// FAIL，远端 trz -d 会等 ACT 超时自退——v1 限制声明）。
+pub const TRZSZ_D_TRIGGER: &[u8] = b"::TRZSZ:TRANSFER:D:";
+
+/// 触发串（`F` = 拖拽上传）：同 D，v1 识别即吞行。
+pub const TRZSZ_F_TRIGGER: &[u8] = b"::TRZSZ:TRANSFER:F:";
+
 /// 载荷编码：base64(zlib(data))；解码为其逆。
 fn encode_payload(data: &[u8]) -> String {
     use base64::Engine as _;
@@ -134,39 +141,57 @@ struct Frame {
 ///
 /// 读阻塞受 feed 的 `set_read_timeout` 约束（见 [`DEFAULT_TIMEOUT_SECS`]）；
 /// 行长受 [`FRAME_LINE_LIMIT`] 约束——两者共同封死「误触发后远端无换行
-/// 输出洪流」导致的 worker 永久阻塞 / 内存无界。
-fn recv_frame(reader: &mut UnixStream) -> io::Result<Frame> {
+/// 输出洪流」导致的 worker 永久阻塞 / 内存无界。BufReader 缓冲内逐字节
+/// 扫描零额外 syscall（修复逐字节 read 把吞吐封在 ~1-2MB/s 的问题）。
+fn recv_frame(reader: &mut BufReader<UnixStream>) -> io::Result<Frame> {
     let mut line = Vec::new();
-    let mut byte = [0u8; 1];
     loop {
-        let n = reader.read(&mut byte).map_err(|error| {
-            if matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ) {
-                io::Error::other("trzsz: 读超时（远端无响应，按协议报错终止）")
-            } else {
-                error
-            }
-        })?;
-        if n == 0 {
+        let available = reader.fill_buf().map_err(map_read_error)?;
+        if available.is_empty() {
             return Err(io::Error::other("trzsz: 连接在帧中途中断"));
         }
-        match byte[0] {
-            b'\n' => break,
-            0x03 => return Err(io::Error::other("trzsz: 被中断（ctrl+c）")),
-            b'\r' => continue,
-            other => {
-                line.push(other);
-                if line.len() > FRAME_LINE_LIMIT {
-                    return Err(io::Error::other(
-                        "trzsz: 帧行长超限（>16MiB），疑似非协议数据洪流",
-                    ));
+        let mut consumed = 0usize;
+        for &byte in available {
+            consumed += 1;
+            match byte {
+                b'\n' => {
+                    reader.consume(consumed);
+                    return parse_frame_line(&line);
+                }
+                0x03 => {
+                    reader.consume(consumed);
+                    return Err(io::Error::other("trzsz: 被中断（ctrl+c）"));
+                }
+                b'\r' => {}
+                other => {
+                    line.push(other);
+                    if line.len() > FRAME_LINE_LIMIT {
+                        return Err(io::Error::other(
+                            "trzsz: 帧行长超限（>16MiB），疑似非协议数据洪流",
+                        ));
+                    }
                 }
             }
         }
+        reader.consume(consumed);
     }
-    let text = String::from_utf8_lossy(&line).into_owned();
+}
+
+/// 读错误文案映射：超时类统一为「远端无响应」终止口径。
+fn map_read_error(error: io::Error) -> io::Error {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    ) {
+        io::Error::other("trzsz: 读超时（远端无响应，按协议报错终止）")
+    } else {
+        error
+    }
+}
+
+/// 行字节 → 协议帧（`#TYPE:payload`）。
+fn parse_frame_line(line: &[u8]) -> io::Result<Frame> {
+    let text = String::from_utf8_lossy(line).into_owned();
     let (typ, payload) = text
         .strip_prefix('#')
         .and_then(|rest| rest.split_once(':'))
@@ -184,10 +209,32 @@ pub(crate) fn run_trzsz_receive(
     feed: UnixStream,
     done: Arc<AtomicBool>,
 ) {
-    let result = trzsz_receive_loop(options, reply, feed);
-    let event = match result {
-        Ok(paths) => TransferEvent::Finished(paths),
-        Err(error) => TransferEvent::Failed(format!("trzsz: {error}")),
+    // 失败/中止时向远端补发 FAIL：官方终止语义，远端不必干等自身超时。
+    // reply 可克隆（Arc<Mutex>），loop 消费原件、此处留副件发终止帧。
+    let fail_reply = reply.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        trzsz_receive_loop(options, reply, BufReader::new(feed))
+    }));
+    let event = match &result {
+        Ok(Ok(paths)) => TransferEvent::Finished(paths.clone()),
+        Ok(Err(error)) => {
+            let _ = send_line(
+                &fail_reply,
+                "FAIL",
+                &encode_payload(error.to_string().as_bytes()),
+            );
+            TransferEvent::Failed(format!("trzsz: {error}"))
+        }
+        Err(panic) => {
+            // panic 兜底：worker 无终态事件会让键盘接管 gate 永久锁死
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "worker panic".into());
+            let _ = send_line(&fail_reply, "FAIL", &encode_payload(message.as_bytes()));
+            TransferEvent::Failed(format!("trzsz worker panic: {message}"))
+        }
     };
     let _ = options.events.send(event);
     done.store(true, Ordering::Release);
@@ -199,14 +246,30 @@ fn send_line(reply: &SharedWriter, typ: &str, payload: &str) -> io::Result<()> {
     writer.flush()
 }
 
+/// 按服务端 CFG 的 timeout 刷新读超时。官方口径 timeout=0 = 不限时
+/// （py_utils.py 仅 CONFIG.timeout>0 才 alarm、transfer.go 仅 Timeout>0 建
+/// timer）——钳成 1s 会对配置 timeout:0 的服务端每秒误判超时中止；不设
+/// 读超时的泄漏风险由用户 Esc 取消兜底。字段缺失/非法保持既有默认 20s。
+fn apply_server_timeout(feed: &UnixStream, config_payload: &str) -> io::Result<()> {
+    let timeout = serde_json::from_str::<serde_json::Value>(config_payload.trim())
+        .ok()
+        .and_then(|value| value.get("timeout").and_then(|value| value.as_u64()));
+    match timeout {
+        Some(0) => feed.set_read_timeout(None),
+        Some(seconds) => feed.set_read_timeout(Some(Duration::from_secs(seconds))),
+        None => Ok(()),
+    }
+}
+
 fn trzsz_receive_loop(
     options: &TransferOptions,
     reply: SharedWriter,
-    mut feed: UnixStream,
+    mut feed: BufReader<UnixStream>,
 ) -> io::Result<Vec<PathBuf>> {
     std::fs::create_dir_all(&options.download_dir)?;
     // 读超时兜底（默认 20s）：远端中途断流/静默时 worker 报错退出，不永久泄漏
-    feed.set_read_timeout(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)))?;
+    feed.get_ref()
+        .set_read_timeout(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)))?;
 
     // ① ACT：客户端能力声明（lang=rs 标识实现方）
     let action = serde_json::json!({
@@ -224,12 +287,8 @@ fn trzsz_receive_loop(
         return Err(io::Error::other(format!("期望 CFG，收到 {}", frame.typ)));
     }
     // 按服务端 CFG 的 timeout 刷新读超时（官方口径：超时 = 报错终止，无重传；
-    // 字段缺失/非法保持默认 20s）
-    if let Ok(server_cfg) = serde_json::from_str::<serde_json::Value>(frame.payload.trim())
-        && let Some(timeout) = server_cfg.get("timeout").and_then(|value| value.as_u64())
-    {
-        feed.set_read_timeout(Some(Duration::from_secs(timeout.max(1))))?;
-    }
+    // timeout=0 = 不限时，见 apply_server_timeout 注记；字段缺失保持默认 20s）
+    apply_server_timeout(feed.get_ref(), frame.payload.trim())?;
     // ③ 暂不支持安全目录传输，明确关闭目录能力。不声明 binary：官方语义下
     //    binary=true 的 DATA 走「长度行 + 原始转义字节」非行帧（见模块头），
     //    protocol-1 纯 ASCII 字符串编码是唯一与本端解析器兼容的路径。
@@ -241,7 +300,7 @@ fn trzsz_receive_loop(
         "bufsize": 131_072,
         "timeout": 60,
         "overwrite": false,
-        "tmux_output_junk": true,
+        "tmux_output_junk": false,
         "tmux_pane_width": 120,
         "protocol": 1,
     });
@@ -261,10 +320,10 @@ fn trzsz_receive_loop(
         saved.push(recv_one_file(options, &reply, &mut feed)?);
     }
 
-    // ⑮ EXIT 双向道别
+    // ⑮ EXIT：官方客户端只收不发（py_transfer recv_exit）——不回发多余帧
     let frame = recv_frame(&mut feed)?;
-    if frame.typ == "EXIT" {
-        send_line(&reply, "EXIT", &encode_payload(b"Done"))?;
+    if frame.typ != "EXIT" {
+        return Err(io::Error::other(format!("期望 EXIT，收到 {}", frame.typ)));
     }
     Ok(saved.into_iter().flatten().collect())
 }
@@ -273,7 +332,7 @@ fn trzsz_receive_loop(
 fn recv_one_file(
     options: &TransferOptions,
     reply: &SharedWriter,
-    feed: &mut UnixStream,
+    feed: &mut BufReader<UnixStream>,
 ) -> io::Result<Option<PathBuf>> {
     let frame = recv_frame(feed)?;
     if frame.typ != "NAME" {
@@ -285,7 +344,12 @@ fn recv_one_file(
     // NAME 载荷：base64(zlib(utf8 名字)) 或 json 对象（目录模式）
     let decoded = decode_payload(&frame.payload)?;
     let text = String::from_utf8_lossy(&decoded).into_owned();
-    if text.trim_start().starts_with('{') {
+    // 目录模式的 NAME 载荷是 JSON 对象（官方按协商的 directory 标志分派，
+    // 不看载荷形状）——只认合法 JSON 对象才拒，普通名字以 { 开头不误拒
+    let looks_like_directory = serde_json::from_str::<serde_json::Value>(&text)
+        .map(|value| value.is_object())
+        .unwrap_or(false);
+    if looks_like_directory {
         return Err(io::Error::other("暂不支持 trzsz 目录传输"));
     }
     let name = text;
@@ -294,7 +358,8 @@ fn recv_one_file(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "unnamed".into());
-    if safe_name.is_empty() || safe_name == "." || safe_name == ".." {
+    // file_name() 永不返回 "." / ".."（会被剥离），旧守卫是死代码
+    if safe_name.is_empty() {
         return Err(io::Error::other(format!("非法文件名: {name}")));
     }
     let target = options.download_dir.join(&safe_name);
@@ -309,7 +374,7 @@ fn recv_one_file(
     // SIZE 上限（4GiB）：远端谎报超大文件时拒绝并回 ERRO，不进入接收循环
     if size > MAX_TRANSFER_BYTES {
         let message = format!("文件超过 4GiB 上限（SIZE={size}），已拒绝");
-        let _ = send_line(reply, "ERRO", &encode_payload(message.as_bytes()));
+        let _ = send_line(reply, "FAIL", &encode_payload(message.as_bytes()));
         return Err(io::Error::other(message));
     }
     send_line(reply, "SUCC", frame.payload.trim())?;
@@ -331,7 +396,7 @@ fn recv_one_file(
         // 累计接收量上限（4GiB）：远端拆块绕过 SIZE 校验的第二道闸
         if received > MAX_TRANSFER_BYTES {
             let message = format!("接收量超过 4GiB 上限（SIZE={size}），已中止");
-            let _ = send_line(reply, "ERRO", &encode_payload(message.as_bytes()));
+            let _ = send_line(reply, "FAIL", &encode_payload(message.as_bytes()));
             return Err(io::Error::other(message));
         }
         // 进度事件（节流发射）：驱动 UI 浮条（trzsz 专属；ZMODEM 无回调不发）
@@ -371,10 +436,30 @@ pub(crate) fn run_trzsz_upload(
     feed: UnixStream,
     done: Arc<AtomicBool>,
 ) {
-    let result = trzsz_upload_loop(options, reply, feed);
-    let event = match result {
-        Ok(_count) => TransferEvent::Finished(vec![]), // 上传无落盘路径
-        Err(error) => TransferEvent::Failed(format!("trzsz 上传: {error}")),
+    // 失败/中止补发 FAIL + panic 兜底，口径同接收方向 worker
+    let fail_reply = reply.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        trzsz_upload_loop(options, reply, BufReader::new(feed))
+    }));
+    let event = match &result {
+        Ok(Ok(_count)) => TransferEvent::Finished(vec![]), // 上传无落盘路径
+        Ok(Err(error)) => {
+            let _ = send_line(
+                &fail_reply,
+                "FAIL",
+                &encode_payload(error.to_string().as_bytes()),
+            );
+            TransferEvent::Failed(format!("trzsz 上传: {error}"))
+        }
+        Err(panic) => {
+            let message = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "worker panic".into());
+            let _ = send_line(&fail_reply, "FAIL", &encode_payload(message.as_bytes()));
+            TransferEvent::Failed(format!("trzsz worker panic: {message}"))
+        }
     };
     let _ = options.events.send(event);
     done.store(true, Ordering::Release);
@@ -386,10 +471,11 @@ pub(crate) fn run_trzsz_upload(
 fn trzsz_upload_loop(
     options: &TransferOptions,
     reply: SharedWriter,
-    mut feed: UnixStream,
+    mut feed: BufReader<UnixStream>,
 ) -> io::Result<usize> {
     // 读超时兜底（同接收方向）：远端断流/静默时 worker 报错退出，不永久泄漏
-    feed.set_read_timeout(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)))?;
+    feed.get_ref()
+        .set_read_timeout(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)))?;
     // 无可上传文件：优雅拒绝（不让远端挂在等 ACT 的状态）
     let Some(files) = &options.upload_files else {
         send_line(
@@ -399,7 +485,7 @@ fn trzsz_upload_loop(
         )?;
         // 等 CFG 再回 ERRO（远端 trz 在等 ACT 后进入 CFG 交换）
         let _frame = recv_frame(&mut feed)?;
-        send_line(&reply, "ERRO", &encode_payload(b"no files to upload"))?;
+        send_line(&reply, "FAIL", &encode_payload(b"no files to upload"))?;
         return Err(io::Error::other("无可上传文件（upload_files 未设置）"));
     };
     if files.is_empty() {
@@ -409,7 +495,7 @@ fn trzsz_upload_loop(
             r#"{"lang":"rs","confirm":true,"protocol":1}"#,
         )?;
         let _frame = recv_frame(&mut feed)?;
-        send_line(&reply, "ERRO", &encode_payload(b"file list is empty"))?;
+        send_line(&reply, "FAIL", &encode_payload(b"file list is empty"))?;
         return Err(io::Error::other("上传文件列表为空"));
     }
 
@@ -428,6 +514,9 @@ fn trzsz_upload_loop(
     if frame.typ != "CFG" {
         return Err(io::Error::other(format!("期望 CFG，收到 {}", frame.typ)));
     }
+    // 上传方向对称刷新读超时：服务端 CFG timeout 覆盖本端 20s 初值——
+    // 慢 ACK（>20s）不被本端单方面判死，与本端声明的 timeout:60 一致
+    apply_server_timeout(feed.get_ref(), frame.payload.trim())?;
     // ③ 回客户端 CFG（上传不开目录——只传文件；不声明 binary，口径同接收方向）
     let config = serde_json::json!({
         "lang": "rs",
@@ -437,7 +526,7 @@ fn trzsz_upload_loop(
         "bufsize": 131_072,
         "timeout": 60,
         "overwrite": true,
-        "tmux_output_junk": true,
+        "tmux_output_junk": false,
         "tmux_pane_width": 120,
         "protocol": 1,
     });
@@ -463,7 +552,7 @@ fn trzsz_upload_loop(
 fn upload_one_file(
     options: &TransferOptions,
     reply: &SharedWriter,
-    feed: &mut UnixStream,
+    feed: &mut BufReader<UnixStream>,
     path: &std::path::Path,
 ) -> io::Result<()> {
     let name = path
@@ -473,9 +562,9 @@ fn upload_one_file(
     let data =
         std::fs::read(path).map_err(|e| io::Error::other(format!("读 {}: {e}", path.display())))?;
 
-    // NAME（文件名）
+    // NAME（文件名）：官方对 NAME 的 SUCC 不校验载荷，本端只验帧类型
     send_line(reply, "NAME", &encode_payload(name.as_bytes()))?;
-    expect_succ(feed, &encode_payload(name.as_bytes()))?;
+    expect_succ_decoded(feed)?;
 
     // SIZE
     send_line(reply, "SIZE", &data.len().to_string())?;
@@ -505,17 +594,19 @@ fn upload_one_file(
         ctx.finalize()
     };
     send_line(reply, "MD5", &encode_payload(&digest.0))?;
-    expect_succ(feed, &encode_payload(&digest.0))?;
+    // 官方互操作语义：服务端自行校验 MD5，不符回 FAIL；SUCC 即通过——
+    // 本端不比对回显载荷（各实现 SUCC 载荷不一，压缩器字节也不保证一致）
+    expect_succ_decoded(feed)?;
 
     Ok(())
 }
 
-/// 收一帧并断言 SUCC 载荷与期望一致。
-fn expect_succ(feed: &mut UnixStream, expect: &str) -> io::Result<()> {
+/// 收一帧并断言 SUCC 载荷与期望一致（数字长度类：双方均为明文，可逐字节比）。
+fn expect_succ(feed: &mut BufReader<UnixStream>, expect: &str) -> io::Result<()> {
     let frame = recv_frame(feed)?;
     if frame.typ == "SUCC" && frame.payload == expect {
         Ok(())
-    } else if frame.typ == "ERRO" {
+    } else if frame.typ == "FAIL" || frame.typ == "ERRO" {
         let decoded = decode_payload(&frame.payload)
             .map(|b| String::from_utf8_lossy(&b).into_owned())
             .unwrap_or_else(|_| frame.payload.clone());
@@ -523,6 +614,27 @@ fn expect_succ(feed: &mut UnixStream, expect: &str) -> io::Result<()> {
     } else {
         Err(io::Error::other(format!(
             "期望 SUCC:{expect}，收到 {}:{}",
+            frame.typ, frame.payload
+        )))
+    }
+}
+
+/// 收一帧并断言 SUCC 类型、忽略载荷、返回解码内容：NAME/MD5 步的官方语义
+/// 是解码后比对——zlib 压缩器实现间字节不保证一致（本端 flate2 与参考
+/// zlib 对同一输入可产出不同字节），按本端编码原文逐字节比对会对真实
+/// trzsz-go/trzsz 服务端误判失败（官方对 NAME 的 SUCC 根本不校验载荷）。
+fn expect_succ_decoded(feed: &mut BufReader<UnixStream>) -> io::Result<Vec<u8>> {
+    let frame = recv_frame(feed)?;
+    if frame.typ == "SUCC" {
+        decode_payload(&frame.payload)
+    } else if frame.typ == "FAIL" || frame.typ == "ERRO" {
+        let decoded = decode_payload(&frame.payload)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_else(|_| frame.payload.clone());
+        Err(io::Error::other(format!("远端拒绝: {decoded}")))
+    } else {
+        Err(io::Error::other(format!(
+            "期望 SUCC，收到 {}:{}",
             frame.typ, frame.payload
         )))
     }
@@ -556,7 +668,7 @@ mod tests {
                 Box::new(io::sink()) as Box<dyn Write + Send>
             )),
         };
-        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
         write!(
             sender,
             "#NAME:{}\n#SIZE:3\n#DATA:{}\n#MD5:{}\n",
@@ -565,7 +677,7 @@ mod tests {
             encode_payload(&md5::compute(b"new").0)
         )
         .unwrap();
-        assert!(recv_one_file(&options, &reply, &mut receiver).is_err());
+        assert!(recv_one_file(&options, &reply, &mut BufReader::new(receiver)).is_err());
         assert_eq!(std::fs::read(target).unwrap(), "原始内容".as_bytes());
     }
 
@@ -583,7 +695,7 @@ mod tests {
                 Box::new(io::sink()) as Box<dyn Write + Send>
             )),
         };
-        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
         write!(
             sender,
             "#NAME:{}\n#SIZE:5\n#DATA:{}\n",
@@ -592,7 +704,7 @@ mod tests {
         )
         .unwrap();
         drop(sender);
-        assert!(recv_one_file(&options, &reply, &mut receiver).is_err());
+        assert!(recv_one_file(&options, &reply, &mut BufReader::new(receiver)).is_err());
         assert!(!dir.path().join("partial.txt").exists());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
@@ -611,11 +723,11 @@ mod tests {
                 Box::new(io::sink()) as Box<dyn Write + Send>
             )),
         };
-        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
         let name =
             serde_json::json!({"path_name": ["parent", "child"], "is_dir": true}).to_string();
         writeln!(sender, "#NAME:{}", encode_payload(name.as_bytes())).unwrap();
-        assert!(recv_one_file(&options, &reply, &mut receiver).is_err());
+        assert!(recv_one_file(&options, &reply, &mut BufReader::new(receiver)).is_err());
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
@@ -706,10 +818,10 @@ mod tests {
         let succ = step(&mut pump, &mut reply_r, "NUM", "1");
         assert_eq!(succ, "#SUCC:1");
 
-        // NAME → SUCC 回显
+        // NAME → SUCC（官方不校验 NAME 载荷，本端只验帧类型）
         let name_payload = encode_payload("回放文件.txt".as_bytes());
         let succ = step(&mut pump, &mut reply_r, "NAME", &name_payload);
-        assert_eq!(succ, format!("#SUCC:{name_payload}"));
+        assert!(succ.starts_with("#SUCC:"), "{succ}");
 
         // SIZE → SUCC
         let succ = step(&mut pump, &mut reply_r, "SIZE", &content.len().to_string());
@@ -722,18 +834,19 @@ mod tests {
         let succ = step(&mut pump, &mut reply_r, "DATA", &encode_payload(b));
         assert_eq!(succ, format!("#SUCC:{}", b.len()));
 
-        // MD5 → SUCC 回显
+        // MD5 → SUCC（服务端自行校验，本端不比对回显载荷）
         let digest = {
             let mut ctx = md5::Context::new();
             let _ = ctx.write(&content);
             ctx.finalize()
         };
         let succ = step(&mut pump, &mut reply_r, "MD5", &encode_payload(&digest.0));
-        assert_eq!(succ, format!("#SUCC:{}", encode_payload(&digest.0)));
+        assert!(succ.starts_with("#SUCC:"), "{succ}");
 
-        // EXIT → 期望 EXIT 应答
-        let exit = step(&mut pump, &mut reply_r, "EXIT", &encode_payload(b"bye"));
-        assert!(exit.starts_with("#EXIT:"), "{exit}");
+        // EXIT → 官方客户端只收不发：喂帧不等应答（worker 收 EXIT 即收尾）
+        pump.write_all(format!("#EXIT:{}\n", encode_payload(b"bye")).as_bytes())
+            .unwrap();
+        pump.flush().unwrap();
 
         // 断言事件与落盘（DATA 块会先发节流 Progress 事件：排空至 Finished）
         worker.join().expect("工作线程");
@@ -974,10 +1087,10 @@ mod tests {
         );
     }
 
-    /// SIZE 超限（>4GiB）：拒绝接收并回 ERRO 帧，远端可见失败原因；
-    /// 本端不产生任何落盘文件。
+    /// SIZE 超限（>4GiB）：拒绝接收并回 FAIL 帧（官方帧类型），远端可见
+    /// 失败原因；本端不产生任何落盘文件。
     #[test]
-    fn oversize_size_is_rejected_with_erro() {
+    fn oversize_size_is_rejected_with_fail() {
         let dir = tempfile::tempdir().expect("临时目录");
         let (events, _) = flume::unbounded();
         let options = TransferOptions {
@@ -991,7 +1104,7 @@ mod tests {
                 Box::new(reply_w) as Box<dyn Write + Send>
             )),
         };
-        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        let (mut sender, receiver) = UnixStream::pair().unwrap();
         write!(
             sender,
             "#NAME:{}\n#SIZE:{}\n",
@@ -999,7 +1112,7 @@ mod tests {
             MAX_TRANSFER_BYTES + 1
         )
         .unwrap();
-        let error = recv_one_file(&options, &reply, &mut receiver).unwrap_err();
+        let error = recv_one_file(&options, &reply, &mut BufReader::new(receiver)).unwrap_err();
         assert!(
             error.to_string().contains("4GiB"),
             "错误应说明上限: {error}"
@@ -1020,8 +1133,8 @@ mod tests {
         }
         assert!(responses[0].starts_with("#SUCC:"), "{:?}", responses);
         assert!(
-            responses[1].starts_with("#ERRO:"),
-            "超限必须回 ERRO 帧: {:?}",
+            responses[1].starts_with("#FAIL:"),
+            "超限必须回 FAIL 帧: {:?}",
             responses
         );
         assert_eq!(
@@ -1034,7 +1147,7 @@ mod tests {
     /// 帧行长超限：无换行洪流灌满 16MiB 行缓冲必须报错终止，不无界增长内存。
     #[test]
     fn frame_line_over_limit_is_rejected() {
-        let (mut sender, mut receiver) = UnixStream::pair().expect("pair");
+        let (mut sender, receiver) = UnixStream::pair().expect("pair");
         let flood_len = FRAME_LINE_LIMIT + 1;
         let writer = std::thread::Builder::new()
             .name("test-flood".into())
@@ -1050,7 +1163,7 @@ mod tests {
                 sender.write_all(b"\n").expect("写行尾");
             })
             .expect("起写线程");
-        let error = recv_frame(&mut receiver).unwrap_err();
+        let error = recv_frame(&mut BufReader::new(receiver)).unwrap_err();
         assert!(
             error.to_string().contains("行长超限"),
             "错误应说明行长超限: {error}"
