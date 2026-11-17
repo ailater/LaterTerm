@@ -3656,6 +3656,41 @@ impl WorkspaceView {
         .detach();
     }
 
+    /// 设置页「选择下载目录」：portal 目录对话框（sftp_browse_local 同模式）。
+    /// 落盘即生效于新传输（路径在会话装配时固化，运行中不热切——设置页文案
+    /// 同口径）；不走 apply_appearance（无外观热更内容，且异步回调无 window）。
+    pub(crate) fn browse_download_dir(
+        &mut self,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let receiver = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("选择传输下载目录".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = receiver
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("对话框已关闭")));
+            let _ = this.update(cx, |workspace, cx| {
+                if let Ok(Some(paths)) = picked
+                    && let Some(dir) = paths.into_iter().next()
+                {
+                    let previous = workspace.settings.appearance.clone();
+                    workspace.settings.appearance.downloads_dir = dir.display().to_string();
+                    if workspace.settings.appearance != previous {
+                        workspace.settings.save();
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     /// 合并收尾（主线程）：合并结果**先落盘**，再与热加载同轨应用
     /// （apply_loaded_settings：版本推进/审计规则/预览作废/quake 联动/外观）。
     /// 落盘直接序列化合并结果而不先赋 self.settings——apply_loaded_settings
@@ -11571,7 +11606,9 @@ fn wrap_transfer(
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("Downloads")
     } else {
-        PathBuf::from(&settings.downloads_dir)
+        // 展开 `~`/`~/` 前缀：UI 提示写 ~/Downloads，原样 PathBuf 会落成
+        // 字面名为「~」的目录（展开平台差异：Unix $HOME / Windows USERPROFILE）
+        expand_home(&settings.downloads_dir)
     };
     let (events, events_rx) = flume::unbounded();
     (
@@ -11582,6 +11619,29 @@ fn wrap_transfer(
         }),
         events_rx,
     )
+}
+
+/// 展开 `~`/`~/` 前缀为主目录；无前缀原样返回，取不到主目录按字面处理。
+fn expand_home(path: &str) -> PathBuf {
+    let home = || {
+        #[cfg(target_os = "windows")]
+        {
+            std::env::var_os("USERPROFILE").map(PathBuf::from)
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            std::env::var_os("HOME").map(PathBuf::from)
+        }
+    };
+    if path == "~" {
+        return home().unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(dir) = home()
+    {
+        return dir.join(rest);
+    }
+    PathBuf::from(path)
 }
 
 /// 会话装配统一组合：传输拦截（内层，先吞协议字节）→ 审计 tap（外层）。

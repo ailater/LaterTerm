@@ -978,9 +978,22 @@ fn settings_terminal_body(
                     .child("下载目录")
                     .child(
                         div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(COLOR_TEXT))
-                            .child(downloads_text),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(COLOR_TEXT))
+                                    .child(downloads_text),
+                            )
+                            .child(setting_button(
+                                "选择目录",
+                                false,
+                                cx.listener(|this, event, window, cx| {
+                                    this.browse_download_dir(event, window, cx);
+                                }),
+                            )),
                     ),
             )
             .child(

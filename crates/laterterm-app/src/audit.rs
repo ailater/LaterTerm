@@ -216,9 +216,9 @@ impl TerminalSession for AuditSession {
         self.inner.probe_running(snapshot)
     }
 
-    /// 非预期退出判别透传：审计层在最内层贴近真实字节源，判定一律转
-    /// inner（SSH 层置位）。默认方法不穿透装饰器，必须显式转发——漏转发
-    /// 则重连判别在最外层恒读 false（评审 1 必须项）。
+    /// 非预期退出判别透传：装饰叠放修订后为 transfer 内层贴近字节源、
+    /// audit 外层——判定一律转 inner（SSH 层置位）。默认方法不穿透装饰器，
+    /// 必须显式转发——漏转发则重连判别在最外层恒读 false（评审 1 必须项）。
     fn exit_unexpected(&self) -> bool {
         self.inner.exit_unexpected()
     }
