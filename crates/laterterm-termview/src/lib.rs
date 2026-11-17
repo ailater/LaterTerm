@@ -333,6 +333,6 @@ pub use render::TerminalRenderer;
 pub use terminal::TerminalState;
 pub use view::{
     BellCallback, ClipboardStoreCallback, CursorStyle, ExitCallback, KeyHandler, ResizeCallback,
-    TerminalConfig, TerminalMenuRequested, TerminalView, TitleCallback, open_url,
+    TerminalConfig, TerminalMenuRequested, TerminalView, TitleCallback, TransferFlavor, open_url,
     send_desktop_notification,
 };

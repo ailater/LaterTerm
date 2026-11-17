@@ -630,9 +630,28 @@ pub struct TerminalView {
     /// 回滚搜索状态；打开时终端按键被拦截为搜索输入，不再写入 PTY。
     search: Option<SearchState>,
 
+    /// 终端内文件传输的键盘接管 gate：Some(flavor) = 协议传输进行中，
+    /// stdin 全部写点经 [`Self::pty_write`] 被吞（Esc 特判取消序列除外）。
+    /// 由宿主工作区在传输 Started/Finished/Failed 事件时经
+    /// [`Self::set_transfer_active`] 开关（事件驱动，非视图自检测——视图
+    /// 只见 VT 解析后的网格，协议字节根本不到这里）。
+    transfer_gate: parking_lot::Mutex<Option<TransferFlavor>>,
+
     /// 所属窗口句柄；首帧 render 时记录，PTY 数据路径用它把 notify
     /// 绑定到窗口上下文，避免后台任务通知不触发窗口重绘。
     window_handle: Option<AnyWindowHandle>,
+}
+
+/// 终端内文件传输的协议族（键盘接管 gate 的取消序列按此分流）。
+///
+/// 与 laterterm-transfer 的同名概念一一对应；termview 不依赖传输 crate，
+/// gate 只需要「按协议族写哪个取消序列」这一事实。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferFlavor {
+    /// trzsz（trz/tsz）：取消 = 单字节 0x03（ETX，trzsz 协议中断口径）。
+    Trzsz,
+    /// ZMODEM（rz/sz）：取消 = 5×CAN（lrzsz 惯例，连按 5 次 Ctrl+X 同款）。
+    Zmodem,
 }
 
 /// 搜索栏状态。
@@ -1018,6 +1037,7 @@ impl TerminalView {
             last_motion_report: None,
             marked_text: String::new(),
             search: None,
+            transfer_gate: parking_lot::Mutex::new(None),
             window_handle: None,
         }
     }
@@ -1379,27 +1399,75 @@ impl TerminalView {
     }
 
     /// 真实用户输入的统一提交口；先写本端，再在锁外观察，失败不广播。
+    ///
+    /// 传输期特判：Esc（`\x1b`）不进 gate，改写为对应协议的取消序列直接
+    /// 下发（trzsz=0x03、ZMODEM=5×CAN）——用户在传输中按 Esc 的意图就是
+    /// 中止传输；其余键入照常被 gate 吞掉（不污染协议流）。
     fn commit_input(&self, bytes: &[u8]) {
+        if bytes == b"\x1b" && self.transfer_gate.lock().is_some() {
+            self.cancel_transfer();
+            return;
+        }
+        if self.pty_write(bytes)
+            && let Some(callback) = &self.input_callback
+        {
+            callback(bytes);
+        }
+    }
+
+    /// stdin 生产写点统一入口：键盘接管 gate 检查 + 写入合一。
+    ///
+    /// 传输进行中（gate 置位）一律静默吞并返回 false——广播键入、快捷
+    /// 命令、OSC 52 剪贴板回写、滚轮上报、应用查询应答（经 write_input）
+    /// 都汇经此处，传输期写入会污染协议流导致解码失败。不弹提示防刷屏。
+    /// 协议 worker 的应答写端不走本函数（wrap 时捕获的 SharedWriter 直写
+    /// PTY），不受 gate 影响。返回 true = 字节已真实写入。
+    fn pty_write(&self, bytes: &[u8]) -> bool {
+        if self.transfer_gate.lock().is_some() {
+            return false;
+        }
         let result = {
             let mut writer = self.stdin_writer.lock();
             writer.write_all(bytes).and_then(|_| writer.flush())
         };
         match result {
-            Ok(()) => {
-                if let Some(callback) = &self.input_callback {
-                    callback(bytes);
-                }
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("写入终端输入失败: {error}");
+                false
             }
-            Err(error) => eprintln!("写入终端输入失败: {error}"),
+        }
+    }
+
+    /// 键盘接管 gate 开关（宿主工作区在传输 Started/Finished/Failed 事件时
+    /// 驱动）：Some(flavor) 开启接管，None 关闭。传输窗口之外不产生任何
+    /// 行为变化（gate 关闭时 pty_write 与直写逐字节等价）。
+    pub fn set_transfer_active(&self, flavor: Option<TransferFlavor>) {
+        *self.transfer_gate.lock() = flavor;
+    }
+
+    /// 取消进行中的传输（浮条取消钮与 Esc 共用）：绕过 gate 直写取消序列
+    /// （trzsz=0x03、ZMODEM=5×CAN）并立即关闭 gate。传输结束事件（Failed）
+    /// 仍由协议 worker 发出，浮条/通知由宿主事件泵收口——本方法只负责
+    /// 「让远端停下来」。
+    pub fn cancel_transfer(&self) {
+        let Some(flavor) = self.transfer_gate.lock().take() else {
+            return;
+        };
+        let cancel: &[u8] = match flavor {
+            TransferFlavor::Trzsz => b"\x03",
+            TransferFlavor::Zmodem => b"\x18\x18\x18\x18\x18", // 5×CAN
+        };
+        let mut writer = self.stdin_writer.lock();
+        if let Err(error) = writer.write_all(cancel).and_then(|_| writer.flush()) {
+            eprintln!("写入传输取消序列失败: {error}");
         }
     }
 
     /// 会话写端克隆（广播输入用）：把字节写入底层 PTY/SSH 通道。
+    /// 传输期被 gate 吞（返回且不写），语义收敛见 [`Self::pty_write`]。
     pub fn write_input(&self, bytes: &[u8]) {
-        let mut writer = self.stdin_writer.lock();
-        if let Err(error) = writer.write_all(bytes).and_then(|_| writer.flush()) {
-            eprintln!("广播写入失败: {error}");
-        }
+        self.pty_write(bytes);
     }
 
     /// 把窗口像素坐标换算为终端网格坐标。
@@ -1801,10 +1869,8 @@ impl TerminalView {
                 | alacritty_terminal::term::TermMode::MOUSE_DRAG)
         };
         if let Some(bytes) = crate::mouse::scroll_report(lines, point, 0, fallback_mode) {
-            let mut writer = self.stdin_writer.lock();
-            if let Err(error) = writer.write_all(&bytes).and_then(|_| writer.flush()) {
-                eprintln!("写入滚轮事件失败: {error}");
-            }
+            // 传输期被 gate 静默吞（防污染协议流），见 pty_write
+            self.pty_write(&bytes);
         } else {
             self.state.with_term_mut(|term| {
                 term.scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
@@ -1856,15 +1922,13 @@ impl TerminalView {
                     }
                 }
                 TerminalEvent::ClipboardLoad => {
-                    // OSC 52 读：把系统剪贴板内容写入终端输入（等价粘贴）
+                    // OSC 52 读：把系统剪贴板内容写入终端输入（等价粘贴）。
+                    // 传输期被 gate 静默吞（等价粘贴也属「键入」，见 pty_write）。
                     if let Ok(text) = crate::clipboard::Clipboard::new()
                         .and_then(|mut clipboard| clipboard.paste())
                         && !text.is_empty()
                     {
-                        let mut writer = self.stdin_writer.lock();
-                        let _ = writer
-                            .write_all(text.as_bytes())
-                            .and_then(|_| writer.flush());
+                        self.pty_write(text.as_bytes());
                     }
                 }
                 TerminalEvent::Exit => {
@@ -2007,14 +2071,9 @@ impl TerminalView {
     }
 
     /// Send text directly to the PTY, used by trusted quick-command UI actions.
+    /// 传输期被 gate 静默吞（快捷命令不是协议应答，见 pty_write）。
     pub fn send_text(&mut self, text: &str) {
-        let mut writer = self.stdin_writer.lock();
-        if let Err(error) = writer
-            .write_all(text.as_bytes())
-            .and_then(|_| writer.flush())
-        {
-            eprintln!("写入快捷命令失败: {error}");
-        }
+        self.pty_write(text.as_bytes());
     }
 
     /// 打开回滚搜索（Ctrl+Shift+F），终端保持焦点但按键转为搜索输入。
@@ -3082,7 +3141,7 @@ pub fn paste_shortcut_matches(keystroke: &Keystroke) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{TerminalConfig, TerminalExited, TerminalSession, TerminalView};
+    use super::{TerminalConfig, TerminalExited, TerminalSession, TerminalView, TransferFlavor};
     use alacritty_terminal::grid::Dimensions;
     use gpui::{AppContext, MouseButton, MouseDownEvent, TestAppContext};
     use laterterm_core::{BackendKind, SessionStreams};
@@ -3893,6 +3952,110 @@ mod tests {
             assert!(buffer.lock().unwrap().is_empty(), "关闭后滚轮零字节");
             assert_eq!(display_offset(view), 1, "关闭后滚轮走本地回滚");
         });
+    }
+
+    /// 传输期键盘接管：stdin 全部生产写点（广播/快捷命令/键入/滚轮上报）
+    /// 一律静默吞；传输窗格不再收广播键入属有意收敛。gate 关闭后逐字节
+    /// 恢复直写（无行为回归）。
+    #[gpui::test]
+    fn transfer_gate_swallows_all_stdin_write_points(cx: &mut TestAppContext) {
+        use gpui::{ScrollDelta, ScrollWheelEvent, TouchPhase};
+        use std::sync::Mutex;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let recorded = buffer.clone();
+        let broadcast = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let received = broadcast.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let view = TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+                .with_input_callback(move |bytes| received.lock().unwrap().push(bytes.to_vec()));
+            *view.stdin_writer.lock() = Box::new(RecordingWriter(recorded));
+            view
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            view.resize(10, 5);
+            // 鼠标上报模式 + 网格度量（滚轮上报路径的前提）
+            view.state.process_bytes(b"\x1b[?1000;1006h");
+            view.last_content_origin = Some(gpui::Point {
+                x: gpui::px(0.0),
+                y: gpui::px(0.0),
+            });
+            view.renderer.cell_width = gpui::px(10.0);
+            view.renderer.cell_height = gpui::px(20.0);
+
+            // 开启接管（模拟 trzsz Started 事件落地）
+            view.set_transfer_active(Some(TransferFlavor::Trzsz));
+            buffer.lock().unwrap().clear();
+
+            // ① 广播（write_input）
+            view.write_input(b"broadcast text");
+            // ② 快捷命令（send_text）
+            view.send_text("ls -la\r");
+            // ③ 键入（commit_input，非 Esc）
+            view.commit_input(b"typed bytes");
+            // ④ 滚轮上报（SGR 1000+1006 已协商：走 write_input 生产写点）
+            let wheel = ScrollWheelEvent {
+                position: gpui::point(gpui::px(5.0), gpui::px(10.0)),
+                delta: ScrollDelta::Lines(gpui::point(0.0, 1.0)),
+                modifiers: Default::default(),
+                touch_phase: TouchPhase::Moved,
+            };
+            view.on_scroll(&wheel, window, cx);
+
+            assert!(
+                buffer.lock().unwrap().is_empty(),
+                "传输期四个写点必须全部静默吞: {:?}",
+                std::str::from_utf8(&buffer.lock().unwrap())
+            );
+            assert!(
+                broadcast.lock().unwrap().is_empty(),
+                "传输期被吞的键入不得触发广播回调"
+            );
+            // 滚轮上报被吞后不回落本地滚动（字节已消费，非编码拒绝）
+            assert_eq!(
+                view.state.with_term(|term| term.grid().display_offset()),
+                0,
+                "gate 吞滚轮上报属「已接管」，不应再本地回滚"
+            );
+
+            // gate 关闭（Finished/Failed 事件落地）：逐字节恢复直写
+            view.set_transfer_active(None);
+            view.write_input(b"after");
+            assert_eq!(*buffer.lock().unwrap(), b"after", "gate 关闭后恢复直写");
+        });
+    }
+
+    /// 传输期 Esc 取消特判：commit_input 收到单字节 ESC 时改写为对应协议的
+    /// 取消序列绕过 gate 直写，并立即解除接管（后续键入照常通过）。
+    #[gpui::test]
+    fn esc_during_transfer_sends_cancel_sequence_per_flavor(cx: &mut TestAppContext) {
+        use std::sync::Mutex;
+
+        for (flavor, cancel) in [
+            (TransferFlavor::Trzsz, &b"\x03"[..]),
+            (TransferFlavor::Zmodem, &b"\x18\x18\x18\x18\x18"[..]),
+        ] {
+            let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+            let recorded = buffer.clone();
+            let (terminal, cx) = cx.add_window_view(|_, cx| {
+                let view =
+                    TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx);
+                *view.stdin_writer.lock() = Box::new(RecordingWriter(recorded));
+                view
+            });
+            terminal.update_in(cx, |view, _window, _cx| {
+                view.set_transfer_active(Some(flavor));
+                view.commit_input(b"\x1b");
+                assert_eq!(*buffer.lock().unwrap(), cancel, "{flavor:?} 的取消序列");
+                // 取消即解除接管：后续写点不再被吞
+                view.write_input(b"ok");
+                assert_eq!(
+                    *buffer.lock().unwrap(),
+                    [cancel, b"ok".as_slice()].concat(),
+                    "取消后 gate 必须已解除"
+                );
+            });
+        }
     }
 
     #[gpui::test]

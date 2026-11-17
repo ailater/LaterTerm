@@ -8,6 +8,8 @@ description = "LaterTerm 终端内文件传输：ZMODEM(rz/sz) 兼容通道，tr
 
 [dependencies]
 base64 = "0.23.1"
+# 事件通道与 app/termview 同源（flume：worker 内低频事件，unbounded 无内存风险）
+flume.workspace = true
 flate2 = "1.1.10"
 laterterm-core.workspace = true
 md5 = "0.8.1"
