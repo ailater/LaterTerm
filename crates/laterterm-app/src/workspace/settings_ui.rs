@@ -955,12 +955,40 @@ fn settings_terminal_body(
     let dir_text = crate::audit::logs_dir()
         .map(|dir| dir.display().to_string())
         .unwrap_or_else(|| "（无法定位状态目录）".into());
+    // 下载目录行：空值提示默认路径（~/Downloads）；路径在会话装配时固化，
+    // 改动只对新连接会话生效——文案如实注明，防「改了不生效」困惑。
+    let downloads_text = if appearance.downloads_dir.is_empty() {
+        "~/Downloads（未配置，默认）".to_string()
+    } else {
+        appearance.downloads_dir.clone()
+    };
     vec![
         setting_card()
             .child(info_row("Shell", "$SHELL / bash"))
             .child(info_row("TERM", "xterm-256color"))
             .child(info_row("COLORTERM", "truecolor"))
-            .child(info_row("滚动", "自然滚动，支持历史回看")),
+            .child(info_row("滚动", "自然滚动，支持历史回看"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .py_2()
+                    .text_color(rgb(COLOR_TEXT_SECONDARY))
+                    .child("下载目录")
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(COLOR_TEXT))
+                            .child(downloads_text),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .child("终端内传输（trz/sz/rz）的落盘位置，留空 = ~/Downloads；改动仅对新连接的会话生效（已连接会话不热切）"),
+            ),
         // 会话日志卡：全局默认只约束「新会话初值」，运行中窗格在标签右键
         // 菜单逐标签热开/热关。默认关——PTY 输出含潜在敏感内容（回显型
         // 密码提示仍可能入盘），安全优先（change_setting 即时落盘生效）。
@@ -2235,7 +2263,8 @@ fn value_chip(text: &str) -> Div {
 /// 设置面板/对话框按钮的统一色系：面板是固定深色 overlay（不随终端主题
 /// 换肤），按钮色固定由内置 Tokyo Night 派生，与面板底色自洽；几何与语义
 /// 则全部走 workspace 的 ui_button 工厂（标题栏/边栏按钮同源）。
-fn panel_ui() -> UiColors {
+/// 传输进度浮条的取消钮同源复用（窗格 overlay 属同族固定深色 chrome）。
+pub(crate) fn panel_ui() -> UiColors {
     UiColors::from_theme(&ThemeColors::tokyo_night())
 }
 

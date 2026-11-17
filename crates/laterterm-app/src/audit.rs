@@ -3,9 +3,14 @@
 //!
 //! 口径（评审定案）：
 //! - 挂点 = `take_streams` 会话级装饰器（[`AuditSession`]），不动 termview
-//!   读泵；装饰器叠放顺序 = audit 内层（贴近真实字节源）→ transfer 外层
-//!   （ZMODEM 拦截，见 workspace::wrap_session）。因此 ZMODEM 传输期间入
-//!   日志的是 PTY 原始输出字节（如实行为，非缺陷）。
+//!   读泵；装饰器叠放顺序 = **transfer 内层（先吞协议字节）→ audit 外层**
+//!   （见 workspace::wrap_session，2026-11 修订）。
+//!   推翻旧「audit 内层（贴近真实字节源）」定案的依据：协议字节若先过
+//!   tee，trzsz/ZMODEM 传输期间的 base64 洪流会写入会话日志并灌进触发器
+//!   扫描窗口（日志被污染 + 扫描无界截断）；ask 明文要求「传输字节不入
+//!   日志/扫描」，transfer 内层让协议字节在 tee 之前即被吞，日志与触发器
+//!   零污染，且无需加抑制开关（防过度设计）。代价 = 传输期间会话日志空窗
+//!   （正是需求本身；SZ/RZ 协议本身也从未承诺可读日志）。
 //! - SSH GBK 会话的 tee 点在 `encoding.apply`（laterterm-ssh lib.rs:522）
 //!   下游，落盘/扫描的都是转码后的 UTF-8 而非字节级原始流（中文模式可用，
 //!   如实标注）。

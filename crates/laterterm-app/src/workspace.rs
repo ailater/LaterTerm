@@ -1035,7 +1035,30 @@ struct Pane {
     /// 隧道状态快照（spec → state）：watcher 从事件流收敛，server_entry_row
     /// 渲染活跃/失败 chip；render 不碰会话锁。
     tunnel_states: Vec<(TunnelSpec, TunnelState)>,
+    /// 终端内文件传输事件接收端（wrap_session 建通道时留下）：render 期
+    /// process_transfer_events 泵消费。Receiver 随窗格回收丢弃，迟到 send
+    /// 静默失败（flume 语义）。
+    transfer_rx: flume::Receiver<laterterm_transfer::TransferEvent>,
+    /// 进行中的终端内传输（Started 置位 → Finished/Failed 清除）：驱动窗格
+    /// 进度浮条 overlay；键盘接管 gate 由同一事件经 view 端
+    /// set_transfer_active 开关（无 Started 必无 gate，无锁死路径）。
+    transfer: Option<PaneTransfer>,
     status: TabStatus,
+}
+
+/// 窗格内进行中的终端内传输（进度浮条 overlay 的数据源）。
+#[derive(Clone)]
+struct PaneTransfer {
+    flavor: laterterm_transfer::TransferFlavor,
+    direction: laterterm_transfer::TransferDirection,
+    /// 当前文件名（Progress 更新；ZMODEM 因 rzsz crate 无进度回调恒 None，
+    /// 浮条降级为状态文案）。
+    file: Option<String>,
+    transferred: u64,
+    /// 当前文件总字节（未知为 0，浮条不显示百分比）。
+    total: u64,
+    /// Started 时刻：浮条速度 = transferred / elapsed。
+    started_at: std::time::Instant,
 }
 
 /// 终端右键菜单的打开状态与来源窗格。
@@ -1411,7 +1434,7 @@ impl WorkspaceView {
             height: viewport.height - px(TITLEBAR_HEIGHT),
         };
         let (initial_cols, initial_rows) = estimate_grid_size(&settings.appearance, terminal_area);
-        let (terminal, session, first_audit) = create_local_terminal(
+        let (terminal, session, first_audit, first_transfer_rx) = create_local_terminal(
             first_pane,
             weak_workspace,
             cx,
@@ -1540,6 +1563,8 @@ impl WorkspaceView {
                 reconnect: None,
                 tunnel_session: None,
                 tunnel_states: Vec::new(),
+                transfer_rx: first_transfer_rx,
+                transfer: None,
                 status: TabStatus::Running,
             }],
             tabs: vec![WorkspaceTab {
@@ -2293,11 +2318,11 @@ impl WorkspaceView {
         self.next_pane_id += 1;
         // 预览期间新建的分屏/标签与既有窗格同色：读 effective 而非已保存值。
         let theme = self.themes.resolve(self.effective_theme_name()).clone();
-        // 会话装配：审计 tap 内层 tee、传输拦截外层（wrap_session 统一组合）。
-        // 日志 label 取 attach 标题参数（SSH=条目名、本地=「终端 N」）；全局
-        // 默认（session_logging）作文件日志初值，运行期在标签右键菜单热开/
+        // 会话装配：传输拦截内层（先吞协议字节）、审计 tap 外层（wrap_session
+        // 统一组合）。日志 label 取 attach 标题参数（SSH=条目名、本地=「终端 N」）；
+        // 全局默认（session_logging）作文件日志初值，运行期在标签右键菜单热开/
         // 热关；触发器扫描与该开关无关（共享规则句柄见 audit.rs）。
-        let (session, audit) = wrap_session(
+        let (session, audit, transfer_rx) = wrap_session(
             session,
             pane_id,
             &title,
@@ -2333,6 +2358,8 @@ impl WorkspaceView {
             reconnect: None,
             tunnel_session: None,
             tunnel_states: Vec::new(),
+            transfer_rx,
+            transfer: None,
             status: TabStatus::Running,
         });
         pane_id
@@ -6336,6 +6363,90 @@ impl WorkspaceView {
         }
     }
 
+    /// 终端内传输事件泵（render 头部，process_trigger_events 同款位置）：
+    /// Started（仅 worker spawn 成功后发出）置位窗格传输状态并开启 termview
+    /// 键盘接管 gate；Progress 刷新浮条数据（worker 内已节流）；Finished/
+    /// Failed 清状态、关 gate 并写 server_notice——每个 Started 必有配对
+    /// 终态事件（传输 crate 契约），gate/浮条生命周期有界。窗格已回收的
+    /// 迟到事件随 Receiver 丢弃。
+    fn process_transfer_events(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for pane in &mut self.panes {
+            while let Ok(event) = pane.transfer_rx.try_recv() {
+                match event {
+                    laterterm_transfer::TransferEvent::Started { flavor, direction } => {
+                        pane.transfer = Some(PaneTransfer {
+                            flavor,
+                            direction,
+                            file: None,
+                            transferred: 0,
+                            total: 0,
+                            started_at: std::time::Instant::now(),
+                        });
+                        // 键盘接管随 Started 开启；spawn→UI 处理间的异步间隙
+                        // 内键入可能漏进协议流（有界风险，方案已如实接受）
+                        pane.terminal.update(cx, |view, _| {
+                            view.set_transfer_active(Some(view_transfer_flavor(flavor)))
+                        });
+                        changed = true;
+                    }
+                    laterterm_transfer::TransferEvent::Progress {
+                        file,
+                        transferred,
+                        total,
+                        ..
+                    } => {
+                        if let Some(active) = &mut pane.transfer {
+                            active.file = Some(file);
+                            active.transferred = transferred;
+                            active.total = total;
+                            changed = true;
+                        }
+                    }
+                    laterterm_transfer::TransferEvent::Finished(paths) => {
+                        let active = pane.transfer.take();
+                        pane.terminal
+                            .update(cx, |view, _| view.set_transfer_active(None));
+                        self.server_notice = Some(match active {
+                            Some(active) => transfer_finished_notice(
+                                &pane.title,
+                                &active,
+                                &paths,
+                                self.server_notice.take(),
+                            ),
+                            // 无 Started 的迟到终态（理论不可达）：仍收口不悬空
+                            None => "文件传输完成".into(),
+                        });
+                        changed = true;
+                    }
+                    laterterm_transfer::TransferEvent::Failed(message) => {
+                        let active = pane.transfer.take();
+                        pane.terminal
+                            .update(cx, |view, _| view.set_transfer_active(None));
+                        let summary = match &active {
+                            Some(active) => format!(
+                                "「{}」{}{}传输失败：{message}",
+                                pane.title,
+                                transfer_flavor_label(active.flavor),
+                                transfer_direction_label(active.direction),
+                            ),
+                            // 会话断开等无 Started 上下文的失败：原样透出
+                            None => format!("文件传输失败：{message}"),
+                        };
+                        self.server_notice = Some(match self.server_notice.take() {
+                            Some(previous) => format!("{previous}；{summary}"),
+                            None => summary,
+                        });
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
     // ---------- SFTP 双栏面板 ----------
 
     /// 后台事件泵：列表/传输进度全部经此回 UI（面板关闭后事件自然丢弃）。
@@ -7785,7 +7896,7 @@ impl WorkspaceView {
             session.kill();
             return;
         };
-        // 与 attach_pane 同一装配口径：审计 tap 内层、传输拦截外层；
+        // 与 attach_pane 同一装配口径：传输拦截内层、审计 tap 外层；
         // label 沿用 attach 时的标题参数（SSH = 条目名）。
         // 会话延续语义：旧 tap 在录则新 tap 立即续录（新 tap 初值=全局默认，
         // 不继承的话全局关+手动开的会话重连后日志静默停止）。
@@ -7793,7 +7904,7 @@ impl WorkspaceView {
             .audit
             .as_ref()
             .is_some_and(|tap| tap.is_logging());
-        let (session, audit) = wrap_session(
+        let (session, audit, transfer_rx) = wrap_session(
             session,
             pane_id,
             &state.link.entry.name,
@@ -7826,6 +7937,8 @@ impl WorkspaceView {
         pane.terminal = terminal;
         pane.session = session_control;
         pane.audit = Some(audit);
+        pane.transfer_rx = transfer_rx; // 新会话新通道；旧通道残留事件随旧 Receiver 丢弃
+        pane.transfer = None; // 新会话从干净状态开始（旧传输随会话断开已终结）
         pane.status = TabStatus::Running;
         pane.highlighted = false; // 新会话从干净状态开始
         pane.reconnect = None;
@@ -7960,6 +8073,7 @@ impl Render for WorkspaceView {
         self.process_ssh_results(window, cx);
         self.process_sftp_results(window, cx);
         self.process_trigger_events(window, cx);
+        self.process_transfer_events(window, cx);
         self.process_reconnect_results(window, cx);
         if let Some(handle) = self.pending_focus.take() {
             handle.focus(window);
@@ -8711,6 +8825,73 @@ fn scrollbar_thumb_color(hovered: bool) -> gpui::Hsla {
     }
 }
 
+/// 终端内传输进度浮条 overlay（窗格底部居中）：方向/协议族/文件名/百分比/
+/// 速度 + 取消钮。取消钮与 Esc 共用 cancel_transfer（只发取消序列，浮条随
+/// 终态事件收口，不在此直接清状态）。ZMODEM 无进度回调（rzsz crate 限制）：
+/// 只显示状态文案，无百分比/速度。配色对齐窗格角标（固定 Tokyo Night 派生，
+/// 同 pane chrome 先例）。
+fn transfer_progress_overlay(
+    active: &PaneTransfer,
+    pane: PaneId,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let arrow = match active.direction {
+        laterterm_transfer::TransferDirection::Receive => "⬇",
+        laterterm_transfer::TransferDirection::Upload => "⬆",
+    };
+    let flavor = transfer_flavor_label(active.flavor);
+    let direction = transfer_direction_label(active.direction);
+    // 速度 = 已传字节 / 开始至今秒数（终态事件到达前持续刷新）
+    let speed = {
+        let elapsed = active.started_at.elapsed().as_secs_f64().max(0.5);
+        let bytes_per_sec = (active.transferred as f64 / elapsed) as u64;
+        format!("{}/s", crate::sftp_panel::format_size(bytes_per_sec))
+    };
+    let text = match &active.file {
+        Some(file) => {
+            // 总量未知（total=0）不显示百分比
+            let percent = if active.total > 0 {
+                let ratio = active.transferred.min(active.total) as f64 / active.total as f64;
+                format!(" {:.0}%", ratio * 100.0)
+            } else {
+                String::new()
+            };
+            format!("{arrow} {flavor} {direction} {file}{percent} · {speed}")
+        }
+        None => format!("{arrow} {flavor} {direction}中…"),
+    };
+    div()
+        .absolute()
+        .bottom_2()
+        .left_1_2()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .bg(gpui::Hsla::from(rgb(0x24283B)).opacity(0.92))
+        .border_1()
+        .border_color(rgb(0x3B4261))
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(rgb(0xC0CAF5))
+                .child(text),
+        )
+        .child(ui_button(
+            "取消",
+            ButtonKind::Secondary,
+            settings_ui::panel_ui(),
+            cx.listener(move |this, _event, _window, cx| {
+                // 只发取消序列并解除键盘接管；浮条/通知随 worker 终态事件收口
+                if let Some(pane) = this.panes.iter().find(|p| p.id == pane) {
+                    pane.terminal.update(cx, |view, _| view.cancel_transfer());
+                }
+            }),
+        ))
+}
+
 fn render_layout(
     node: &LayoutNode,
     panes: &[Pane],
@@ -8832,6 +9013,11 @@ fn render_layout(
                             .bg(gpui::Hsla::from(rgb(0x7AA2F7)).opacity(0.7)),
                     );
                 }
+            }
+            // 终端内传输进度浮条（Started→终态事件窗口内显示）；取消钮与 Esc
+            // 共用 cancel_transfer，浮条本身随 Finished/Failed 事件统一收口。
+            if let Some(active) = &pane.transfer {
+                pane_div = pane_div.child(transfer_progress_overlay(active, close_id, cx));
             }
             pane_div
         }
@@ -11318,6 +11504,11 @@ fn panel_caption(text: &str, ui: UiColors) -> gpui::Div {
 struct TransferWrappedSession {
     inner: Arc<dyn TerminalSession>,
     download_dir: std::path::PathBuf,
+    /// 传输事件出口（wrap_session 时创建、take_streams 时克隆下发）：
+    /// Receiver 存 Pane，render 期事件泵消费——替换旧「通道建后即弃」
+    /// （传输无任何 UI 反馈）的口径。接收端随窗格回收 drop 后 send 静默
+    /// 失败，传输本身不受影响。
+    events: flume::Sender<laterterm_transfer::TransferEvent>,
 }
 
 impl TerminalSession for TransferWrappedSession {
@@ -11331,13 +11522,11 @@ impl TerminalSession for TransferWrappedSession {
 
     fn take_streams(&self) -> std::io::Result<laterterm_core::SessionStreams> {
         let streams = self.inner.take_streams()?;
-        // 事件通道：接收端 drop 后 send 静默失败——传输仍正常工作，只是没有 UI 通知
-        let (events, _observer) = std::sync::mpsc::channel();
         Ok(laterterm_transfer::wrap(
             streams,
             laterterm_transfer::TransferOptions {
                 download_dir: self.download_dir.clone(),
-                events,
+                events: self.events.clone(),
                 upload_files: None,
             },
         ))
@@ -11368,10 +11557,14 @@ impl TerminalSession for TransferWrappedSession {
     }
 }
 
+/// 给会话装上 ZMODEM/trzsz 通道，并返回事件接收端（存 Pane 供事件泵消费）。
 fn wrap_transfer(
     session: Arc<dyn TerminalSession>,
     settings: &Appearance,
-) -> Arc<dyn TerminalSession> {
+) -> (
+    Arc<dyn TerminalSession>,
+    flume::Receiver<laterterm_transfer::TransferEvent>,
+) {
     let download_dir = if settings.downloads_dir.is_empty() {
         std::env::var_os("HOME")
             .map(PathBuf::from)
@@ -11380,25 +11573,97 @@ fn wrap_transfer(
     } else {
         PathBuf::from(&settings.downloads_dir)
     };
-    Arc::new(TransferWrappedSession {
-        inner: session,
-        download_dir,
-    })
+    let (events, events_rx) = flume::unbounded();
+    (
+        Arc::new(TransferWrappedSession {
+            inner: session,
+            download_dir,
+            events,
+        }),
+        events_rx,
+    )
 }
 
-/// 会话装配统一组合：审计 tap（内层，贴近真实字节源）→ 传输拦截（外层）。
-/// 叠放顺序固定：ZMODEM 传输期间入日志的是 PTY 原始输出字节（audit.rs 模块
-/// 头注记）；新增装饰器一律在此串联，装配点只认本函数。
+/// 会话装配统一组合：传输拦截（内层，先吞协议字节）→ 审计 tap（外层）。
+///
+/// 叠放顺序（2026-11 修订，推翻旧「audit 内层」定案）：协议字节若先过
+/// audit tee，base64 洪流会污染会话日志与触发器扫描；transfer 内层让协议
+/// 字节在 tee 之前即被吞，日志与触发器零污染、无需加抑制开关。代价 =
+/// 传输期间日志空窗（正是需求本身）。推翻依据与影响面记录在 audit.rs
+/// 模块头注记。新增装饰器一律在此串联，装配点只认本函数。
 fn wrap_session(
     session: Arc<dyn TerminalSession>,
     pane: PaneId,
     label: &str,
     settings: &Appearance,
     hub: &crate::audit::AuditHub,
-) -> (Arc<dyn TerminalSession>, Arc<TapControl>) {
+) -> (
+    Arc<dyn TerminalSession>,
+    Arc<TapControl>,
+    flume::Receiver<laterterm_transfer::TransferEvent>,
+) {
+    let (session, events_rx) = wrap_transfer(session, settings);
     let (session, tap) =
         crate::audit::wrap_audit(session, pane, label, settings.session_logging, hub);
-    (wrap_transfer(session, settings), tap)
+    (session, tap, events_rx)
+}
+
+/// 传输协议族 → 展示文案（浮条/通知共用）。
+fn transfer_flavor_label(flavor: laterterm_transfer::TransferFlavor) -> &'static str {
+    match flavor {
+        laterterm_transfer::TransferFlavor::Trzsz => "trzsz",
+        laterterm_transfer::TransferFlavor::Zmodem => "ZMODEM",
+    }
+}
+
+/// 传输方向 → 展示文案。
+fn transfer_direction_label(direction: laterterm_transfer::TransferDirection) -> &'static str {
+    match direction {
+        laterterm_transfer::TransferDirection::Receive => "接收",
+        laterterm_transfer::TransferDirection::Upload => "上传",
+    }
+}
+
+/// 传输协议族 → termview 键盘接管 gate 的取消序列分派（两 crate 各持同名
+/// 概念，termview 不反向依赖传输 crate，此处唯一映射点）。
+fn view_transfer_flavor(
+    flavor: laterterm_transfer::TransferFlavor,
+) -> laterterm_termview::TransferFlavor {
+    match flavor {
+        laterterm_transfer::TransferFlavor::Trzsz => laterterm_termview::TransferFlavor::Trzsz,
+        laterterm_transfer::TransferFlavor::Zmodem => laterterm_termview::TransferFlavor::Zmodem,
+    }
+}
+
+/// 完成提示文案（server_notice 通道；既有提示按 5551 先例以「；」拼接）：
+/// 接收 = 落盘目录 + 文件数；上传无落盘路径，只报完成。
+fn transfer_finished_notice(
+    title: &str,
+    active: &PaneTransfer,
+    paths: &[PathBuf],
+    previous: Option<String>,
+) -> String {
+    let flavor = transfer_flavor_label(active.flavor);
+    let summary = match active.direction {
+        laterterm_transfer::TransferDirection::Receive => {
+            let dir = paths
+                .first()
+                .and_then(|path| path.parent())
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_else(|| "（未知目录）".into());
+            format!(
+                "「{title}」{flavor}接收完成：{} 个文件 → {dir}",
+                paths.len()
+            )
+        }
+        laterterm_transfer::TransferDirection::Upload => {
+            format!("「{title}」{flavor}上传完成")
+        }
+    };
+    match previous {
+        Some(previous) => format!("{previous}；{summary}"),
+        None => summary,
+    }
 }
 /// 解析本地会话 shell：显式配置（首启引导固化 / 手改 settings.toml）优先，
 /// 否则跟随平台默认（$SHELL / COMSPEC，由 laterterm-local 动态解析）。
@@ -11425,7 +11690,12 @@ fn create_local_terminal(
     // 继承的初始工作目录（OSC 7 上报；首窗格无来源窗格传 None）。
     cwd: Option<PathBuf>,
     label: &str,
-) -> (Entity<TerminalView>, Arc<SessionControl>, Arc<TapControl>) {
+) -> (
+    Entity<TerminalView>,
+    Arc<SessionControl>,
+    Arc<TapControl>,
+    flume::Receiver<laterterm_transfer::TransferEvent>,
+) {
     // 会话的开启/spawn/回收线程全部内聚在 LocalSession（laterterm-local）。
     // PTY 初始尺寸直接用窗口实际尺寸：避免启动后 resize 触发 bash readline
     // 的 \r 重画，把光标拉回提示符行首。
@@ -11441,9 +11711,9 @@ fn create_local_terminal(
         })
         .expect("启动本地会话失败"),
     );
-    // 与 attach_pane 同一装配口径：审计 tap 内层、传输拦截外层；label 显式
+    // 与 attach_pane 同一装配口径：传输拦截内层、审计 tap 外层；label 显式
     // 传入（首窗格 = 「本地终端」，与 Pane.title 一致）
-    let (session, audit) = wrap_session(session, id, label, settings, audit_hub);
+    let (session, audit, transfer_rx) = wrap_session(session, id, label, settings, audit_hub);
     let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
     let terminal = create_terminal_view(
         id,
@@ -11454,7 +11724,7 @@ fn create_local_terminal(
         broadcast_tx,
         cx,
     );
-    (terminal, session_control, audit)
+    (terminal, session_control, audit, transfer_rx)
 }
 
 /// 密钥环操作包一层 5s 超时：Secret Service 偶发卡住（等解锁/授权确认而
@@ -15387,7 +15657,8 @@ mod reconnect_tests {
     fn decorator_chain_forwards_exit_unexpected() {
         // 默认方法不穿透装饰器：mark_exited 读的是最外层包装（SessionControl
         // 持有 wrap_session 的产物）。漏转发则静默恒 false、重连永不触发且
-        // 无报错——本断言钉死该失效面。
+        // 无报错——本断言钉死该失效面。装配走 wrap_session 本体（传输内层/
+        // 审计外层的现行叠放），与生产路径一字不差。
         let unexpected = Arc::new(AtomicBool::new(false));
         let inner: Arc<dyn TerminalSession> = Arc::new(ReconnectStub {
             unexpected: Arc::clone(&unexpected),
@@ -15395,14 +15666,18 @@ mod reconnect_tests {
             receiver: Mutex::new(None),
         });
         let (hub, _rx) = crate::audit::AuditHub::new();
-        let (session, _tap) =
-            crate::audit::wrap_audit(Arc::clone(&inner), PaneId(99), "测试", false, &hub);
-        let wrapped = super::wrap_transfer(session, &laterterm_config::Appearance::default());
+        let (wrapped, _tap, _transfer_rx) = super::wrap_session(
+            Arc::clone(&inner),
+            PaneId(99),
+            "测试",
+            &laterterm_config::Appearance::default(),
+            &hub,
+        );
         assert!(!wrapped.exit_unexpected(), "未置位时全链路应为 false");
         unexpected.store(true, Ordering::Release);
         assert!(
             wrapped.exit_unexpected(),
-            "置位后必须经 AuditSession→TransferWrapped 两层转发为 true"
+            "置位后必须经 TransferWrapped→AuditSession 两层转发为 true"
         );
         assert!(inner.exit_unexpected());
     }

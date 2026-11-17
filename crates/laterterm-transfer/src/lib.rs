@@ -29,16 +29,52 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc as std_mpsc;
 #[cfg(unix)]
 use std::sync::{Arc, Mutex};
 
+/// 传输协议族（UI 浮条/键盘取消序列按此分流）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferFlavor {
+    /// ZMODEM（rz/sz）：取消 = 5×CAN。
+    Zmodem,
+    /// trzsz（trz/tsz）：取消 = 单字节 0x03。
+    Trzsz,
+}
+
+/// 传输方向（UI 浮条方向标识）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferDirection {
+    /// 远端推送，本端落盘（trz / sz）。
+    Receive,
+    /// 本端推送，远端落盘（tsz / rz）。
+    Upload,
+}
+
 /// 传输事件（UI/日志观察口）。
+///
+/// 生命周期保证：每个 [`TransferEvent::Started`] 必有配对终态事件
+/// （[`TransferEvent::Finished`] / [`TransferEvent::Failed`]）——Started 只在
+/// 工作线程 spawn 成功（`divert=Some`）后发送，工作线程全路径收尾必发终态；
+/// UI 侧的键盘接管与浮条据此开启/关闭，无传输则无 Started，不会锁死。
 #[derive(Clone, Debug)]
 pub enum TransferEvent {
-    /// 检测到 ZMODEM 触发序列，接收已启动。
-    Started,
-    /// 全部文件接收完成（参数为落盘路径）。
+    /// 检测到触发序列且工作线程已启动（协议族/方向驱动浮条与键盘接管）。
+    Started {
+        flavor: TransferFlavor,
+        direction: TransferDirection,
+    },
+    /// 单文件进度（worker 内节流发射；ZMODEM 因 rzsz crate 无进度回调不产生）。
+    Progress {
+        flavor: TransferFlavor,
+        direction: TransferDirection,
+        /// 当前文件名（本地显示用，已剥离路径）。
+        file: String,
+        /// 当前文件已传输字节数。
+        transferred: u64,
+        /// 当前文件总字节数（未知为 0，UI 降级显示）。
+        total: u64,
+    },
+    /// 全部文件接收完成（参数为落盘路径；上传方向为空列表）。
     Finished(Vec<PathBuf>),
     /// 传输失败/中止（协议错误、远端取消、会话 EOF）。
     Failed(String),
@@ -48,8 +84,8 @@ pub enum TransferEvent {
 pub struct TransferOptions {
     /// 接收文件的落盘目录（不存在则自动创建）。
     pub download_dir: PathBuf,
-    /// 事件接收端。
-    pub events: std_mpsc::Sender<TransferEvent>,
+    /// 事件接收端（flume：与 app 层事件泵同源，Receiver 关闭后 send 静默失败）。
+    pub events: flume::Sender<TransferEvent>,
     /// 上传文件列表（R 触发时推送给远端；None = 优雅拒绝）。
     pub upload_files: Option<Vec<PathBuf>>,
 }
@@ -57,6 +93,12 @@ pub struct TransferOptions {
 /// ZMODEM ZRQINIT 触发序列：`** ␘(CAN) B 0`（lrzsz 同款检测串）。
 #[cfg(unix)]
 const ZMODEM_TRIGGER: &[u8] = b"**\x18B0";
+
+/// 触发行「行未到齐」扣留等待上限：合法触发行 <100 字节，等满 64KiB 还没
+/// 换行的只是普通输出（回显误触发类），超限即放行复位扫描，封死无界滞留
+/// （对齐 audit::SCAN_WINDOW_LIMIT 先例）。
+#[cfg(unix)]
+const CARRY_WAIT_LIMIT: usize = 64 * 1024;
 
 /// 会话字节流的共享写端：UI 键入与协议应答同一出口。
 #[cfg(unix)]
@@ -238,7 +280,6 @@ impl TransferReader {
         }
 
         if let Some((route, pos)) = route {
-            let _ = self.options.events.send(TransferEvent::Started);
             // trzsz 系触发行需完整到达才能定位行尾；行未到齐则等下一块
             let after_trigger = &window[pos..];
             let divert = match route {
@@ -259,6 +300,16 @@ impl TransferReader {
                             Route::Zmodem => unreachable!(),
                         },
                         None => {
+                            // 行未到齐的扣留等待必须有上限：误触发后涌入无换行的
+                            // 普通输出时不能无界滞留（合法触发行 <100 字节，64KiB
+                            // 余量充分，对齐 audit::SCAN_WINDOW_LIMIT）。超限 = 扣留
+                            // 的只是普通输出，本候选放弃、复位扫描——走「未触发」
+                            // 放行路径（候选触发串本身随前缀一起放行，不会滞留重扣；
+                            // 真触发行不可能等满 64KiB 才换行，属可忽略的极端边界）。
+                            // 行未到齐分支不发生任何传输事件（无 Started，无需收口）。
+                            if window.len() > CARRY_WAIT_LIMIT {
+                                return self.release_as_output(window, buf);
+                            }
                             // 触发行未到齐：只把当前 buffer 能容纳的普通前缀
                             // 交给视图，前缀剩余部分与候选触发串一起保留。
                             let out_len = pos.min(buf.len());
@@ -271,10 +322,35 @@ impl TransferReader {
             };
             match divert {
                 Some((pump, done)) => {
+                    // Started 只在工作线程 spawn 成功后发送：每个 Started 必有
+                    // 配对终态事件（worker 全路径收尾发 Finished/Failed），UI 的
+                    // 键盘接管/浮条据此开关，不会出现无传输锁死。
+                    let event = match route {
+                        Route::Zmodem => TransferEvent::Started {
+                            flavor: TransferFlavor::Zmodem,
+                            direction: TransferDirection::Receive,
+                        },
+                        Route::TrzszReceive => TransferEvent::Started {
+                            flavor: TransferFlavor::Trzsz,
+                            direction: TransferDirection::Receive,
+                        },
+                        Route::TrzszUpload => TransferEvent::Started {
+                            flavor: TransferFlavor::Trzsz,
+                            direction: TransferDirection::Upload,
+                        },
+                    };
+                    let _ = self.options.events.send(event);
                     self.state = ReaderState::Active { pump, done };
-                    // 触发帧在内全部转喂；外层 read 会继续泵送，不能伪造
-                    // 一个正长度让 VT 解析器读取未初始化的调用方缓冲区。
-                    return Ok(0);
+                    // 起传前的普通前缀（window[..pos]）必须保留上屏：buffer 装
+                    // 得下的当场交出，余量进 carry 由 Active 态头部优先排空——
+                    // 否则起传前的最后一行输出随协议分流被吞（历史缺陷）。
+                    // 触发帧本身（window[pos..]）已随 initial 灌入协议管道，
+                    // 绝不进视图；此外不能伪造正长度让 VT 解析器读到未初始化
+                    // 的调用方缓冲区（take=0 时照旧返回 0 继续泵送）。
+                    let take = pos.min(buf.len());
+                    buf[..take].copy_from_slice(&window[..take]);
+                    self.carry = window[take..pos].to_vec();
+                    return Ok(take);
                 }
                 None => {
                     let _ = self
@@ -285,8 +361,13 @@ impl TransferReader {
             }
         }
 
-        // 未触发：只保留确实可能成为触发串开头的尾部字节。
-        // 普通提示符、ANSI 控制序列和 UTF-8 文本不能因为协议扫描而延迟。
+        // 未触发：放行为普通输出（尾部触发候选保留）。
+        self.release_as_output(window, buf)
+    }
+
+    /// 把整窗按普通输出放行：只保留确实可能成为触发串开头的尾部字节。
+    /// 普通提示符、ANSI 控制序列和 UTF-8 文本不能因为协议扫描而延迟。
+    fn release_as_output(&mut self, window: Vec<u8>, buf: &mut [u8]) -> io::Result<usize> {
         let keep = longest_trigger_prefix_suffix(&window);
         let safe_len = window.len().saturating_sub(keep);
         let out_len = safe_len.min(buf.len());
@@ -456,7 +537,7 @@ mod tests {
     }
 
     fn scanner(inner: impl Read + Send + 'static) -> TransferReader {
-        let (events, _) = std_mpsc::channel();
+        let (events, _) = flume::unbounded();
         TransferReader {
             inner: Box::new(inner),
             state: ReaderState::Scanning,
@@ -545,6 +626,34 @@ mod tests {
         assert_eq!(&buf[..n], b"user@host:~$ ");
     }
 
+    /// 触发命中路径的普通前缀保留：起传前 window[..pos] 的普通输出必须上屏
+    /// （buffer 装得下的当场交出，余量进 carry 由 Active 态头部优先排空），
+    /// 不得随协议分流被吞；触发帧本身绝不出现在视图侧。
+    #[test]
+    fn trigger_prefix_output_survives_divert() {
+        let mut reader = scanner(io::empty());
+        let mut buf = [0u8; 4];
+        let mut chunk = b"last line\r\n".to_vec();
+        chunk.extend_from_slice(trzsz::TRZSZ_TRIGGER);
+        chunk.extend_from_slice(b"1.0.0:123:456\nrest-goes-to-worker");
+        let n = reader.scan_chunk(&chunk, &mut buf).expect("分流成功");
+        assert_eq!(&buf[..n], b"last", "前缀按 buffer 容量当场交出");
+        assert!(
+            matches!(reader.state, ReaderState::Active { .. }),
+            "触发行完整到达应已分流"
+        );
+        // 余下前缀经 Active 态的 carry 优先排空路径完整保留
+        let mut remainder = Vec::new();
+        let mut drain = [0u8; 16];
+        while !reader.carry.is_empty() {
+            let take = reader.carry.len().min(drain.len());
+            drain[..take].copy_from_slice(&reader.carry[..take]);
+            reader.carry.drain(..take);
+            remainder.extend_from_slice(&drain[..take]);
+        }
+        assert_eq!(remainder, b" line\r\n", "前缀余量全部保留，无丢失");
+    }
+
     #[test]
     fn active_protocol_bytes_are_not_terminal_output() {
         let mut reader = scanner(IdleReader(io::Cursor::new(b"protocol frame".to_vec())));
@@ -617,7 +726,7 @@ mod tests {
             .expect("起 sz 线程");
 
         // 会话流：读端=远端协议输出，写端=应答回远端；装上传输装饰器
-        let (events_tx, events_rx) = std_mpsc::channel::<TransferEvent>();
+        let (events_tx, events_rx) = flume::unbounded::<TransferEvent>();
         let streams = SessionStreams {
             reader: Box::new(proto_r),
             writer: Box::new(reply_s),
@@ -645,11 +754,14 @@ mod tests {
             })
             .expect("起读泵");
 
-        // 事件断言：Started → Finished(1 文件)
+        // 事件断言：Started（spawn 成功后发）→ Finished(1 文件)
         let first = events_rx
             .recv_timeout(Duration::from_secs(30))
             .expect("Started 事件");
-        assert!(matches!(first, TransferEvent::Started), "首事件: {first:?}");
+        assert!(
+            matches!(first, TransferEvent::Started { .. }),
+            "首事件: {first:?}"
+        );
         let second = events_rx
             .recv_timeout(Duration::from_secs(60))
             .expect("Finished 事件");
@@ -683,7 +795,7 @@ mod tests {
                 Ok(n)
             }
         }
-        let (events_tx, _events_rx) = std_mpsc::channel();
+        let (events_tx, _events_rx) = flume::unbounded();
         let streams = SessionStreams {
             reader: Box::new(OnceReader(b"ls -la\r\ntotal 0\r\n".to_vec())),
             writer: Box::new(Vec::new()),
@@ -726,7 +838,7 @@ mod windows_tests {
         let download_dir = dir.path().join("downloads");
         let bytes = b"before**\x18B0::TRZSZ:TRANSFER:S:1\r\nafter";
         let output = MemoryWriter(Arc::new(Mutex::new(Vec::new())));
-        let (events, received_events) = std_mpsc::channel();
+        let (events, received_events) = flume::unbounded();
         let streams = SessionStreams {
             reader: Box::new(io::Cursor::new(bytes.to_vec())),
             writer: Box::new(output.clone()),
