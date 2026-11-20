@@ -255,9 +255,28 @@ fn apply_server_timeout(feed: &UnixStream, config_payload: &str) -> io::Result<(
         .ok()
         .and_then(|value| value.get("timeout").and_then(|value| value.as_u64()));
     match timeout {
-        Some(0) => feed.set_read_timeout(None),
-        Some(seconds) => feed.set_read_timeout(Some(Duration::from_secs(seconds))),
+        Some(0) => set_feed_read_timeout(feed, None),
+        Some(seconds) => set_feed_read_timeout(feed, Some(Duration::from_secs(seconds))),
         None => Ok(()),
+    }
+}
+
+/// 设置传输读超时。
+///
+/// Darwin 对「写端已关闭」的 UnixStream 设置 `SO_RCVTIMEO` 会返回 `EINVAL`
+/// （实测 Rust `UnixStream::set_read_timeout` 稳定复现）；此时后续 read 直接
+/// 看到 EOF，超时已无意义，放行让正常 EOF/协议错误路径接管。仅放行非零
+/// 合法时长与 None；显式零时长仍是调用方 bug，继续报错。
+fn set_feed_read_timeout(feed: &UnixStream, timeout: Option<Duration>) -> io::Result<()> {
+    match feed.set_read_timeout(timeout) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error.kind() == io::ErrorKind::InvalidInput
+                && timeout.is_none_or(|duration| !duration.is_zero()) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -268,8 +287,10 @@ fn trzsz_receive_loop(
 ) -> io::Result<Vec<PathBuf>> {
     std::fs::create_dir_all(&options.download_dir)?;
     // 读超时兜底（默认 20s）：远端中途断流/静默时 worker 报错退出，不永久泄漏
-    feed.get_ref()
-        .set_read_timeout(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)))?;
+    set_feed_read_timeout(
+        feed.get_ref(),
+        Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+    )?;
 
     // ① ACT：客户端能力声明（lang=rs 标识实现方）
     let action = serde_json::json!({
@@ -474,8 +495,10 @@ fn trzsz_upload_loop(
     mut feed: BufReader<UnixStream>,
 ) -> io::Result<usize> {
     // 读超时兜底（同接收方向）：远端断流/静默时 worker 报错退出，不永久泄漏
-    feed.get_ref()
-        .set_read_timeout(Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)))?;
+    set_feed_read_timeout(
+        feed.get_ref(),
+        Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)),
+    )?;
     // 无可上传文件：优雅拒绝（不让远端挂在等 ACT 的状态）
     let Some(files) = &options.upload_files else {
         send_line(

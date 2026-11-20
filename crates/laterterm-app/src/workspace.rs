@@ -1384,6 +1384,7 @@ pub struct WorkspaceView {
     /// Quake 呼出/收起状态机（纯逻辑，见 quake.rs）。
     quake: crate::quake::QuakeMachine,
     /// portal worker 事件 → 泵。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     quake_tx: flume::Sender<QuakePortalEvent>,
     quake_rx: flume::Receiver<QuakePortalEvent>,
     /// 设置面板状态行（portal 授权/绑定/降级）。
@@ -1462,6 +1463,8 @@ impl WorkspaceView {
         };
         // appearance 随 settings 在下面的字面量里被移动，图钉模式提前取值（注同上）。
         let right_panel_pinned = settings.appearance.right_panel_pinned;
+        // Linux 启动路径会按 Quake 设置拉起 portal worker；其他平台无可变消费方。
+        #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut view = Self {
             settings,
             themes,
@@ -1775,6 +1778,8 @@ impl WorkspaceView {
     }
 
     /// 设置→快捷键页的 Quake 开关：落盘 + worker 生命周期联动 + 需要时呼回窗口。
+    /// portal 生命周期仅 Linux 接线；非 Linux 编译目标下方法暂无调用方。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn change_quake_setting(
         &mut self,
         _event: &MouseDownEvent,

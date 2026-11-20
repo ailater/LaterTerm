@@ -463,6 +463,8 @@ pub(crate) fn settings_content(
 
 /// 「终端外观」卡：字号 / 行高 / 内边距 / 背景不透明度 / 背景模糊。
 fn settings_appearance_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) -> Vec<Div> {
+    // Linux 下的透明降级提示会追加到 card；其他平台无可变消费方。
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut card = setting_card()
         .child(setting_row(
             "字号",

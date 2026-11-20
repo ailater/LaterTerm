@@ -9,6 +9,11 @@
 //! portal 侧遵循 docs/architecture.md「系统级」四坑：先订阅 Activated 再 bind（坑4）、
 //! 注册阶段套 8s deadline（坑2）、失败隔 1s 重试一次后降级（坑3）、授权等待期不算失败
 //! 而是发 AwaitingConsent 供 UI 引导（坑1）。
+//!
+//! 状态机与事件类型跨平台编译，但 portal 接线仅 Linux；非 Linux 编译目标下
+//! 部分 pub(crate) 入口没有调用方，属预期平台差异而非遗漏。
+
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::time::Duration;
 

@@ -636,7 +636,7 @@ fn state_dir() -> Option<PathBuf> {
 
     #[cfg(target_os = "macos")]
     {
-        return home_dir().map(|home| home.join("Library").join("Application Support"));
+        home_dir().map(|home| home.join("Library").join("Application Support"))
     }
 
     #[cfg(target_os = "windows")]
@@ -664,7 +664,7 @@ fn config_dir() -> Option<PathBuf> {
 
     #[cfg(target_os = "macos")]
     {
-        return home_dir().map(|home| home.join("Library").join("Application Support"));
+        home_dir().map(|home| home.join("Library").join("Application Support"))
     }
 
     #[cfg(target_os = "windows")]

@@ -30,6 +30,8 @@ struct StartupSettings(Settings);
 impl gpui::Global for StartupSettings {}
 
 fn window_options(cx: &mut gpui::App, settings: &Settings) -> gpui::WindowOptions {
+    // 仅 Linux 的 Quake 几何需要可变；macOS 下方会另取阴影绑定。
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
     let mut options = gpui::WindowOptions {
         titlebar: Some(gpui::TitlebarOptions {
             title: Some("LaterTerm".into()),
