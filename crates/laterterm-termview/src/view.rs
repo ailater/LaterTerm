@@ -620,6 +620,10 @@ pub struct TerminalView {
     /// 用于拖拽移动的按钮编码与 release 配对，take() 释放防悬挂标记。
     mouse_down_reported: Option<MouseButton>,
 
+    /// 本地 Simple 选区的按下格：同格微拖时保留空选区，交给 mouse-up 清除；
+    /// 真正拖出原格后选区变为非空，再拖回来仍可选择该单格。
+    local_selection_origin: Option<AlacPoint>,
+
     /// 最近一次移动上报的去重键（视口列, 视口行, 修饰位）；
     /// 同格且修饰位未变的连续 move 不重发（按 cell 上报语义，防逐像素刷 PTY）。
     last_motion_report: Option<(usize, usize, u8)>,
@@ -1034,6 +1038,7 @@ impl TerminalView {
             last_failed: false,
             scroll_report_scheduled: false,
             mouse_down_reported: None,
+            local_selection_origin: None,
             last_motion_report: None,
             marked_text: String::new(),
             search: None,
@@ -1524,6 +1529,8 @@ impl TerminalView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 每次按下都重置本地选区起点，鼠标上报 / URL 的提前返回不能沿用上次状态。
+        self.local_selection_origin = None;
         // Request focus when clicking the terminal
         window.focus(&self.focus_handle);
         // 点击后光标立即回到可见相位，避免刚点完就停在熄灭态。
@@ -1585,6 +1592,8 @@ impl TerminalView {
             2 => AlacSelectionType::Semantic,
             _ => AlacSelectionType::Lines,
         };
+        self.local_selection_origin =
+            (selection_type == AlacSelectionType::Simple).then_some(point);
         let selection = AlacSelection::new(selection_type, point, Side::Left);
         self.state
             .with_term_mut(|term| term.selection = Some(selection));
@@ -1593,6 +1602,7 @@ impl TerminalView {
 
     /// Handle mouse up events: 结束拖拽；未成形的单击选区直接清除。
     fn on_mouse_up(&mut self, event: &MouseUpEvent, window: &mut Window, cx: &mut Context<Self>) {
+        self.local_selection_origin = None;
         // 上报期间的 release：与已上报的 press 配对发给应用。take() 立即清理
         // 按下标记；期间不存在本地选区，直接返回。门控与 down/move/scroll
         // 三入口同口径——模式中途翻转（按住期间应用单独发 ?1006l 退到
@@ -1667,6 +1677,11 @@ impl TerminalView {
             };
             self.state.with_term_mut(|term| {
                 if let Some(selection) = term.selection.as_mut() {
+                    // 同格微拖仍保持 Left→Left 空选区，mouse-up 据此清除；
+                    // 已拖出原格再回来时选区非空，不拦截真正的单格选择。
+                    if self.local_selection_origin == Some(point) && selection.is_empty() {
+                        return;
+                    }
                     selection.update(point, Side::Right);
                 }
             });
@@ -3374,6 +3389,56 @@ mod tests {
             );
             view.on_mouse_up(&up(gpui::point(gpui::px(5.0), gpui::px(10.0))), window, cx);
             assert!(!view.has_selection(), "单击未拖拽不应留下选区");
+        });
+    }
+
+    #[gpui::test]
+    fn simple_selection_distinguishes_same_cell_jitter_from_real_drag(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseMoveEvent, MouseUpEvent};
+
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            view.resize(10, 5);
+            view.last_content_origin = Some(gpui::Point {
+                x: gpui::px(0.0),
+                y: gpui::px(0.0),
+            });
+            view.renderer.cell_width = gpui::px(10.0);
+            view.renderer.cell_height = gpui::px(20.0);
+
+            let down = || MouseDownEvent {
+                button: MouseButton::Left,
+                position: gpui::point(gpui::px(25.0), gpui::px(70.0)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            let move_to = |x, y| MouseMoveEvent {
+                position: gpui::point(gpui::px(x), gpui::px(y)),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            };
+            let up = || MouseUpEvent {
+                button: MouseButton::Left,
+                position: gpui::point(gpui::px(29.0), gpui::px(74.0)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+
+            // macOS 单击常伴随同格 NSLeftMouseDragged：不能因此选中一个空白格。
+            view.on_mouse_down(&down(), window, cx);
+            view.on_mouse_move(&move_to(29.0, 74.0), window, cx);
+            view.on_mouse_up(&up(), window, cx);
+            assert!(!view.has_selection(), "同格微小拖动不应留下选区");
+
+            // 真正离开原格后再拖回来，仍保留 alacritty 的单格选择语义。
+            view.on_mouse_down(&down(), window, cx);
+            view.on_mouse_move(&move_to(55.0, 70.0), window, cx);
+            view.on_mouse_move(&move_to(29.0, 74.0), window, cx);
+            view.on_mouse_up(&up(), window, cx);
+            assert!(view.has_selection(), "拖出再返回原格应保留单格选区");
         });
     }
 
