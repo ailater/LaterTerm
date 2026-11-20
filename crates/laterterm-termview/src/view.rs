@@ -1399,16 +1399,34 @@ impl TerminalView {
         }
 
         if let Some(bytes) = keystroke_to_bytes(keystroke, self.state.mode()) {
-            self.commit_input(&bytes);
+            self.commit_input(&bytes, cx);
         }
     }
 
     /// 真实用户输入的统一提交口；先写本端，再在锁外观察，失败不广播。
     ///
+    /// 键盘输入语义上表明用户已放弃旧选区：先清掉，避免空白选区高亮继续
+    /// 盖在提示符前被误读为光标/布局空隙。传输期也照清；Esc 取消特判在
+    /// 清理后执行。
+    ///
     /// 传输期特判：Esc（`\x1b`）不进 gate，改写为对应协议的取消序列直接
     /// 下发（trzsz=0x03、ZMODEM=5×CAN）——用户在传输中按 Esc 的意图就是
     /// 中止传输；其余键入照常被 gate 吞掉（不污染协议流）。
-    fn commit_input(&self, bytes: &[u8]) {
+    fn commit_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
+        self.clear_selection_for_input(cx);
+        self.commit_input_bytes(bytes);
+    }
+
+    /// 用户键入前清空旧选区并触发重绘。
+    fn clear_selection_for_input(&mut self, cx: &mut Context<Self>) {
+        if self.has_selection() {
+            self.state.with_term_mut(|term| term.selection = None);
+            cx.notify();
+        }
+    }
+
+    /// 选区清理后的实际提交路径；测试取消序列等内部路径可直连。
+    fn commit_input_bytes(&self, bytes: &[u8]) {
         if bytes == b"\x1b" && self.transfer_gate.lock().is_some() {
             self.cancel_transfer();
             return;
@@ -2556,7 +2574,7 @@ impl EntityInputHandler for TerminalView {
             return;
         }
         self.marked_text.clear();
-        self.commit_input(text.as_bytes());
+        self.commit_input(text.as_bytes(), cx);
         cx.notify();
     }
 
@@ -3443,6 +3461,56 @@ mod tests {
     }
 
     #[gpui::test]
+    fn keyboard_input_clears_existing_selection(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseMoveEvent, MouseUpEvent};
+        use std::sync::Mutex;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let recorded = buffer.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let view = TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx);
+            *view.stdin_writer.lock() = Box::new(RecordingWriter(recorded));
+            view
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            view.state.process_bytes(b"hello selection\r\n$ ");
+            view.last_content_origin = Some(gpui::Point {
+                x: gpui::px(0.0),
+                y: gpui::px(0.0),
+            });
+            view.renderer.cell_width = gpui::px(10.0);
+            view.renderer.cell_height = gpui::px(20.0);
+
+            let down = MouseDownEvent {
+                button: MouseButton::Left,
+                position: gpui::point(gpui::px(5.0), gpui::px(10.0)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            };
+            let move_to = MouseMoveEvent {
+                position: gpui::point(gpui::px(45.0), gpui::px(10.0)),
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::default(),
+            };
+            let up = MouseUpEvent {
+                button: MouseButton::Left,
+                position: gpui::point(gpui::px(45.0), gpui::px(10.0)),
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            };
+            view.on_mouse_down(&down, window, cx);
+            view.on_mouse_move(&move_to, window, cx);
+            view.on_mouse_up(&up, window, cx);
+            assert!(view.has_selection(), "前置条件：拖拽后应有选区");
+
+            view.commit_input(b"x", cx);
+            assert!(!view.has_selection(), "键盘输入应清除旧选区");
+            assert_eq!(*buffer.lock().unwrap(), b"x", "清除选区不得吞掉键入");
+        });
+    }
+
+    #[gpui::test]
     fn copy_on_select_auto_copies_valid_selection_on_mouse_up(cx: &mut TestAppContext) {
         use gpui::{ClipboardItem, Modifiers, MouseMoveEvent, MouseUpEvent};
 
@@ -4057,7 +4125,7 @@ mod tests {
             // ② 快捷命令（send_text）
             view.send_text("ls -la\r");
             // ③ 键入（commit_input，非 Esc）
-            view.commit_input(b"typed bytes");
+            view.commit_input(b"typed bytes", cx);
             // ④ 滚轮上报（SGR 1000+1006 已协商：走 write_input 生产写点）
             let wheel = ScrollWheelEvent {
                 position: gpui::point(gpui::px(5.0), gpui::px(10.0)),
@@ -4110,7 +4178,7 @@ mod tests {
             });
             terminal.update_in(cx, |view, _window, _cx| {
                 view.set_transfer_active(Some(flavor));
-                view.commit_input(b"\x1b");
+                view.commit_input_bytes(b"\x1b");
                 assert_eq!(*buffer.lock().unwrap(), cancel, "{flavor:?} 的取消序列");
                 // 取消即解除接管：后续写点不再被吞
                 view.write_input(b"ok");
