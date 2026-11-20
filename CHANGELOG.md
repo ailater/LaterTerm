@@ -4,6 +4,20 @@
 发版时把 `Cargo.toml` 的 `workspace.package.version` 提到新版本号，并在顶部追加
 `## v<版本> - <日期>` 小节（两者同 PR 提交，合入后 auto-tag 自动打 tag 发布）。
 
+## v0.5.1 - 2026-11-20
+
+macOS 发布门禁与传输稳定性补丁。
+
+### 终端文件传输
+
+- 修复 Darwin 下对端已关闭的 UnixStream 设置读超时返回 `EINVAL`，导致 trzsz 拒绝路径误报 `Invalid argument` 的问题
+- 远端先 EOF 时仍走正常 EOF / 协议错误路径；真正的零时长配置继续显式报错
+
+### 跨平台门禁
+
+- 标注 macOS 编译目标下 Quake 相关 dead code 与 `unused_mut` 平台差异
+- 清理 macOS 配置目录路径中的多余 `return`，恢复本机完整 `script/gate.sh` 通过
+
 ## v0.5.0 - 2026-11-20
 
 终端文件传输与服务器录入体验更新，并包含配置同步、发布链及鼠标选区修复。
