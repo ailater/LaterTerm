@@ -10,6 +10,7 @@ use crate::sftp_panel::{
     load_remote_into, sftp_overlay,
 };
 use crate::shortcut_recorder::{ShortcutChanged, ShortcutRecorder};
+use crate::ssh_command::parse_ssh_command;
 use crate::update_check::{self, UpdateCheck};
 use crate::webdav_sync::{SyncOutcome, WebDavTaskKind, WebDavTaskState};
 use gpui::{
@@ -5033,7 +5034,12 @@ impl WorkspaceView {
                 ServerAuthKind::Agent => "Agent（无需密码）",
             }
         };
-        let rows: [(&str, String, &str); 10] = [
+        let rows: [(&str, String, &str); 11] = [
+            (
+                "SSH 命令",
+                String::new(),
+                "可选：ssh user@host -p 22；粘贴后自动填充",
+            ),
             ("名称", meta.name, "如 跳板机A"),
             ("主机", meta.host, "host 或 IP"),
             ("端口", meta.port.to_string(), "22"),
@@ -5070,6 +5076,14 @@ impl WorkspaceView {
                     field
                 }
             });
+            if label == "SSH 命令" {
+                self.server_field_subscriptions.push(cx.subscribe(
+                    &field,
+                    |workspace, _, _: &CommandTextChanged, cx| {
+                        workspace.apply_server_ssh_command(cx);
+                    },
+                ));
+            }
             self.server_fields.push((label.into(), field));
         }
         self.server_dialog = Some(ServerDialog::Edit {
@@ -5129,6 +5143,47 @@ impl WorkspaceView {
         }
     }
 
+    /// SSH 命令输入变为合法目标后立即回填；输入过程中不合法属于中间态，
+    /// 保持静默，真正保存时再由 save_server 给出具体解析错误。
+    fn apply_server_ssh_command(&mut self, cx: &mut Context<Self>) {
+        let values = self
+            .server_fields
+            .iter()
+            .map(|(name, field)| (name.as_str(), field.read(cx).value().trim().to_string()))
+            .collect::<BTreeMap<_, _>>();
+        let Some(command) = values.get("SSH 命令").filter(|value| !value.is_empty()) else {
+            return;
+        };
+        let Ok(target) = parse_ssh_command(command) else {
+            return;
+        };
+
+        let is_new = matches!(
+            &self.server_dialog,
+            Some(ServerDialog::Edit { original: None })
+        );
+        let current_name = values.get("名称").map(String::as_str).unwrap_or_default();
+        let current_host = values.get("主机").map(String::as_str).unwrap_or_default();
+        let mut updates = vec![
+            ("主机", target.host.clone()),
+            ("端口", target.port.to_string()),
+        ];
+        if let Some(username) = target.username {
+            updates.push(("用户名", username));
+        }
+        // 新建时仅在名称为空或仍沿用旧主机名时同步名称；编辑与自定义名称不覆盖。
+        if is_new && (current_name.is_empty() || current_name == current_host) {
+            updates.push(("名称", target.host));
+        }
+        for (label, value) in updates {
+            if let Some((_, entity)) = self.server_fields.iter().find(|(name, _)| name == label) {
+                entity.update(cx, |field, cx| field.set_value(&value, cx));
+            }
+        }
+        self.server_error = None;
+        cx.notify();
+    }
+
     /// 保存服务器：校验与凭据写入（改名迁移）都在后台线程，避免密钥环 DBus 阻塞。
     fn save_server(&mut self, original: Option<String>, cx: &mut Context<Self>) {
         if self.server_save.is_some() {
@@ -5139,6 +5194,16 @@ impl WorkspaceView {
             .iter()
             .map(|(name, field)| (name.as_str(), field.read(cx).value().to_string()))
             .collect::<BTreeMap<_, _>>();
+        if let Some(command) = values
+            .get("SSH 命令")
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            && let Err(error) = parse_ssh_command(command)
+        {
+            self.server_error = Some(format!("SSH 命令无效：{error}"));
+            cx.notify();
+            return;
+        }
         let mut meta = self.server_meta_draft.clone();
         meta.name = values
             .get("名称")
@@ -5359,6 +5424,7 @@ impl WorkspaceView {
                             }
                             workspace.server_dialog = None;
                             workspace.server_fields.clear();
+                            workspace.server_field_subscriptions.clear();
                             workspace.server_error = None;
                             workspace.pending_focus =
                                 Some(workspace.focused_terminal().read(cx).focus_handle().clone());
@@ -13368,6 +13434,123 @@ mod exit_regression_tests {
             view.settings.appearance.copy_toast = false;
             view.show_copy_toast(5, cx);
             assert!(view.copy_toast.is_none(), "开关关闭不得显示 toast");
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod server_ssh_command_tests {
+    use super::WorkspaceView;
+    use gpui::TestAppContext;
+    use laterterm_config::ServerEntry;
+
+    fn fill_field(
+        view: &mut WorkspaceView,
+        label: &str,
+        value: &str,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<WorkspaceView>,
+    ) {
+        use gpui::EntityInputHandler;
+        let field = view
+            .server_fields
+            .iter()
+            .find(|(name, _)| name == label)
+            .unwrap_or_else(|| panic!("弹窗缺少「{label}」字段"))
+            .1
+            .clone();
+        field.update(cx, |field, cx| {
+            field.replace_text_in_range(None, value, window, cx)
+        });
+    }
+
+    fn assert_field(
+        view: &WorkspaceView,
+        label: &str,
+        expected: &str,
+        cx: &gpui::Context<WorkspaceView>,
+    ) {
+        let actual = view
+            .server_fields
+            .iter()
+            .find(|(name, _)| name == label)
+            .unwrap_or_else(|| panic!("弹窗缺少「{label}」字段"))
+            .1
+            .read(cx)
+            .value();
+        assert_eq!(actual, expected, "字段「{label}」");
+    }
+
+    #[gpui::test]
+    fn paste_ssh_command_prefills_new_server_form(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            view.edit_server(None, window, cx);
+            fill_field(
+                view,
+                "SSH 命令",
+                "ssh ops@bastion.example.com -p22222",
+                window,
+                cx,
+            );
+        });
+        // 嵌套 field.update 的 CommandTextChanged 在外层 workspace 更新结束后投递。
+        workspace.update(cx, |view, cx| {
+            assert_field(view, "名称", "bastion.example.com", cx);
+            assert_field(view, "主机", "bastion.example.com", cx);
+            assert_field(view, "端口", "22222", cx);
+            assert_field(view, "用户名", "ops", cx);
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn paste_ssh_command_does_not_rename_existing_server(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            let existing = ServerEntry {
+                name: "生产入口".into(),
+                host: "old.example.com".into(),
+                username: "old-ops".into(),
+                ..Default::default()
+            };
+            view.edit_server(Some(&existing), window, cx);
+            fill_field(
+                view,
+                "SSH 命令",
+                "ssh new-ops@new.example.com -p 22222",
+                window,
+                cx,
+            );
+        });
+        workspace.update(cx, |view, cx| {
+            assert_field(view, "名称", "生产入口", cx);
+            assert_field(view, "主机", "new.example.com", cx);
+            assert_field(view, "端口", "22222", cx);
+            assert_field(view, "用户名", "new-ops", cx);
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn invalid_ssh_command_is_rejected_without_saving(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            view.edit_server(None, window, cx);
+            fill_field(view, "SSH 命令", "ssh -i key ops@example.com", window, cx);
+            view.save_server(None, cx);
+            let error = view.server_error.clone().expect("非法命令必须报错");
+            assert!(error.contains("SSH 命令无效"), "{error}");
+            assert!(error.contains("仅支持 -p"), "{error}");
+            assert!(view.settings.servers.is_empty(), "校验失败不得落盘");
+            assert!(view.server_save.is_none(), "同步早退不应进入后台保存");
             for pane in &view.panes {
                 pane.session.close();
             }

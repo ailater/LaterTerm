@@ -10,6 +10,7 @@ mod quake;
 mod server_connection;
 mod sftp_panel;
 mod shortcut_recorder;
+mod ssh_command;
 mod update_check;
 mod webdav_sync;
 mod workspace;

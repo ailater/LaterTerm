@@ -71,6 +71,17 @@ impl CommandTextField {
         &self.text
     }
 
+    /// 表单逻辑回填文本：移动光标到末尾并重绘，但不伪造用户编辑事件。
+    pub(crate) fn set_value(&mut self, value: &str, cx: &mut Context<Self>) {
+        if self.text == value {
+            return;
+        }
+        self.selection = 0..self.utf16_len();
+        self.replace_selection(value);
+        self.marked_range = None;
+        cx.notify();
+    }
+
     pub(crate) fn has_context_menu(&self) -> bool {
         self.context_menu.is_some()
     }
