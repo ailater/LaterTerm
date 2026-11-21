@@ -2978,6 +2978,33 @@ impl WorkspaceView {
         dragged
     }
 
+    /// 侧栏行箭头：标签沿列表上移/下移一格（滑动动画 + 快照落盘）。
+    /// 顶部无上移、底部无下移（渲染侧隐藏，此处再钳制防越界）。
+    /// 被移标签相邻的行反向让出一格，滑动偏移与拖拽共用衰减循环。
+    fn move_tab_vertical(&mut self, tab_id: TabId, up: bool, cx: &mut Context<Self>) {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let Some(target) = (if up {
+            index.checked_sub(1)
+        } else {
+            Some(index + 1).filter(|target| *target < self.tabs.len())
+        }) else {
+            return;
+        };
+        // 让位邻居：上移时上邻下移一格（视觉起使偏移为正），下移对称
+        let neighbor = self.tabs[target].id;
+        let sign = if up { 1.0 } else { -1.0 };
+        if Self::reorder_tabs(&mut self.tabs, tab_id, target) {
+            if let Some(shift) = Self::dragged_slot_shift(TabDragAxis::Vertical, tab_id) {
+                *self.tab_slide_offsets.entry(neighbor).or_insert(0.0) += sign * shift;
+                self.ensure_tab_slide_anim(cx);
+            }
+            self.save_session_snapshot();
+            cx.notify();
+        }
+    }
+
     /// 标签重排纯逻辑：把 `id` 从当前位置移到 `to_index`（remove + insert）。
     /// 原地/越界/找不到返回 false；tabs 顺序即 session snapshot 落盘顺序，
     /// 重排后无需额外持久化处理。
@@ -9463,8 +9490,8 @@ fn left_sidebar(
                 .track_scroll(scroll)
                 .px_2()
                 .pb_2()
-                .children(tab_labels.iter().map(
-                    |(id, title, count, color, highlighted, command_failed)| {
+                .children(tab_labels.iter().enumerate().map(
+                    |(index, (id, title, count, color, highlighted, command_failed))| {
                         let id = *id;
                         let color = *color;
                         let highlighted = *highlighted;
@@ -9598,6 +9625,45 @@ fn left_sidebar(
                                         .rounded_full()
                                         .flex_shrink_0()
                                         .bg(rgb(0xF7768E)),
+                                )
+                            })
+                            // 上移/下移箭头：hover 显示，点击沿列表移一格
+                            // （首行无上箭头、末行无下箭头；拦截冒泡防触发
+                            // 行激活与拖拽起点）
+                            .when(index > 0, |row| {
+                                row.child(
+                                    div()
+                                        .px_1()
+                                        .opacity(0.0)
+                                        .group_hover("session-row", |style| style.opacity(1.0))
+                                        .text_color(rgb(ui.text_secondary))
+                                        .hover(|style| style.text_color(rgb(ui.text)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.move_tab_vertical(id, true, cx);
+                                            }),
+                                        )
+                                        .child("↑"),
+                                )
+                            })
+                            .when(index + 1 < tab_labels.len(), |row| {
+                                row.child(
+                                    div()
+                                        .px_1()
+                                        .opacity(0.0)
+                                        .group_hover("session-row", |style| style.opacity(1.0))
+                                        .text_color(rgb(ui.text_secondary))
+                                        .hover(|style| style.text_color(rgb(ui.text)))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.move_tab_vertical(id, false, cx);
+                                            }),
+                                        )
+                                        .child("↓"),
                                 )
                             })
                             .child(
@@ -15233,6 +15299,56 @@ mod tab_drag_tests {
         }
         assert!(offsets.is_empty(), "全部偏移应落定移除");
         assert!(steps >= 8, "收敛不应一帧完成（否则没有滑动观感）");
+    }
+
+    /// 侧栏箭头：上移/下移各交换一格并在边界钳制；顺序变更落盘快照。
+    #[gpui::test]
+    fn move_tab_vertical_swaps_with_boundary_clamp(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            view.spawn_tab(window, cx);
+            view.spawn_tab(window, cx);
+            let ids: Vec<TabId> = view.tabs.iter().map(|t| t.id).collect();
+            let (a, b, c) = (ids[0], ids[1], ids[2]);
+
+            // 首行上移：钳制不重排
+            view.move_tab_vertical(a, true, cx);
+            assert_eq!(
+                view.tabs.iter().map(|t| t.id).collect::<Vec<_>>(),
+                vec![a, b, c],
+                "首行上移应被钳制"
+            );
+
+            // a 下移一格 → [b, a, c]
+            view.move_tab_vertical(a, false, cx);
+            assert_eq!(
+                view.tabs.iter().map(|t| t.id).collect::<Vec<_>>(),
+                vec![b, a, c],
+                "下移应与后一行交换"
+            );
+
+            // 末行（c）下移：钳制不重排
+            view.move_tab_vertical(c, false, cx);
+            assert_eq!(
+                view.tabs.iter().map(|t| t.id).collect::<Vec<_>>(),
+                vec![b, a, c],
+                "末行下移应被钳制"
+            );
+
+            // a 再上移一格回原位 → [a, b, c]
+            view.move_tab_vertical(a, true, cx);
+            assert_eq!(
+                view.tabs.iter().map(|t| t.id).collect::<Vec<_>>(),
+                vec![a, b, c]
+            );
+
+            // 顺序变更已落盘快照
+            let snapshot = view.snapshot_session();
+            assert_eq!(snapshot.tabs.len(), 3, "快照应覆盖全部标签");
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
     }
 }
 
