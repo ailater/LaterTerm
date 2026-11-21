@@ -1167,7 +1167,7 @@ enum TabDragAxis {
     Vertical,
 }
 
-/// 标签拖拽排序中：被拖标签 + 按下起点与实时位置。
+/// 标签拖拽排序中：被拖标签 + 按下起点。
 #[derive(Clone, Copy, Debug)]
 struct TabDrag {
     tab_id: TabId,
@@ -1178,10 +1178,12 @@ struct TabDrag {
     from_index: usize,
     /// 拖拽表面（标题栏横拖 / 左栏纵拖）。
     axis: TabDragAxis,
-    /// 阈值已过，进入视觉拖拽态：被拖标签跟随光标并抬升。
+    /// 阈值已过，进入视觉拖拽态：被拖标签抬升高亮，邻居滑动让位。
+    ///
+    /// 有意**不**让被拖标签跟随光标：跟随偏移以按下起点为基准，而模型槽位
+    /// 在实时交换，两者叠加视觉位置双重漂移（乱跑）；标签留在原槽位 +
+    /// 邻居滑动让位是稳定交互。
     active: bool,
-    /// 实时鼠标位置（窗口坐标）；每帧跟随用。
-    current: Point<Pixels>,
 }
 
 /// 标签：持有自己的分屏树与窗格焦点。
@@ -2841,18 +2843,16 @@ impl WorkspaceView {
             from_index,
             axis,
             active: false,
-            current: origin,
         });
     }
 
-    /// 拖拽中：沿拖拽轴位移超阈值进入视觉拖拽态（被拖标签跟随光标并抬升）；
-    /// 悬停到其他标签时实时交换位置，相邻标签做滑动微动画。
+    /// 拖拽中：沿拖拽轴位移超阈值进入视觉拖拽态（被拖标签抬升高亮）；
+    /// 悬停到其他标签时实时交换位置，邻居做滑动微动画。
     /// 未超阈值前不动——与单击激活/双击重命名共存。
     fn update_tab_drag(&mut self, hovered: TabId, position: Point<Pixels>, cx: &mut Context<Self>) {
         let Some(drag) = self.tab_drag.as_mut() else {
             return;
         };
-        drag.current = position;
         let displacement = match drag.axis {
             TabDragAxis::Horizontal => (position.x - drag.origin.x).abs(),
             TabDragAxis::Vertical => (position.y - drag.origin.y).abs(),
@@ -2861,12 +2861,11 @@ impl WorkspaceView {
             if displacement <= px(TAB_DRAG_THRESHOLD_PX) {
                 return;
             }
+            // 激活与首次交换在同一事件完成：不 return，落入下方交换逻辑
             drag.active = true;
             cx.notify();
         }
         if hovered == drag.tab_id {
-            // 跟随光标需逐帧重绘；悬停回自身不重排但视觉持续更新。
-            cx.notify();
             return;
         }
         let Some(to) = self.tabs.iter().position(|tab| tab.id == hovered) else {
@@ -8413,14 +8412,14 @@ impl Render for WorkspaceView {
                                         } else {
                                             title
                                         };
-                                        // 拖拽视觉：激活态的被拖标签跟随光标横移并抬升；
-                                        // 抬升 bg 用 hover 色保证可读。
-                                        let drag_offset = self
+                                        // 拖拽视觉：激活态的被拖标签抬升高亮（bg 用
+                                        // hover 色 + 阴影）；标签留在原槽位，不做
+                                        // 光标跟随——跟随偏移与实时交换叠加会双重
+                                        // 漂移（乱跑），让位交给邻居滑动动画。
+                                        let being_dragged = self
                                             .tab_drag
                                             .as_ref()
-                                            .filter(|drag| drag.active && drag.tab_id == id)
-                                            .map(|drag| drag.current.x - drag.origin.x);
-                                        let being_dragged = drag_offset.is_some();
+                                            .is_some_and(|drag| drag.active && drag.tab_id == id);
                                         let slide_offset = self.tab_slide_offsets.get(&id).copied();
                                         let slide_epoch = self.tab_slide_epoch;
                                         let tab = div()
@@ -8531,10 +8530,8 @@ impl Render for WorkspaceView {
                                                     )
                                                     .child("×"),
                                             );
-                                        // 被拖标签跟随光标横移 + 抬升阴影
-                                        let tab = tab.when_some(drag_offset, |el, dx| {
-                                            el.left(dx).shadow_sm()
-                                        });
+                                        // 被拖标签抬升阴影
+                                        let tab = tab.when(being_dragged, |el| el.shadow_sm());
                                         // 重排滑动微动画：受影响邻居从旧位置方向缓动落位
                                         match slide_offset {
                                             Some(offset) => tab
@@ -9333,12 +9330,11 @@ struct TabDragVisual<'a> {
     slide_epoch: u64,
 }
 
-/// 拖拽视觉：激活态的被拖行跟随光标纵移并抬升阴影
-fn sidebar_drag_offset(visual: &TabDragVisual<'_>, id: TabId) -> Option<Pixels> {
+/// 拖拽视觉：激活态的被拖行抬升高亮（不跟随光标，理由见 TabDrag.active）。
+fn sidebar_being_dragged(visual: &TabDragVisual<'_>, id: TabId) -> bool {
     visual
         .drag
-        .filter(|drag| drag.active && drag.tab_id == id)
-        .map(|drag| drag.current.y - drag.origin.y)
+        .is_some_and(|drag| drag.active && drag.tab_id == id)
 }
 
 /// 标签列表采用固定标题和独立滚动区域，长标题不挤占关闭按钮。
@@ -9414,9 +9410,8 @@ fn left_sidebar(
                             },
                         );
                         let count = *count;
-                        // 拖拽视觉：激活态的被拖行跟随光标纵移并抬升阴影
-                        let drag_offset = sidebar_drag_offset(&drag_visual, id);
-                        let being_dragged = drag_offset.is_some();
+                        // 拖拽视觉：激活态的被拖行抬升高亮（不跟随光标）
+                        let being_dragged = sidebar_being_dragged(&drag_visual, id);
                         let slide_offset = drag_visual.slide_offsets.get(&id).copied();
                         let slide_epoch = drag_visual.slide_epoch;
                         let row = div()
@@ -9550,8 +9545,8 @@ fn left_sidebar(
                                     )
                                     .child("×"),
                             );
-                        // 被拖行跟随光标纵移 + 抬升阴影
-                        let row = row.when_some(drag_offset, |el, dy| el.top(dy).shadow_sm());
+                        // 被拖行抬升阴影
+                        let row = row.when(being_dragged, |el| el.shadow_sm());
                         // 重排滑动微动画：受影响邻居从旧位置方向缓动落位
                         match slide_offset {
                             Some(offset) => row
