@@ -32,15 +32,15 @@
 //! 3. **Default Background Skip**: Cells with the default background color don't
 //!    generate separate background rectangles.
 //!
-//! 4. **Cell Measurement**: Font metrics are measured once using the '│' (BOX DRAWINGS
-//!    LIGHT VERTICAL) character and cached for consistent cell dimensions.
+//! 4. **Cell Measurement**: Font metrics are measured once from a common ASCII
+//!    sample and cached for consistent cell dimensions.
 //!
 //! # Cell Dimensions
 //!
-//! Cell size is calculated from actual font metrics using the '│' character,
-//! which spans the full cell height in properly designed terminal fonts:
+//! Cell size is calculated from actual font metrics:
 //!
-//! - **Width**: Measured from shaped '│' character
+//! - **Width**: average advance of common lowercase/digits (fallback fonts may
+//!   make single glyphs non-uniform)
 //! - **Height**: `(ascent + descent) × line_height_multiplier`
 //!
 //! The `line_height_multiplier` (default 1.0) can be adjusted to add extra
@@ -695,20 +695,24 @@ impl TerminalRenderer {
     /// Measure cell dimensions based on actual font metrics.
     ///
     /// This method measures the actual width and height of characters
-    /// using the GPUI text system. It uses the '│' (BOX DRAWINGS LIGHT VERTICAL)
-    /// character which spans the full cell height in properly designed terminal fonts.
+    /// using the GPUI text system. Width uses a digit sample because Nerd
+    /// Fonts or fallback chains may assign inconsistent advances to different
+    /// ASCII classes.
     ///
     /// # Arguments
     ///
     /// * `window` - The GPUI window for text system access
     pub fn measure_cell(&mut self, window: &mut Window) {
-        // Measure using '│' (U+2502, BOX DRAWINGS LIGHT VERTICAL)
-        // This character spans the full cell height in terminal fonts, making it
-        // ideal for measuring exact cell dimensions used by TUIs
+        // 用数字 ASCII 测量单元格宽度。该字体的 M/m 与小写/数字会落入不同
+        // 回退宽度；终端行的 token 又会被空白切断成独立 run。若用单个宽字符
+        // 当列距，后续 run 会按过宽列距定位，提示符字段被推开（用户可见为
+        // prompt 中间大片空白）。数字 advance 与常见 shell 文本列距一致。
+        let sample = "0123456789";
+        let sample_chars = sample.chars().count() as f32;
         let font = self.font_for(false, false);
 
         let text_run = TextRun {
-            len: "│".len(),
+            len: sample.len(),
             font,
             color: gpui::black(),
             background_color: None,
@@ -716,14 +720,15 @@ impl TerminalRenderer {
             strikethrough: None,
         };
 
-        // Shape the box-drawing character to get cell metrics
-        let shaped = window
-            .text_system()
-            .shape_line("│".into(), self.font_size, &[text_run], None);
+        let shaped =
+            window
+                .text_system()
+                .shape_line(sample.into(), self.font_size, &[text_run], None);
+        let measured_width = shaped.width / sample_chars;
 
         // Get the width from the shaped line
-        if shaped.width > px(0.0) {
-            self.cell_width = shaped.width;
+        if measured_width > px(0.0) {
+            self.cell_width = measured_width;
         }
 
         // Calculate height from ascent + descent with optional multiplier
