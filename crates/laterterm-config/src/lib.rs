@@ -283,10 +283,37 @@ fn default_background_opacity() -> f32 {
     1.0
 }
 
+/// 平台默认等宽字体：优先系统内置，开箱即用且观感与原生终端一致。
+///
+/// - macOS：Menlo 系统内置保证存在（SF Mono 家族名不可靠）；
+/// - Windows：Cascadia Mono（Win11 内置；缺失时渲染层探测回退 Consolas）；
+/// - Linux：`monospace` 别名恒可经 fontconfig 解析到发行版默认等宽。
+///
+/// 渲染层（laterterm-termview `measure_cell`）另有等宽探测兜底：配置的
+/// family 缺失或非等宽时自动回退平台候选，故这里不必选「必然存在」的值。
+#[allow(clippy::doc_markdown)] // 平台名按原文书写
+pub fn default_font_family() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Menlo"
+    } else if cfg!(target_os = "windows") {
+        "Cascadia Mono"
+    } else {
+        "monospace"
+    }
+}
+
+/// 0.5.x 前的硬编码默认字体。它依赖用户自装 Nerd Font，未安装时 GPUI 会
+/// 静默逐字符回退（非等宽 advance），观感差于原生终端——已被平台内置
+/// 默认取代；sanitize 把残留的该值迁移到 [`default_font_family`]。
+///
+/// 边界：FONT_PRESETS 仍保留 Nerd 字体供显式选择；迁移只覆盖「从未改过
+/// 字体设置」的存量文件，显式选过 Nerd 字体的用户需重选一次。
+const LEGACY_DEFAULT_FONT_FAMILY: &str = "JetBrainsMono Nerd Font";
+
 impl Default for Appearance {
     fn default() -> Self {
         Self {
-            font_family: "JetBrainsMono Nerd Font".into(),
+            font_family: default_font_family().into(),
             font_size: 13.0,
             // 1.2 行距读长日志更舒适；纯网格对齐不受影响（TUI 按单元格定位）
             line_height: 1.2,
@@ -593,7 +620,11 @@ impl Appearance {
             self.background_opacity = 1.0;
         }
         self.background_opacity = self.background_opacity.clamp(0.15, 1.0);
-        if self.font_family.trim().is_empty() {
+        if self.font_family.trim().is_empty()
+            || self.font_family.trim() == LEGACY_DEFAULT_FONT_FAMILY
+        {
+            // 空值 + 旧硬编码默认值都归位到平台内置字体：旧值依赖用户自装
+            // Nerd Font，未装时渲染回退观感差（见 LEGACY_DEFAULT_FONT_FAMILY）。
             self.font_family = Self::default().font_family;
         }
         self.theme = self.theme.trim().to_string();
@@ -713,7 +744,7 @@ mod tests {
         let raw = "[appearance]\nfont_size = 15.0\n";
         let settings: Settings = toml::from_str(raw).unwrap();
         assert_eq!(settings.appearance.font_size, 15.0);
-        assert_eq!(settings.appearance.font_family, "JetBrainsMono Nerd Font");
+        assert_eq!(settings.appearance.font_family, default_font_family());
         assert_eq!(settings.appearance.scrollback, 100_000);
     }
 
@@ -890,7 +921,33 @@ shortcut = "  legacy shortcut  "
         assert_eq!(appearance.line_height, 2.0);
         assert_eq!(appearance.padding, 0.0);
         assert_eq!(appearance.scrollback, 1_000);
-        assert_eq!(appearance.font_family, "JetBrainsMono Nerd Font");
+        assert_eq!(appearance.font_family, default_font_family());
+    }
+
+    /// 旧硬编码默认值（依赖自装 Nerd Font）在载入期迁移到平台内置字体；
+    /// 显式自定义值不受迁移影响。
+    #[test]
+    fn load_migrates_legacy_default_font_family() {
+        let path = temp_settings_path("legacy-font");
+        std::fs::write(
+            &path,
+            format!("[appearance]\nfont_family = \"{LEGACY_DEFAULT_FONT_FAMILY}\"\n"),
+        )
+        .unwrap();
+        let settings = Settings::load(&path).unwrap();
+        assert_eq!(settings.appearance.font_family, default_font_family());
+
+        let custom = temp_settings_path("custom-font");
+        std::fs::write(
+            &custom,
+            "[appearance]\nfont_family = \"JetBrainsMono Nerd Font Mono\"\n",
+        )
+        .unwrap();
+        let settings = Settings::load(&custom).unwrap();
+        assert_eq!(
+            settings.appearance.font_family,
+            "JetBrainsMono Nerd Font Mono"
+        );
     }
 
     #[test]
