@@ -585,8 +585,95 @@ pub struct TerminalRenderer {
     /// 相等比较，缩放只在 paint 时乘一次。
     pub background_opacity: f32,
 
+    /// 探测选定的实际渲染 family（Some = 用户字体不可用/非等宽，已回退）。
+    /// None = 尚未探测或沿用用户字体。`font_for` 全部走这里。
+    resolved_family: Option<String>,
+
+    /// 回退提示只打一次（measure_cell 会在字体切换/窗口新建时多次执行）。
+    fallback_notice_emitted: bool,
+
     /// Whether cell metrics need to be measured again.
     needs_measurement: bool,
+}
+
+/// 探测一个 family 是否可用且为真等宽。
+///
+/// 返回 `(单元格宽, ascent, descent)`；None = family 缺失（GPUI 逐字符回退
+/// 会拆出多个 font run）或字形 advance 不一致（混入比例字体）。GPUI 对
+/// 缺失字体的行为不是报错而是静默回退，必须靠字形级探测识别。
+fn probe_monospace(
+    window: &mut Window,
+    font: &Font,
+    font_size: Pixels,
+) -> Option<(Pixels, Pixels, Pixels)> {
+    // 混合宽窄 ASCII 类别：真等宽字体逐字形 advance 一致；比例字体/
+    // 混合回退必然拉开差距。不含空格与连字对，避免字距/合字干扰。
+    let sample = "Mm0%";
+    let text_run = TextRun {
+        len: sample.len(),
+        font: font.clone(),
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window
+        .text_system()
+        .shape_line(sample.into(), font_size, &[text_run], None);
+    if shaped.runs.len() != 1 || shaped.runs[0].glyphs.len() != sample.len() {
+        return None;
+    }
+    let glyphs = &shaped.runs[0].glyphs;
+    let mut advances: Vec<Pixels> = glyphs
+        .windows(2)
+        .map(|pair| pair[1].position.x - pair[0].position.x)
+        .collect();
+    advances.push(shaped.width - glyphs.last().unwrap().position.x);
+    let first = advances[0];
+    if first <= px(0.0) {
+        return None;
+    }
+    // 容差 1%：吸收亚像素舍入；真等宽差距为 0，混排回退远超此值
+    if advances
+        .iter()
+        .any(|advance| (*advance - first).abs() > first * 0.01)
+    {
+        return None;
+    }
+    Some((first, shaped.ascent, shaped.descent))
+}
+
+/// 平台内置等宽兜底候选（按观感优先级排序），供用户字体不可用时探测。
+fn platform_monospace_candidates() -> Vec<String> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![
+            "SF Mono".into(),
+            "Menlo".into(),
+            "Monaco".into(),
+            "Courier New".into(),
+            "monospace".into(),
+        ]
+    }
+    #[cfg(target_os = "linux")]
+    {
+        vec![
+            "JetBrains Mono".into(),
+            "Noto Sans Mono".into(),
+            "DejaVu Sans Mono".into(),
+            "Liberation Mono".into(),
+            "monospace".into(),
+        ]
+    }
+    #[cfg(target_os = "windows")]
+    {
+        vec![
+            "Cascadia Mono".into(),
+            "Consolas".into(),
+            "Courier New".into(),
+            "monospace".into(),
+        ]
+    }
 }
 
 impl TerminalRenderer {
@@ -649,6 +736,8 @@ impl TerminalRenderer {
             palette,
             // 默认完全不透明（历史行为）；宿主经 pub 字段按需覆写
             background_opacity: 1.0,
+            resolved_family: None,
+            fallback_notice_emitted: false,
             needs_measurement: true,
         }
     }
@@ -656,9 +745,20 @@ impl TerminalRenderer {
     /// 按样式构造字体：应用连字开关与备选字体链。
     ///
     /// 渲染器所有 Font 构造点（测量/批量文本）都走这里，保证设置一致。
+    /// family 取 [`Self::resolved_family`]（用户字体不可用时探测选定），
+    /// 未探测过则用用户配置值。
     pub fn font_for(&self, bold: bool, italic: bool) -> Font {
+        let family = self
+            .resolved_family
+            .clone()
+            .unwrap_or_else(|| self.font_family.clone());
+        self.font_for_family(&family, bold, italic)
+    }
+
+    /// 指定 family 构造字体（连字/备选链与 [`Self::font_for`] 同口径）。
+    fn font_for_family(&self, family: &str, bold: bool, italic: bool) -> Font {
         Font {
-            family: self.font_family.clone().into(),
+            family: family.to_string().into(),
             features: if self.ligatures {
                 FontFeatures::default()
             } else {
@@ -687,6 +787,13 @@ impl TerminalRenderer {
         self.needs_measurement
     }
 
+    /// 探测选定的实际渲染 family（Some = 用户字体不可用，已回退）。
+    /// 仅测试断言使用；非测试构建无调用方（平台差异，见 workspace 同款标注）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn resolved_family(&self) -> Option<&str> {
+        self.resolved_family.as_deref()
+    }
+
     /// Mark the cached cell metrics as stale.
     pub fn invalidate_measurement(&mut self) {
         self.needs_measurement = true;
@@ -694,45 +801,83 @@ impl TerminalRenderer {
 
     /// Measure cell dimensions based on actual font metrics.
     ///
-    /// This method measures the actual width and height of characters
-    /// using the GPUI text system. Width uses a digit sample because Nerd
-    /// Fonts or fallback chains may assign inconsistent advances to different
-    /// ASCII classes.
+    /// 先探测用户配置 family 是否为真等宽（GPUI 文本系统对缺失字体会按
+    /// 字符类别走不同回退，M 与数字 advance 不一致 → prompt token 被列距
+    /// 推开形成大空隙、整体观感显著差于原生终端）。不可用时按平台顺序
+    /// 探测内置等宽候选，选定后经 [`Self::resolved_family`] 供全部渲染
+    /// 使用；全部候选失败则沿用数字均值（旧行为）。
     ///
     /// # Arguments
     ///
     /// * `window` - The GPUI window for text system access
     pub fn measure_cell(&mut self, window: &mut Window) {
-        // 用数字 ASCII 测量单元格宽度。该字体的 M/m 与小写/数字会落入不同
-        // 回退宽度；终端行的 token 又会被空白切断成独立 run。若用单个宽字符
-        // 当列距，后续 run 会按过宽列距定位，提示符字段被推开（用户可见为
-        // prompt 中间大片空白）。数字 advance 与常见 shell 文本列距一致。
-        let sample = "0123456789";
-        let sample_chars = sample.chars().count() as f32;
-        let font = self.font_for(false, false);
+        let mut candidates = vec![self.font_family.clone()];
+        candidates.extend(platform_monospace_candidates());
+        candidates.dedup();
+        // 平台 family 名单预检：GPUI/CoreText 对未知 family 会静默落到
+        // 缺省字形（notdef 等宽），单靠 advance 探测识别不出来；先查
+        // all_font_names 再探测。
+        let available = window.text_system().all_font_names();
 
-        let text_run = TextRun {
-            len: sample.len(),
-            font,
-            color: gpui::black(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-
-        let shaped =
-            window
-                .text_system()
-                .shape_line(sample.into(), self.font_size, &[text_run], None);
-        let measured_width = shaped.width / sample_chars;
-
-        // Get the width from the shaped line
-        if measured_width > px(0.0) {
-            self.cell_width = measured_width;
+        let mut selected: Option<(String, Pixels, Pixels, Pixels)> = None;
+        for family in &candidates {
+            let is_generic = family == "monospace";
+            if !is_generic
+                && !available
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(family))
+            {
+                continue;
+            }
+            let font = self.font_for_family(family, false, false);
+            if let Some((advance, ascent, descent)) = probe_monospace(window, &font, self.font_size)
+            {
+                selected = Some((family.clone(), advance, ascent, descent));
+                break;
+            }
         }
 
-        // Calculate height from ascent + descent with optional multiplier
-        let line_height = (shaped.ascent + shaped.descent).ceil();
+        let Some((family, advance, ascent, descent)) = selected else {
+            // 全部候选（含平台兜底）都非等宽：沿用用户字体 + 数字均值，
+            // 不崩但观感受限——与旧口径一致。
+            let sample = "0123456789";
+            let sample_chars = sample.chars().count() as f32;
+            let font = self.font_for(false, false);
+            let text_run = TextRun {
+                len: sample.len(),
+                font,
+                color: gpui::black(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            let shaped =
+                window
+                    .text_system()
+                    .shape_line(sample.into(), self.font_size, &[text_run], None);
+            let measured_width = shaped.width / sample_chars;
+            if measured_width > px(0.0) {
+                self.cell_width = measured_width;
+            }
+            let line_height = (shaped.ascent + shaped.descent).ceil();
+            if line_height > px(0.0) {
+                self.cell_height = line_height * self.line_height_multiplier.max(0.1);
+            }
+            self.resolved_family = None;
+            self.needs_measurement = false;
+            return;
+        };
+
+        if family != self.font_family && !self.fallback_notice_emitted {
+            eprintln!(
+                "字体 {:?} 不可用（未安装或非等宽），已回退到 {:?}；可在设置中更改终端字体",
+                self.font_family, family
+            );
+            self.fallback_notice_emitted = true;
+        }
+        self.resolved_family = Some(family);
+        self.cell_width = advance;
+        let line_height = (ascent + descent).ceil();
         if line_height > px(0.0) {
             self.cell_height = line_height * self.line_height_multiplier.max(0.1);
         }

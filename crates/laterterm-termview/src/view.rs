@@ -3673,6 +3673,32 @@ mod tests {
         });
     }
 
+    /// 配置的字体缺失时必须回退到平台等宽：GPUI 对缺失 family 是静默
+    /// 逐字符回退，不探测就会得到非等宽 advance（prompt 大空隙 + 观感差）。
+    #[gpui::test]
+    fn missing_font_family_falls_back_to_platform_monospace(cx: &mut TestAppContext) {
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let config = TerminalConfig {
+                font_family: "NoSuchMonoFont-laterterm-probe".into(),
+                ..Default::default()
+            };
+            TerminalView::new(Arc::new(FinishedSession), config, cx)
+        });
+        terminal.update_in(cx, |view, window, _| {
+            use gpui::px as gpui_px;
+            view.renderer.measure_cell(window);
+            let resolved = view
+                .renderer
+                .resolved_family()
+                .expect("缺失字体应回退到平台等宽");
+            assert_ne!(
+                resolved, "NoSuchMonoFont-laterterm-probe",
+                "回退 family 不得等于缺失的配置值"
+            );
+            assert!(view.renderer.cell_width > gpui_px(0.0), "回退后应测得列宽");
+        });
+    }
+
     /// 录制写入字节的 stdin 替身；断言鼠标上报编码用。
     struct RecordingWriter(Arc<std::sync::Mutex<Vec<u8>>>);
     impl std::io::Write for RecordingWriter {
