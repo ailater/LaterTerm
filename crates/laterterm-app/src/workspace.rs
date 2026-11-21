@@ -380,6 +380,25 @@ thread_local! {
     /// 分割容器几何缓存：paint 期由 canvas 写入，mousedown 换算拖拽比例时读取。
     static SPLIT_GEOMETRY: std::cell::RefCell<std::collections::HashMap<u64, Bounds<gpui::Pixels>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    /// 标签槽位几何缓存：paint 期由 canvas 写入（键 = TabId，含标题栏标签与
+    /// 侧栏行），重排时读取被拖标签的槽位尺寸以计算邻居滑动距离。
+    static TAB_BOUNDS: std::cell::RefCell<std::collections::HashMap<TabId, Bounds<gpui::Pixels>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// 滑动偏移衰减一步（纯函数可测）：逐项乘衰减系数指数趋零，落定项移除；
+/// 返回是否仍有动画在跑（供衰减循环判定退出）。
+fn decay_slide_offsets(offsets: &mut BTreeMap<TabId, f32>) -> bool {
+    offsets.retain(|_, offset| {
+        let next = *offset * TAB_SLIDE_DECAY;
+        if next.abs() < TAB_SLIDE_SETTLE_PX {
+            false
+        } else {
+            *offset = next;
+            true
+        }
+    });
+    !offsets.is_empty()
 }
 
 impl LayoutNode {
@@ -1153,6 +1172,15 @@ const TAB_COLOR_SWATCHES: [u32; 8] = [
 /// 避免误触（与单击激活/双击重命名共存）。
 const TAB_DRAG_THRESHOLD_PX: f32 = 6.0;
 
+/// 滑动偏移每帧衰减系数（16ms/帧 ≈ 0.72^10 → 约 160ms 收敛）。
+const TAB_SLIDE_DECAY: f32 = 0.72;
+
+/// 滑动偏移落定阈值（px）：低于该值视为归位，移出偏移表停帧。
+const TAB_SLIDE_SETTLE_PX: f32 = 0.5;
+
+/// 侧栏行下边距（mb_1）：行距 = 行高 + 下边距，滑动距离按此计。
+const SIDEBAR_ROW_MARGIN_PX: f32 = 4.0;
+
 /// 标签拖拽表面：决定位移计量轴与跟随方向。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TabDragAxis {
@@ -1252,6 +1280,12 @@ pub struct WorkspaceView {
     tab_menu: Option<TabMenuState>,
     /// 标签拖拽排序状态（None = 空闲）；标题栏横拖 / 左栏纵拖共用。
     tab_drag: Option<TabDrag>,
+    /// 滑动偏移（px，沿拖拽轴，带符号）：邻居行相对其槽位的当前位移。
+    /// 交换时在原值上累加 ±槽位宽，由 [`Self::ensure_tab_slide_anim`]
+    /// 驱动指数衰减归零——连续交换只改目标，不重启动画（无闪动）。
+    tab_slide_offsets: BTreeMap<TabId, f32>,
+    /// 滑动衰减循环在跑标记（防重复 spawn）。
+    tab_slide_animating: bool,
     /// 会话恢复挂起的服务器标签外观（键 = 服务器名 → (自定义标题, 自定义色)）。
     /// 服务器标签连接成功后才创建，恢复期先把快照值挂这里，
     /// finish_ssh_connect 建标签时消费（自身色优先，缺省回落服务器默认色）。
@@ -1569,6 +1603,8 @@ impl WorkspaceView {
             terminal_menu: None,
             tab_menu: None,
             tab_drag: None,
+            tab_slide_offsets: BTreeMap::new(),
+            tab_slide_animating: false,
             pending_server_tab_restore: BTreeMap::new(),
             secret_store: default_store(),
             settings_section: SettingsSection::Appearance,
@@ -2868,12 +2904,72 @@ impl WorkspaceView {
         let Some(to) = self.tabs.iter().position(|tab| tab.id == hovered) else {
             return;
         };
+        let Some(from) = self.tabs.iter().position(|tab| tab.id == drag.tab_id) else {
+            return;
+        };
+        // 受影响邻居：被拖标签右移 → 邻居左移填补空位（视觉起使偏移为正），
+        // 左移对称。每个邻居恰好让出一个被拖槽位，位移 = 被拖槽位宽。
+        let affected: Vec<TabId> = if to > from {
+            self.tabs[from + 1..=to].iter().map(|tab| tab.id).collect()
+        } else {
+            self.tabs[to..from].iter().map(|tab| tab.id).collect()
+        };
         if Self::reorder_tabs(&mut self.tabs, drag.tab_id, to) {
+            let sign = if to > from { 1.0 } else { -1.0 };
+            if let Some(shift) = Self::dragged_slot_shift(drag.axis, drag.tab_id) {
+                for id in affected {
+                    *self.tab_slide_offsets.entry(id).or_insert(0.0) += sign * shift;
+                }
+                self.ensure_tab_slide_anim(cx);
+            }
             cx.notify();
         }
     }
 
+    /// 被拖标签的槽位位移（px）：标题栏 = 实测标签宽（内容自适应行，邻居
+    /// 恰好让出一个被拖槽位）；侧栏 = 行高 + 下边距。
+    fn dragged_slot_shift(axis: TabDragAxis, tab_id: TabId) -> Option<f32> {
+        TAB_BOUNDS.with_borrow(|map| {
+            let bounds = map.get(&tab_id)?;
+            Some(match axis {
+                TabDragAxis::Horizontal => f32::from(bounds.size.width),
+                TabDragAxis::Vertical => f32::from(bounds.size.height) + SIDEBAR_ROW_MARGIN_PX,
+            })
+        })
+    }
+
+    /// 滑动偏移衰减循环：16ms 一帧指数趋零，全部落定后自动退出。
+    /// 偏移是连续状态、在原值上衰减——连续交换只累加目标，不重启动画。
+    fn ensure_tab_slide_anim(&mut self, cx: &mut Context<Self>) {
+        if self.tab_slide_animating {
+            return;
+        }
+        self.tab_slide_animating = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let still_animating = this
+                    .update(cx, |view, cx| {
+                        let any = decay_slide_offsets(&mut view.tab_slide_offsets);
+                        if any {
+                            cx.notify();
+                        }
+                        any
+                    })
+                    .unwrap_or(false);
+                if !still_animating {
+                    break;
+                }
+            }
+            let _ = this.update(cx, |view, _| view.tab_slide_animating = false);
+        })
+        .detach();
+    }
+
     /// 松开鼠标结束拖拽；有过重排则落盘会话快照（顺序即持久化顺序）。
+    /// 滑动偏移保留，衰减循环继续把它们送归零（松手动画自然收尾）。
     fn end_tab_drag(&mut self) -> bool {
         let dragged = self.tab_drag.take().is_some();
         if dragged {
@@ -8400,13 +8496,13 @@ impl Render for WorkspaceView {
                                             title
                                         };
                                         // 拖拽视觉：激活态的被拖标签抬升高亮（bg 用
-                                        // hover 色 + 阴影）；标签留在原槽位，不做
-                                        // 光标跟随与滑动动画（两者实测均致乱跑/
-                                        // 闪动，见 TabDrag.active 注记）。
+                                        // hover 色 + 阴影）；交换时邻居按被拖槽位宽
+                                        // 平滑滑动让位（偏移由衰减循环驱动）。
                                         let being_dragged = self
                                             .tab_drag
                                             .as_ref()
                                             .is_some_and(|drag| drag.active && drag.tab_id == id);
+                                        let slide_offset = self.tab_slide_offsets.get(&id).copied();
                                         let tab = div()
                                             .h_full()
                                             .relative()
@@ -8515,8 +8611,19 @@ impl Render for WorkspaceView {
                                                     )
                                                     .child("×"),
                                             );
-                                        // 被拖标签抬升阴影
+                                        // 被拖标签抬升阴影；滑动偏移驱动邻居缓动让位
                                         tab.when(being_dragged, |el| el.shadow_sm())
+                                            .when_some(slide_offset, |el, offset| {
+                                                el.relative().left(px(offset))
+                                            })
+                                            .child(div().absolute().inset_0().child(canvas(
+                                                move |_, _, _| {},
+                                                move |bounds, _, _, _| {
+                                                    TAB_BOUNDS.with_borrow_mut(|map| {
+                                                        map.insert(id, bounds);
+                                                    });
+                                                },
+                                            )))
                                     },
                                 ))
                             })
@@ -8600,6 +8707,7 @@ impl Render for WorkspaceView {
                             self.ui_colors(),
                             TabDragVisual {
                                 drag: self.tab_drag.as_ref(),
+                                slide_offsets: &self.tab_slide_offsets,
                             },
                             cx,
                         )
@@ -9286,9 +9394,10 @@ fn render_layout(
 /// （第 6 个字段入列后元组越过阈值）。
 type TabLabelRow = (TabId, String, usize, Option<u32>, bool, bool);
 
-/// 标签拖拽视觉快照：渲染侧只读（被拖行抬升高亮判定）。
+/// 标签拖拽视觉快照：渲染侧只读（被拖行高亮 + 滑动偏移）。
 struct TabDragVisual<'a> {
     drag: Option<&'a TabDrag>,
+    slide_offsets: &'a BTreeMap<TabId, f32>,
 }
 
 /// 拖拽视觉：激活态的被拖行抬升高亮（不跟随光标，理由见 TabDrag.active）。
@@ -9371,9 +9480,10 @@ fn left_sidebar(
                             },
                         );
                         let count = *count;
-                        // 拖拽视觉：激活态的被拖行抬升高亮（不跟随光标、
-                        // 不做滑动动画——闪动根因见 TabDrag.active 注记）
+                        // 拖拽视觉：激活态的被拖行抬升高亮（不跟随光标）；
+                        // 交换时邻居按行距平滑滑动让位（偏移由衰减循环驱动）
                         let being_dragged = sidebar_being_dragged(&drag_visual, id);
+                        let slide_offset = drag_visual.slide_offsets.get(&id).copied();
                         let row = div()
                             .debug_selector(move || {
                                 if selected {
@@ -9505,8 +9615,17 @@ fn left_sidebar(
                                     )
                                     .child("×"),
                             );
-                        // 被拖行抬升阴影
+                        // 被拖行抬升阴影；滑动偏移驱动邻居缓动让位
                         row.when(being_dragged, |el| el.shadow_sm())
+                            .when_some(slide_offset, |el, offset| el.top(px(offset)))
+                            .child(div().absolute().inset_0().child(canvas(
+                                move |_, _, _| {},
+                                move |bounds, _, _, _| {
+                                    TAB_BOUNDS.with_borrow_mut(|map| {
+                                        map.insert(id, bounds);
+                                    });
+                                },
+                            )))
                     },
                 )),
         )
@@ -14954,8 +15073,11 @@ mod tab_rename_tests {
 
 #[cfg(test)]
 mod tab_drag_tests {
-    use super::{LayoutNode, PaneId, TabDragAxis, TabId, WorkspaceTab, WorkspaceView};
+    use super::{
+        LayoutNode, PaneId, TabDragAxis, TabId, WorkspaceTab, WorkspaceView, decay_slide_offsets,
+    };
     use gpui::{Point, TestAppContext, px};
+    use std::collections::BTreeMap;
 
     fn tab(id: u64) -> WorkspaceTab {
         WorkspaceTab {
@@ -15095,6 +15217,22 @@ mod tab_drag_tests {
                 pane.session.close();
             }
         });
+    }
+
+    /// 滑动偏移衰减：逐帧指数趋零，有符号偏移对称收敛，落定后移出。
+    #[test]
+    fn slide_offsets_decay_exponentially_to_settle() {
+        let mut offsets = BTreeMap::from([(TabId(1), 42.0), (TabId(2), -42.0)]);
+        let mut steps = 0;
+        while decay_slide_offsets(&mut offsets) {
+            steps += 1;
+            assert!(steps < 60, "衰减应在有限帧内收敛");
+            for offset in offsets.values() {
+                assert!(offset.abs() <= 42.0, "衰减单调趋零，不得放大: {offset}");
+            }
+        }
+        assert!(offsets.is_empty(), "全部偏移应落定移除");
+        assert!(steps >= 8, "收敛不应一帧完成（否则没有滑动观感）");
     }
 }
 
