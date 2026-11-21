@@ -1389,7 +1389,11 @@ impl TerminalView {
             return;
         }
 
-        let is_plain_text = !keystroke.modifiers.control
+        // macOS 的 Enter 会带 `key_char='\n'`；终端语义必须发送 CR，不能进入
+        // InputHandler 的文本提交路径（LF 在 zsh/交互程序里不等价于回车）。
+        let is_enter = keystroke.key == "enter";
+        let is_plain_text = !is_enter
+            && !keystroke.modifiers.control
             && !keystroke.modifiers.alt
             && (keystroke.key_char.is_some() || keystroke.key.len() == 1);
         if is_plain_text {
@@ -3634,6 +3638,38 @@ mod tests {
                 Some("sentinel".to_string()),
                 "开关关闭时拖拽松开不应写剪贴板"
             );
+        });
+    }
+
+    /// macOS 真实 Enter 事件会带 `key_char='\n'`；必须优先走终端控制键路径
+    /// 发送 CR，而不是被可打印文本分支交给 InputHandler（后者发出 LF）。
+    #[gpui::test]
+    fn macos_enter_key_char_sends_cr(cx: &mut TestAppContext) {
+        use gpui::KeyDownEvent;
+        use std::sync::Mutex;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let recorded = buffer.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let view = TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+                .with_input_callback(move |bytes| {
+                    assert!(bytes != b"\n", "Enter 不得以 LF 形态进入 InputHandler 回调");
+                });
+            *view.stdin_writer.lock() = Box::new(RecordingWriter(recorded));
+            view
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            let mut keystroke = gpui::Keystroke::parse("enter").unwrap();
+            keystroke.key_char = Some("\n".into());
+            view.on_key_down(
+                &KeyDownEvent {
+                    keystroke,
+                    is_held: false,
+                },
+                window,
+                cx,
+            );
+            assert_eq!(*buffer.lock().unwrap(), b"\r", "macOS Enter 必须发送 CR");
         });
     }
 
