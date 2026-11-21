@@ -1334,6 +1334,8 @@ pub struct WorkspaceView {
     server_dialog: Option<ServerDialog>,
     server_fields: Vec<(String, Entity<CommandTextField>)>,
     server_field_subscriptions: Vec<gpui::Subscription>,
+    /// 服务器弹窗「高级选项」折叠态（默认收起；随弹窗重开复位）。
+    server_advanced_open: bool,
     server_save: Option<Arc<AtomicBool>>,
     server_meta_draft: ServerEntry,
     /// 编辑弹窗隧道区草稿（Edit 弹窗随开随建，保存时读回 meta.tunnels；
@@ -1523,6 +1525,7 @@ impl WorkspaceView {
             server_tunnel_drafts: Vec::new(),
             server_fields: Vec::new(),
             server_field_subscriptions: Vec::new(),
+            server_advanced_open: false,
             server_save: None,
             server_meta_draft: ServerEntry::default(),
             server_delete_confirm: None,
@@ -5066,6 +5069,8 @@ impl WorkspaceView {
         );
         self.server_fields.clear();
         self.server_field_subscriptions.clear();
+        // 高级选项默认收起：弹窗高度随开随收，主路径一眼可见
+        self.server_advanced_open = false;
         // 隧道编辑区草稿随弹窗重建（随开随建）：编辑条目按已存 tunnels 逐行
         // 回填；新建弹窗为空列表，用户经「添加」起步（bind 缺省 127.0.0.1）
         self.server_tunnel_drafts = self
@@ -5155,6 +5160,12 @@ impl WorkspaceView {
         });
         self.server_error = None;
         focus_first_field(&self.server_fields, window, cx);
+        cx.notify();
+    }
+
+    /// 编辑弹窗「高级选项」折叠开关（私钥路径/编码/分组/跳板/备注）。
+    fn toggle_server_advanced(&mut self, cx: &mut Context<Self>) {
+        self.server_advanced_open = !self.server_advanced_open;
         cx.notify();
     }
 
@@ -10196,6 +10207,37 @@ fn dialog_field_row(label: &str, field: Entity<CommandTextField>) -> gpui::Div {
         .child(field)
 }
 
+/// 弹窗内一行双字段：两个短字段并排压缩弹窗高度（服务器弹窗专用）。
+/// `b_width` 为 Some 时右列取固定宽（端口这类短值），None 时两列均分。
+fn dialog_field_row_pair(
+    (label_a, field_a): (&str, Entity<CommandTextField>),
+    (label_b, field_b): (&str, Entity<CommandTextField>),
+    b_width: Option<Pixels>,
+) -> gpui::Div {
+    let column = |label: &str, field: Entity<CommandTextField>| {
+        div()
+            .child(div().text_color(rgb(0x7D829F)).child(label.to_string()))
+            .child(field)
+    };
+    div()
+        .pt_2()
+        .flex()
+        .gap_2()
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(column(label_a, field_a)),
+        )
+        .child(
+            match b_width {
+                Some(width) => div().w(width),
+                None => div().flex_1().min_w(px(0.0)),
+            }
+            .child(column(label_b, field_b)),
+        )
+}
+
 fn shortcut_editor_row(recorder: Entity<ShortcutRecorder>) -> gpui::Div {
     div()
         .pt_2()
@@ -10535,21 +10577,64 @@ fn server_edit_modal(
     let fields = workspace.server_fields.clone();
     let meta = workspace.server_meta_draft.clone();
     let error = workspace.server_error.clone();
+    let advanced_open = workspace.server_advanced_open;
     let title = if original.is_some() {
         "编辑服务器"
     } else {
         "新建服务器"
+    };
+    // 按标签取字段实体；字段集在 edit_server 固定创建，缺失即装配 bug。
+    let field = |name: &str| -> Entity<CommandTextField> {
+        fields
+            .iter()
+            .find(|(label, _)| label == name)
+            .expect("服务器弹窗缺少字段")
+            .1
+            .clone()
     };
     let body = div()
         .flex()
         .flex_col()
         .p_4()
         .when_some(error, |body, error| body.child(dialog_error_line(error)))
-        .children(
-            fields
-                .into_iter()
-                .map(|(name, field)| dialog_field_row(&name, field)),
+        // 主路径：SSH 命令回填 + 连接必需字段（双列压缩高度）
+        .child(dialog_field_row("SSH 命令", field("SSH 命令")))
+        .child(dialog_field_row("名称", field("名称")))
+        .child(dialog_field_row_pair(
+            ("主机", field("主机")),
+            ("端口", field("端口")),
+            Some(px(110.0)),
+        ))
+        .child(dialog_field_row_pair(
+            ("用户名", field("用户名")),
+            ("凭据", field("凭据")),
+            None,
+        ))
+        // 可选字段折叠：私钥/编码/分组/跳板/备注默认收起，弹窗不再一屏排满
+        .child(
+            div()
+                .pt_3()
+                .flex()
+                .items_center()
+                .child(setting_button(
+                    "高级选项",
+                    advanced_open,
+                    cx.listener(|this, _, _, cx| this.toggle_server_advanced(cx)),
+                )),
         )
+        .when(advanced_open, |body| {
+            body.child(dialog_field_row("私钥路径", field("私钥路径")))
+                .child(dialog_field_row_pair(
+                    ("编码", field("编码")),
+                    ("分组", field("分组")),
+                    None,
+                ))
+                .child(dialog_field_row_pair(
+                    ("跳板", field("跳板")),
+                    ("备注", field("备注")),
+                    None,
+                ))
+        })
         .when_some(workspace.shortcut_editor.as_ref(), |body, editor| body.child(shortcut_editor_row(editor.recorder.clone())))
         .child(server_tunnel_editor(workspace, cx))
         .child(
