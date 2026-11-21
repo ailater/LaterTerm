@@ -14,11 +14,12 @@ use crate::ssh_command::parse_ssh_command;
 use crate::update_check::{self, UpdateCheck};
 use crate::webdav_sync::{SyncOutcome, WebDavTaskKind, WebDavTaskState};
 use gpui::{
-    App, AppContext, AsyncApp, Bounds, Context, CursorStyle, DispatchPhase, Div, Edges, Entity,
-    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement, PathPromptOptions, Pixels, Point, Render,
-    ScrollHandle, StatefulInteractiveElement, Styled, WeakEntity, Window, anchored, canvas,
-    deferred, div, prelude::FluentBuilder, px, relative, rgb, rgba, svg,
+    Animation, AnimationExt, App, AppContext, AsyncApp, Bounds, Context, CursorStyle,
+    DispatchPhase, Div, Edges, ElementId, Entity, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
+    PathPromptOptions, Pixels, Point, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, WeakEntity, Window, anchored, canvas, deferred, div,
+    ease_out_quint, prelude::FluentBuilder, px, relative, rgb, rgba, svg,
 };
 use laterterm_config::{
     Appearance, CommandTemplate, ServerAuthKind, ServerEntry, ServersFile, Settings, Theme,
@@ -1153,15 +1154,34 @@ const TAB_COLOR_SWATCHES: [u32; 8] = [
 /// 避免误触（与单击激活/双击重命名共存）。
 const TAB_DRAG_THRESHOLD_PX: f32 = 6.0;
 
-/// 标签拖拽排序中：被拖标签 + 按下起点（判断位移阈值）与起始索引。
+/// 重排时相邻标签的滑动起使偏移（px）：微动画从该偏移缓动回 0，
+/// 消除「瞬间跳位」的生硬感。量级取小值——只做 settling 提示，不做全槽位平移。
+const TAB_SLIDE_PX: f32 = 14.0;
+
+/// 标签拖拽表面：决定位移计量轴与跟随方向。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TabDragAxis {
+    /// 标题栏横向标签条。
+    Horizontal,
+    /// 左栏纵向会话列表。
+    Vertical,
+}
+
+/// 标签拖拽排序中：被拖标签 + 按下起点与实时位置。
 #[derive(Clone, Copy, Debug)]
 struct TabDrag {
     tab_id: TabId,
-    /// 按下时的鼠标位置（窗口坐标）；横移/纵移超阈值才算拖拽。
+    /// 按下时的鼠标位置（窗口坐标）；沿拖拽轴位移超阈值才算拖拽。
     origin: Point<Pixels>,
-    /// 按下时的标签索引（诊断与未来视觉反馈预留；交换以实时索引为准）。
+    /// 按下时的标签索引（诊断与视觉反馈预留；交换以实时索引为准）。
     #[allow(dead_code)]
     from_index: usize,
+    /// 拖拽表面（标题栏横拖 / 左栏纵拖）。
+    axis: TabDragAxis,
+    /// 阈值已过，进入视觉拖拽态：被拖标签跟随光标并抬升。
+    active: bool,
+    /// 实时鼠标位置（窗口坐标）；每帧跟随用。
+    current: Point<Pixels>,
 }
 
 /// 标签：持有自己的分屏树与窗格焦点。
@@ -1230,6 +1250,10 @@ pub struct WorkspaceView {
     tab_menu: Option<TabMenuState>,
     /// 标签拖拽排序状态（None = 空闲）；标题栏横拖 / 左栏纵拖共用。
     tab_drag: Option<TabDrag>,
+    /// 重排滑动微动画：标签 id → 起使偏移（px，沿拖拽轴）；随帧缓动回 0。
+    /// epoch 变化即重启动画（with_animation 以元素 id 区分状态）。
+    tab_slide_offsets: BTreeMap<TabId, f32>,
+    tab_slide_epoch: u64,
     /// 会话恢复挂起的服务器标签外观（键 = 服务器名 → (自定义标题, 自定义色)）。
     /// 服务器标签连接成功后才创建，恢复期先把快照值挂这里，
     /// finish_ssh_connect 建标签时消费（自身色优先，缺省回落服务器默认色）。
@@ -1544,6 +1568,8 @@ impl WorkspaceView {
             terminal_menu: None,
             tab_menu: None,
             tab_drag: None,
+            tab_slide_offsets: BTreeMap::new(),
+            tab_slide_epoch: 0,
             pending_server_tab_restore: BTreeMap::new(),
             secret_store: default_store(),
             settings_section: SettingsSection::Appearance,
@@ -2803,9 +2829,9 @@ impl WorkspaceView {
         }
     }
 
-    /// 开始标签拖拽：记录被拖标签与按下起点（阈值判断在 update 侧）。
+    /// 开始标签拖拽：记录被拖标签、按下起点与拖拽表面（阈值判断在 update 侧）。
     /// 不 notify——阈值未过前无视觉变化。
-    fn start_tab_drag(&mut self, tab_id: TabId, origin: Point<Pixels>) {
+    fn start_tab_drag(&mut self, tab_id: TabId, origin: Point<Pixels>, axis: TabDragAxis) {
         let Some(from_index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
             return;
         };
@@ -2813,31 +2839,65 @@ impl WorkspaceView {
             tab_id,
             origin,
             from_index,
+            axis,
+            active: false,
+            current: origin,
         });
     }
 
-    /// 拖拽中：位移超阈值且悬停到其他标签时实时交换位置（remove + insert）。
+    /// 拖拽中：沿拖拽轴位移超阈值进入视觉拖拽态（被拖标签跟随光标并抬升）；
+    /// 悬停到其他标签时实时交换位置，相邻标签做滑动微动画。
     /// 未超阈值前不动——与单击激活/双击重命名共存。
     fn update_tab_drag(&mut self, hovered: TabId, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let Some(drag) = self.tab_drag else {
+        let Some(drag) = self.tab_drag.as_mut() else {
             return;
         };
-        let dx = (position.x - drag.origin.x).abs();
-        let dy = (position.y - drag.origin.y).abs();
-        // 位移取两轴较大者：标题栏横拖 / 左栏纵拖共用一套阈值
-        if dx.max(dy) <= px(TAB_DRAG_THRESHOLD_PX) || hovered == drag.tab_id {
+        drag.current = position;
+        let displacement = match drag.axis {
+            TabDragAxis::Horizontal => (position.x - drag.origin.x).abs(),
+            TabDragAxis::Vertical => (position.y - drag.origin.y).abs(),
+        };
+        if !drag.active {
+            if displacement <= px(TAB_DRAG_THRESHOLD_PX) {
+                return;
+            }
+            drag.active = true;
+            cx.notify();
+        }
+        if hovered == drag.tab_id {
+            // 跟随光标需逐帧重绘；悬停回自身不重排但视觉持续更新。
+            cx.notify();
             return;
         }
-        if let Some(to) = self.tabs.iter().position(|tab| tab.id == hovered)
-            && Self::reorder_tabs(&mut self.tabs, drag.tab_id, to)
-        {
+        let Some(to) = self.tabs.iter().position(|tab| tab.id == hovered) else {
+            return;
+        };
+        let Some(from) = self.tabs.iter().position(|tab| tab.id == drag.tab_id) else {
+            return;
+        };
+        // 重排滑动微动画：受影响邻居从旧位置方向缓动落位（被拖标签右移 →
+        // 邻居左移填补空位，起使偏移为正；左移对称）。
+        let affected: Vec<TabId> = if to > from {
+            self.tabs[from + 1..=to].iter().map(|tab| tab.id).collect()
+        } else {
+            self.tabs[to..from].iter().map(|tab| tab.id).collect()
+        };
+        if Self::reorder_tabs(&mut self.tabs, drag.tab_id, to) {
+            let sign = if to > from { 1.0 } else { -1.0 };
+            self.tab_slide_offsets = affected
+                .into_iter()
+                .map(|id| (id, sign * TAB_SLIDE_PX))
+                .collect();
+            self.tab_slide_epoch += 1;
             cx.notify();
         }
     }
 
     /// 松开鼠标结束拖拽；有过重排则落盘会话快照（顺序即持久化顺序）。
+    /// 滑动微动画偏移一并清空（动画已收敛，清空不改视觉）。
     fn end_tab_drag(&mut self) -> bool {
         let dragged = self.tab_drag.take().is_some();
+        self.tab_slide_offsets.clear();
         if dragged {
             self.save_session_snapshot();
         }
@@ -8353,7 +8413,17 @@ impl Render for WorkspaceView {
                                         } else {
                                             title
                                         };
-                                        div()
+                                        // 拖拽视觉：激活态的被拖标签跟随光标横移并抬升；
+                                        // 抬升 bg 用 hover 色保证可读。
+                                        let drag_offset = self
+                                            .tab_drag
+                                            .as_ref()
+                                            .filter(|drag| drag.active && drag.tab_id == id)
+                                            .map(|drag| drag.current.x - drag.origin.x);
+                                        let being_dragged = drag_offset.is_some();
+                                        let slide_offset = self.tab_slide_offsets.get(&id).copied();
+                                        let slide_epoch = self.tab_slide_epoch;
+                                        let tab = div()
                                             .h_full()
                                             .relative()
                                             .group("tab")
@@ -8361,7 +8431,7 @@ impl Render for WorkspaceView {
                                             .items_center()
                                             .gap_1()
                                             .px_3()
-                                            .bg(if is_active {
+                                            .bg(if is_active || being_dragged {
                                                 rgb(ui.hover_bg)
                                             } else {
                                                 rgb(ui.panel_bg)
@@ -8378,7 +8448,11 @@ impl Render for WorkspaceView {
                                                     // 双击在此基础上弹重命名弹窗；
                                                     // 记下拖拽起点，位移超阈值即进入重排
                                                     this.activate_tab(id, event, window, cx);
-                                                    this.start_tab_drag(id, event.position);
+                                                    this.start_tab_drag(
+                                                        id,
+                                                        event.position,
+                                                        TabDragAxis::Horizontal,
+                                                    );
                                                     if event.click_count >= 2 {
                                                         this.start_tab_rename(id, window, cx);
                                                     }
@@ -8456,7 +8530,30 @@ impl Render for WorkspaceView {
                                                         }),
                                                     )
                                                     .child("×"),
-                                            )
+                                            );
+                                        // 被拖标签跟随光标横移 + 抬升阴影
+                                        let tab = tab.when_some(drag_offset, |el, dx| {
+                                            el.left(dx).shadow_sm()
+                                        });
+                                        // 重排滑动微动画：受影响邻居从旧位置方向缓动落位
+                                        match slide_offset {
+                                            Some(offset) => tab
+                                                .with_animation(
+                                                    ElementId::NamedInteger(
+                                                        SharedString::from(format!(
+                                                            "tab-slide-{slide_epoch}"
+                                                        )),
+                                                        id.0,
+                                                    ),
+                                                    Animation::new(Duration::from_millis(160))
+                                                        .with_easing(ease_out_quint()),
+                                                    move |el, delta| {
+                                                        el.left(px(offset * (1.0 - delta)))
+                                                    },
+                                                )
+                                                .into_any_element(),
+                                            None => tab.into_any_element(),
+                                        }
                                     },
                                 ))
                             })
@@ -8538,6 +8635,11 @@ impl Render for WorkspaceView {
                             active_tab_id,
                             &self.tab_scroll,
                             self.ui_colors(),
+                            TabDragVisual {
+                                drag: self.tab_drag.as_ref(),
+                                slide_offsets: &self.tab_slide_offsets,
+                                slide_epoch: self.tab_slide_epoch,
+                            },
                             cx,
                         )
                     } else {
@@ -9223,6 +9325,22 @@ fn render_layout(
 /// （第 6 个字段入列后元组越过阈值）。
 type TabLabelRow = (TabId, String, usize, Option<u32>, bool, bool);
 
+/// 标签拖拽视觉快照：渲染侧只读（跟随态 + 滑动微动画参数）。
+/// 打包成结构体避免 left_sidebar 参数过长（clippy::too_many_arguments）。
+struct TabDragVisual<'a> {
+    drag: Option<&'a TabDrag>,
+    slide_offsets: &'a BTreeMap<TabId, f32>,
+    slide_epoch: u64,
+}
+
+/// 拖拽视觉：激活态的被拖行跟随光标纵移并抬升阴影
+fn sidebar_drag_offset(visual: &TabDragVisual<'_>, id: TabId) -> Option<Pixels> {
+    visual
+        .drag
+        .filter(|drag| drag.active && drag.tab_id == id)
+        .map(|drag| drag.current.y - drag.origin.y)
+}
+
 /// 标签列表采用固定标题和独立滚动区域，长标题不挤占关闭按钮。
 /// 颜色全部走 `ui`（主题派生），不再写死 Tokyo Night 色值。
 fn left_sidebar(
@@ -9230,6 +9348,7 @@ fn left_sidebar(
     active_tab_id: TabId,
     scroll: &ScrollHandle,
     ui: UiColors,
+    drag_visual: TabDragVisual<'_>,
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
     div()
@@ -9295,7 +9414,12 @@ fn left_sidebar(
                             },
                         );
                         let count = *count;
-                        div()
+                        // 拖拽视觉：激活态的被拖行跟随光标纵移并抬升阴影
+                        let drag_offset = sidebar_drag_offset(&drag_visual, id);
+                        let being_dragged = drag_offset.is_some();
+                        let slide_offset = drag_visual.slide_offsets.get(&id).copied();
+                        let slide_epoch = drag_visual.slide_epoch;
+                        let row = div()
                             .debug_selector(move || {
                                 if selected {
                                     "sidebar-active-tab".into()
@@ -9303,6 +9427,7 @@ fn left_sidebar(
                                     "sidebar-other-tab".into()
                                 }
                             })
+                            .relative()
                             .group("session-row")
                             .h(px(38.0))
                             .mb_1()
@@ -9311,7 +9436,7 @@ fn left_sidebar(
                             .items_center()
                             .gap_2()
                             .rounded_md()
-                            .bg(if selected {
+                            .bg(if selected || being_dragged {
                                 rgb(ui.selected_bg)
                             } else {
                                 rgb(ui.panel_bg)
@@ -9332,7 +9457,7 @@ fn left_sidebar(
                                 MouseButton::Left,
                                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                                     // 记下拖拽起点（纵拖超阈值重排，松开即清）
-                                    this.start_tab_drag(id, event.position);
+                                    this.start_tab_drag(id, event.position, TabDragAxis::Vertical);
                                     if event.click_count >= 2 {
                                         this.start_tab_rename(id, window, cx);
                                     } else {
@@ -9424,7 +9549,24 @@ fn left_sidebar(
                                         }),
                                     )
                                     .child("×"),
-                            )
+                            );
+                        // 被拖行跟随光标纵移 + 抬升阴影
+                        let row = row.when_some(drag_offset, |el, dy| el.top(dy).shadow_sm());
+                        // 重排滑动微动画：受影响邻居从旧位置方向缓动落位
+                        match slide_offset {
+                            Some(offset) => row
+                                .with_animation(
+                                    ElementId::NamedInteger(
+                                        SharedString::from(format!("tab-slide-{slide_epoch}")),
+                                        id.0,
+                                    ),
+                                    Animation::new(Duration::from_millis(160))
+                                        .with_easing(ease_out_quint()),
+                                    move |el, delta| el.top(px(offset * (1.0 - delta))),
+                                )
+                                .into_any_element(),
+                            None => row.into_any_element(),
+                        }
                     },
                 )),
         )
@@ -14798,7 +14940,7 @@ mod tab_rename_tests {
 
 #[cfg(test)]
 mod tab_drag_tests {
-    use super::{LayoutNode, PaneId, TabId, WorkspaceTab, WorkspaceView};
+    use super::{LayoutNode, PaneId, TabDragAxis, TabId, WorkspaceTab, WorkspaceView};
     use gpui::{Point, TestAppContext, px};
 
     fn tab(id: u64) -> WorkspaceTab {
@@ -14850,22 +14992,26 @@ mod tab_drag_tests {
             let ids: Vec<TabId> = view.tabs.iter().map(|t| t.id).collect();
             let (a, b) = (ids[0], ids[1]);
 
-            // 按下记录起点
-            view.start_tab_drag(a, Point::new(px(100.0), px(10.0)));
+            // 按下记录起点：未过阈值时不进入视觉拖拽态
+            view.start_tab_drag(a, Point::new(px(100.0), px(10.0)), TabDragAxis::Horizontal);
             assert!(view.tab_drag.is_some());
+            assert!(!view.tab_drag.as_ref().unwrap().active);
 
             // 位移 3px < 6px 阈值：不交换（与单击激活共存）
             view.update_tab_drag(b, Point::new(px(103.0), px(10.0)), cx);
             assert_eq!(view.tabs[0].id, a, "未超阈值不得重排");
+            assert!(!view.tab_drag.as_ref().unwrap().active);
 
-            // 位移 12px 且悬停到 b：实时交换
+            // 位移 12px 且悬停到 b：进入视觉拖拽态并实时交换
             view.update_tab_drag(b, Point::new(px(112.0), px(10.0)), cx);
+            assert!(view.tab_drag.as_ref().unwrap().active, "超阈值进入跟随态");
             assert_eq!(view.tabs[0].id, b, "超阈值悬停应交换到目标位置");
             assert_eq!(view.tabs[1].id, a);
 
             // 松开清状态；快照按新顺序落盘
             assert!(view.end_tab_drag());
             assert!(view.tab_drag.is_none(), "松开后应清拖拽状态");
+            assert!(view.tab_slide_offsets.is_empty(), "松开应清滑动偏移");
             let snapshot = view.snapshot_session();
             assert_eq!(snapshot.tabs[0].server_name, None);
             let after: Vec<TabId> = view.tabs.iter().map(|t| t.id).collect();
@@ -14878,6 +15024,67 @@ mod tab_drag_tests {
             assert!(!view.end_tab_drag());
         });
         workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    /// 重排滑动微动画：被拖标签右移时，中间邻居带正起使偏移（自右向左落位）。
+    /// 偏移在松开时清空。
+    #[gpui::test]
+    fn reorder_sets_slide_offsets_for_affected_neighbors(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            for _ in 0..4 {
+                view.spawn_tab(window, cx);
+            }
+            view.start_tab_drag(
+                view.tabs[0].id,
+                Point::new(px(0.0), px(0.0)),
+                TabDragAxis::Horizontal,
+            );
+            // 直接越过阈值（起点即远端），悬停到第 3 个标签位
+            let target = view.tabs[2].id;
+            view.update_tab_drag(target, Point::new(px(400.0), px(0.0)), cx);
+            assert_eq!(view.tab_slide_epoch, 1, "重排一次即推进一次动画 epoch");
+            // 1 号右移后，原 2、3 号自右向左落位 = 正偏移
+            for id in &view.tabs[0..2] {
+                assert_eq!(
+                    view.tab_slide_offsets.get(&id.id).copied(),
+                    Some(super::TAB_SLIDE_PX),
+                    "右移时被跨过的邻居应带正偏移"
+                );
+            }
+            assert!(
+                !view.tab_slide_offsets.contains_key(&view.tabs[3].id),
+                "未受影响标签不得带偏移"
+            );
+            view.end_tab_drag();
+            assert!(view.tab_slide_offsets.is_empty(), "松开清滑动偏移");
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    /// 纵拖表面只按 y 轴计量位移；横移超阈值不触发重排与视觉态。
+    #[gpui::test]
+    fn vertical_axis_ignores_horizontal_displacement(cx: &mut TestAppContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            view.spawn_tab(window, cx);
+            view.spawn_tab(window, cx);
+            let (a, b) = (view.tabs[0].id, view.tabs[1].id);
+            view.start_tab_drag(a, Point::new(px(0.0), px(0.0)), TabDragAxis::Vertical);
+            // 横移 100px：纵拖表面不计入
+            view.update_tab_drag(b, Point::new(px(100.0), px(0.0)), cx);
+            assert!(!view.tab_drag.as_ref().unwrap().active, "横移不激活纵拖");
+            assert_eq!(view.tabs[0].id, a, "横移不得重排");
+            // 纵移超阈值：激活并重排
+            view.update_tab_drag(b, Point::new(px(100.0), px(30.0)), cx);
+            assert!(view.tab_drag.as_ref().unwrap().active);
+            assert_eq!(view.tabs[0].id, b, "纵移超阈值应重排");
             for pane in &view.panes {
                 pane.session.close();
             }
