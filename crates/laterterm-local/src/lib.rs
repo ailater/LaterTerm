@@ -89,6 +89,10 @@ pub struct LocalOptions {
     pub cols: u16,
     /// 初始行数。
     pub rows: u16,
+    /// 初始宽度像素（cols × 单格宽）；0 = 未知，由首帧 resize 补上。
+    pub pixel_width: u16,
+    /// 初始高度像素（rows × 单格高）；0 = 未知，由首帧 resize 补上。
+    pub pixel_height: u16,
 }
 
 /// bash 提示符集成钩子（OSC 133 D/A + OSC 7 cwd），前置进 `PROMPT_COMMAND`：
@@ -178,8 +182,8 @@ impl LocalSession {
             .openpty(PtySize {
                 rows: options.rows,
                 cols: options.cols,
-                pixel_width: 0,
-                pixel_height: 0,
+                pixel_width: options.pixel_width,
+                pixel_height: options.pixel_height,
             })
             .map_err(io::Error::other)?;
 
@@ -247,15 +251,15 @@ impl TerminalSession for LocalSession {
             .ok_or_else(|| io::Error::other("会话字节流已被取走（take_streams 只能调用一次）"))
     }
 
-    fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+    fn resize(&self, cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) -> io::Result<()> {
         self.master
             .lock()
             .unwrap()
             .resize(PtySize {
                 cols,
                 rows,
-                pixel_width: 0,
-                pixel_height: 0,
+                pixel_width,
+                pixel_height,
             })
             .map_err(io::Error::other)
     }
@@ -617,6 +621,8 @@ mod tests {
             cwd: None,
             cols: 80,
             rows: 24,
+            pixel_width: 0,
+            pixel_height: 0,
         })
         .expect("spawn 失败");
         let mut streams = session.take_streams().expect("take_streams");
@@ -689,6 +695,8 @@ mod tests {
             cwd: None,
             cols: 20,
             rows: 5,
+            pixel_width: 0,
+            pixel_height: 0,
         })
         .expect("spawn 失败");
 
@@ -713,10 +721,12 @@ mod tests {
             cwd: None,
             cols: 20,
             rows: 5,
+            pixel_width: 0,
+            pixel_height: 0,
         })
         .expect("spawn 失败");
 
-        session.resize(80, 24).expect("resize 应成功");
+        session.resize(80, 24, 640, 480).expect("resize 应成功");
         assert_eq!(session.backend(), BackendKind::Local);
         assert!(!session.title().is_empty());
 
@@ -747,6 +757,8 @@ mod tests {
             cwd: Some(dir.clone()),
             cols: 20,
             rows: 5,
+            pixel_width: 0,
+            pixel_height: 0,
         })
         .expect("spawn 失败");
 
@@ -825,6 +837,8 @@ mod tests {
                 cwd: None,
                 cols: 20,
                 rows: 5,
+                pixel_width: 0,
+                pixel_height: 0,
             })
             .expect("spawn 失败")
         }

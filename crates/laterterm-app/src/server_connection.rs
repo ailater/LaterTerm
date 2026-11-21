@@ -850,7 +850,7 @@ mod tests {
         fn take_streams(&self) -> std::io::Result<SessionStreams> {
             unreachable!()
         }
-        fn resize(&self, _: u16, _: u16) -> std::io::Result<()> {
+        fn resize(&self, _: u16, _: u16, _: u16, _: u16) -> std::io::Result<()> {
             Ok(())
         }
         fn kill(&self) {

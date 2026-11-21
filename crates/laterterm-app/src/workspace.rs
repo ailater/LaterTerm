@@ -1136,17 +1136,29 @@ struct CloseConfirmState {
     entries: Vec<CloseConfirmEntry>,
 }
 
-/// 复制提示 toast 状态（窗口右下角「已复制 N 字符」）。
-struct CopyToastState {
-    /// 已复制字符数（文案显示用）。
-    chars: usize,
-    /// 续期代数：show 时自增；到期任务比对代数，不匹配（期间又有新复制）
+/// toast 语气：普通操作结果 / 失败告警（红色文字）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ToastKind {
+    Notice,
+    Danger,
+}
+
+/// 一次性 toast 状态（窗口右下角浮层；复制提示与服务器区操作结果共用槽位）。
+struct ToastState {
+    /// 完整文案（显示用）。
+    text: String,
+    /// 语气（普通/失败告警红色）。
+    kind: ToastKind,
+    /// 续期代数：show 时自增；到期任务比对代数，不匹配（期间又有新 toast）
     /// 不动新状态，避免旧定时误清新 toast。
     generation: u64,
 }
 
-/// toast 停留时长：到期直接消失（不做动画框架）。
+/// 复制提示停留时长：到期直接消失（不做动画框架）。
 const COPY_TOAST_DURATION: Duration = Duration::from_millis(1500);
+
+/// 服务器/传输等操作结果的停留时长：路径类文案可读性优先，比复制提示久。
+const SERVER_NOTICE_TOAST_DURATION: Duration = Duration::from_millis(4000);
 
 /// 标签右键菜单的打开状态与来源标签。
 #[derive(Clone)]
@@ -1373,8 +1385,6 @@ pub struct WorkspaceView {
     server_tunnel_drafts: Vec<TunnelDraft>,
     server_delete_confirm: Option<String>,
     server_error: Option<String>,
-    /// 服务器区的一次性提示（导入/导出结果等），下次操作时清除。
-    server_notice: Option<String>,
     /// 分组折叠态（键 = 组名，None = 未分组桶；会话级，不持久化）。
     server_groups_collapsed: BTreeSet<Option<String>>,
     /// 标签重命名弹窗（双击标签/右键菜单「重命名」弹出）。
@@ -1429,9 +1439,9 @@ pub struct WorkspaceView {
     paste_confirm: Option<PasteConfirmState>,
     /// 关闭运行中终端的二次确认弹窗（None = 关闭）。
     close_confirm: Option<CloseConfirmState>,
-    /// 复制提示 toast（None = 隐藏；窗口右下角浮层）。
-    copy_toast: Option<CopyToastState>,
-    /// toast 代数计数器（连续复制续期用，见 CopyToastState.generation）。
+    /// 一次性 toast（None = 隐藏；窗口右下角浮层，复制提示/操作结果共用）。
+    notice_toast: Option<ToastState>,
+    /// toast 代数计数器（连续弹出续期用，见 ToastState.generation）。
     next_toast_generation: u64,
     /// 待生效的焦点请求：异步上下文拿不到 window，先记下 handle，render 期统一 focus。
     pending_focus: Option<FocusHandle>,
@@ -1560,7 +1570,6 @@ impl WorkspaceView {
             server_meta_draft: ServerEntry::default(),
             server_delete_confirm: None,
             server_error: None,
-            server_notice: None,
             server_groups_collapsed: BTreeSet::new(),
             tab_rename_field: None,
             tab_rename_submit: None,
@@ -1587,7 +1596,7 @@ impl WorkspaceView {
             sftp_prompt_subscriptions: Vec::new(),
             paste_confirm: None,
             close_confirm: None,
-            copy_toast: None,
+            notice_toast: None,
             next_toast_generation: 0,
             pending_focus: None,
             window_handle: window.window_handle(),
@@ -3211,19 +3220,50 @@ impl WorkspaceView {
         if !self.settings.appearance.copy_toast {
             return;
         }
+        self.show_toast(
+            format!("已复制 {chars} 字符"),
+            ToastKind::Notice,
+            COPY_TOAST_DURATION,
+            cx,
+        );
+    }
+
+    /// 服务器/传输等操作结果 toast：不走 copy_toast 设置开关（那是复制
+    /// 专属偏好），4s 后到期消失。
+    fn show_server_notice_toast(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.show_toast(text, ToastKind::Notice, SERVER_NOTICE_TOAST_DURATION, cx);
+    }
+
+    /// 失败告警 toast（红色文字）：无弹窗兜着的操作失败，别让错误无处可去。
+    fn show_server_error_toast(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.show_toast(text, ToastKind::Danger, SERVER_NOTICE_TOAST_DURATION, cx);
+    }
+
+    /// toast 公共槽位：同槽新弹以代数续期，旧到期任务比对代数不动新状态。
+    fn show_toast(
+        &mut self,
+        text: impl Into<String>,
+        kind: ToastKind,
+        duration: Duration,
+        cx: &mut Context<Self>,
+    ) {
         self.next_toast_generation += 1;
         let generation = self.next_toast_generation;
-        self.copy_toast = Some(CopyToastState { chars, generation });
+        self.notice_toast = Some(ToastState {
+            text: text.into(),
+            kind,
+            generation,
+        });
         cx.notify();
         cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(COPY_TOAST_DURATION).await;
+            cx.background_executor().timer(duration).await;
             let _ = this.update(cx, |workspace, cx| {
                 if workspace
-                    .copy_toast
+                    .notice_toast
                     .as_ref()
                     .is_some_and(|toast| toast.generation == generation)
                 {
-                    workspace.copy_toast = None;
+                    workspace.notice_toast = None;
                     cx.notify();
                 }
             });
@@ -5634,7 +5674,6 @@ impl WorkspaceView {
         self.shortcut_editor = None;
         self.server_dialog = None;
         self.server_error = None;
-        self.server_notice = None;
         self.server_fields.clear();
         self.server_field_subscriptions.clear();
         self.server_delete_confirm = None;
@@ -5653,11 +5692,14 @@ impl WorkspaceView {
         // 被其他条目按名引用为跳板时阻断删除：先解除引用，宁报错不断链。
         let referrers = laterterm_config::servers_referencing_jump(&self.settings.servers, name);
         if !referrers.is_empty() {
-            self.server_error = Some(format!(
-                "「{name}」正被 {} 台服务器作为跳板引用：{}，先解除引用再删除",
-                referrers.len(),
-                referrers.join("、")
-            ));
+            self.show_server_error_toast(
+                format!(
+                    "「{name}」正被 {} 台服务器作为跳板引用：{}，先解除引用再删除",
+                    referrers.len(),
+                    referrers.join("、")
+                ),
+                cx,
+            );
             self.server_delete_confirm = None;
             cx.notify();
             return;
@@ -5685,7 +5727,7 @@ impl WorkspaceView {
                 Ok(()) => {
                     workspace.settings.remove_server(&name);
                     if let Err(error) = workspace.persist_settings() {
-                        workspace.server_error = Some(format!("删除服务器失败: {error:#}"));
+                        workspace.show_server_error_toast(format!("删除服务器失败: {error:#}"), cx);
                     } else {
                         workspace.server_delete_confirm = None;
                         workspace.server_error = None;
@@ -5693,7 +5735,7 @@ impl WorkspaceView {
                     cx.notify();
                 }
                 Err(error) => {
-                    workspace.server_error = Some(format!("删除凭据失败: {error:#}"));
+                    workspace.show_server_error_toast(format!("删除凭据失败: {error:#}"), cx);
                     cx.notify();
                 }
             });
@@ -5705,9 +5747,8 @@ impl WorkspaceView {
     /// 凭据在系统密钥环里，永不写入导出文件；导入端首次连接时补输即可。
     fn export_servers(&mut self, cx: &mut Context<Self>) {
         self.server_error = None;
-        self.server_notice = None;
         if self.settings.servers.is_empty() {
-            self.server_error = Some("没有可导出的服务器".into());
+            self.show_server_error_toast("没有可导出的服务器", cx);
             cx.notify();
             return;
         }
@@ -5735,17 +5776,22 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         match picked {
-            Err(error) => self.server_error = Some(format!("打开保存对话框失败: {error:#}")),
+            Err(error) => {
+                self.show_server_error_toast(format!("打开保存对话框失败: {error:#}"), cx)
+            }
             Ok(None) => {}
             Ok(Some(path)) => match file.save_to(&path) {
                 Ok(()) => {
-                    self.server_notice = Some(format!(
-                        "已导出 {} 台服务器到 {}（不含凭据）",
-                        file.servers.len(),
-                        path.display()
-                    ));
+                    self.show_server_notice_toast(
+                        format!(
+                            "已导出 {} 台服务器到 {}（不含凭据）",
+                            file.servers.len(),
+                            path.display()
+                        ),
+                        cx,
+                    );
                 }
-                Err(error) => self.server_error = Some(format!("导出失败: {error:#}")),
+                Err(error) => self.show_server_error_toast(format!("导出失败: {error:#}"), cx),
             },
         }
         cx.notify();
@@ -5754,7 +5800,6 @@ impl WorkspaceView {
     /// 打开导入来源选择弹窗（LaterTerm 文件 / Deepin / Xshell）。
     fn open_server_import(&mut self, cx: &mut Context<Self>) {
         self.server_error = None;
-        self.server_notice = None;
         self.server_import_dialog = Some(ServerImportSource::LaterTerm);
         cx.notify();
     }
@@ -5781,7 +5826,6 @@ impl WorkspaceView {
             return;
         };
         self.server_error = None;
-        self.server_notice = None;
         match source {
             ServerImportSource::LaterTerm => self.import_servers(cx),
             ServerImportSource::Deepin => self.import_servers_deepin(cx),
@@ -5814,7 +5858,7 @@ impl WorkspaceView {
     ) {
         let paths = match picked {
             Err(error) => {
-                self.server_error = Some(format!("打开文件对话框失败: {error:#}"));
+                self.show_server_error_toast(format!("打开文件对话框失败: {error:#}"), cx);
                 cx.notify();
                 return;
             }
@@ -5825,9 +5869,15 @@ impl WorkspaceView {
             return;
         };
         match ServersFile::load_from(&path) {
-            Ok(file) => self.merge_server_entries(file.servers, &path.display().to_string(), cx),
+            Ok(file) => {
+                if let Some(notice) =
+                    self.merge_server_entries(file.servers, &path.display().to_string(), cx)
+                {
+                    self.show_server_notice_toast(notice, cx);
+                }
+            }
             Err(error) => {
-                self.server_error = Some(format!("导入失败: {error:#}"));
+                self.show_server_error_toast(format!("导入失败: {error:#}"), cx);
                 cx.notify();
             }
         }
@@ -5837,29 +5887,31 @@ impl WorkspaceView {
     ///
     /// 落盘取舍（定稿）：命令与服务器是**两次独立提交**，各自 previous-clone
     /// 回滚——命令已生效而服务器保存失败时命令保留，不合成一次 clone（合成
-    /// 会让两个语义耦合，回滚时不知道该回滚谁）。命令计数拼进 server_notice，
+    /// 会让两个语义耦合，回滚时不知道该回滚谁）。命令计数拼进结果 toast，
     /// 格式：`导入 N 台服务器…；命令模板 导入 X，同名 Y，…`。
     fn import_servers_deepin(&mut self, cx: &mut Context<Self>) {
         let Some(path) = deepin_default_path() else {
-            self.server_error = Some("无法定位 HOME 目录，Deepin 导入失败".into());
+            self.show_server_error_toast("无法定位 HOME 目录，Deepin 导入失败", cx);
             cx.notify();
             return;
         };
         let command_summary = self.import_deepin_commands_beside(&path);
         match load_deepin_servers(&path) {
             Ok(entries) => {
-                self.merge_server_entries(entries, &path.display().to_string(), cx);
-                if let Some(summary) = command_summary {
-                    self.server_notice = Some(match self.server_notice.take() {
-                        Some(notice) => format!("{notice}；{summary}"),
-                        None => summary,
-                    });
+                let notice = self.merge_server_entries(entries, &path.display().to_string(), cx);
+                match (notice, command_summary) {
+                    (Some(notice), Some(summary)) => {
+                        self.show_server_notice_toast(format!("{notice}；{summary}"), cx)
+                    }
+                    (Some(notice), None) => self.show_server_notice_toast(notice, cx),
+                    (None, Some(summary)) => self.show_server_notice_toast(summary, cx),
+                    (None, None) => {}
                 }
             }
             Err(error) => {
-                self.server_error = Some(format!("Deepin 导入失败: {error:#}"));
+                self.show_server_error_toast(format!("Deepin 导入失败: {error:#}"), cx);
                 if let Some(summary) = command_summary {
-                    self.server_notice = Some(summary);
+                    self.show_server_notice_toast(summary, cx);
                 }
                 cx.notify();
             }
@@ -5968,7 +6020,7 @@ impl WorkspaceView {
     ) {
         let paths = match picked {
             Err(error) => {
-                self.server_error = Some(format!("打开文件对话框失败: {error:#}"));
+                self.show_server_error_toast(format!("打开文件对话框失败: {error:#}"), cx);
                 cx.notify();
                 return;
             }
@@ -5997,9 +6049,10 @@ impl WorkspaceView {
         }
         match Ok::<_, anyhow::Error>((imported, rejected)) {
             Ok((entries, skipped)) if entries.is_empty() => {
-                self.server_error = Some(format!(
-                    "所选文件中没有可识别的 .xsh 会话（跳过 {skipped} 个文件）"
-                ));
+                self.show_server_error_toast(
+                    format!("所选文件中没有可识别的 .xsh 会话（跳过 {skipped} 个文件）"),
+                    cx,
+                );
                 cx.notify();
             }
             Ok((entries, skipped)) => {
@@ -6008,10 +6061,12 @@ impl WorkspaceView {
                 } else {
                     String::new()
                 };
-                self.merge_server_entries(entries, &context, cx);
+                if let Some(notice) = self.merge_server_entries(entries, &context, cx) {
+                    self.show_server_notice_toast(notice, cx);
+                }
             }
             Err(error) => {
-                self.server_error = Some(format!("Xshell 导入失败: {error:#}"));
+                self.show_server_error_toast(format!("Xshell 导入失败: {error:#}"), cx);
                 cx.notify();
             }
         }
@@ -6019,12 +6074,14 @@ impl WorkspaceView {
 
     /// 合并导入条目：同名跳过、无效丢弃，计数回报；有新增则落盘。
     /// 合并后全表做跳板引用清理——宁断链不丢条目，清了多少要回报。
+    /// 有新增时返回计数文案（调用方负责弹 toast）；全跳过走 server_error
+    /// 通道并返回 None。
     fn merge_server_entries(
         &mut self,
         entries: Vec<ServerEntry>,
         source_desc: &str,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<String> {
         let previous = self.settings.clone();
         let (added, skipped_dup, skipped_bad, cleared_jumps) =
             merge_entries_into(&mut self.settings.servers, entries);
@@ -6032,9 +6089,9 @@ impl WorkspaceView {
             && let Err(error) = self.persist_settings()
         {
             self.settings = previous;
-            self.server_error = Some(format!("导入失败: {error:#}"));
+            self.show_server_error_toast(format!("导入失败: {error:#}"), cx);
             cx.notify();
-            return;
+            return None;
         }
         let mut notice = format!("导入 {added} 台服务器");
         if skipped_dup > 0 {
@@ -6052,21 +6109,26 @@ impl WorkspaceView {
         }
         if added == 0 {
             if skipped_dup == 0 && skipped_bad == 0 && cleared_jumps.is_empty() {
-                self.server_error = Some(format!("没有可导入的服务器条目（{source_desc}）"));
+                self.show_server_error_toast(
+                    format!("没有可导入的服务器条目（{source_desc}）"),
+                    cx,
+                );
             } else {
-                self.server_error = Some(notice);
+                self.show_server_error_toast(notice, cx);
             }
-        } else {
-            self.server_notice = Some(notice);
+            cx.notify();
+            return None;
         }
         cx.notify();
+        Some(notice)
     }
 
     // ---------- 主机分组（批量改组/解散/折叠）----------
 
     /// 批量组操作的落盘包装：previous-clone（含折叠态）→ 改内存 → 落盘 →
     /// 失败整体回滚（照 merge_server_entries 的口径）。
-    /// 返回是否成功（失败已写入 server_error，调用方不要展示成功提示）。
+    /// 返回是否成功（失败按有无模态弹窗分流：弹窗内联渲染 / 无弹窗走
+    /// danger toast，调用方不要重复展示）。
     fn save_group_change(
         &mut self,
         change: impl FnOnce(&mut Self) -> anyhow::Result<usize>,
@@ -6082,7 +6144,13 @@ impl WorkspaceView {
                 {
                     self.settings = previous;
                     self.server_groups_collapsed = previous_collapsed;
-                    self.server_error = Some(format!("分组更新失败: {error:#}"));
+                    // 改组弹窗开着时错误渲染在弹窗里；组头解散等无模态场景走 toast
+                    let message = format!("分组更新失败: {error:#}");
+                    if self.server_dialog.is_none() {
+                        self.show_server_error_toast(message, cx);
+                    } else {
+                        self.server_error = Some(message);
+                    }
                     cx.notify();
                     return false;
                 }
@@ -6091,7 +6159,12 @@ impl WorkspaceView {
             }
             Err(error) => {
                 self.server_group_confirm = None;
-                self.server_error = Some(error.to_string());
+                let message = error.to_string();
+                if self.server_dialog.is_none() {
+                    self.show_server_error_toast(message, cx);
+                } else {
+                    self.server_error = Some(message);
+                }
                 cx.notify();
                 false
             }
@@ -6125,7 +6198,7 @@ impl WorkspaceView {
             cx,
         );
         if succeeded && let Some(notice) = notice {
-            self.server_notice = Some(notice);
+            self.show_server_notice_toast(notice, cx);
         }
     }
 
@@ -6175,7 +6248,7 @@ impl WorkspaceView {
             self.server_dialog = None;
             self.server_fields.clear();
             if let Some(notice) = notice {
-                self.server_notice = Some(notice);
+                self.show_server_notice_toast(notice, cx);
             }
         }
     }
@@ -6206,7 +6279,6 @@ impl WorkspaceView {
             return;
         };
         self.shortcut_editor = None;
-        self.server_notice = None;
         self.server_error = None;
         self.server_fields.clear();
         self.server_field_subscriptions.clear();
@@ -6220,7 +6292,7 @@ impl WorkspaceView {
             match laterterm_config::resolve_jump_chain(&self.settings.servers, &entry.name) {
                 Ok(chain) => chain.into_iter().cloned().collect(),
                 Err(error) => {
-                    self.server_error = Some(format!("解析跳板链失败: {error}"));
+                    self.show_server_error_toast(format!("解析跳板链失败: {error}"), cx);
                     cx.notify();
                     return;
                 }
@@ -6416,7 +6488,9 @@ impl WorkspaceView {
                 self.server_fields.clear();
                 self.server_field_subscriptions.clear();
                 self.server_error = None;
-                self.server_notice = warning;
+                if let Some(warning) = warning {
+                    self.show_server_notice_toast(warning, cx);
+                }
                 let server_name = entry.name.clone();
                 let pane_id = self.attach_pane(entry.name.clone(), session, window, cx);
                 // SSH 链路快照挂到窗格（本地窗格恒 None）
@@ -6458,18 +6532,37 @@ impl WorkspaceView {
                 self.focus_pane(pane_id, window, cx);
             }
             Ok(ConnectionOutcome::Prompt { kind, warning }) => {
-                self.present_credential_prompt(request_id, entry.name, kind, warning, window, cx);
+                self.present_credential_prompt(request_id, &entry, kind, warning, window, cx);
             }
             Err(error) => {
                 // 连接失败不挂起恢复外观（防残留误应用到同名后续连接）
                 self.pending_server_tab_restore.remove(&entry.name);
-                self.server_error = Some(format!("连接 {} 失败: {error:#}", entry.name));
-                if matches!(self.server_dialog, Some(ServerDialog::Connecting { .. })) {
-                    self.cancel_ssh_request();
-                    self.server_dialog = None;
-                    self.right_panel = true;
-                    self.right_panel_tab = RightPanelTab::Servers;
-                    self.focus_active(window, cx);
+                let message = format!("连接 {} 失败: {error:#}", entry.name);
+                // 认证失败：回凭据框让用户换凭据重试。存了坏凭据时若只发
+                // toast 就是死路——再点连接只会读同一个密码再失败一次
+                // （ssh 客户端拒绝后重新询问的同款语义）。其余失败（网络/
+                // 超时等）原样重试无益，维持 toast 收场。
+                // 耦合注记：laterterm-ssh 的认证失败是字符串错误（「SSH/
+                // ssh-agent 认证失败： …」），这里按文案识别；若日后改成
+                // typed error，改为下行匹配。
+                if message.contains("认证失败") {
+                    self.present_credential_prompt(
+                        request_id,
+                        &entry,
+                        CredentialKind::Login,
+                        Some(message),
+                        window,
+                        cx,
+                    );
+                } else {
+                    self.show_server_error_toast(message, cx);
+                    if matches!(self.server_dialog, Some(ServerDialog::Connecting { .. })) {
+                        self.cancel_ssh_request();
+                        self.server_dialog = None;
+                        self.right_panel = true;
+                        self.right_panel_tab = RightPanelTab::Servers;
+                        self.focus_active(window, cx);
+                    }
                 }
             }
         }
@@ -6477,11 +6570,12 @@ impl WorkspaceView {
     }
 
     /// 补输凭据弹窗（shell 与 SFTP 连接共用；ServerDialog::Connect 复用，
-    /// 标题按 ssh_request 去向区分）。
+    /// 标题按 ssh_request 去向区分）。字段标签跟随条目认证方式：
+    /// KeyboardInteractive 条目收集的是交互口令（动态码/二次验证），不是密码。
     fn present_credential_prompt(
         &mut self,
         request_id: u64,
-        name: String,
+        entry: &ServerEntry,
         kind: CredentialKind,
         warning: Option<String>,
         window: &mut Window,
@@ -6492,6 +6586,8 @@ impl WorkspaceView {
         self.server_error = warning;
         let label = if matches!(kind, CredentialKind::PrivateKey { .. }) {
             "私钥解锁口令"
+        } else if entry.auth == ServerAuthKind::KeyboardInteractive {
+            "交互口令（动态码 / 二次验证）"
         } else {
             "登录密码 / 交互口令（可留空使用私钥）"
         };
@@ -6504,7 +6600,7 @@ impl WorkspaceView {
         field.read(cx).focus_handle().focus(window);
         self.server_fields.push((label.into(), field));
         self.server_dialog = Some(ServerDialog::Connect {
-            name,
+            name: entry.name.clone(),
             kind,
             request_id,
             remember: false,
@@ -6565,7 +6661,9 @@ impl WorkspaceView {
                 self.server_fields.clear();
                 self.server_field_subscriptions.clear();
                 self.server_error = None;
-                self.server_notice = warning;
+                if let Some(warning) = warning {
+                    self.show_server_notice_toast(warning, cx);
+                }
                 let local_dir = std::env::home_dir().unwrap_or_else(|| PathBuf::from("/"));
                 let mut panel = SftpPanelState::new(
                     sftp_panel::panel_title(&endpoint, &hops),
@@ -6579,11 +6677,11 @@ impl WorkspaceView {
                 cx.notify();
             }
             Ok(SftpOutcome::Prompt { kind, warning }) => {
-                self.present_credential_prompt(request_id, entry.name, kind, warning, window, cx);
+                self.present_credential_prompt(request_id, &entry, kind, warning, window, cx);
                 cx.notify();
             }
             Err(error) => {
-                self.server_error = Some(format!("打开 SFTP 面板失败: {error:#}"));
+                self.show_server_error_toast(format!("打开 SFTP 面板失败: {error:#}"), cx);
                 if matches!(self.server_dialog, Some(ServerDialog::Connecting { .. })) {
                     self.cancel_ssh_request();
                     self.server_dialog = None;
@@ -6641,11 +6739,13 @@ impl WorkspaceView {
     /// 终端内传输事件泵（render 头部，process_trigger_events 同款位置）：
     /// Started（仅 worker spawn 成功后发出）置位窗格传输状态并开启 termview
     /// 键盘接管 gate；Progress 刷新浮条数据（worker 内已节流）；Finished/
-    /// Failed 清状态、关 gate 并写 server_notice——每个 Started 必有配对
+    /// Failed 清状态、关 gate 并写结果 toast——每个 Started 必有配对
     /// 终态事件（传输 crate 契约），gate/浮条生命周期有界。窗格已回收的
     /// 迟到事件随 Receiver 丢弃。
     fn process_transfer_events(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let mut changed = false;
+        // pane 借用存活期内不能调 &mut self 的 toast，终态文案先攒后弹
+        let mut toast_texts: Vec<String> = Vec::new();
         for pane in &mut self.panes {
             while let Ok(event) = pane.transfer_rx.try_recv() {
                 match event {
@@ -6682,16 +6782,12 @@ impl WorkspaceView {
                         let active = pane.transfer.take();
                         pane.terminal
                             .update(cx, |view, _| view.set_transfer_active(None));
-                        self.server_notice = Some(match active {
-                            Some(active) => transfer_finished_notice(
-                                &pane.title,
-                                &active,
-                                &paths,
-                                self.server_notice.take(),
-                            ),
+                        let summary = match active {
+                            Some(active) => transfer_finished_notice(&pane.title, &active, &paths),
                             // 无 Started 的迟到终态（理论不可达）：仍收口不悬空
                             None => "文件传输完成".into(),
-                        });
+                        };
+                        toast_texts.push(summary);
                         changed = true;
                     }
                     laterterm_transfer::TransferEvent::Failed(message) => {
@@ -6708,14 +6804,20 @@ impl WorkspaceView {
                             // 会话断开等无 Started 上下文的失败：原样透出
                             None => format!("文件传输失败：{message}"),
                         };
-                        self.server_notice = Some(match self.server_notice.take() {
-                            Some(previous) => format!("{previous}；{summary}"),
-                            None => summary,
-                        });
+                        toast_texts.push(summary);
                         changed = true;
                     }
                 }
             }
+        }
+        // 同帧多终态拼接展示（原 server_notice「；」拼接口径的等价物）
+        if let Some((first, rest)) = toast_texts.split_first() {
+            let text = if rest.is_empty() {
+                first.clone()
+            } else {
+                format!("{first}；{}", rest.join("；"))
+            };
+            self.show_server_notice_toast(text, cx);
         }
         if changed {
             cx.notify();
@@ -7959,6 +8061,8 @@ impl WorkspaceView {
             .unwrap_or((false, None));
         let max_attempts = self.settings.reconnect.max_attempts;
         let mut start_reconnect = None;
+        // pane 借用存活期内不能调 &mut self 的 toast，先把文案攒下来
+        let mut disconnected_toast = None;
         if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == id)
             && pane.status.mark_exited()
         {
@@ -7979,18 +8083,21 @@ impl WorkspaceView {
                 pane.title = state.display_title();
                 start_reconnect = Some(state);
             } else {
-                // 意外断开且不走重连：server_notice 兜底不留无提示死窗格
+                // 意外断开且不走重连：结果 toast 兜底不留无提示死窗格
                 // （标题仍有「（已退出）」后缀，双通道冗余是有意的）
                 if unexpected
                     && let Some(name) = pane.ssh_link.as_ref().map(|link| link.entry.name.clone())
                 {
-                    self.server_notice = Some(format!("「{name}」连接意外断开（已退出）"));
+                    disconnected_toast = Some(format!("「{name}」连接意外断开（已退出）"));
                 }
                 if !pane.title.ends_with("（已退出）") {
                     pane.title.push_str("（已退出）");
                 }
             }
             cx.notify();
+        }
+        if let Some(text) = disconnected_toast {
+            self.show_server_notice_toast(text, cx);
         }
         if let Some(state) = start_reconnect {
             self.begin_ssh_reconnect(id, state, cx);
@@ -8095,15 +8202,15 @@ impl WorkspaceView {
                     Ok(ConnectionOutcome::Prompt { .. }) => {
                         // 凭据缺失：停止重连（放弃态）并委托既有补输流程；
                         // 条目已删时 begin_ssh_connect 静默 return，此处
-                        // server_notice 兜底不留无提示死窗格（评审 5）。
+                        // 结果 toast 兜底不留无提示死窗格（评审 5）。
                         let _ = this.update(cx, |ws, cx| {
                             state.abandoned = true;
                             ws.apply_reconnect_title(pane_id, &state, cx);
                             ws.begin_ssh_connect(&state.link.entry.name, ConnectDest::Shell, cx);
                             if ws.ssh_request.is_none() {
-                                ws.server_notice = Some(
-                                    "凭据缺失且无法发起补输（条目可能已删除/跳板链失效），已停止自动重连"
-                                        .into(),
+                                ws.show_server_notice_toast(
+                                    "凭据缺失且无法发起补输（条目可能已删除/跳板链失效），已停止自动重连",
+                                    cx,
                                 );
                             }
                             cx.notify();
@@ -8225,8 +8332,9 @@ impl WorkspaceView {
         if let Some(typed) = tunnel_session {
             self.start_tunnel_watcher(pane_id, typed, cx);
         }
-        if warning.is_some() {
-            self.server_notice = warning; // 非致命警告如实提示（与手动连接同通道）
+        // 非致命警告如实提示（与手动连接同通道）
+        if let Some(warning) = warning {
+            self.show_server_notice_toast(warning, cx);
         }
         // 已恢复提示 = 后缀清除 + 状态复位 Running；仅当窗格在活动标签时
         // 聚焦（不抢用户当前焦点，后台标签恢复由标签行标题自然呈现）。
@@ -8779,14 +8887,45 @@ impl Render for WorkspaceView {
             })
             // SFTP 双栏面板：窗口级大覆盖层（右面板 240px 放不下双栏）
             .when_some(sftp_overlay(self, cx), |root, overlay| root.child(overlay))
-            // 复制提示 toast：窗口右下角短暂浮层。不 occlude、不挂鼠标事件，
-            // 纯展示（挂 workspace 层而非窗格层——分屏下窗格右下角≠窗口右下角）。
+            .when(self.welcome_visible, |root| {
+                root.child(self.welcome_overlay(cx))
+            })
+            // 命令/动态码/服务器/标签重命名对话框：窗口级模态弹窗
             .when_some(
-                self.copy_toast.as_ref().map(|toast| {
+                render_active_dialog(self, self.ui_colors(), cx),
+                |root, overlay| root.child(overlay),
+            )
+            // 终端右键菜单：anchored 浮层
+            .when_some(
+                self.terminal_menu
+                    .clone()
+                    .map(|menu| self.terminal_context_menu(menu, cx)),
+                |root, menu_overlay| root.child(menu_overlay),
+            )
+            // 标签右键菜单：同一浮层基建
+            .when_some(
+                self.tab_menu
+                    .clone()
+                    .map(|menu| self.tab_context_menu(menu, cx)),
+                |root, menu_overlay| root.child(menu_overlay),
+            )
+            // 一次性 toast（复制提示/服务器操作结果/失败告警）：窗口右下角
+            // 短暂浮层。不 occlude、不挂鼠标事件，纯展示（挂 workspace 层
+            // 而非窗格层——分屏下窗格右下角≠窗口右下角）。放在模态弹窗之后：
+            // toast 是瞬时通知，不能被弹窗遮罩压暗（弹窗打开时连接失败等
+            // 提示仍须可读）。
+            .when_some(
+                self.notice_toast.as_ref().map(|toast| {
+                    // 失败告警红字（0xF7768E = Tokyo Night red，与搜索报错一致）
+                    let text_color = match toast.kind {
+                        ToastKind::Notice => rgb(0xC0CAF5),
+                        ToastKind::Danger => rgb(0xF7768E),
+                    };
                     div()
                         .absolute()
                         .bottom_4()
                         .right_4()
+                        .max_w(px(360.0))
                         .px_3()
                         .py_2()
                         .rounded_md()
@@ -8794,32 +8933,10 @@ impl Render for WorkspaceView {
                         .bg(rgba((0x252939 << 8) | 0xEB))
                         .border_1()
                         .border_color(rgb(0x292D40))
-                        .text_color(rgb(0xC0CAF5))
-                        .child(format!("已复制 {} 字符", toast.chars))
+                        .text_color(text_color)
+                        .child(toast.text.clone())
                 }),
                 |root, toast| root.child(toast),
-            )
-            .when(self.welcome_visible, |root| {
-                root.child(self.welcome_overlay(cx))
-            })
-            // 命令/动态码/服务器/标签重命名对话框：窗口级模态弹窗（最上层）
-            .when_some(
-                render_active_dialog(self, self.ui_colors(), cx),
-                |root, overlay| root.child(overlay),
-            )
-            // 终端右键菜单：anchored 浮层，最顶层
-            .when_some(
-                self.terminal_menu
-                    .clone()
-                    .map(|menu| self.terminal_context_menu(menu, cx)),
-                |root, menu_overlay| root.child(menu_overlay),
-            )
-            // 标签右键菜单：同一浮层基建，最顶层
-            .when_some(
-                self.tab_menu
-                    .clone()
-                    .map(|menu| self.tab_context_menu(menu, cx)),
-                |root, menu_overlay| root.child(menu_overlay),
             )
             // 在全部窗格完成绘制后提交同一帧的几何快照。
             .child(canvas(
@@ -9747,7 +9864,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
             .when_some(error, |panel, error| {
                 panel.child(div().text_color(rgb(ui.danger)).child(error))
             })
-            // 导入/批量操作的一次性计数提示（同 server_notice 的绿色口径）
+            // 导入/批量操作的一次性计数提示（同服务器区的结果 toast 口径）
             .when_some(notice, |panel, notice| {
                 panel.child(div().pt_2().text_color(rgb(ui.success)).child(notice))
             })
@@ -10143,6 +10260,7 @@ fn render_active_dialog(
     if workspace.server_save.is_some() {
         let body = div()
             .p_4()
+            .text_color(rgb(0xC0CAF5))
             .child("正在保存服务器配置，请稍候…")
             .child(
                 div()
@@ -10170,7 +10288,12 @@ fn render_active_dialog(
     if let Some(ServerDialog::Connecting { name }) = workspace.server_dialog.clone() {
         let body = div()
             .p_4()
-            .child("正在准备连接（可取消）…")
+            // 显式正文色：不设会继承到根容器的暗色，与卡片上其他弹窗不一致
+            .child(
+                div()
+                    .text_color(rgb(0xC0CAF5))
+                    .child("正在准备连接（可取消）…"),
+            )
             .child(dialog_footer(vec![setting_button(
                 "取消连接",
                 false,
@@ -11019,24 +11142,35 @@ fn server_connect_modal(
 ) -> gpui::Div {
     let fields = workspace.server_fields.clone();
     let error = workspace.server_error.clone();
-    let is_private_key = matches!(
-        workspace.server_dialog,
-        Some(ServerDialog::Connect {
-            kind: CredentialKind::PrivateKey { .. },
-            ..
-        })
-    );
+    let kind = match &workspace.server_dialog {
+        Some(ServerDialog::Connect { kind, .. }) => Some(kind.clone()),
+        _ => None,
+    };
+    // 条目认证方式：交互口令条目收集的是动态码/二次验证，不是登录密码
+    let entry_auth = workspace
+        .settings
+        .servers
+        .iter()
+        .find(|entry| entry.name == name)
+        .map(|entry| entry.auth);
+    let hint = match (&kind, entry_auth) {
+        (Some(CredentialKind::PrivateKey { .. }), _) => {
+            "本机私钥已加密，请输入私钥解锁口令（不是远端登录密码）"
+        }
+        (_, Some(ServerAuthKind::KeyboardInteractive)) => {
+            "该服务器配置为「交互口令」认证（跳板机动态码 / 二次验证常见）。输入当前有效的交互口令；留空将尝试本机私钥。"
+        }
+        _ => {
+            "输入登录凭据；密码留空将使用本机对应私钥，不发送空密码。私钥路径留空时尝试 id_ed25519、id_rsa。"
+        }
+    };
     let busy = workspace.ssh_connecting.is_some();
     let body = div()
         .flex()
         .flex_col()
         .p_4()
         .when_some(error, |body, error| body.child(dialog_error_line(error)))
-        .child(
-            div()
-                .text_color(rgb(0x7D829F))
-                .child(if is_private_key { "本机私钥已加密，请输入私钥解锁口令（不是远端登录密码）" } else { "输入登录凭据；密码留空将使用本机对应私钥，不发送空密码。私钥路径留空时尝试 id_ed25519、id_rsa。" }),
-        )
+        .child(div().text_color(rgb(0x7D829F)).child(hint))
         .children(
             fields
                 .into_iter()
@@ -11064,9 +11198,20 @@ fn server_connect_modal(
                         cx.notify();
                     }),
                 ))
-                .child(div().text_color(rgb(0x7D829F)).child("连接成功后才保存；不勾选则仅本次使用")),
+                .child(
+                    div()
+                        .text_color(rgb(0x7D829F))
+                        .child("连接成功后才保存；不勾选则仅本次使用"),
+                ),
         )
-        .when(busy, |body| body.child(div().pt_2().child("正在连接，可取消…")))
+        .when(busy, |body| {
+            body.child(
+                div()
+                    .pt_2()
+                    .text_color(rgb(0xC0CAF5))
+                    .child("正在连接，可取消…"),
+            )
+        })
         .child(dialog_footer(vec![
             setting_button(
                 if busy { "连接中…" } else { "连接" },
@@ -11308,9 +11453,6 @@ fn render_server_section(
     cx: &mut Context<WorkspaceView>,
 ) -> gpui::Div {
     let delete_confirm = workspace.server_delete_confirm.clone();
-    let error = workspace.server_error.clone();
-    let notice = workspace.server_notice.clone();
-    let connecting = workspace.ssh_connecting.clone();
     let collapsed = workspace.server_groups_collapsed.clone();
     let disband_confirm = workspace.server_group_confirm.clone();
 
@@ -11356,20 +11498,9 @@ fn render_server_section(
                 ui,
             ))
         })
-        .when_some(notice, |panel, notice| {
-            panel.child(div().pt_2().text_color(rgb(ui.success)).child(notice))
-        })
-        .when_some(connecting, |panel, connecting| {
-            panel.child(
-                div()
-                    .pt_2()
-                    .text_color(rgb(ui.accent))
-                    .child(format!("正在连接 {connecting} …（最长 15s）")),
-            )
-        })
-        .when_some(error, |panel, error| {
-            panel.child(div().text_color(rgb(ui.danger)).child(error))
-        })
+        // 连接进度不进面板：两条路径都有模态弹窗兜着（Connecting 弹窗
+        // 「正在准备连接（可取消）…」/ 凭据弹窗 busy 态「正在连接，可取消…」），
+        // 面板内联状态与弹窗重复且无法交互取消。
         // 分组渲染：组头（▸/▾ + 组名 + 计数）+ 成员条目；折叠的组不渲染成员行。
         // 硬约束：纯未分组（无任何命名组）时保持旧版平铺外观，一个组头都不渲染。
         .children({
@@ -11979,8 +12110,14 @@ impl TerminalSession for TransferWrappedSession {
         ))
     }
 
-    fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
-        self.inner.resize(cols, rows)
+    fn resize(
+        &self,
+        cols: u16,
+        rows: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> std::io::Result<()> {
+        self.inner.resize(cols, rows, pixel_width, pixel_height)
     }
 
     fn kill(&self) {
@@ -12107,16 +12244,11 @@ fn view_transfer_flavor(
     }
 }
 
-/// 完成提示文案（server_notice 通道；既有提示按 5551 先例以「；」拼接）：
-/// 接收 = 落盘目录 + 文件数；上传无落盘路径，只报完成。
-fn transfer_finished_notice(
-    title: &str,
-    active: &PaneTransfer,
-    paths: &[PathBuf],
-    previous: Option<String>,
-) -> String {
+/// 完成提示文案（操作结果 toast 通道）：接收 = 落盘目录 + 文件数；
+/// 上传无落盘路径，只报完成。
+fn transfer_finished_notice(title: &str, active: &PaneTransfer, paths: &[PathBuf]) -> String {
     let flavor = transfer_flavor_label(active.flavor);
-    let summary = match active.direction {
+    match active.direction {
         laterterm_transfer::TransferDirection::Receive => {
             let dir = paths
                 .first()
@@ -12131,10 +12263,6 @@ fn transfer_finished_notice(
         laterterm_transfer::TransferDirection::Upload => {
             format!("「{title}」{flavor}上传完成")
         }
-    };
-    match previous {
-        Some(previous) => format!("{previous}；{summary}"),
-        None => summary,
     }
 }
 /// 解析本地会话 shell：显式配置（首启引导固化 / 手改 settings.toml）优先，
@@ -12172,6 +12300,7 @@ fn create_local_terminal(
     // PTY 初始尺寸直接用窗口实际尺寸：避免启动后 resize 触发 bash readline
     // 的 \r 重画，把光标拉回提示符行首。
     let env = local_session_env(&shell, settings.shell_integration);
+    let (pixel_width, pixel_height) = grid_pixel_size(settings, cols, rows);
     let session: Arc<dyn TerminalSession> = Arc::new(
         LocalSession::spawn(LocalOptions {
             shell,
@@ -12180,6 +12309,8 @@ fn create_local_terminal(
             cwd,
             cols: cols as u16,
             rows: rows as u16,
+            pixel_width,
+            pixel_height,
         })
         .expect("启动本地会话失败"),
     );
@@ -12237,6 +12368,9 @@ fn spawn_local_session(
             cwd,
             cols: 110,
             rows: 30,
+            // 占位值：此处拿不到设置度量，首帧 canvas 按实测单格像素校正
+            pixel_width: 0,
+            pixel_height: 0,
         })
         .expect("启动本地会话失败"),
     )
@@ -12266,6 +12400,18 @@ fn estimate_grid_size(settings: &Appearance, viewport: gpui::Size<gpui::Pixels>)
     let cols = ((usable_width / px(cell_width)) as usize).clamp(2, 500);
     let rows = ((usable_height / px(cell_height)) as usize).clamp(2, 200);
     (cols, rows)
+}
+
+/// 按估算网格换算像素尺寸（与 estimate_grid_size 同系数），作为 PTY 初始
+/// ws_xpixel/ws_ypixel：为 0 时依赖像素密度的远端程序（堡垒机二维码等）
+/// 会误判窗口过小而拒绝渲染。首帧 canvas 会用实测度量再校正一次。
+fn grid_pixel_size(settings: &Appearance, cols: usize, rows: usize) -> (u16, u16) {
+    let cell_width = settings.font_size * 0.6058;
+    let cell_height = settings.font_size * 1.2308 * settings.line_height;
+    (
+        ((cols as f32 * cell_width).round() as u16).max(1),
+        ((rows as f32 * cell_height).round() as u16).max(1),
+    )
 }
 
 fn terminal_config_for(
@@ -13408,7 +13554,7 @@ mod exit_regression_tests {
             fn take_streams(&self) -> std::io::Result<laterterm_core::SessionStreams> {
                 panic!("过期会话不得进入视图")
             }
-            fn resize(&self, _: u16, _: u16) -> std::io::Result<()> {
+            fn resize(&self, _: u16, _: u16, _: u16, _: u16) -> std::io::Result<()> {
                 Ok(())
             }
             fn kill(&self) {
@@ -13583,7 +13729,7 @@ mod exit_regression_tests {
                 writer: Box::new(PasteSpyWriter(self.written.clone())),
             })
         }
-        fn resize(&self, _: u16, _: u16) -> std::io::Result<()> {
+        fn resize(&self, _: u16, _: u16, _: u16, _: u16) -> std::io::Result<()> {
             Ok(())
         }
         fn kill(&self) {}
@@ -13737,8 +13883,8 @@ mod exit_regression_tests {
         workspace.update(cx, |view, cx| {
             view.show_copy_toast(5, cx);
             assert_eq!(
-                view.copy_toast.as_ref().map(|toast| toast.chars),
-                Some(5),
+                view.notice_toast.as_ref().map(|toast| toast.text.clone()),
+                Some("已复制 5 字符".into()),
                 "toast 应立即显示"
             );
         });
@@ -13746,7 +13892,7 @@ mod exit_regression_tests {
         cx.executor().advance_clock(Duration::from_millis(700));
         cx.run_until_parked();
         workspace.read_with(cx, |view, _| {
-            assert!(view.copy_toast.is_some(), "未满 1.5s 不得提前消失");
+            assert!(view.notice_toast.is_some(), "未满 1.5s 不得提前消失");
         });
         // t=700ms 续期：新 toast 代数自增，旧定时（t=1500ms 到期）不动新状态
         workspace.update(cx, |view, cx| {
@@ -13756,8 +13902,8 @@ mod exit_regression_tests {
         cx.run_until_parked();
         workspace.read_with(cx, |view, _| {
             assert_eq!(
-                view.copy_toast.as_ref().map(|toast| toast.chars),
-                Some(9),
+                view.notice_toast.as_ref().map(|toast| toast.text.clone()),
+                Some("已复制 9 字符".into()),
                 "续期后旧定时任务不得清除新 toast"
             );
         });
@@ -13765,7 +13911,7 @@ mod exit_regression_tests {
         cx.executor().advance_clock(Duration::from_millis(600));
         cx.run_until_parked();
         workspace.read_with(cx, |view, _| {
-            assert!(view.copy_toast.is_none(), "到期后 toast 应消失");
+            assert!(view.notice_toast.is_none(), "到期后 toast 应消失");
             for pane in &view.panes {
                 pane.session.close();
             }
@@ -13779,7 +13925,7 @@ mod exit_regression_tests {
         workspace.update(cx, |view, cx| {
             view.settings.appearance.copy_toast = false;
             view.show_copy_toast(5, cx);
-            assert!(view.copy_toast.is_none(), "开关关闭不得显示 toast");
+            assert!(view.notice_toast.is_none(), "开关关闭不得显示 toast");
             for pane in &view.panes {
                 pane.session.close();
             }
@@ -13910,7 +14056,7 @@ mod server_ssh_command_tests {
 /// server_connection 的 MemoryStore 测试里覆盖。
 #[cfg(test)]
 mod server_jump_tests {
-    use super::{WorkspaceView, apply_server_save, merge_entries_into};
+    use super::{ToastKind, WorkspaceView, apply_server_save, merge_entries_into};
     use gpui::TestAppContext;
     use laterterm_config::{ServerEntry, Settings};
 
@@ -14015,7 +14161,13 @@ mod server_jump_tests {
             view.delete_server("堡垒机", cx);
             assert_eq!(view.server_delete_confirm.as_deref(), Some("堡垒机"));
             view.delete_server("堡垒机", cx);
-            let error = view.server_error.clone().expect("被引用必须阻断");
+            // 阻断提示走 danger toast（无模态弹窗兜着，面板不再内联渲染）
+            let error = view
+                .notice_toast
+                .as_ref()
+                .map(|toast| toast.text.clone())
+                .expect("被引用必须阻断");
+            assert_eq!(view.notice_toast.as_ref().unwrap().kind, ToastKind::Danger);
             assert!(error.contains("堡垒机"), "{error}");
             assert!(error.contains("内网机"), "应列出引用方: {error}");
             assert!(error.contains("先解除引用"), "{error}");
@@ -15992,7 +16144,7 @@ mod close_confirm_tests {
             })
         }
 
-        fn resize(&self, _: u16, _: u16) -> io::Result<()> {
+        fn resize(&self, _: u16, _: u16, _: u16, _: u16) -> io::Result<()> {
             Ok(())
         }
 
@@ -16284,7 +16436,7 @@ mod reconnect_tests {
             })
         }
 
-        fn resize(&self, _: u16, _: u16) -> io::Result<()> {
+        fn resize(&self, _: u16, _: u16, _: u16, _: u16) -> io::Result<()> {
             Ok(())
         }
 

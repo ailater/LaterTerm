@@ -41,6 +41,7 @@
 //!         let session: Arc<dyn TerminalSession> = Arc::new(
 //!             LocalSession::spawn(LocalOptions {
 //!                 shell, args: vec![], env: vec![], cols: 80, rows: 24,
+//!                 pixel_width: 0, pixel_height: 0,
 //!             }).expect("Failed to spawn shell"),
 //!         );
 //!
@@ -194,13 +195,13 @@
 //! dimensions change (e.g., when the window is resized):
 //!
 //! ```ignore
-//! terminal.with_resize_callback(move |cols, rows| {
+//! terminal.with_resize_callback(move |cols, rows, pixel_width, pixel_height| {
 //!     // Notify your PTY about the new size
 //!     pty.lock().resize(PtySize {
 //!         cols: cols as u16,
 //!         rows: rows as u16,
-//!         pixel_width: 0,
-//!         pixel_height: 0,
+//!         pixel_width,
+//!         pixel_height,
 //!     }).ok();
 //! })
 //! ```

@@ -73,8 +73,12 @@ pub trait TerminalSession: Send + Sync {
     /// 一次性取出会话的字节流。
     fn take_streams(&self) -> io::Result<SessionStreams>;
 
-    /// 视口尺寸变化。本地 = PTY resize；SSH = 窗口变更转义序列。
-    fn resize(&self, cols: u16, rows: u16) -> io::Result<()>;
+    /// 视口尺寸变化。本地 = PTY resize；SSH = 窗口变更请求。
+    ///
+    /// 像素尺寸（格子数 × 单格像素）必须透传：TIOCSWINSZ 的 `ws_xpixel/
+    /// ws_ypixel` 为 0 时，依赖像素密度计算绘制内容的应用（堡垒机二维码、
+    /// 图片协议等）会误判窗口尺寸而拒绝渲染。
+    fn resize(&self, cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) -> io::Result<()>;
 
     /// 请求终止会话（幂等）。
     fn kill(&self);

@@ -291,11 +291,15 @@ impl Default for TerminalConfig {
 ///
 /// ```ignore
 /// // 默认回调已把 resize 转发给 TerminalSession；仅特殊后端才需要覆盖：
-/// terminal.with_resize_callback(move |cols, rows| {
-///     custom_backend.resize(cols, rows);
+/// terminal.with_resize_callback(move |cols, rows, pixel_width, pixel_height| {
+///     custom_backend.resize(cols, rows, pixel_width, pixel_height);
 /// });
 /// ```
-pub type ResizeCallback = Box<dyn Fn(usize, usize) + Send + Sync>;
+///
+/// 像素参数（格子数 × 实测单格像素）随行/列一起下发：PTY 的
+/// `ws_xpixel/ws_ypixel` 为 0 会让依赖像素密度的程序（堡垒机二维码、
+/// 图片协议等）误判窗口大小，下游必须透传而不是归零。
+pub type ResizeCallback = Box<dyn Fn(usize, usize, u16, u16) + Send + Sync>;
 
 /// Callback type for key event interception.
 ///
@@ -1016,11 +1020,18 @@ impl TerminalView {
             // 默认 resize 回调转发给会话；with_resize_callback 可整体覆盖
             resize_callback: {
                 let session_for_resize = Arc::clone(&session);
-                Some(Arc::new(Box::new(move |cols: usize, rows: usize| {
-                    if let Err(error) = session_for_resize.resize(cols as u16, rows as u16) {
-                        eprintln!("会话 resize 失败: {error}");
-                    }
-                })))
+                Some(Arc::new(Box::new(
+                    move |cols: usize, rows: usize, pixel_width: u16, pixel_height: u16| {
+                        if let Err(error) = session_for_resize.resize(
+                            cols as u16,
+                            rows as u16,
+                            pixel_width,
+                            pixel_height,
+                        ) {
+                            eprintln!("会话 resize 失败: {error}");
+                        }
+                    },
+                )))
             },
             session_size: Arc::new(parking_lot::Mutex::new(None)),
             key_handler: None,
@@ -1050,14 +1061,14 @@ impl TerminalView {
     /// Set a callback to be invoked when the terminal is resized.
     ///
     /// This callback should resize the underlying PTY to match the new dimensions.
-    /// The callback receives (cols, rows) as arguments.
+    /// The callback receives (cols, rows, pixel_width, pixel_height) as arguments.
     ///
     /// # Arguments
     ///
-    /// * `callback` - A function that will be called with (cols, rows) on resize
+    /// * `callback` - A function that will be called with (cols, rows, pixel_width, pixel_height) on resize
     pub fn with_resize_callback(
         mut self,
-        callback: impl Fn(usize, usize) + Send + Sync + 'static,
+        callback: impl Fn(usize, usize, u16, u16) + Send + Sync + 'static,
     ) -> Self {
         self.resize_callback = Some(Arc::new(Box::new(callback)));
         self
@@ -1391,8 +1402,14 @@ impl TerminalView {
 
         // macOS 的 Enter 会带 `key_char='\n'`；终端语义必须发送 CR，不能进入
         // InputHandler 的文本提交路径（LF 在 zsh/交互程序里不等价于回车）。
+        // Tab 同理（macOS 也给它 key_char='\t'）：且 Tab 是 key equivalent，
+        // GPUI 对 key equivalent 跳过 interpretKeyEvents，两条文本路径都到
+        // 不了 InputHandler——不加排除会被整键吞掉，shell 补全（含 SSH
+        // 远端）全部失灵。Shift+Tab 的 \x1b[Z 由 keystroke_to_bytes 编码。
         let is_enter = keystroke.key == "enter";
+        let is_tab = keystroke.key == "tab";
         let is_plain_text = !is_enter
+            && !is_tab
             && !keystroke.modifiers.control
             && !keystroke.modifiers.alt
             && (keystroke.key_char.is_some() || keystroke.key.len() == 1);
@@ -2101,8 +2118,22 @@ impl TerminalView {
         let cols = cols.max(1);
         let rows = rows.max(1);
         self.state.resize(cols, rows);
+        // 像素尺寸 = 格子数 × 实测单格像素；0 会让远端按「窗口过小」降级
+        // （堡垒机二维码等），拿不到度量时才归零。
+        let cell_width: f32 = self.renderer.cell_width.into();
+        let cell_height: f32 = self.renderer.cell_height.into();
+        let pixel_width = if cell_width > 0.0 {
+            (cols as f32 * cell_width).round() as u16
+        } else {
+            0
+        };
+        let pixel_height = if cell_height > 0.0 {
+            (rows as f32 * cell_height).round() as u16
+        } else {
+            0
+        };
         if let Some(callback) = &self.resize_callback {
-            callback(cols, rows);
+            callback(cols, rows, pixel_width, pixel_height);
             *self.session_size.lock() = Some((cols, rows));
         }
     }
@@ -2863,7 +2894,13 @@ impl Render for TerminalView {
                         let callback_elapsed = if needs_resize || *session_size.lock() != Some((cols, rows)) {
                             if let Some(ref callback) = resize_callback {
                                 let callback_started = trace.map(|_| Instant::now());
-                                callback(cols, rows);
+                                // 像素尺寸 = 格子数 × 实测单格像素，透传给 PTY
+                                // （ws_xpixel/ypixel 为 0 会让远端误判窗口过小）
+                                let pixel_width =
+                                    (cols as f32 * cell_width_f32).round().max(0.0) as u16;
+                                let pixel_height =
+                                    (rows as f32 * cell_height_f32).round().max(0.0) as u16;
+                                callback(cols, rows, pixel_width, pixel_height);
                                 *session_size.lock() = Some((cols, rows));
                                 callback_started.map(|started| started.elapsed())
                             } else {
@@ -3165,15 +3202,21 @@ fn escape_applescript_string(text: &str) -> String {
 /// 命中后按键交宿主 [`PasteRequestCallback`] 处理，不再透传 PTY。
 pub fn paste_shortcut_matches(keystroke: &Keystroke) -> bool {
     let m = &keystroke.modifiers;
-    if m.alt || m.platform || m.function {
+    if m.alt || m.function {
         return false;
     }
-    // Ctrl+Shift+V：三个修饰位全亮才认（避免 Ctrl+V 0x16 透传终端惯例被误伤）
-    if m.control && m.shift && keystroke.key.eq_ignore_ascii_case("v") {
+    // Cmd+V（macOS 平台惯例）：platform 在 mac = Cmd。此前 platform 直接
+    // 排除，Cmd+V 既不走粘贴也不透传（key equivalent 双路皆断），整键被吞。
+    if m.platform && !m.control && !m.shift && keystroke.key.eq_ignore_ascii_case("v") {
+        return true;
+    }
+    // Ctrl+Shift+V：三个修饰位全亮才认（避免 Ctrl+V 0x16 透传终端惯例被误
+    // 伤），平台修饰（Cmd/Super）附加时也不认——与原精确匹配语义一致。
+    if m.control && m.shift && !m.platform && keystroke.key.eq_ignore_ascii_case("v") {
         return true;
     }
     // Shift+Insert：笔记本无菜单键场景的主粘贴键；Ctrl/Alt 附加时不认
-    !m.control && m.shift && keystroke.key == "insert"
+    !m.control && !m.platform && m.shift && keystroke.key == "insert"
 }
 
 #[cfg(test)]
@@ -3199,7 +3242,7 @@ mod tests {
                 writer: Box::new(std::io::sink()),
             })
         }
-        fn resize(&self, _: u16, _: u16) -> std::io::Result<()> {
+        fn resize(&self, _: u16, _: u16, _: u16, _: u16) -> std::io::Result<()> {
             Ok(())
         }
         fn kill(&self) {}
@@ -3220,7 +3263,7 @@ mod tests {
                 writer: Box::new(std::io::sink()),
             })
         }
-        fn resize(&self, _: u16, _: u16) -> std::io::Result<()> {
+        fn resize(&self, _: u16, _: u16, _: u16, _: u16) -> std::io::Result<()> {
             Ok(())
         }
         fn kill(&self) {}
@@ -3276,7 +3319,13 @@ mod tests {
                     writer: Box::new(std::io::sink()),
                 })
             }
-            fn resize(&self, cols: u16, rows: u16) -> std::io::Result<()> {
+            fn resize(
+                &self,
+                cols: u16,
+                rows: u16,
+                _pixel_width: u16,
+                _pixel_height: u16,
+            ) -> std::io::Result<()> {
                 self.0.lock().unwrap().push((cols, rows));
                 Ok(())
             }
@@ -3670,6 +3719,58 @@ mod tests {
                 cx,
             );
             assert_eq!(*buffer.lock().unwrap(), b"\r", "macOS Enter 必须发送 CR");
+        });
+    }
+
+    /// macOS 的 Tab 同样带 `key_char='\t'`（且是 key equivalent，GPUI 对
+    /// equivalent 跳过 interpretKeyEvents，InputHandler 路径到不了）——
+    /// 若被可打印文本分支拦下，整键被吞，shell 补全（本地与 SSH 远端）
+    /// 全部失灵。必须走按键编码发 HT；Shift+Tab 编码为 \x1b[Z。
+    #[gpui::test]
+    fn macos_tab_key_char_sends_ht_and_shift_tab_sends_backtab(cx: &mut TestAppContext) {
+        use gpui::KeyDownEvent;
+        use std::sync::Mutex;
+
+        let buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let recorded = buffer.clone();
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let view = TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx);
+            *view.stdin_writer.lock() = Box::new(RecordingWriter(recorded));
+            view
+        });
+        terminal.update_in(cx, |view, window, cx| {
+            let mut keystroke = gpui::Keystroke::parse("tab").unwrap();
+            keystroke.key_char = Some("\t".into());
+            view.on_key_down(
+                &KeyDownEvent {
+                    keystroke,
+                    is_held: false,
+                },
+                window,
+                cx,
+            );
+            assert_eq!(
+                *buffer.lock().unwrap(),
+                b"\t",
+                "macOS Tab 必须发送 HT（补全依赖）"
+            );
+
+            buffer.lock().unwrap().clear();
+            let mut keystroke = gpui::Keystroke::parse("shift-tab").unwrap();
+            keystroke.key_char = Some("\t".into());
+            view.on_key_down(
+                &KeyDownEvent {
+                    keystroke,
+                    is_held: false,
+                },
+                window,
+                cx,
+            );
+            assert_eq!(
+                *buffer.lock().unwrap(),
+                b"\x1b[Z",
+                "Shift+Tab 必须发送 backtab 序列"
+            );
         });
     }
 
@@ -4954,14 +5055,15 @@ mod tests {
     fn paste_shortcut_matches_only_exact_two_combos() {
         use super::paste_shortcut_matches;
 
-        for hit in ["ctrl-shift-v", "ctrl-shift-V", "shift-insert"] {
+        for hit in ["ctrl-shift-v", "ctrl-shift-V", "shift-insert", "cmd-v"] {
             assert!(
                 paste_shortcut_matches(&gpui::Keystroke::parse(hit).unwrap()),
                 "{hit} 应命中粘贴快捷键"
             );
         }
         // 单 Ctrl+V 是终端 0x16 惯例、Ctrl+C/Ctrl+Shift+C 等均不命中；
-        // 附加修饰（Alt/Super/Fn）与 Shift+其它键也不命中。
+        // 附加修饰（Alt/Fn）与 Shift+其它键也不命中；Shift+Insert 带平台
+        // 修饰也不命中（macOS Cmd+Shift+Insert 非粘贴惯例）。
         for miss in [
             "ctrl-v",
             "ctrl-c",
@@ -4972,6 +5074,9 @@ mod tests {
             "insert",
             "ctrl-insert",
             "shift-v",
+            "cmd-shift-v",
+            "cmd-c",
+            "super-shift-v",
         ] {
             assert!(
                 !paste_shortcut_matches(&gpui::Keystroke::parse(miss).unwrap()),

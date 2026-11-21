@@ -480,6 +480,9 @@ enum SessionCmd {
     Resize {
         cols: u32,
         rows: u32,
+        /// 像素尺寸（格子数 × 单格像素）；远端 pty-req 的 ws_xpixel/ypixel。
+        pixel_width: u32,
+        pixel_height: u32,
     },
     /// 已连接会话内启停隧道（hub 按 spec 差异增删；v1 UI 未接入运行时编辑，
     /// 改动默认下次连接生效——本指令是运行时启停的既有入口，见 roadmap）。
@@ -635,7 +638,7 @@ impl TerminalSession for SshSession {
             .ok_or_else(|| io::Error::other("会话字节流已被取走（take_streams 只能调用一次）"))
     }
 
-    fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
+    fn resize(&self, cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) -> io::Result<()> {
         if self.closing.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -643,6 +646,8 @@ impl TerminalSession for SshSession {
             .send(SessionCmd::Resize {
                 cols: cols as u32,
                 rows: rows as u32,
+                pixel_width: pixel_width as u32,
+                pixel_height: pixel_height as u32,
             })
             .map_err(|_| io::Error::other("SSH 会话已结束"))
     }
@@ -1250,8 +1255,17 @@ async fn network_main(
                     }
                 },
                 cmd = cmd_rx.recv() => match cmd {
-                    Some(SessionCmd::Resize { cols, rows }) => {
-                        if channel.window_change(cols, rows, 0, 0).await.is_err() {
+                    Some(SessionCmd::Resize {
+                        cols,
+                        rows,
+                        pixel_width,
+                        pixel_height,
+                    }) => {
+                        if channel
+                            .window_change(cols, rows, pixel_width, pixel_height)
+                            .await
+                            .is_err()
+                        {
                             // window_change 失败 = 连接层死亡，同 wait None 置位
                             unexpected_exit.store(true, Ordering::Release);
                             break;

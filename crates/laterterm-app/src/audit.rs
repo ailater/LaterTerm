@@ -203,8 +203,8 @@ impl TerminalSession for AuditSession {
         Ok(streams)
     }
 
-    fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
-        self.inner.resize(cols, rows)
+    fn resize(&self, cols: u16, rows: u16, pixel_width: u16, pixel_height: u16) -> io::Result<()> {
+        self.inner.resize(cols, rows, pixel_width, pixel_height)
     }
 
     fn kill(&self) {

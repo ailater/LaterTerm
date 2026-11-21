@@ -865,13 +865,15 @@ fn password_auth_echo_resize_and_kill_eof() {
     eprintln!("[test] 已写入，等待回显");
     read_until(&mut streams, "Got data: ping-laterterm");
 
-    session.resize(40, 12).expect("resize 应成功");
+    session.resize(40, 12, 640, 480).expect("resize 应成功");
     session.kill();
     session.kill(); // 幂等
     wait_eof(&mut streams);
 
     // kill 之后 resize 静默成功（关闭路径视图仍会触发 resize）
-    session.resize(80, 24).expect("kill 后 resize 应静默成功");
+    session
+        .resize(80, 24, 640, 480)
+        .expect("kill 后 resize 应静默成功");
     drop(session);
 }
 
@@ -1073,7 +1075,9 @@ fn jump_chain_three_hops_keeps_tunnels_alive() {
     let mut streams = session.take_streams().expect("take_streams");
     streams.writer.write_all(b"via-chain\n").expect("写入");
     read_until(&mut streams, "Got data: via-chain");
-    session.resize(60, 20).expect("三跳会话 resize 应正常");
+    session
+        .resize(60, 20, 640, 480)
+        .expect("三跳会话 resize 应正常");
     assert_eq!(
         outer_count.load(Ordering::SeqCst),
         1,

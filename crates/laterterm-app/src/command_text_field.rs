@@ -1,8 +1,8 @@
 use gpui::{
     Bounds, Context, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, Render, Styled, UTF16Selection, Window, anchored, canvas, deferred, div,
-    prelude::FluentBuilder, px, rgb,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Render, Styled, UTF16Selection, Window, anchored, canvas,
+    deferred, div, prelude::FluentBuilder, px, rgb,
 };
 use std::cell::Cell;
 use std::ops::Range;
@@ -38,6 +38,10 @@ pub(crate) struct CommandTextField {
     caret_on: bool,
     /// 是否已有闪烁任务在跑，避免 render 反复 spawn。
     blink_scheduled: bool,
+    /// 左键拖拽选区的锚点（UTF-16 偏移）；None = 非拖拽态。
+    /// 拖拽中鼠标移出元素后松键收不到 on_mouse_up，靠 on_mouse_move 的
+    /// `pressed_button == None` 兜底复位。
+    drag_anchor: Option<usize>,
 }
 
 impl EventEmitter<CommandTextChanged> for CommandTextField {}
@@ -64,6 +68,7 @@ impl CommandTextField {
             focused: false,
             caret_on: true,
             blink_scheduled: false,
+            drag_anchor: None,
         }
     }
 
@@ -187,6 +192,27 @@ impl CommandTextField {
         }
     }
 
+    /// 双击选词：以 offset 所在字符为种子，向两侧扩展到同类（空白/非空白）
+    /// 边界——落在空白上选中空白段，落在词上选中整词。
+    /// 掩码模式显示字符数与原文一致，偏移通用。
+    fn word_range_at(&self, offset: usize) -> Range<usize> {
+        let byte = self.byte_offset(offset);
+        let seed_is_ws = self.text[byte..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace);
+        let start = self.text[..byte]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| c.is_whitespace() != seed_is_ws)
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let end = self.text[byte..]
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace() != seed_is_ws)
+            .map_or(self.text.len(), |(i, _)| byte + i);
+        start..end
+    }
+
     /// 渲染用文本（掩码模式返回等量圆点；字符数与原文一致）。
     fn display_text(&self) -> String {
         if self.masked {
@@ -206,10 +232,52 @@ impl CommandTextField {
         self.focus_handle.focus(window);
         self.caret_on = true;
         let had_menu = self.context_menu.take().is_some();
-        if !had_menu {
-            self.place_caret_at(event.position, window);
+        if !had_menu && let Some(offset) = self.caret_offset_at(event.position, window) {
+            if event.click_count >= 2 {
+                // 双击选词；拖拽锚点清掉，避免双击后继续移动误扩展选区
+                self.selection = self.word_range_at(offset);
+                self.reversed = false;
+                self.drag_anchor = None;
+            } else {
+                // 单击落点 + 记录拖拽锚点（on_mouse_move 扩展选区）
+                self.selection = offset..offset;
+                self.reversed = false;
+                self.drag_anchor = Some(offset);
+            }
         }
         cx.notify();
+    }
+
+    /// 左键拖拽扩展选区；元素外松键收不到 mouse_up，靠 pressed_button
+    /// 复位兜底（move 事件在窗口内仍会送达）。
+    fn on_field_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.drag_anchor.is_some() && event.pressed_button != Some(MouseButton::Left) {
+            self.drag_anchor = None;
+            return;
+        }
+        let Some(anchor) = self.drag_anchor else {
+            return;
+        };
+        if let Some(offset) = self.caret_offset_at(event.position, window) {
+            self.selection = anchor.min(offset)..anchor.max(offset);
+            self.reversed = offset < anchor;
+            self.caret_on = true;
+            cx.notify();
+        }
+    }
+
+    fn on_field_mouse_up(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.drag_anchor = None;
     }
 
     fn on_field_right_click(
@@ -278,29 +346,31 @@ impl CommandTextField {
     }
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         let k = event.keystroke.key.as_str();
-        let ctrl = event.keystroke.modifiers.control
+        // 剪贴板/全选加速键：macOS 走 Cmd（platform），Linux/Windows 走 Ctrl。
+        // 两个都接受，跨平台测试与外接键位都能命中。
+        let accel = (event.keystroke.modifiers.platform || event.keystroke.modifiers.control)
             && !event.keystroke.modifiers.alt
             && !event.keystroke.modifiers.shift;
-        if ctrl && matches!(k.to_ascii_lowercase().as_str(), "a" | "c" | "x" | "v") {
+        if accel && matches!(k.to_ascii_lowercase().as_str(), "a" | "c" | "x" | "v") {
             cx.stop_propagation();
         }
-        if ctrl && k.eq_ignore_ascii_case("a") {
+        if accel && k.eq_ignore_ascii_case("a") {
             self.selection = 0..self.utf16_len();
             self.reversed = false;
             self.caret_on = true;
             cx.notify();
             return;
         }
-        // 剪贴板：Ctrl+C 复制选区 / Ctrl+X 剪切 / Ctrl+V 粘贴（多行折叠为空格）
-        if ctrl && k.eq_ignore_ascii_case("c") {
+        // 剪贴板：Cmd/Ctrl+C 复制选区 / X 剪切 / V 粘贴（多行折叠为空格）
+        if accel && k.eq_ignore_ascii_case("c") {
             self.copy_selection(cx);
             return;
         }
-        if ctrl && k.eq_ignore_ascii_case("x") {
+        if accel && k.eq_ignore_ascii_case("x") {
             self.cut_selection(cx);
             return;
         }
-        if ctrl && k.eq_ignore_ascii_case("v") {
+        if accel && k.eq_ignore_ascii_case("v") {
             self.paste_clipboard(cx);
             return;
         }
@@ -452,6 +522,8 @@ impl Render for CommandTextField {
             )
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_field_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_field_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_field_mouse_up))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_field_right_click));
 
         if let Some(pos) = self.context_menu {
@@ -709,6 +781,66 @@ mod tests {
                 .as_deref(),
             Some("保留剪贴板")
         );
+    }
+
+    /// 平台主修饰键（macOS Cmd / 其余 Ctrl，"secondary" 映射）也必须触发
+    /// 全选+粘贴：回归「服务器弹窗 Cmd+V 无效，只能右键粘贴」。
+    #[gpui::test]
+    fn platform_modifier_pastes_into_field(cx: &mut TestAppContext) {
+        let (field, cx) = cx.add_window_view(|_, cx| CommandTextField::new("旧文本", "", cx));
+        cx.update(|window, cx| {
+            field.read(cx).focus_handle().focus(window);
+            window.activate_window();
+        });
+        cx.write_to_clipboard(ClipboardItem::new_string("平台粘贴".into()));
+        cx.simulate_keystrokes("secondary-a secondary-v");
+        field.read_with(cx, |field, _| assert_eq!(field.value(), "平台粘贴"));
+    }
+
+    /// 鼠标按住拖拽必须能全选文本（回归「只能 Ctrl+A 全选，鼠标拖不出选区」）。
+    #[gpui::test]
+    fn mouse_drag_selects_all_text(cx: &mut TestAppContext) {
+        use gpui::{Modifiers, MouseButton, point, px};
+
+        let (field, cx) = cx.add_window_view(|_, cx| CommandTextField::new("hello world", "", cx));
+        cx.update(|window, _cx| {
+            window.activate_window();
+        });
+        cx.simulate_mouse_down(
+            point(px(10.0), px(15.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_move(
+            point(px(400.0), px(15.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_up(
+            point(px(400.0), px(15.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        field.read_with(cx, |field, _| {
+            assert_eq!(
+                field.selection,
+                0..field.utf16_len(),
+                "从行首拖到行尾应全选，松键不清选区"
+            );
+        });
+    }
+
+    /// 双击选词：落在词中选中整词，落在空白上选中空白段。
+    #[gpui::test]
+    fn double_click_selects_word(cx: &mut TestAppContext) {
+        let (field, cx) = cx.add_window_view(|_, cx| CommandTextField::new("hello world", "", cx));
+        // "hello world"：h=0..5，空格=5，w=6..11（UTF-16 偏移）
+        field.update(cx, |field, _| {
+            assert_eq!(field.word_range_at(2), 0..5, "词中双击选中整词");
+            assert_eq!(field.word_range_at(5), 5..6, "空白双击选中空白段");
+            assert_eq!(field.word_range_at(7), 6..11, "词中双击选中整词");
+            assert_eq!(field.word_range_at(11), 6..11, "末尾双击归到最后一个词");
+        });
     }
 
     #[gpui::test]
