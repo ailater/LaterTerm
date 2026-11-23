@@ -347,6 +347,12 @@ impl Settings {
         if self.legacy_servers_migrated {
             return false;
         }
+        // 旧 store 有条目才置位 + 落盘：空 store（首次安装/旧文件缺失）零迁移
+        // 即不写盘——否则每个用默认 settings 构造视图的测试都会触发一次
+        // Settings::save()（写死默认路径），在 XDG 隔离失效的环境里覆盖用户
+        // 真实配置（macOS 曾中招，见 config_dir 注释）。置位语义 = 「见过旧
+        // 数据」，同名单纯去重也置位，保住「删除后不复活」的原有保障。
+        let had_legacy_data = !legacy.servers.is_empty();
         for entry in legacy.servers {
             let entry: servers::ServerEntry = entry.into();
             if let Some(entry) = entry.sanitized()
@@ -358,8 +364,10 @@ impl Settings {
                 self.servers.push(entry);
             }
         }
-        self.legacy_servers_migrated = true;
-        true
+        if had_legacy_data {
+            self.legacy_servers_migrated = true;
+        }
+        had_legacy_data
     }
 
     pub fn upsert_command(&mut self, command: CommandTemplate) -> Result<()> {
@@ -651,9 +659,9 @@ pub fn app_state_dir() -> Option<PathBuf> {
     Some(state_dir()?.join(APP_DIR))
 }
 
-/// 平台状态目录（Linux 优先，遵循 XDG Base Directory 的 state 规范）。
-/// 与 [`config_dir`] 同构：Linux 读 `XDG_STATE_HOME`（绝对路径校验同口径），
-/// 回落 `~/.local/state`；macOS / Windows 无 state 惯例，按配置目录同源处理。
+/// 平台状态目录（Linux/macOS 遵循 XDG Base Directory 的 state 规范）。
+/// 与 [`config_dir`] 同构：Linux/macOS 读绝对 `XDG_STATE_HOME`（校验同口径），
+/// Linux 回落 `~/.local/state`；Windows 无 state 惯例，按配置目录同源处理。
 fn state_dir() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -667,6 +675,12 @@ fn state_dir() -> Option<PathBuf> {
 
     #[cfg(target_os = "macos")]
     {
+        // 与 config_dir 的 XDG 隔离口径一致（gate.sh 同时设两个变量）。
+        if let Some(xdg) = std::env::var_os("XDG_STATE_HOME")
+            && Path::new(&xdg).is_absolute()
+        {
+            return Some(PathBuf::from(xdg));
+        }
         home_dir().map(|home| home.join("Library").join("Application Support"))
     }
 
@@ -681,7 +695,7 @@ fn state_dir() -> Option<PathBuf> {
     }
 }
 
-/// 平台配置目录（Linux 优先，遵循 XDG）。
+/// 平台配置目录（Linux/macOS 遵循绝对 `XDG_CONFIG_HOME`，回落各自惯例目录）。
 fn config_dir() -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -695,6 +709,15 @@ fn config_dir() -> Option<PathBuf> {
 
     #[cfg(target_os = "macos")]
     {
+        // 显式设置绝对 XDG_CONFIG_HOME 时与 Linux 同口径遵从：script/gate.sh
+        // 靠它隔离测试（此前 macOS 不读该变量，隔离空转，测试会读写真实
+        // 配置目录并曾把用户 settings.toml 覆盖成默认值）。常规 macOS 运行
+        // 不设此变量，仍走 Application Support。
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
+            && Path::new(&xdg).is_absolute()
+        {
+            return Some(PathBuf::from(xdg));
+        }
         home_dir().map(|home| home.join("Library").join("Application Support"))
     }
 
