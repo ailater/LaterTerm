@@ -19,7 +19,7 @@ use gpui::{
     point, px, svg,
 };
 
-use crate::palette::UiPalette;
+use crate::palette::{UiPalette, tint_hsla};
 use crate::tokens::{H_CTRL, H_MENU, TEXT_BODY_SM, icon_size_for};
 
 /// 按钮语义（全应用统一）：主操作 / 次操作。
@@ -230,4 +230,54 @@ pub fn overlay_shadow() -> Vec<BoxShadow> {
             spread_radius: px(-6.),
         },
     ]
+}
+
+/// 设置行滑动开关：34×18 轨道 + 14 滑钮，checked = accent 轨 + 亮滑钮，
+/// unchecked = 中性轨 + 次级滑钮（对照 macOS 系统设置的开关心智模型）。
+/// 不做位置过渡动画：状态切换重走布局，过渡无收益还可能重启闪烁
+/// （同标签拖拽动画的教训）；按压反馈走轨道压暗（Stateful .active）。
+/// `id` 供按压态寻址：同帧内必须唯一（调用方用行键拼前缀）。
+pub fn setting_switch(
+    id: impl Into<SharedString>,
+    ui: &UiPalette,
+    checked: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
+    let id = id.into();
+    let (track, hover_track, active_track, knob) = if checked {
+        (
+            ui.accent,
+            tint_hsla(ui.accent, 0xCC),
+            tint_hsla(ui.accent, 0xB3),
+            ui.text,
+        )
+    } else {
+        (
+            ui.hover_bg,
+            ui.border_strong,
+            ui.border_strong,
+            ui.text_secondary,
+        )
+    };
+    div()
+        .id(id)
+        .cursor_pointer()
+        .w(px(34.0))
+        .h(px(18.0))
+        .rounded_full()
+        .bg(track)
+        .hover(move |style| style.bg(hover_track))
+        .active(move |style| style.bg(active_track))
+        .child(
+            div()
+                .flex()
+                .h_full()
+                .w_full()
+                .items_center()
+                .px(px(2.0))
+                .justify_end()
+                .when(!checked, |row| row.justify_start())
+                .child(div().size(px(14.0)).rounded_full().bg(knob)),
+        )
+        .on_mouse_down(MouseButton::Left, listener)
 }

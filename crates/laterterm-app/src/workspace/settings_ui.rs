@@ -30,7 +30,9 @@ use gpui::{
 use laterterm_config::theme::ThemeColors;
 use laterterm_config::{Appearance, ReconnectSettings, TriggerRule};
 use laterterm_ui::tokens::{H_CTRL, H_NAV};
-use laterterm_ui::{ButtonKind, IconButtonSpec, UiPalette, icon_button, tint_hsla, ui_button};
+use laterterm_ui::{
+    ButtonKind, IconButtonSpec, UiPalette, icon_button, setting_switch, tint_hsla, ui_button,
+};
 
 // ---------------------------------------------------------------------------
 // 色板口径（原 Tokyo Night 固定常量组已删，全量改走 UiPalette 参数）：
@@ -268,7 +270,7 @@ pub(crate) fn settings_overlay(
                         .justify_between()
                         .px_5()
                         .border_b_1()
-                        .border_color(ui.border_strong)
+                        .border_color(ui.divider)
                         .child(div().text_color(ui.text).child("设置"))
                         // 关闭钮统一图标钮（原文本「×」，danger 悬停警示）
                         .child(icon_button(
@@ -301,8 +303,8 @@ pub(crate) fn settings_overlay(
                         .justify_between()
                         .px_5()
                         .border_t_1()
-                        .border_color(ui.border_strong)
-                        .text_color(ui.text_secondary)
+                        .border_color(ui.divider)
+                        .text_color(ui.text_muted)
                         .child(format!(
                             "修改即时生效 · 共 {} 节，上下滚动查看全部设置",
                             SettingsSection::ALL.len()
@@ -323,6 +325,9 @@ pub(crate) fn settings_navigation(
         .h_full()
         .p_3()
         .bg(ui.base_bg)
+        // 与内容区的分界走 hairline：浅色系下不再是生硬的底色交界带
+        .border_r_1()
+        .border_color(ui.divider)
         .flex()
         .flex_col()
         .gap_1()
@@ -344,8 +349,8 @@ fn settings_nav_item(
 ) -> Div {
     let (bg, hover_bg, text) = if selected {
         (
-            tint_hsla(ui.accent, 0x26),
             tint_hsla(ui.accent, 0x33),
+            tint_hsla(ui.accent, 0x40),
             ui.text,
         )
     } else {
@@ -405,7 +410,7 @@ pub(crate) fn settings_content(
 ) -> Stateful<Div> {
     let appearance = workspace.settings.appearance.clone();
     let mut children = Vec::with_capacity(SettingsSection::ALL.len());
-    for section in SettingsSection::ALL {
+    for (index, section) in SettingsSection::ALL.iter().enumerate() {
         let body: Vec<AnyElement> = match section {
             SettingsSection::Appearance => settings_appearance_body(&appearance, ui, cx)
                 .into_iter()
@@ -445,7 +450,12 @@ pub(crate) fn settings_content(
         };
         let block = div()
             .debug_selector(move || format!("settings-section-{}", section.debug_key()))
-            .pt_2()
+            // 单页滚动里相邻节容易读成嵌套（评审反馈「外观面板里出现字体
+            // 区块」即此观感）：非首节加通宽分隔线 + 上留白加倍
+            .when(index > 0, |block| {
+                block.border_t_1().border_color(ui.divider)
+            })
+            .pt_4()
             .pb_5()
             .flex()
             .flex_col()
@@ -2182,6 +2192,9 @@ fn font_family_controls(ui: &UiPalette, cx: &mut Context<WorkspaceView>, current
                     this.change_setting(event, window, cx, |s| s.font_family = name.to_string());
                 }),
             )
+            // 所见即所得：芯片文字用该字体本身渲染（等宽一目了然，缺失时
+            // gpui 回落默认字体，无崩溃路径）
+            .font_family(name)
             .w(px(FONT_CHIP_WIDTH))
         }))
 }
@@ -2233,31 +2246,22 @@ fn toggle_controls(
     ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
     key: &'static str,
-    on: (&'static str, bool),
-    off: (&'static str, bool),
+    _on: (&'static str, bool),
+    _off: (&'static str, bool),
     current: bool,
     apply: impl Fn(&mut Appearance, bool) + Clone + 'static,
 ) -> Div {
-    div()
-        .flex()
-        .gap_1()
-        .children(
-            [(on, true), (off, false)]
-                .into_iter()
-                .map(|((label, value), _)| {
-                    let selected = value == current;
-                    let apply = apply.clone();
-                    setting_button_keyed(
-                        ui,
-                        format!("{key}-{label}"),
-                        label,
-                        selected,
-                        cx.listener(move |this, event, window, cx| {
-                            this.change_setting(event, window, cx, |s| apply(s, value));
-                        }),
-                    )
-                }),
-        )
+    // 滑动开关（macOS 系统设置心智模型）；on/off 文字参数已废弃不渲染，
+    // 签名保留以免十余处调用点机械翻改。点击即取反。
+    let next = !current;
+    div().child(setting_switch(
+        format!("{key}-switch"),
+        ui,
+        current,
+        cx.listener(move |this, event, window, cx| {
+            this.change_setting(event, window, cx, |s| apply(s, next));
+        }),
+    ))
 }
 
 /// Quake 设置的二值开关控件：与 `toggle_controls` 同形，但落点是
@@ -2268,31 +2272,21 @@ fn quake_toggle_controls(
     ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
     key: &'static str,
-    on: (&'static str, bool),
-    off: (&'static str, bool),
+    _on: (&'static str, bool),
+    _off: (&'static str, bool),
     current: bool,
     apply: impl Fn(&mut laterterm_config::QuakeSettings, bool) + Clone + 'static,
 ) -> Div {
-    div()
-        .flex()
-        .gap_1()
-        .children(
-            [(on, true), (off, false)]
-                .into_iter()
-                .map(|((label, value), _)| {
-                    let selected = value == current;
-                    let apply = apply.clone();
-                    setting_button_keyed(
-                        ui,
-                        format!("{key}-{label}"),
-                        label,
-                        selected,
-                        cx.listener(move |this, event, window, cx| {
-                            this.change_quake_setting(event, window, cx, |s| apply(s, value));
-                        }),
-                    )
-                }),
-        )
+    // 滑动开关，口径同 toggle_controls（文字参数废弃不渲染）。
+    let next = !current;
+    div().child(setting_switch(
+        format!("{key}-switch"),
+        ui,
+        current,
+        cx.listener(move |this, event, window, cx| {
+            this.change_quake_setting(event, window, cx, |s| apply(s, next));
+        }),
+    ))
 }
 
 /// 主题芯片行：选中态读生效主题（预览期间高亮跟随预览，与色板卡/窗格
@@ -2390,6 +2384,7 @@ fn section_title(ui: &UiPalette, text: &str) -> Div {
         .child(
             div()
                 .text_size(px(14.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(ui.text)
                 .child(text.to_string()),
         )
@@ -2412,7 +2407,9 @@ fn setting_card(ui: &UiPalette) -> Div {
         .gap_1()
         .bg(ui.card_bg)
         .border_1()
-        .border_color(ui.border_strong)
+        // 卡片与区域分隔同档 hairline：浅色系下深绿描边会把设置项
+        // 框得很重；控件级描边（数值框/按钮）仍保留 border_strong
+        .border_color(ui.divider)
         .rounded_md()
 }
 

@@ -300,6 +300,7 @@ fn palette_preview_orders_ansi_rows_and_copies_values() {
 
     // 19 色各异：行序与逐值拷贝一一对位
     let distinct = ThemeColors {
+        ui_accent: None,
         background: 0x010001,
         foreground: 0x010002,
         cursor: 0x010003,

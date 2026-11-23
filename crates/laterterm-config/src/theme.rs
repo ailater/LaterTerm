@@ -37,9 +37,12 @@ pub struct Theme {
     pub colors: ThemeColors,
 }
 
-/// 主题颜色，19 个 `0xRRGGBB` 值。
+/// 主题颜色，19 个 `0xRRGGBB` 值 + 可选 UI 强调色。
 #[derive(Clone, Debug, PartialEq)]
 pub struct ThemeColors {
+    /// UI 强调色（开关/选中/导航高亮）：缺省回落 ANSI blue。
+    /// 绿色系主题用它把 UI accent 与终端 ANSI 蓝解耦——否则绿底蓝按钮。
+    pub ui_accent: Option<u32>,
     pub background: u32,
     pub foreground: u32,
     pub cursor: u32,
@@ -84,6 +87,7 @@ impl ThemeColors {
             bright_magenta: 0xBB9AF7,
             bright_cyan: 0x7DCFFF,
             bright_white: 0xC0CAF5,
+            ui_accent: None,
         }
     }
 
@@ -109,6 +113,7 @@ impl ThemeColors {
             bright_magenta: 0xBB9AF7,
             bright_cyan: 0x0DB9D7,
             bright_white: 0xC0CAF5,
+            ui_accent: None,
         }
     }
 
@@ -134,11 +139,66 @@ impl ThemeColors {
             bright_magenta: 0xD3869B,
             bright_cyan: 0x8EC07C,
             bright_white: 0xEBDBB2,
+            ui_accent: None,
+        }
+    }
+
+    /// 内置纯白预设（浅色）：纸面白 + 近黑正文 + 文档蓝；ANSI 取浅色可用变体
+    /// （黄偏橙棕、亮色系压深保对比）。
+    pub fn pure_white() -> Self {
+        Self {
+            background: 0xFFFFFF,
+            foreground: 0x212429,
+            cursor: 0x2F6BD8,
+            black: 0x383A42,
+            red: 0xC62828,
+            green: 0x2E7D32,
+            yellow: 0xB26A00,
+            blue: 0x2F6BD8,
+            magenta: 0x8E24AA,
+            cyan: 0x00838F,
+            white: 0xD6DAE0,
+            bright_black: 0x6B7280,
+            bright_red: 0xD32F2F,
+            bright_green: 0x388E3C,
+            bright_yellow: 0xC77700,
+            bright_blue: 0x2563EB,
+            bright_magenta: 0xA13FB8,
+            bright_cyan: 0x0097A7,
+            bright_white: 0xF9FAFB,
+            ui_accent: None,
+        }
+    }
+
+    /// 内置森绿预设（浅色）：薄荷纸面 + 深林绿正文 + 春绿强调，绿调清新不刺眼。
+    pub fn forest_green() -> Self {
+        Self {
+            background: 0xF2FBF4,
+            foreground: 0x1A3D2C,
+            cursor: 0x177A42,
+            black: 0x16301F,
+            red: 0xC62828,
+            green: 0x177A42,
+            yellow: 0x8A6D1A,
+            blue: 0x1F6FB2,
+            magenta: 0x8E24AA,
+            cyan: 0x00838F,
+            white: 0xD8EBDD,
+            bright_black: 0x47705A,
+            bright_red: 0xD32F2F,
+            bright_green: 0x1E9E50,
+            bright_yellow: 0xA8841F,
+            bright_blue: 0x2B86C5,
+            bright_magenta: 0xA13FB8,
+            bright_cyan: 0x0097A7,
+            bright_white: 0xEFFAF1,
+            ui_accent: Some(0x177A42),
         }
     }
 
     fn set(&mut self, key: &str, value: u32) -> bool {
         match key {
+            "ui_accent" => self.ui_accent = Some(value),
             "background" => self.background = value,
             "foreground" => self.foreground = value,
             "cursor" => self.cursor = value,
@@ -206,11 +266,14 @@ pub fn format_hex_color(value: u32) -> String {
 // 序列化为 { "background": "#1A1B26", ... }；未知键忽略、缺键回退默认。
 impl Serialize for ThemeColors {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let map: BTreeMap<&str, String> = self
+        let mut map: BTreeMap<&str, String> = self
             .entries()
             .into_iter()
             .map(|(key, value)| (key, format_hex_color(value)))
             .collect();
+        if let Some(accent) = self.ui_accent {
+            map.insert("ui_accent", format_hex_color(accent));
+        }
         map.serialize(serializer)
     }
 }
@@ -261,6 +324,8 @@ impl ThemeRegistry {
             (DEFAULT_THEME, ThemeColors::tokyo_night()),
             ("tokyo-night-storm", ThemeColors::tokyo_night_storm()),
             ("gruvbox-dark", ThemeColors::gruvbox_dark()),
+            ("pure-white", ThemeColors::pure_white()),
+            ("forest-green", ThemeColors::forest_green()),
         ];
         Self {
             themes: presets
@@ -325,15 +390,52 @@ impl ThemeRegistry {
         self.themes.get(name)
     }
 
-    /// 全部主题名（BTreeMap 保证稳定顺序，内置在前不保证但排序稳定）。
+    /// 全部主题名：内置按注册顺序在前（tokyo-night 家族优先），自定义
+    /// 主题按名称字典序在后（BTreeMap 稳定）。不再全局字典序——否则
+    /// forest-green/pure-white 会排到 tokyo-night 前面（用户评审）。
     pub fn names(&self) -> Vec<String> {
-        self.themes.keys().cloned().collect()
+        const BUILTIN_ORDER: [&str; 5] = [
+            DEFAULT_THEME,
+            "tokyo-night-storm",
+            "gruvbox-dark",
+            "pure-white",
+            "forest-green",
+        ];
+        let mut names: Vec<String> = BUILTIN_ORDER
+            .into_iter()
+            .filter(|name| self.themes.contains_key(*name))
+            .map(str::to_string)
+            .collect();
+        names.extend(
+            self.themes
+                .keys()
+                .filter(|name| !BUILTIN_ORDER.contains(&name.as_str()))
+                .cloned(),
+        );
+        names
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_names_keep_registration_order_before_custom() {
+        let registry = ThemeRegistry::builtin();
+        let names = registry.names();
+        assert_eq!(
+            names,
+            vec![
+                "tokyo-night",
+                "tokyo-night-storm",
+                "gruvbox-dark",
+                "pure-white",
+                "forest-green"
+            ],
+            "内置主题按注册序：tokyo-night 家族在前，新增浅色在后"
+        );
+    }
 
     #[test]
     fn hex_color_parsing() {
@@ -415,7 +517,7 @@ mod tests {
         let registry = ThemeRegistry::load_from_dir(&dir);
         assert_eq!(registry.resolve("tokyo-night").colors.background, 0x000000);
         assert_eq!(registry.resolve("solarized").colors.background, 0x002B36);
-        assert_eq!(registry.names().len(), 4); // 3 内置 + solarized；broken 被跳过
+        assert_eq!(registry.names().len(), 6); // 5 内置 + solarized；broken 被跳过
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -20,5 +20,7 @@ pub mod controls;
 pub mod palette;
 pub mod tokens;
 
-pub use controls::{ButtonKind, IconButtonSpec, icon_button, menu_item, overlay_shadow, ui_button};
+pub use controls::{
+    ButtonKind, IconButtonSpec, icon_button, menu_item, overlay_shadow, setting_switch, ui_button,
+};
 pub use palette::{ActivePalette, UiPalette, active_palette, tint, tint_hsla};

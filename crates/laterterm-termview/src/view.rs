@@ -769,6 +769,7 @@ fn fallback_ui_palette() -> UiPalette {
         active_bg: Hsla::from(rgb(0x3B3D56)),
         selected_bg: Hsla::from(rgb(0x354161)),
         border: Hsla::from(rgb(0x1A1D29)),
+        divider: Hsla::from(rgb(0x262838)),
         border_strong: Hsla::from(rgb(0x59628E)),
         text: Hsla::from(rgb(0xC0CAF5)),
         text_secondary: Hsla::from(rgb(0x888CA0)),
@@ -2336,8 +2337,11 @@ impl TerminalView {
     /// `None` 表示无有效内容。
     pub fn copy_selection(&mut self, cx: &mut Context<Self>) -> Option<usize> {
         let text = self.state.with_term(|term| term.selection_to_string());
+        // 纯空白选区（空格/换行/Tab 等不可见字符）不复制：空白区误拖选
+        // 不该顶掉剪贴板里的有效内容，也不弹「已复制 N 字符」误导 toast。
+        // 只拦截「trim 后为空」的选区；正常文本的首尾空白原样保留。
         if let Some(text) = text
-            && !text.is_empty()
+            && !text.trim().is_empty()
         {
             let chars = text.chars().count();
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
@@ -3018,9 +3022,10 @@ impl Render for TerminalView {
                 .items_center()
                 .gap_3()
                 .px_3()
-                // scrim 语义半透明黑底：盖在终端内容之上的浮层遮罩，有
-                // 意保留 gpui::black 不随主题亮暗翻转（任何主题下压暗内容）
-                .bg(gpui::black().opacity(0.8))
+                // scrim 语义浮层遮罩：随主题亮暗翻转（overlay_scrim = 底色
+                // 微压暗 @0.96）。原 gpui::black 硬编码在浅色主题下会黑底
+                // 黑字（ui.text 为深色），必须走色板槽位
+                .bg(ui.overlay_scrim)
                 .text_size(px(12.0))
                 .text_color(ui.text)
                 // 「搜索」标签：0x7DCFFF → accent（有意变更：标签类语义
@@ -5580,6 +5585,35 @@ mod tests {
             assert_eq!(view.copy_selection(cx), Some(5));
             view.state.with_term_mut(|term| term.selection = None);
             assert_eq!(view.copy_selection(cx), None);
+        });
+    }
+
+    #[gpui::test]
+    fn copy_selection_skips_whitespace_only_selection(cx: &mut TestAppContext) {
+        use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
+        use alacritty_terminal::selection::{
+            Selection as AlacSelection, SelectionType as AlacSelectionType,
+        };
+
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update(cx, |view, cx| {
+            view.state.process_bytes(b"   \r\n  \r\n");
+            view.state.with_term_mut(|term| {
+                let mut selection = AlacSelection::new(
+                    AlacSelectionType::Lines,
+                    AlacPoint::new(Line(0), Column(0)),
+                    Side::Left,
+                );
+                selection.update(AlacPoint::new(Line(1), Column(1)), Side::Right);
+                term.selection = Some(selection);
+            });
+            assert_eq!(
+                view.copy_selection(cx),
+                None,
+                "纯空白（空格/换行）选区不写剪贴板、不报字符数"
+            );
         });
     }
 

@@ -1083,7 +1083,7 @@ pub(crate) fn sftp_overlay(
                 .justify_between()
                 .px_4()
                 .border_b_1()
-                .border_color(ui.border_strong)
+                .border_color(ui.divider)
                 .child(
                     // 字重 MEDIUM 为 tokens 字重档位口径，保留（不走 SEMIBOLD，
                     // 与 modal 标题区分层级）。
@@ -1184,7 +1184,7 @@ pub(crate) fn sftp_overlay(
         .child(
             div()
                 .border_t_1()
-                .border_color(ui.border_strong)
+                .border_color(ui.divider)
                 .h(px(150.0))
                 .flex_shrink_0()
                 .flex()
@@ -1314,7 +1314,7 @@ fn file_pane(
                 .px_2()
                 .py_1()
                 .border_b_1()
-                .border_color(ui.border_strong)
+                .border_color(ui.divider)
                 .child(chip("上级", parent_ok, &ui, {
                     let view = view.clone();
                     let path = path_text.clone();
@@ -1412,7 +1412,7 @@ fn file_pane(
                 .px_2()
                 .py_1()
                 .border_t_1()
-                .border_color(ui.border_strong)
+                .border_color(ui.divider)
                 .child(chip("新建目录", true, &ui, {
                     let view = view.clone();
                     move |_event, window, cx| {

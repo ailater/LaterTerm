@@ -65,6 +65,9 @@ pub struct UiPalette {
     /// 边框/分隔线**暗档**（bright_black 压暗 20%）：仅侧栏既有口径分隔与
     /// 禁用态退隐，可交互控件不得再用它（约定④）。
     pub border: Hsla,
+    /// 区域分隔线（边栏/面板/节间 hairline）：贴近底色的微明度差，
+    /// 比控件描边（border/border_strong）更弱，不抢内容视觉重心
+    pub divider: Hsla,
     /// 边框/分隔线**提亮档**（bright_black 提亮 12%）：可交互控件常态边、
     /// 浮层（菜单/弹窗）边、分割线、输入框边一律用它（约定④）。
     /// 提亮步长与 `hover_bg` 同为 +12%，保证边框在 card_bg/hover_bg 之上
@@ -109,23 +112,52 @@ impl UiPalette {
     /// 扩展字段（elevated/active/disabled/accent_hover/warning）按同族
     /// 公式派生；数值由 [`palette_tests`] 快照逐字段锁定（不依赖手算）。
     pub fn from_theme(colors: &ThemeColors) -> Self {
+        // 明暗自适应：浅色主题（HSL L > 0.5）把「表面提亮系」公式反向——
+        // 白底上 lighten 会饱和成纯白（hover 无反馈、卡片层次消失），
+        // 必须转为压暗出层次。暗色下 dir=+1，公式与初版逐字节一致
+        // （palette_tests 的 TN 钉值不受影响）。
+        let dir = if is_light(colors.background) {
+            -1.0
+        } else {
+            1.0
+        };
+        // UI 强调色与 ANSI 蓝解耦：绿色系主题显式给 ui_accent（绿），
+        // 其余主题沿用 blue（TN 蓝/纯白文档蓝），缺省零行为变化
+        let accent = colors.ui_accent.unwrap_or(colors.blue);
         Self {
+            // base 始终压暗：浅色系窗口基底略深于内容区（macOS 浅灰窗口惯例）
             base_bg: solid(darken(colors.background, 0.06)),
             terminal_bg: solid(colors.background),
-            panel_bg: solid(lighten(colors.background, 0.04)),
-            card_bg: solid(lighten(colors.background, 0.08)),
-            elevated_bg: solid(lighten(colors.background, 0.10)),
-            hover_bg: solid(lighten(colors.background, 0.12)),
-            active_bg: solid(lighten(colors.background, 0.16)),
-            selected_bg: solid(mix(colors.blue, colors.background, 0.28)),
+            panel_bg: solid(lighten(colors.background, 0.04 * dir)),
+            // 卡片层次分明暗分治：暗色卡片提亮浮起；浅色系卡片同样**提亮**
+            // （近白卡浮在灰绿/浅灰底上，iOS/macOS 设置惯例）——此前浅色
+            // 压暗卡片造成「白底绿卡」的白绿相间突兀感
+            card_bg: solid(lighten(
+                colors.background,
+                if dir < 0.0 { 0.04 } else { 0.08 },
+            )),
+            // 弹层（设置/对话框）：浅色系提亮而非压暗——压暗会让面板比
+            // 终端还阴沉（灰绿观感投诉）；暗色系维持提亮浮起层次
+            elevated_bg: solid(lighten(
+                colors.background,
+                if dir < 0.0 { 0.03 } else { 0.10 },
+            )),
+            hover_bg: solid(lighten(colors.background, 0.12 * dir)),
+            active_bg: solid(lighten(colors.background, 0.16 * dir)),
+            selected_bg: solid(mix(accent, colors.background, 0.28)),
+            // border 始终压暗 bright_black：浅色主题的 bright_black 取中灰，
+            // 压暗后在白底上仍可见；strong 档与 secondary/disabled 随 dir 反向
             border: solid(darken(colors.bright_black, 0.20)),
-            border_strong: solid(lighten(colors.bright_black, 0.12)),
+            // 分隔线只与底色拉开 6% 明度：暗色微亮、浅色微暗（VSCode/macOS
+            // hairline 口径）；不再复用 bright_black 派生的控件描边色
+            divider: solid(lighten(colors.background, 0.06 * dir)),
+            border_strong: solid(lighten(colors.bright_black, 0.12 * dir)),
             text: solid(colors.foreground),
-            text_secondary: solid(lighten(colors.bright_black, 0.25)),
+            text_secondary: solid(lighten(colors.bright_black, 0.25 * dir)),
             text_muted: solid(colors.bright_black),
-            text_disabled: solid(darken(colors.bright_black, 0.08)),
-            accent: solid(colors.blue),
-            accent_hover: solid(lighten(colors.blue, 0.10)),
+            text_disabled: solid(darken(colors.bright_black, 0.08 * dir)),
+            accent: solid(accent),
+            accent_hover: solid(lighten(accent, 0.10 * dir)),
             danger: solid(colors.red),
             warning: solid(colors.yellow),
             success: solid(colors.green),
@@ -139,6 +171,13 @@ impl UiPalette {
     pub fn tokyo_night_default() -> Self {
         Self::from_theme(&ThemeColors::tokyo_night())
     }
+}
+
+/// 背景明暗判定：HSL L = (max+min)/2 > 0.5 视为浅色主题。
+fn is_light(rgb: u32) -> bool {
+    let (r, g, b) = (rgb >> 16 & 0xFF, rgb >> 8 & 0xFF, rgb & 0xFF);
+    let (rf, gf, bf) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    (rf.max(gf).max(bf) + rf.min(gf).min(bf)) / 2.0 > 0.5
 }
 
 /// 不透明色：`0xRRGGBB` → alpha=1.0 的 [`Hsla`]（内部助手）。
@@ -274,6 +313,39 @@ mod palette_tests {
     use gpui::{Hsla, rgb};
     use laterterm_config::theme::ThemeColors;
 
+    /// 浅色主题派生方向：表面系（hover/card）必须**压暗**出层次（白底
+    /// lighten 会饱和成纯白、反馈消失）；正文对底色对比度 ≥ 4.5；
+    /// 次文字比 muted 更深（浅色系 secondary = muted 压暗）。
+    #[test]
+    fn light_theme_derives_darkened_surfaces_and_readable_text() {
+        for colors in [ThemeColors::pure_white(), ThemeColors::forest_green()] {
+            let ui = UiPalette::from_theme(&colors);
+            assert!(
+                ui.hover_bg.l < ui.terminal_bg.l,
+                "浅色主题 hover 必须比底色暗（{:X}）",
+                colors.background
+            );
+            assert!(
+                ui.card_bg.l >= ui.terminal_bg.l,
+                "浅色系卡片不得比底色暗（近白卡浮灰绿底；纯白主题同白靠 divider 分界）"
+            );
+            assert!(ui.panel_bg.l < ui.terminal_bg.l, "浅色系 panel 必须压暗");
+            assert!(
+                ui.text_secondary.l < ui.text_muted.l,
+                "浅色系次文字应比 muted 更深"
+            );
+            let contrast = |a: Hsla, b: Hsla| (a.l.max(b.l) + 0.05) / (a.l.min(b.l) + 0.05);
+            assert!(
+                contrast(ui.text, ui.terminal_bg) >= 4.5,
+                "浅色正文对比度不足（{:X}）",
+                colors.background
+            );
+        }
+        // 暗色公式不回归：TN 下 hover 仍比底色亮
+        let tn = UiPalette::from_theme(&ThemeColors::tokyo_night());
+        assert!(tn.hover_bg.l > tn.terminal_bg.l, "暗色 hover 仍应提亮");
+    }
+
     /// Tokyo Night 全字段快照（模式同 workspace.rs `titlebar_scrollbar_tests`
     /// 的字面量锁定）：任何派生公式改动都会在此显式留痕。
     /// 各期望值来自独立 rustc 程序执行 `adjust_lightness`/`mix` 原实现的
@@ -289,6 +361,8 @@ mod palette_tests {
         assert_eq!(p.hover_bg, Hsla::from(rgb(0x33354A)));
         assert_eq!(p.selected_bg, Hsla::from(rgb(0x354161)));
         assert_eq!(p.border, Hsla::from(rgb(0x1A1D29)));
+        // 分隔线：background +6% L（独立复刻 adjust_lightness 计算钉值）
+        assert_eq!(p.divider, Hsla::from(rgb(0x262838)));
         assert_eq!(p.text, Hsla::from(rgb(0xC0CAF5)));
         assert_eq!(p.text_secondary, Hsla::from(rgb(0x888CA0)));
         assert_eq!(p.text_muted, Hsla::from(rgb(0x414868)));

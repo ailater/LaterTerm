@@ -1671,7 +1671,9 @@ impl WorkspaceView {
         if self.settings.quake == previous {
             return;
         }
-        self.settings.save();
+        if let Err(error) = self.persist_settings() {
+            eprintln!("保存 Quake 设置失败: {error:#}");
+        }
         self.sync_quake_worker(cx);
         cx.notify();
     }
@@ -1693,7 +1695,9 @@ impl WorkspaceView {
         if self.settings.reconnect == previous {
             return;
         }
-        self.settings.save();
+        if let Err(error) = self.persist_settings() {
+            eprintln!("保存重连设置失败: {error:#}");
+        }
         cx.notify();
     }
 
@@ -3731,7 +3735,9 @@ impl WorkspaceView {
                     let previous = workspace.settings.appearance.clone();
                     workspace.settings.appearance.downloads_dir = dir.display().to_string();
                     if workspace.settings.appearance != previous {
-                        workspace.settings.save();
+                        if let Err(error) = workspace.persist_settings() {
+                            eprintln!("保存下载目录失败: {error:#}");
+                        }
                         cx.notify();
                     }
                 }
@@ -3928,7 +3934,12 @@ impl WorkspaceView {
         let trace =
             std::env::var_os("LATERTERM_FONT_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"));
         let save_started = trace.then(std::time::Instant::now);
-        self.settings.save();
+        // 统一走 persist_settings：尊重测试注入路径（settings.save() 写死
+        // 真实配置目录，曾致测试清空用户 servers，且与 apply 的读回口径
+        // 不一致——reset 后旧值覆盖内存）；生产路径行为不变
+        if let Err(error) = self.persist_settings() {
+            eprintln!("保存外观设置失败: {error:#}");
+        }
         let save_elapsed = save_started.map(|started| started.elapsed());
         let apply_started = trace.then(std::time::Instant::now);
         self.apply_appearance(Some(window), cx);
@@ -3958,7 +3969,8 @@ impl WorkspaceView {
         UiPalette::from_theme(&theme.colors)
     }
 
-    /// 设置面板点选主题芯片：只进预览态，不落盘（落盘走 commit_theme_preview）。
+    /// 设置面板点选主题芯片：**点选即生效并落盘**（不再预览后二次保存）；
+    /// 预览卡因 theme_preview 恒 None 不再渲染，保存/还原按钮随之消失。
     /// 点回已保存主题 = 放弃当前预览，必须委托 cancel_theme_preview（take + apply
     /// 恢复已保存色）——裸清 theme_preview 会让窗格钉在预览色且无任何恢复路径
     /// （评审必改1：提示行消失、芯片高亮已保存值、窗格仍是预览色的三方漂移）。
@@ -3974,11 +3986,18 @@ impl WorkspaceView {
             self.cancel_theme_preview(Some(window), cx);
             return;
         }
-        if self.theme_preview.as_deref() == Some(name.as_str()) {
-            return; // 重复点击同一预览主题：等值短路
+        // 点选即生效并落盘（2026-11-23 交互评审：不再预览后二次保存）。
+        // 校验与 commit_theme_preview 同口径：热加载删掉的主题不应用。
+        if self.themes.get(&name).is_none() {
+            return;
         }
-        self.theme_preview = Some(name);
+        self.settings.appearance.theme = name;
+        self.theme_preview = None;
+        if let Err(error) = self.persist_settings() {
+            eprintln!("保存主题设置失败: {error:#}");
+        }
         self.apply_appearance(Some(window), cx);
+        cx.notify();
     }
 
     /// 提交预览主题：先用 `themes.get` 严格校验再落盘——自定义主题可能被
@@ -4274,6 +4293,13 @@ impl WorkspaceView {
     /// 只是多做一次重算，语义仍正确）。
     fn persist_settings(&mut self) -> anyhow::Result<()> {
         self.settings_version += 1;
+        // 测试构建的最后防线：未注入临时路径时**绝不回落真实配置目录**。
+        // 漏注入的测试（如 reset_settings 用例）曾把用户 servers 清空——
+        // 内存断言照样有效，落盘语义由显式注入路径的测试覆盖。
+        #[cfg(test)]
+        if self.settings_save_path.is_none() {
+            return Ok(());
+        }
         let path = self
             .settings_save_path
             .clone()
@@ -9632,7 +9658,7 @@ fn left_sidebar(
         .flex_col()
         .bg(ui.panel_bg)
         .border_r_1()
-        .border_color(ui.border)
+        .border_color(ui.divider)
         .child(
             div()
                 .h(px(52.0))
@@ -10097,7 +10123,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
         .flex_col()
         .bg(ui.panel_bg)
         .border_l_1()
-        .border_color(ui.border)
+        .border_color(ui.divider)
         .child(sidebar_header(
             "工具",
             item_count,
@@ -10515,7 +10541,7 @@ fn modal_dialog(
                         .justify_between()
                         .px_4()
                         .border_b_1()
-                        .border_color(ui.border_strong)
+                        .border_color(ui.divider)
                         .child(
                             div()
                                 .text_size(px(TEXT_TITLE))
@@ -15067,15 +15093,19 @@ mod settings_panel_tests {
         });
     }
 
-    /// 主题预览闭环：选中即应用到全部真实窗格，已保存值不动；关面板
-    /// （scrim/× 同一入口 close_settings）自动还原已保存主题色；预览期间
-    /// 点回已保存主题 = 放弃预览（评审必改1：不能裸清 theme_preview）。
+    /// 点选主题即生效并落盘：已保存值同步更新、全部窗格立即换色、预览
+    /// 保存卡不再渲染；点回上一主题同样即时；关面板保持点选结果；不存在
+    /// 的主题不应用不落盘（热加载删除场景，同 commit 校验口径）。
     #[gpui::test]
-    fn theme_preview_applies_to_existing_panes_and_restores_on_close(cx: &mut TestAppContext) {
+    fn theme_selection_applies_and_persists_immediately(cx: &mut TestAppContext) {
         let (workspace, cx) = open_settings_panel(cx);
-        // 钉已知已保存主题：WorkspaceView::new 读开发者真实 settings.toml，
-        // 恢复目标不能写死 tokyo-night（评审必改2，否则随本机配置抖动）。
+        // 落盘必须走临时路径：persist_settings 未注入时会写真实配置目录
+        let dir =
+            std::env::temp_dir().join(format!("laterterm-theme-apply-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         workspace.update(cx, |view, cx| {
+            view.test_set_settings_save_path(dir.join("settings.toml"));
             view.settings.appearance.theme = "tokyo-night".into();
             view.apply_appearance(None, cx);
         });
@@ -15089,17 +15119,14 @@ mod settings_panel_tests {
             );
         });
         cx.run_until_parked();
-        // 色板预览卡常驻于「滚动与主题」分区块内部（六节对位约束）
-        assert!(
-            cx.debug_bounds("theme-preview-card").is_some(),
-            "主题色板预览卡必须在场"
-        );
+        // 色板卡常驻不消失；保存/还原按钮因 theme_preview 恒 None 不再渲染
+        // （按钮无独立 debug key，预览态清空即其消失语义，下方断言覆盖）
         workspace.read_with(cx, |view, cx| {
-            assert_eq!(view.theme_preview.as_deref(), Some("gruvbox-dark"));
             assert_eq!(
-                view.settings.appearance.theme, "tokyo-night",
-                "预览不得改动已保存值"
+                view.settings.appearance.theme, "gruvbox-dark",
+                "点选即写入已保存值"
             );
+            assert!(view.theme_preview.is_none(), "不再进入待保存预览态");
             let expected = gpui::Rgba::from(
                 super::palette_for(view.themes.resolve("gruvbox-dark")).background(),
             );
@@ -15107,74 +15134,54 @@ mod settings_panel_tests {
                 assert_eq!(
                     gpui::Rgba::from(pane.terminal.read(cx).config().colors.background()),
                     expected,
-                    "预览主题应立即应用到全部既有窗格"
+                    "全部窗格立即换色"
                 );
             }
         });
-        // 预览期间新建窗格应继承预览色（attach_pane 走 effective 读口）
+        let saved = laterterm_config::Settings::load(&dir.join("settings.toml")).unwrap();
+        assert_eq!(saved.appearance.theme, "gruvbox-dark", "主题必须已落盘");
+        // 点回 tokyo-night：同样立即生效
         workspace.update_in(cx, |view, window, cx| {
-            view.spawn_tab(window, cx);
+            view.preview_theme(&MouseDownEvent::default(), "tokyo-night".into(), window, cx);
         });
         workspace.read_with(cx, |view, cx| {
-            assert_eq!(view.panes.len(), 3, "初始窗格 + 两次新建");
+            assert_eq!(view.settings.appearance.theme, "tokyo-night");
             let expected = gpui::Rgba::from(
-                super::palette_for(view.themes.resolve("gruvbox-dark")).background(),
+                super::palette_for(view.themes.resolve("tokyo-night")).background(),
             );
             for pane in &view.panes {
                 assert_eq!(
                     gpui::Rgba::from(pane.terminal.read(cx).config().colors.background()),
                     expected,
-                    "预览期间新建窗格应与预览色一致"
+                    "点回上一主题立即恢复"
                 );
             }
         });
-        // 关闭（scrim/× 同一入口）：预览清空，窗格恢复已保存主题色
+        // 关面板：保持点选结果，无还原语义
         workspace.update_in(cx, |view, window, cx| {
             view.close_settings(&MouseDownEvent::default(), window, cx);
         });
         cx.run_until_parked();
-        workspace.read_with(cx, |view, cx| {
-            assert!(view.theme_preview.is_none(), "关面板必须自动还原预览");
-            let expected = gpui::Rgba::from(
-                super::palette_for(view.themes.resolve("tokyo-night")).background(),
-            );
-            for pane in &view.panes {
-                assert_eq!(
-                    gpui::Rgba::from(pane.terminal.read(cx).config().colors.background()),
-                    expected,
-                    "关面板应恢复已保存主题色"
-                );
-            }
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(view.settings.appearance.theme, "tokyo-night");
+            assert!(view.theme_preview.is_none());
         });
-        // 必改1回归：预览期间点回已保存主题 = 放弃预览（委托 cancel take+apply）
+        // 不存在的主题：不应用不落盘
         workspace.update_in(cx, |view, window, cx| {
             view.preview_theme(
                 &MouseDownEvent::default(),
-                "gruvbox-dark".into(),
+                "no-such-theme".into(),
                 window,
                 cx,
             );
-            assert_eq!(view.theme_preview.as_deref(), Some("gruvbox-dark"));
-            view.preview_theme(&MouseDownEvent::default(), "tokyo-night".into(), window, cx);
-        });
-        workspace.read_with(cx, |view, cx| {
-            assert!(view.theme_preview.is_none(), "点回已保存主题必须放弃预览");
-            let expected = gpui::Rgba::from(
-                super::palette_for(view.themes.resolve("tokyo-night")).background(),
-            );
-            for pane in &view.panes {
-                assert_eq!(
-                    gpui::Rgba::from(pane.terminal.read(cx).config().colors.background()),
-                    expected,
-                    "点回已保存主题应立即恢复已保存色"
-                );
-            }
         });
         workspace.read_with(cx, |view, _| {
+            assert_eq!(view.settings.appearance.theme, "tokyo-night");
             for pane in &view.panes {
                 pane.session.close();
             }
         });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 提交预览：落盘走 persist_settings 注入路径（不碰真实配置），内存态、
@@ -15232,10 +15239,10 @@ mod settings_panel_tests {
         });
     }
 
-    /// 预览不存在的主题名：resolve 静默回退默认主题（窗格仍是已保存主题色）；
-    /// commit 被 themes.get 严格校验拦截——不落盘、不落内存、预览清空并恢复。
+    /// 点选不存在的主题名（热加载删除场景）：直接不应用——已保存值不动、
+    /// 无预览态、窗格保持已保存主题色、绝不写盘。
     #[gpui::test]
-    fn theme_preview_missing_theme_falls_back_and_commit_does_not_persist(cx: &mut TestAppContext) {
+    fn missing_theme_is_not_applied_nor_persisted(cx: &mut TestAppContext) {
         let dir = std::env::temp_dir().join(format!(
             "laterterm-theme-missing-test-{}",
             std::process::id()
@@ -15257,35 +15264,10 @@ mod settings_panel_tests {
         });
         cx.run_until_parked();
         workspace.read_with(cx, |view, cx| {
-            assert_eq!(view.theme_preview.as_deref(), Some("no-such-theme"));
+            assert!(view.theme_preview.is_none(), "缺失主题不产生预览态");
             assert_eq!(
                 view.settings.appearance.theme, "tokyo-night",
-                "缺失主题的预览不得改动已保存值"
-            );
-            // resolve 回退目标 = DEFAULT_THEME（theme.rs 硬编码，环境无关）
-            let expected = gpui::Rgba::from(
-                super::palette_for(view.themes.resolve(laterterm_config::DEFAULT_THEME))
-                    .background(),
-            );
-            for pane in &view.panes {
-                assert_eq!(
-                    gpui::Rgba::from(pane.terminal.read(cx).config().colors.background()),
-                    expected,
-                    "缺失主题的预览应回退默认主题色"
-                );
-            }
-        });
-        workspace.update_in(cx, |view, window, cx| {
-            view.commit_theme_preview(&MouseDownEvent::default(), window, cx);
-        });
-        workspace.read_with(cx, |view, cx| {
-            assert!(
-                view.theme_preview.is_none(),
-                "缺失主题的 commit 必须清空预览"
-            );
-            assert_eq!(
-                view.settings.appearance.theme, "tokyo-night",
-                "缺失主题的 commit 不得落内存"
+                "缺失主题不得改动已保存值"
             );
             let expected = gpui::Rgba::from(
                 super::palette_for(view.themes.resolve("tokyo-night")).background(),
@@ -15294,14 +15276,11 @@ mod settings_panel_tests {
                 assert_eq!(
                     gpui::Rgba::from(pane.terminal.read(cx).config().colors.background()),
                     expected,
-                    "缺失主题的 commit 应恢复已保存主题色"
+                    "缺失主题不应用：窗格保持已保存主题色"
                 );
             }
         });
-        assert!(
-            !dir.join("settings.toml").exists(),
-            "缺失主题的 commit 绝不能写盘"
-        );
+        assert!(!dir.join("settings.toml").exists(), "缺失主题绝不能写盘");
         let _ = std::fs::remove_dir_all(&dir);
         workspace.read_with(cx, |view, _| {
             for pane in &view.panes {
@@ -15317,8 +15296,13 @@ mod settings_panel_tests {
     fn theme_reset_discards_preview_even_when_change_setting_early_returns(
         cx: &mut TestAppContext,
     ) {
+        let dir =
+            std::env::temp_dir().join(format!("laterterm-theme-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
         let (workspace, cx) = open_settings_panel(cx);
         workspace.update(cx, |view, cx| {
+            view.test_set_settings_save_path(dir.join("settings.toml"));
             // 外观钉成默认值：触发 change_setting 的等值早退分支（不落盘不 apply）
             view.settings.appearance = laterterm_config::Appearance::default();
             view.apply_appearance(None, cx);
@@ -15330,7 +15314,10 @@ mod settings_panel_tests {
                 window,
                 cx,
             );
-            assert_eq!(view.theme_preview.as_deref(), Some("gruvbox-dark"));
+            assert_eq!(
+                view.settings.appearance.theme, "gruvbox-dark",
+                "点选即生效：已保存值先落到 gruvbox"
+            );
             view.reset_settings(&MouseDownEvent::default(), window, cx);
         });
         cx.run_until_parked();
