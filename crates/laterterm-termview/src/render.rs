@@ -35,6 +35,17 @@
 //! 4. **Cell Measurement**: Font metrics are measured once from a common ASCII
 //!    sample and cached for consistent cell dimensions.
 //!
+//! 5. **竖直 run 合并**：盒线字符的竖直分量按列跨行合并为单段（帧级列状态
+//!    [`TerminalRenderer::vrun_state`]），tmux 边框/树形的 │├└ 从逐格绘制
+//!    变为一次整段绘制；端点收缩见 [`box_drawing::vertical_run_extent`]。
+//!
+//! 6. **轴对齐段 quad 化**：盒线水平/垂直段走 `paint_quad` 直绘（floor/ceil
+//!    整像素对齐），零 tessellation；仅斜线与圆角曲线保留路径构建。
+//!
+//! 7. **逐帧零分配**：Font 8 槽缓存（family/fallbacks 仅重建时分配）、颜色
+//!    解析 memo（帧内 Vec 线性查，[`resolve_cached`]）、行级布局缓冲
+//!    （[`RowScratch`] 每行 clear 复用）全部跨行/跨槽位复用。
+//!
 //! # Cell Dimensions
 //!
 //! Cell size is calculated from actual font metrics:
@@ -79,6 +90,7 @@ use gpui::{
     App, Bounds, Edges, Font, FontFallbacks, FontFeatures, FontStyle, FontWeight, Hsla, Pixels,
     Point, SharedString, Size, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
 };
+use std::cell::RefCell;
 
 /// 一次绘制期的可见网格快照。
 ///
@@ -519,6 +531,41 @@ impl BackgroundRect {
     }
 }
 
+/// 行级布局缓冲：paint 循环外创建一次、每行 [`RowScratch::clear`] 复用
+///（与快照缓冲池同款），布局阶段稳态帧不再逐行分配 Vec/String。
+#[derive(Default)]
+pub struct RowScratch {
+    /// 本行合并后的背景矩形
+    backgrounds: Vec<BackgroundRect>,
+    /// 本行分批后的文本 run（第三遍绘制时被 drain，容量保留）
+    text_runs: Vec<BatchedTextRun>,
+    /// 新 run 首字符的暂存缓冲：clear + push 后整体移交 run（`mem::take`），
+    /// 消除逐格 `ch.to_string()` 分配；断点改为整体移交后不再有 run 克隆
+    text: String,
+    /// 第一遍水平 span 的列覆盖位图（替代逐行 HashSet；clear+resize 复用）
+    horizontal_flags: Vec<bool>,
+}
+
+impl RowScratch {
+    /// 清空全部行级缓冲（容量保留，供下一行复用）。
+    pub fn clear(&mut self) {
+        self.backgrounds.clear();
+        self.text_runs.clear();
+        self.text.clear();
+        self.horizontal_flags.clear();
+    }
+
+    /// 本行背景矩形（布局后只读视图）。
+    pub fn backgrounds(&self) -> &[BackgroundRect] {
+        &self.backgrounds
+    }
+
+    /// 本行文本 run（布局后只读视图；第三遍绘制时会被 drain）。
+    pub fn text_runs(&self) -> &[BatchedTextRun] {
+        &self.text_runs
+    }
+}
+
 /// Terminal renderer with font settings and cell dimensions.
 ///
 /// This struct manages the rendering of terminal content, including text,
@@ -594,6 +641,19 @@ pub struct TerminalRenderer {
 
     /// Whether cell metrics need to be measured again.
     needs_measurement: bool,
+
+    /// 连字/粗体/斜体 8 槽字体缓存（槽位索引见 [`font_slot_index`]）。
+    /// 命中时每 text run 不再重建 family String 与 FontFallbacks。
+    fonts: RefCell<[Option<Font>; 8]>,
+
+    /// 字体缓存置脏：family/fallbacks/resolved_family 变化时置位。重建收敛
+    /// 于本文件内两处——[`Self::invalidate_measurement`]（view 层设置变化
+    /// 的唯一入口）与 [`Self::measure_cell`] 的探测落定点，view 层零改动。
+    fonts_dirty: std::cell::Cell<bool>,
+
+    /// 帧级竖直 run 列状态（每列一槽）：paint 入口按列数 clear+resize，
+    /// 容量跨帧保留；RefCell 因 paint_frame 为 `&self`。
+    vrun_state: RefCell<Vec<Option<VPending>>>,
 }
 
 /// 探测一个 family 是否可用且为真等宽。
@@ -676,6 +736,121 @@ fn platform_monospace_candidates() -> Vec<String> {
     }
 }
 
+/// 帧内颜色解析 memo 表：`(终端色, 已解析 Hsla)` 线性小表。
+///
+/// vte 0.15 的 `ansi::Color` 只派生 `Debug, Clone, Copy, PartialEq, Eq`
+///（无 `Hash`），HashMap 方案不成立；终端一帧的唯一色通常几十个，线性扫
+/// 低于建表 + 哈希成本且零额外分配。生命周期为单帧：paint 入口创建、
+/// 帧末随栈帧释放；`colors`（OSC 覆盖快照）一帧内不变，故仅以终端色为
+/// 键即帧内一致。
+pub type ColorMemo = Vec<(Color, Hsla)>;
+
+/// 带帧内 memo 的颜色解析：命中直接返回，未命中 `palette.resolve` 后入表。
+fn resolve_cached(
+    memo: &mut ColorMemo,
+    palette: &ColorPalette,
+    color: Color,
+    colors: &Colors,
+) -> Hsla {
+    if let Some((_, resolved)) = memo.iter().find(|(c, _)| c == &color) {
+        return *resolved;
+    }
+    let resolved = palette.resolve(color, colors);
+    memo.push((color, resolved));
+    resolved
+}
+
+/// 字体缓存槽位索引：bit0=bold、bit1=italic、bit2=ligatures（共 8 组合）。
+#[inline]
+fn font_slot_index(bold: bool, italic: bool, ligatures: bool) -> usize {
+    bold as usize | ((italic as usize) << 1) | ((ligatures as usize) << 2)
+}
+
+/// Font 构造唯一入口：连字/粗体/斜体均显式传参，不隐式读渲染器运行时状态。
+/// family 与备选链由调用方决定（缓存重建时才分配 String/Vec）。
+fn build_font(
+    family: &str,
+    fallbacks: &[String],
+    ligatures: bool,
+    bold: bool,
+    italic: bool,
+) -> Font {
+    Font {
+        family: family.to_string().into(),
+        features: if ligatures {
+            FontFeatures::default()
+        } else {
+            FontFeatures::disable_ligatures()
+        },
+        fallbacks: if fallbacks.is_empty() {
+            None
+        } else {
+            Some(FontFallbacks::from_fonts(fallbacks.to_vec()))
+        },
+        weight: if bold {
+            FontWeight::BOLD
+        } else {
+            FontWeight::NORMAL
+        },
+        style: if italic {
+            FontStyle::Italic
+        } else {
+            FontStyle::Normal
+        },
+    }
+}
+
+/// 竖直 run 合并的列级 pending：一列中尚未冲刷的连续竖线段。
+#[derive(Clone)]
+struct VPending {
+    /// run 首格上缘的视口 y（含滚动偏移）
+    start_y: Pixels,
+    /// 竖直分量粗细（整段一致）
+    weight: box_drawing::LineWeight,
+    /// 前景色（整段一致）
+    color: Hsla,
+    /// 首格 segments.top 是否存在（true=起点贴首格上缘；false=退到首格中心）
+    top_extends: bool,
+    /// 已扫入末格 segments.bottom 是否存在（冲刷时决定终点是否退半格）
+    bottom_extends: bool,
+    /// run 首格行号（计算末格上缘用）
+    first_row: usize,
+    /// 期望的下一行号（= 已扫入末行 + 1；行连续性判定）
+    next_row: usize,
+}
+
+/// 冲刷一列的竖直 run：按首/末格端点收缩（[`box_drawing::vertical_run_extent`]）
+/// 整段绘制，槽位随即清空。空槽为无操作。
+fn flush_vrun(
+    vrun: &mut [Option<VPending>],
+    col: usize,
+    origin: Point<Pixels>,
+    cell_width: Pixels,
+    cell_height: Pixels,
+    window: &mut Window,
+) {
+    let Some(pending) = vrun[col].take() else {
+        return;
+    };
+    let rows_spanned = (pending.next_row - pending.first_row) as f32;
+    // 末格上缘 y = 首格上缘 + (段内行数 - 1) × 格高
+    let last_top = pending.start_y + cell_height * (rows_spanned - 1.0);
+    let (start_frac, end_frac) =
+        box_drawing::vertical_run_extent(pending.top_extends, pending.bottom_extends);
+    let start_y = pending.start_y + cell_height * f32::from(start_frac);
+    let end_y = last_top + cell_height * f32::from(end_frac);
+    let cx = origin.x + cell_width * (col as f32 + 0.5);
+    box_drawing::draw_vertical_span(
+        cx,
+        start_y,
+        end_y,
+        pending.weight,
+        cell_width,
+        pending.color,
+        window,
+    );
+}
+
 impl TerminalRenderer {
     /// Creates a new terminal renderer with the given font settings and color palette.
     ///
@@ -739,47 +914,54 @@ impl TerminalRenderer {
             resolved_family: None,
             fallback_notice_emitted: false,
             needs_measurement: true,
+            fonts: RefCell::new([const { None }; 8]),
+            fonts_dirty: std::cell::Cell::new(false),
+            vrun_state: RefCell::new(Vec::new()),
         }
     }
 
-    /// 按样式构造字体：应用连字开关与备选字体链。
+    /// 按样式取字体（带 8 槽缓存）。
     ///
-    /// 渲染器所有 Font 构造点（测量/批量文本）都走这里，保证设置一致。
-    /// family 取 [`Self::resolved_family`]（用户字体不可用时探测选定），
-    /// 未探测过则用用户配置值。
+    /// 查询侧读 [`Self::ligatures`] **选槽**（运行时状态）；重建侧
+    /// [`Self::construct_slot_font`] 按槽位自身的 ligatures 位构造（缓存
+    /// 内容）——两侧职责分离：连字翻转只是换槽，旧槽内容原样保留可复用，
+    /// features 永远与所在槽位一致。命中时零分配（family String 与
+    /// FontFallbacks 仅在重建时构造一次）。
     pub fn font_for(&self, bold: bool, italic: bool) -> Font {
+        if self.fonts_dirty.get() {
+            // 置脏自闭合：family/fallbacks/resolved_family 变化统一在此生效
+            let mut slots = self.fonts.borrow_mut();
+            for slot in slots.iter_mut() {
+                *slot = None;
+            }
+            drop(slots);
+            self.fonts_dirty.set(false);
+        }
+        let idx = font_slot_index(bold, italic, self.ligatures);
+        if let Some(font) = self.fonts.borrow()[idx].clone() {
+            return font;
+        }
+        let font = self.construct_slot_font(idx);
+        self.fonts.borrow_mut()[idx] = Some(font.clone());
+        font
+    }
+
+    /// 按槽位构造 Font（重建侧）：features 必须由**该槽自身的 ligatures 位**
+    ///（idx bit2）决定，禁止读 self.ligatures——ligatures 变更不触发
+    /// invalidate_measurement（连字不影响单元格度量，view 层有意不重测），
+    /// 若重建读运行时值，连字切换后 8 槽 features 一起错且永不自愈。
+    fn construct_slot_font(&self, idx: usize) -> Font {
         let family = self
             .resolved_family
             .clone()
             .unwrap_or_else(|| self.font_family.clone());
-        self.font_for_family(&family, bold, italic)
-    }
-
-    /// 指定 family 构造字体（连字/备选链与 [`Self::font_for`] 同口径）。
-    fn font_for_family(&self, family: &str, bold: bool, italic: bool) -> Font {
-        Font {
-            family: family.to_string().into(),
-            features: if self.ligatures {
-                FontFeatures::default()
-            } else {
-                FontFeatures::disable_ligatures()
-            },
-            fallbacks: if self.font_fallbacks.is_empty() {
-                None
-            } else {
-                Some(FontFallbacks::from_fonts(self.font_fallbacks.clone()))
-            },
-            weight: if bold {
-                FontWeight::BOLD
-            } else {
-                FontWeight::NORMAL
-            },
-            style: if italic {
-                FontStyle::Italic
-            } else {
-                FontStyle::Normal
-            },
-        }
+        build_font(
+            &family,
+            &self.font_fallbacks,
+            idx & 0b100 != 0,
+            idx & 0b001 != 0,
+            idx & 0b010 != 0,
+        )
     }
 
     /// Whether the renderer needs fresh font metrics.
@@ -795,8 +977,12 @@ impl TerminalRenderer {
     }
 
     /// Mark the cached cell metrics as stale.
+    ///
+    /// 同步置脏 8 槽字体缓存：view 层的 family/fallbacks 变化统一走这里
+    ///（view.rs 仅有的两处调用点），缓存失效不需要 view 层感知。
     pub fn invalidate_measurement(&mut self) {
         self.needs_measurement = true;
+        self.fonts_dirty.set(true);
     }
 
     /// Measure cell dimensions based on actual font metrics.
@@ -829,7 +1015,7 @@ impl TerminalRenderer {
             {
                 continue;
             }
-            let font = self.font_for_family(family, false, false);
+            let font = build_font(family, &self.font_fallbacks, self.ligatures, false, false);
             if let Some((advance, ascent, descent)) = probe_monospace(window, &font, self.font_size)
             {
                 selected = Some((family.clone(), advance, ascent, descent));
@@ -864,6 +1050,9 @@ impl TerminalRenderer {
                 self.cell_height = line_height * self.line_height_multiplier.max(0.1);
             }
             self.resolved_family = None;
+            // 探测落定也是字体缓存的失效点：resolved_family 变化（含 Some→None）
+            // 必须让 8 槽在下一次 font_for 重建
+            self.fonts_dirty.set(true);
             self.needs_measurement = false;
             return;
         };
@@ -876,6 +1065,8 @@ impl TerminalRenderer {
             self.fallback_notice_emitted = true;
         }
         self.resolved_family = Some(family);
+        // 探测落定：resolved_family 变化必须让 8 槽字体缓存重建
+        self.fonts_dirty.set(true);
         self.cell_width = advance;
         let line_height = (ascent + descent).ceil();
         if line_height > px(0.0) {
@@ -898,21 +1089,21 @@ impl TerminalRenderer {
     ///   签名自快照改造起由 `(usize, Cell)` 有意变更为 `(usize, &Cell)`，
     ///   工作区内唯一调用方为 [`Self::paint_frame`]）
     /// * `colors` - Terminal color configuration
-    ///
-    /// # Returns
-    ///
-    /// A tuple of `(backgrounds, text_runs)` where:
-    /// - `backgrounds` is a vector of merged background rectangles
-    /// - `text_runs` is a vector of batched text runs
+    /// * `memo` - 帧内颜色解析 memo（跨行复用，随帧释放）
+    /// * `scratch` - 行级布局缓冲：入口清空（容量保留）、填充后经只读
+    ///   访问器 [`RowScratch::backgrounds`] / [`RowScratch::text_runs`]
+    ///   取用；调用方跨行复用同一实例
     pub fn layout_row<'a>(
         &self,
         row: usize,
         cells: impl Iterator<Item = (usize, &'a Cell)>,
         colors: &Colors,
         default_bg: Hsla,
-    ) -> (Vec<BackgroundRect>, Vec<BatchedTextRun>) {
-        let mut backgrounds = Vec::new();
-        let mut text_runs = Vec::new();
+        memo: &mut ColorMemo,
+        scratch: &mut RowScratch,
+    ) {
+        // 行级缓冲复用：清空（容量保留）后填充
+        scratch.clear();
 
         let mut current_run: Option<BatchedTextRun> = None;
         let mut current_bg: Option<BackgroundRect> = None;
@@ -921,14 +1112,14 @@ impl TerminalRenderer {
             // Skip wide-character spacers; the leading cell owns both columns.
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                 if let Some(run) = current_run.take() {
-                    text_runs.push(run);
+                    scratch.text_runs.push(run);
                 }
                 continue;
             }
 
-            // Extract cell styling
-            let fg_color = self.palette.resolve(cell.fg, colors);
-            let bg_color = self.palette.resolve(cell.bg, colors);
+            // Extract cell styling（帧内 memo：命中零成本）
+            let fg_color = resolve_cached(memo, &self.palette, cell.fg, colors);
+            let bg_color = resolve_cached(memo, &self.palette, cell.bg, colors);
             let bold = cell.flags.contains(Flags::BOLD);
             let italic = cell.flags.contains(Flags::ITALIC);
             // SGR 4:0~4:5 五种下划线形态（bitflags 并存时按直线优先的固定
@@ -950,7 +1141,7 @@ impl TerminalRenderer {
             //（由绘制侧 unwrap_or(fg_color) 兜底，同 xterm 口径）
             let underline_color = cell
                 .underline_color()
-                .map(|color| self.palette.resolve(color, colors));
+                .map(|color| resolve_cached(memo, &self.palette, color, colors));
 
             // Get the character (or space if empty)
             let ch = if cell.c == ' ' || cell.c == '\0' {
@@ -962,13 +1153,13 @@ impl TerminalRenderer {
             // 默认背景由整行底色覆盖，不创建逐格背景矩形。
             if bg_color == default_bg {
                 if let Some(bg_rect) = current_bg.take() {
-                    backgrounds.push(bg_rect);
+                    scratch.backgrounds.push(bg_rect);
                 }
             } else if let Some(ref mut bg_rect) = current_bg {
                 if bg_rect.color == bg_color && bg_rect.end_col == col {
                     bg_rect.end_col = col + 1;
                 } else {
-                    backgrounds.push(bg_rect.clone());
+                    scratch.backgrounds.push(bg_rect.clone());
                     current_bg = Some(BackgroundRect {
                         start_col: col,
                         end_col: col + 1,
@@ -988,7 +1179,7 @@ impl TerminalRenderer {
             // 空格只由背景层覆盖，不需要进入字体整形；空白处也切断文本 run。
             if ch == ' ' || ch == '\0' {
                 if let Some(run) = current_run.take() {
-                    text_runs.push(run);
+                    scratch.text_runs.push(run);
                 }
                 continue;
             }
@@ -996,27 +1187,34 @@ impl TerminalRenderer {
             // Handle text runs; custom box-drawing passes own these glyphs.
             if box_drawing::is_box_drawing_char(cell.c) {
                 if let Some(run) = current_run.take() {
-                    text_runs.push(run);
+                    scratch.text_runs.push(run);
                 }
                 continue;
             }
-            if let Some(ref mut run) = current_run {
-                if run.fg_color == fg_color
-                    && run.bg_color == bg_color
-                    && run.bold == bold
-                    && run.italic == italic
-                    && run.underline == underline
-                    && run.underline_color == underline_color
-                    && run.end_col == col
+            match current_run.take() {
+                Some(mut run)
+                    if run.fg_color == fg_color
+                        && run.bg_color == bg_color
+                        && run.bold == bold
+                        && run.italic == italic
+                        && run.underline == underline
+                        && run.underline_color == underline_color
+                        && run.end_col == col =>
                 {
-                    // Extend current run
+                    // Extend current run（原地追加，零分配）
                     run.text.push(ch);
                     run.end_col = col + char_columns(ch);
-                } else {
-                    // Save current run and start new one
-                    text_runs.push(run.clone());
+                    current_run = Some(run);
+                }
+                Some(run) => {
+                    // 断点：旧 run 整体移入列表（消除 run.clone() 的 O(n)
+                    // 深拷贝）；新 run 首字符走暂存缓冲——clear + push 后
+                    // mem::take 整体移交，消除逐格 ch.to_string() 分配
+                    scratch.text_runs.push(run);
+                    scratch.text.clear();
+                    scratch.text.push(ch);
                     current_run = Some(BatchedTextRun {
-                        text: ch.to_string(),
+                        text: std::mem::take(&mut scratch.text),
                         start_col: col,
                         end_col: col + char_columns(ch),
                         row,
@@ -1028,68 +1226,58 @@ impl TerminalRenderer {
                         underline_color,
                     });
                 }
-            } else {
-                // Start new run
-                current_run = Some(BatchedTextRun {
-                    text: ch.to_string(),
-                    start_col: col,
-                    end_col: col + char_columns(ch),
-                    row,
-                    fg_color,
-                    bg_color,
-                    bold,
-                    italic,
-                    underline,
-                    underline_color,
-                });
+                None => {
+                    // Start new run（同断点路径：暂存缓冲整体移交）
+                    scratch.text.clear();
+                    scratch.text.push(ch);
+                    current_run = Some(BatchedTextRun {
+                        text: std::mem::take(&mut scratch.text),
+                        start_col: col,
+                        end_col: col + char_columns(ch),
+                        row,
+                        fg_color,
+                        bg_color,
+                        bold,
+                        italic,
+                        underline,
+                        underline_color,
+                    });
+                }
             }
         }
 
         // Push final run and background
         if let Some(run) = current_run {
-            text_runs.push(run);
+            scratch.text_runs.push(run);
         }
         if let Some(bg) = current_bg {
-            backgrounds.push(bg);
+            scratch.backgrounds.push(bg);
         }
 
-        // Merge adjacent backgrounds with same color
-        let merged_backgrounds = self.merge_backgrounds(backgrounds);
-
-        (merged_backgrounds, text_runs)
+        // Merge adjacent backgrounds with same color（原地合并，复用缓冲容量）
+        self.merge_backgrounds(&mut scratch.backgrounds);
     }
 
-    /// Merge adjacent background rects with same color.
+    /// Merge adjacent background rects with same color（原地）。
     ///
     /// This optimization reduces the number of rectangles to paint by
     /// combining horizontally adjacent rectangles that share the same color.
-    ///
-    /// # Arguments
-    ///
-    /// * `rects` - Vector of background rectangles to merge
-    ///
-    /// # Returns
-    ///
-    /// A new vector with merged rectangles
-    fn merge_backgrounds(&self, mut rects: Vec<BackgroundRect>) -> Vec<BackgroundRect> {
-        if rects.is_empty() {
-            return rects;
+    /// 双指针原地压实，不新分配 Vec（调用方缓冲跨行复用）。
+    fn merge_backgrounds(&self, rects: &mut Vec<BackgroundRect>) {
+        if rects.len() < 2 {
+            return;
         }
 
-        let mut merged = Vec::new();
-        let mut current = rects.remove(0);
-
-        for rect in rects {
-            if current.can_merge_with(&rect) {
-                current.end_col = rect.end_col;
+        let mut write = 0;
+        for read in 1..rects.len() {
+            if rects[write].can_merge_with(&rects[read]) {
+                rects[write].end_col = rects[read].end_col;
             } else {
-                merged.push(current);
-                current = rect;
+                write += 1;
+                rects[write] = rects[read].clone();
             }
         }
-
-        merged.push(current);
-        merged
+        rects.truncate(write + 1);
     }
 
     /// Paint terminal content to the window.
@@ -1157,6 +1345,19 @@ impl TerminalRenderer {
             colors,
         );
 
+        // 帧内颜色解析 memo：随帧创建/释放（终端唯一色几十个，线性查即可）
+        let mut color_memo: ColorMemo = Vec::new();
+
+        // 帧级竖直 run 列状态：按列数 clear+resize（容量跨帧保留，逐帧零分配）
+        {
+            let mut vrun = self.vrun_state.borrow_mut();
+            vrun.clear();
+            vrun.resize_with(frame.columns, || None);
+        }
+
+        // 行级布局缓冲：循环外创建一次，每行 layout_row 入口 clear() 复用
+        let mut scratch = RowScratch::default();
+
         // Paint default background (covers full bounds including padding)
         // 透明模式（background_opacity<1）跳绘：窗口底色由宿主层以主题
         // background 原色@o 承载，此处再画满幅底色会叠高有效 alpha
@@ -1185,12 +1386,19 @@ impl TerminalRenderer {
             let row_cells = &frame.cells[line_idx];
 
             // Layout the row once; text runs are shaped in batches below.
-            // 借用迭代：消除快照前「进 cells Vec 一次 + 值迭代再 clone 一次」的第二遍复制。
-            let (backgrounds, text_runs) =
-                self.layout_row(line_idx, row_cells.iter().enumerate(), colors, default_bg);
+            // 借用迭代：消除快照前「进 cells Vec 一次 + 值迭代再 clone 一次」的第二遍复制；
+            // 行级缓冲经 scratch 复用（每行 clear，容量保留）。
+            self.layout_row(
+                line_idx,
+                row_cells.iter().enumerate(),
+                colors,
+                default_bg,
+                &mut color_memo,
+                &mut scratch,
+            );
 
             // Paint backgrounds
-            for bg_rect in backgrounds {
+            for bg_rect in scratch.backgrounds() {
                 // Skip if it's the default background color
                 if bg_rect.color == default_bg {
                     continue;
@@ -1229,8 +1437,9 @@ impl TerminalRenderer {
 
             // First pass: find and draw horizontal spans of box-drawing characters
             // This draws continuous lines across multiple cells to avoid gaps
-            let mut processed_horizontal: std::collections::HashSet<usize> =
-                std::collections::HashSet::new();
+            // 列覆盖改用位图（clear+resize 复用缓冲），替代逐行 HashSet 分配
+            scratch.horizontal_flags.clear();
+            scratch.horizontal_flags.resize(row_cells.len(), false);
 
             let mut i = 0;
             while i < row_cells.len() {
@@ -1240,7 +1449,7 @@ impl TerminalRenderer {
 
                 // Check if this starts a horizontal span
                 if let Some(weight) = box_drawing::get_horizontal_weight(ch) {
-                    let fg_color = self.palette.resolve(cell.fg, colors);
+                    let fg_color = resolve_cached(&mut color_memo, &self.palette, cell.fg, colors);
                     let start_col = col_idx;
                     let mut end_col = col_idx;
 
@@ -1254,7 +1463,8 @@ impl TerminalRenderer {
                             break;
                         }
                         // Must have same horizontal weight and same color
-                        let next_fg = self.palette.resolve(next_cell.fg, colors);
+                        let next_fg =
+                            resolve_cached(&mut color_memo, &self.palette, next_cell.fg, colors);
                         if box_drawing::get_horizontal_weight(next_cell.c) == Some(weight)
                             && next_fg == fg_color
                         {
@@ -1281,7 +1491,7 @@ impl TerminalRenderer {
 
                     // Mark these columns as having horizontal drawn
                     for col in start_col..=end_col {
-                        processed_horizontal.insert(col);
+                        scratch.horizontal_flags[col] = true;
                     }
 
                     // Skip past this span
@@ -1291,18 +1501,93 @@ impl TerminalRenderer {
                 i += 1;
             }
 
-            // Second pass: draw vertical components and non-horizontal box chars
-            for (col_idx, cell) in row_cells.iter().enumerate() {
-                let ch = cell.c;
+            // Second pass: 竖直分量按列跨行合并（帧级列状态 vrun_state），
+            // 同列相邻格粗细/颜色一致即延长，冲刷时整段 draw_vertical_span
+            //（消除逐格 tessellation/逐格 quad）；不参与合并的残段逐格走
+            // 原路径，绘制语义与逐格口径一致（几何对照见 box_drawing 单测）。
+            {
+                let mut vrun = self.vrun_state.borrow_mut();
+                for (col_idx, cell) in row_cells.iter().enumerate() {
+                    let ch = cell.c;
 
-                if ch == ' ' || ch == '\0' {
-                    continue;
-                }
+                    // 空格/普通字符：切断该列 run（y 不连续）；普通字符本体
+                    // 由第三遍文本 run 绘制
+                    if ch == ' ' || ch == '\0' || !box_drawing::is_box_drawing_char(ch) {
+                        flush_vrun(
+                            &mut vrun,
+                            col_idx,
+                            origin,
+                            self.cell_width,
+                            self.cell_height,
+                            window,
+                        );
+                        continue;
+                    }
 
-                let x = origin.x + self.cell_width * (col_idx as f32);
-                let fg_color = self.palette.resolve(cell.fg, colors);
+                    // 圆角（╭╮╯╰）是曲线字符：短路在 v_weight 计算之前——
+                    // corner 的竖直半边若并入 run 会被画成直线端点，弧线退化
+                    // 成直角（draw_rounded_corner 仅 draw_box_character 可达）。
+                    // 与旧逐格路径同口径：冲刷该列 pending 后整格走
+                    // draw_box_character 画二次曲线，不新起 pending。圆角横段
+                    // 是单侧的（corner_tl: left=None/right=Some），不满足
+                    // get_horizontal_weight 的双侧同粗判定，永不进第一遍水平
+                    // 位图，无需判 horizontal_flags
+                    if box_drawing::is_rounded_corner(ch) {
+                        flush_vrun(
+                            &mut vrun,
+                            col_idx,
+                            origin,
+                            self.cell_width,
+                            self.cell_height,
+                            window,
+                        );
+                        box_drawing::draw_box_character(
+                            ch,
+                            Bounds {
+                                origin: Point {
+                                    x: origin.x + self.cell_width * (col_idx as f32),
+                                    y: y_base,
+                                },
+                                size: Size {
+                                    width: self.cell_width,
+                                    height: self.cell_height,
+                                },
+                            },
+                            resolve_cached(&mut color_memo, &self.palette, cell.fg, colors),
+                            self.cell_width,
+                            window,
+                        );
+                        continue;
+                    }
 
-                if box_drawing::is_box_drawing_char(ch) {
+                    // 斜线/曲线字符（get_box_segments 返回 None）：不参与
+                    // 合并，也不在此补段——与历史逐格路径一致（原
+                    // draw_box_character 对 None 直接返回，不产出墨迹），
+                    // 仅需冲刷该列 pending
+                    let Some(segments) = box_drawing::get_box_segments(ch) else {
+                        flush_vrun(
+                            &mut vrun,
+                            col_idx,
+                            origin,
+                            self.cell_width,
+                            self.cell_height,
+                            window,
+                        );
+                        continue;
+                    };
+
+                    let fg_color = resolve_cached(&mut color_memo, &self.palette, cell.fg, colors);
+
+                    // 竖直分量粗细：上下等粗取该粗细；半线取单边粗细；
+                    // 异粗（╿ 等）无法并入单粗细 run，走逐格原路径
+                    let v_weight = match (segments.top, segments.bottom) {
+                        (Some(t), Some(b)) if t == b => Some(t),
+                        (Some(t), None) => Some(t),
+                        (None, Some(b)) => Some(b),
+                        _ => None,
+                    };
+
+                    let x = origin.x + self.cell_width * (col_idx as f32);
                     let cell_bounds = Bounds {
                         origin: Point { x, y: y_base },
                         size: Size {
@@ -1311,32 +1596,98 @@ impl TerminalRenderer {
                         },
                     };
 
-                    if processed_horizontal.contains(&col_idx) {
-                        // Horizontal already drawn, just draw vertical components
-                        box_drawing::draw_vertical_components(
-                            ch,
-                            cell_bounds,
-                            fg_color,
-                            self.cell_width,
-                            window,
-                        );
-                    } else {
-                        // Not part of a horizontal span, draw the whole character
-                        box_drawing::draw_box_character(
-                            ch,
-                            cell_bounds,
-                            fg_color,
-                            self.cell_width,
-                            window,
-                        );
+                    match v_weight {
+                        Some(weight) => {
+                            // 与该列 pending 同粗细同色且行连续 → 延长。
+                            // 延长格必须上下贯通（top&bottom 均存在）：半线/
+                            // 角格只作 run 的首/末格（端点收缩半格），作中段
+                            // 会让整段覆盖其空白半格、偏离逐格墨迹并集
+                            let joins = segments.top.is_some()
+                                && segments.bottom.is_some()
+                                && match &vrun[col_idx] {
+                                    Some(pending) => {
+                                        pending.weight == weight
+                                            && pending.color == fg_color
+                                            && pending.next_row == line_idx
+                                    }
+                                    None => false,
+                                };
+                            if joins {
+                                let pending = vrun[col_idx].as_mut().expect("joins 已判定槽位存在");
+                                pending.bottom_extends = segments.bottom.is_some();
+                                pending.next_row = line_idx + 1;
+                            } else {
+                                // 粗细/颜色变化或 y 不连续：冲刷旧段并起新段
+                                //（被水平位图覆盖的格同样只以竖直分量入段）
+                                flush_vrun(
+                                    &mut vrun,
+                                    col_idx,
+                                    origin,
+                                    self.cell_width,
+                                    self.cell_height,
+                                    window,
+                                );
+                                vrun[col_idx] = Some(VPending {
+                                    start_y: y_base,
+                                    weight,
+                                    color: fg_color,
+                                    top_extends: segments.top.is_some(),
+                                    bottom_extends: segments.bottom.is_some(),
+                                    first_row: line_idx,
+                                    next_row: line_idx + 1,
+                                });
+                            }
+                            // 本格竖直分量已并入 run（冲刷时整段绘制）；这里
+                            // 只补画第一遍未覆盖的水平残段（如 ┌ 的右短横）
+                            if !scratch.horizontal_flags[col_idx] {
+                                box_drawing::draw_horizontal_components(
+                                    ch,
+                                    cell_bounds,
+                                    fg_color,
+                                    self.cell_width,
+                                    window,
+                                );
+                            }
+                        }
+                        None => {
+                            // 异粗竖直：冲刷后逐格原路径（内部分段粗细不同）
+                            flush_vrun(
+                                &mut vrun,
+                                col_idx,
+                                origin,
+                                self.cell_width,
+                                self.cell_height,
+                                window,
+                            );
+                            if scratch.horizontal_flags[col_idx] {
+                                // Horizontal already drawn, just draw vertical components
+                                box_drawing::draw_vertical_components(
+                                    ch,
+                                    cell_bounds,
+                                    fg_color,
+                                    self.cell_width,
+                                    window,
+                                );
+                            } else {
+                                // Not part of a horizontal span, draw the whole character
+                                box_drawing::draw_box_character(
+                                    ch,
+                                    cell_bounds,
+                                    fg_color,
+                                    self.cell_width,
+                                    window,
+                                );
+                            }
+                        }
                     }
-                    continue;
                 }
             }
 
             // Third pass: shape and paint contiguous regular-text runs at once.
             // This avoids one rustybuzz/cosmic-text shaping call per cell per pane.
-            for run in text_runs {
+            // drain 整体移出：run 的 String 直接移交 shape_line（SharedString），
+            // 零克隆；Vec 容量随 drain 保留供下一行复用。
+            for run in scratch.text_runs.drain(..) {
                 let font = self.font_for(run.bold, run.italic);
                 // 直线/波浪走字形下划线（gpui Underline primitive 原生 GPU
                 // 渲染）；颜色回退前景色（SGR 59 未指定时的 xterm 同款口径）。
@@ -1403,6 +1754,22 @@ impl TerminalRenderer {
                     }
                     _ => {}
                 }
+            }
+        }
+
+        // 帧末：冲刷全部列残余竖直 run（扫到最后一行仍未断链的段），
+        // 光标之前绘制，保持光标在网格内容之上
+        {
+            let mut vrun = self.vrun_state.borrow_mut();
+            for col in 0..vrun.len() {
+                flush_vrun(
+                    &mut vrun,
+                    col,
+                    origin,
+                    self.cell_width,
+                    self.cell_height,
+                    window,
+                );
             }
         }
 
@@ -1717,23 +2084,43 @@ mod tests {
         }
         cells[9].c = 'z';
 
-        // 新借用迭代（快照行直引）
-        let (bg_borrowed, runs_borrowed) =
-            renderer.layout_row(0, cells.iter().enumerate(), &colors, default_bg);
+        // 新借用迭代（快照行直引；行级缓冲复用）
+        let mut memo: ColorMemo = Vec::new();
+        let mut scratch_a = RowScratch::default();
+        renderer.layout_row(
+            0,
+            cells.iter().enumerate(),
+            &colors,
+            default_bg,
+            &mut memo,
+            &mut scratch_a,
+        );
         // 旧值迭代语义：先克隆成拥有值再借引用迭代 —— 输出必须一致
         let owned: Vec<(usize, Cell)> = cells.iter().cloned().enumerate().collect();
-        let (bg_owned, runs_owned) = renderer.layout_row(
+        let mut scratch_b = RowScratch::default();
+        renderer.layout_row(
             0,
             owned.iter().map(|(col, cell)| (*col, cell)),
             &colors,
             default_bg,
+            &mut memo,
+            &mut scratch_b,
         );
-        assert_eq!(bg_borrowed, bg_owned, "背景与旧值迭代一致");
-        assert_eq!(runs_borrowed, runs_owned, "文本 run 与旧值迭代一致");
+        assert_eq!(
+            scratch_a.backgrounds(),
+            scratch_b.backgrounds(),
+            "背景与旧值迭代一致"
+        );
+        assert_eq!(
+            scratch_a.text_runs(),
+            scratch_b.text_runs(),
+            "文本 run 与旧值迭代一致"
+        );
 
         // 字面期望：abc 单 run；空格切断；「中」占两列；box-drawing 不进 run；
         // X/Y 同样式合并；z 样式不同自成 run
-        let runs: Vec<(usize, usize, &str)> = runs_borrowed
+        let runs: Vec<(usize, usize, &str)> = scratch_a
+            .text_runs()
             .iter()
             .map(|run| (run.start_col, run.end_col, run.text.as_str()))
             .collect();
@@ -1742,8 +2129,9 @@ mod tests {
             vec![(0, 3, "abc"), (4, 6, "中"), (7, 9, "XY"), (9, 10, "z")]
         );
         // 背景合并：col7-8 蓝底合并为单矩形
-        assert_eq!(bg_borrowed.len(), 1);
-        assert_eq!((bg_borrowed[0].start_col, bg_borrowed[0].end_col), (7, 9));
+        let backgrounds = scratch_a.backgrounds();
+        assert_eq!(backgrounds.len(), 1);
+        assert_eq!((backgrounds[0].start_col, backgrounds[0].end_col), (7, 9));
     }
 
     #[test]
@@ -1856,7 +2244,7 @@ mod tests {
         );
         let black = Hsla::black();
 
-        let rects = vec![
+        let mut rects = vec![
             BackgroundRect {
                 start_col: 0,
                 end_col: 5,
@@ -1871,10 +2259,11 @@ mod tests {
             },
         ];
 
-        let merged = renderer.merge_backgrounds(rects);
-        assert_eq!(merged.len(), 1);
-        assert_eq!(merged[0].start_col, 0);
-        assert_eq!(merged[0].end_col, 10);
+        // 原地合并：缓冲由调用方持有复用
+        renderer.merge_backgrounds(&mut rects);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].start_col, 0);
+        assert_eq!(rects[0].end_col, 10);
     }
 
     // ───────── 下划线（SGR 4:0~4:5 + 彩色下划线） ─────────
@@ -1916,7 +2305,17 @@ mod tests {
             (4, 'e', Flags::empty()),
             (5, 'f', Flags::empty()),
         ]);
-        let (_, runs) = renderer.layout_row(0, cells.iter().enumerate(), &colors, default_bg);
+        let mut memo: ColorMemo = Vec::new();
+        let mut scratch = RowScratch::default();
+        renderer.layout_row(
+            0,
+            cells.iter().enumerate(),
+            &colors,
+            default_bg,
+            &mut memo,
+            &mut scratch,
+        );
+        let runs = scratch.text_runs();
         assert_eq!(runs.len(), 3, "样式三段应分裂为三个 run: {runs:?}");
         assert_eq!(runs[0].underline, UnderlineKind::Straight);
         assert_eq!(runs[0].start_col, 0);
@@ -1934,7 +2333,16 @@ mod tests {
             (1, 'b', Flags::UNDERCURL),
             (2, 'c', Flags::DASHED_UNDERLINE),
         ]);
-        let (_, runs) = renderer.layout_row(0, cells.iter().enumerate(), &colors, default_bg);
+        let mut scratch = RowScratch::default();
+        renderer.layout_row(
+            0,
+            cells.iter().enumerate(),
+            &colors,
+            default_bg,
+            &mut memo,
+            &mut scratch,
+        );
+        let runs = scratch.text_runs();
         assert_eq!(runs.len(), 3, "三异样式应三 run: {runs:?}");
         assert_eq!(runs[0].underline, UnderlineKind::Double);
         assert_eq!(runs[1].underline, UnderlineKind::Wavy);
@@ -1977,7 +2385,17 @@ mod tests {
         )));
         cells[3].c = 'd';
         cells[3].flags = Flags::UNDERLINE;
-        let (_, runs) = renderer.layout_row(0, cells.iter().enumerate(), &colors, default_bg);
+        let mut memo: ColorMemo = Vec::new();
+        let mut scratch = RowScratch::default();
+        renderer.layout_row(
+            0,
+            cells.iter().enumerate(),
+            &colors,
+            default_bg,
+            &mut memo,
+            &mut scratch,
+        );
+        let runs = scratch.text_runs();
         assert_eq!(runs.len(), 3, "颜色红/蓝/回退三段应三 run: {runs:?}");
         assert_eq!(runs[0].underline, UnderlineKind::Straight);
         assert!(runs[0].underline_color.is_some(), "红段带 SGR 58 色");
@@ -2068,6 +2486,172 @@ mod tests {
         assert_eq!(tiny_bar.size.width, px(1.0));
         let tiny_under = cursor_rect(CursorStyle::Underline, px(0.0), px(0.0), px(2.0), px(3.0));
         assert_eq!(tiny_under.size.height, px(1.0));
+    }
+
+    // ───────── Font 8 槽缓存（槽位索引 / 连字翻转 / 置脏闭合） ─────────
+
+    #[test]
+    fn font_slot_index_layout() {
+        // bit0=bold、bit1=italic、bit2=ligatures
+        assert_eq!(font_slot_index(false, false, false), 0);
+        assert_eq!(font_slot_index(true, false, false), 1);
+        assert_eq!(font_slot_index(false, true, false), 2);
+        assert_eq!(font_slot_index(true, true, false), 3);
+        assert_eq!(font_slot_index(false, false, true), 4);
+        assert_eq!(font_slot_index(true, false, true), 5);
+        assert_eq!(font_slot_index(false, true, true), 6);
+        assert_eq!(font_slot_index(true, true, true), 7);
+    }
+
+    #[test]
+    fn font_slots_switch_features_and_retain() {
+        let mut renderer = TerminalRenderer::new(
+            "monospace".to_string(),
+            px(14.0),
+            1.0,
+            ColorPalette::default(),
+            false, // 从连字关闭起步
+            Vec::new(),
+            CursorStyle::Block,
+        );
+        // 连字关闭期构造的槽（bit2=0）→ disable_ligatures
+        let off_plain = renderer.font_for(false, false);
+        let off_bold = renderer.font_for(true, false);
+        assert_eq!(off_plain.features, FontFeatures::disable_ligatures());
+        assert_eq!(off_bold.features, FontFeatures::disable_ligatures());
+
+        // 开启连字：仅换槽（bit2=1），新槽必须按槽位自身位构造 default——
+        // ligatures 变更不触发 invalidate_measurement（view.rs 有意不重测），
+        // 若重建读运行时值或翻转时错误清槽，此处即抓到
+        renderer.ligatures = true;
+        let on_plain = renderer.font_for(false, false);
+        let on_bold = renderer.font_for(true, false);
+        assert_eq!(on_plain.features, FontFeatures::default());
+        assert_eq!(on_bold.features, FontFeatures::default());
+        assert_eq!(on_bold.weight, FontWeight::BOLD);
+
+        // 翻回：旧槽保留可复用（features 仍随槽位）
+        renderer.ligatures = false;
+        assert_eq!(renderer.font_for(false, false), off_plain);
+        assert_eq!(renderer.font_for(true, false), off_bold);
+
+        // 置脏自闭合：invalidate_measurement（view 层 family/fallbacks 变化
+        // 的统一入口）使槽位重建，新 family 生效
+        renderer.font_family = "Fira Code".to_string();
+        renderer.invalidate_measurement();
+        let rebuilt = renderer.font_for(false, false);
+        assert_eq!(rebuilt.family.as_str(), "Fira Code");
+        assert_eq!(rebuilt.features, FontFeatures::disable_ligatures());
+    }
+
+    // ───────── 颜色解析 memo（与 palette.resolve 等值） ─────────
+
+    #[test]
+    fn resolve_cached_matches_palette_and_memoizes() {
+        let renderer = TerminalRenderer::new(
+            "monospace".to_string(),
+            px(14.0),
+            1.0,
+            ColorPalette::default(),
+            true,
+            Vec::new(),
+            CursorStyle::Block,
+        );
+        // OSC 4 覆盖索引色 1（改写为绿）：memo 仅以终端色为键，
+        // 动态覆盖下也必须与 palette.resolve 逐色等值
+        use alacritty_terminal::vte::ansi::Rgb;
+        let mut colors = Colors::default();
+        colors[1] = Some(Rgb {
+            r: 0x00,
+            g: 0xFF,
+            b: 0x00,
+        });
+        let probe = [
+            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background),
+            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Red),
+            Color::Indexed(1),
+            Color::Indexed(42),
+            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Foreground),
+        ];
+        let mut memo: ColorMemo = Vec::new();
+        for color in probe {
+            assert_eq!(
+                resolve_cached(&mut memo, &renderer.palette, color, &colors),
+                renderer.palette.resolve(color, &colors),
+                "memo 解析必须与 palette.resolve 等值: {color:?}"
+            );
+        }
+        assert_eq!(memo.len(), probe.len(), "首轮每色各入表一次");
+        // 二轮全命中：memo 不增长且结果仍等值
+        for color in probe {
+            assert_eq!(
+                resolve_cached(&mut memo, &renderer.palette, color, &colors),
+                renderer.palette.resolve(color, &colors),
+                "二轮命中必须等值: {color:?}"
+            );
+        }
+        assert_eq!(memo.len(), probe.len(), "命中不得重复入表");
+    }
+
+    // ───────── 行级缓冲复用（RowScratch 跨行独立） ─────────
+
+    #[test]
+    fn layout_row_scratch_reuse_rows_stay_independent() {
+        let renderer = TerminalRenderer::new(
+            "monospace".to_string(),
+            px(14.0),
+            1.0,
+            ColorPalette::default(),
+            true,
+            Vec::new(),
+            CursorStyle::Block,
+        );
+        let colors = Colors::default();
+        let default_bg = renderer.palette.resolve(
+            Color::Named(alacritty_terminal::vte::ansi::NamedColor::Background),
+            &colors,
+        );
+        let mut memo: ColorMemo = Vec::new();
+        let mut scratch = RowScratch::default();
+
+        let mut row0 = vec![Cell::default(); 4];
+        row0[0].c = 'a';
+        row0[1].c = 'b';
+        let mut row1 = vec![Cell::default(); 4];
+        row1[0].c = 'x';
+        row1[1].c = 'y';
+        row1[2].c = 'z';
+
+        renderer.layout_row(
+            0,
+            row0.iter().enumerate(),
+            &colors,
+            default_bg,
+            &mut memo,
+            &mut scratch,
+        );
+        let texts: Vec<&str> = scratch
+            .text_runs()
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["ab"]);
+
+        // 同一缓冲 clear 后布局下一行：不得带上一行残留
+        renderer.layout_row(
+            1,
+            row1.iter().enumerate(),
+            &colors,
+            default_bg,
+            &mut memo,
+            &mut scratch,
+        );
+        let texts: Vec<&str> = scratch
+            .text_runs()
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["xyz"], "缓冲复用不得跨行残留");
     }
 }
 

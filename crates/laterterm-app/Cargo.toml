@@ -18,6 +18,8 @@ path = "src/main.rs"
 gpui.workspace = true
 laterterm-termview = { path = "../laterterm-termview" }
 laterterm-config = { path = "../laterterm-config" }
+# UI 设计 token 与共享控件单一真值（地基线）：颜色一律 UiPalette::from_theme 派生。
+laterterm-ui.workspace = true
 laterterm-core.workspace = true
 laterterm-local.workspace = true
 laterterm-secrets.workspace = true

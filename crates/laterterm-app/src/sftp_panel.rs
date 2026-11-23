@@ -19,10 +19,11 @@ use crate::workspace::WorkspaceView;
 use gpui::{
     App, Context, Div, ElementId, FontWeight, InteractiveElement, IntoElement, ListSizingBehavior,
     MouseButton, MouseDownEvent, ParentElement, StatefulInteractiveElement, Styled, Window, div,
-    px, relative, rgb, uniform_list,
+    px, relative, uniform_list,
 };
 use laterterm_ssh::SshEndpoint;
 use laterterm_ssh::sftp::{CancelFlag, ProgressFn, RemoteEntry, SftpHandle};
+use laterterm_ui::{ButtonKind, IconButtonSpec, UiPalette, icon_button, ui_button};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -295,11 +296,13 @@ pub(crate) enum TransferKind {
 }
 
 impl TransferKind {
-    /// 方向标识（传输队列行首）。
+    /// 方向标识（传输队列行首文字）。纯文字不含字形符号——方向图标统一走
+    /// SVG 线性图标（icons/upload.svg / download.svg），Unicode 字形跨字体
+    /// 基线不齐（见 workspace icon_button 注记）。
     pub(crate) fn arrow(self) -> &'static str {
         match self {
-            TransferKind::Upload => "▶ 上传",
-            TransferKind::Download => "◀ 下载",
+            TransferKind::Upload => "上传",
+            TransferKind::Download => "下载",
         }
     }
 }
@@ -997,45 +1000,48 @@ fn close_listener(
 }
 
 /// 覆盖层按钮（对齐 setting_button 观感；本文件内独立实现避免跨模块耦合）。
+/// 色板随主题：常态浮层卡底（elevated_bg）+ 主文字，hover 行 hover 底；
+/// 禁用态退隐（text_disabled 字 + 卡片底，无 hover/指针）。
 fn chip(
     label: &str,
     enabled: bool,
+    ui: &UiPalette,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    let base = div()
-        .px_2()
-        .py_1()
-        .rounded_sm()
-        .text_size(px(12.0))
-        .cursor_pointer();
+    let base = div().px_2().py_1().rounded_sm().text_size(px(12.0));
     if enabled {
-        base.text_color(rgb(0xC0CAF5))
-            .bg(rgb(0x303548))
-            .hover(|style| style.bg(rgb(0x3B4261)))
+        base.text_color(ui.text)
+            .bg(ui.elevated_bg)
+            .cursor_pointer()
+            .hover(|style| style.bg(ui.hover_bg))
             .on_mouse_down(MouseButton::Left, listener)
     } else {
-        base.text_color(rgb(0x565B79)).bg(rgb(0x24273A))
+        base.text_color(ui.text_disabled).bg(ui.card_bg)
     }
     .child(label.to_string())
 }
 
-/// 面板行内低对比文字按钮（重命名/删除，对齐 sidebar 口径）。
+/// 面板行内低对比文字按钮（重命名/删除，对齐 sidebar 口径）：次要文字，
+/// hover 转 danger。
 fn text_chip(
     label: &str,
+    ui: &UiPalette,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
     div()
         .text_size(px(11.0))
-        .text_color(rgb(0xA9B1D6))
+        .text_color(ui.text_secondary)
         .cursor_pointer()
-        .hover(|style| style.text_color(rgb(0xF7768E)))
+        .hover(|style| style.text_color(ui.danger))
         .on_mouse_down(MouseButton::Left, listener)
         .child(label.to_string())
 }
 
 /// SFTP 双栏面板覆盖层。面板未打开时返回 None（render 期 when_some 消费）。
+/// `ui` 由 workspace render 传入（随主题换肤）。
 pub(crate) fn sftp_overlay(
     workspace: &WorkspaceView,
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
 ) -> Option<gpui::Div> {
     let panel = workspace.sftp_panel.as_ref()?;
@@ -1062,9 +1068,9 @@ pub(crate) fn sftp_overlay(
         .flex_col()
         .overflow_hidden()
         .rounded_md()
-        .bg(rgb(0x1C1E2C))
+        .bg(ui.elevated_bg)
         .border_1()
-        .border_color(rgb(0x343A50))
+        .border_color(ui.border_strong)
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         // 头部：主机名（含跳板标注）+ 关闭
         .child(
@@ -1077,25 +1083,30 @@ pub(crate) fn sftp_overlay(
                 .justify_between()
                 .px_4()
                 .border_b_1()
-                .border_color(rgb(0x343750))
+                .border_color(ui.border_strong)
                 .child(
+                    // 字重 MEDIUM 为 tokens 字重档位口径，保留（不走 SEMIBOLD，
+                    // 与 modal 标题区分层级）。
                     div()
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(0xC0CAF5))
+                        .text_color(ui.text)
                         .child(format!("SFTP · {title}")),
                 )
-                .child(
-                    div()
-                        .h(px(26.0))
-                        .w(px(26.0))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(rgb(0x7D829F))
-                        .hover(|style| style.text_color(rgb(0xF7768E)))
-                        .on_mouse_down(MouseButton::Left, dismiss.clone())
-                        .child("×"),
-                ),
+                .child(icon_button(
+                    "sftp-close",
+                    "icons/close.svg",
+                    ui,
+                    IconButtonSpec {
+                        size: 22.0,
+                        reveal_on_group: None,
+                        danger_hover: true,
+                        disabled: false,
+                    },
+                    {
+                        let dismiss = dismiss.clone();
+                        move |event, window, cx| dismiss(event, window, cx)
+                    },
+                )),
         )
         // 主体：双栏 + 中间传输按钮
         .child(
@@ -1113,6 +1124,7 @@ pub(crate) fn sftp_overlay(
                     PaneSide::Local,
                     panel.local.pending.is_some(),
                     panel.local.truncated,
+                    ui,
                 ))
                 .child(
                     div()
@@ -1122,24 +1134,40 @@ pub(crate) fn sftp_overlay(
                         .items_center()
                         .justify_center()
                         .gap_2()
-                        .child(chip("▶ 上传", true, {
-                            let view = weak.clone();
-                            move |_event, _window, cx| {
-                                cx.stop_propagation();
-                                let _ = view.update(cx, |workspace, cx| {
-                                    workspace.sftp_enqueue(TransferKind::Upload, cx)
-                                });
-                            }
-                        }))
-                        .child(chip("◀ 下载", true, {
-                            let view = weak.clone();
-                            move |_event, _window, cx| {
-                                cx.stop_propagation();
-                                let _ = view.update(cx, |workspace, cx| {
-                                    workspace.sftp_enqueue(TransferKind::Download, cx)
-                                });
-                            }
-                        })),
+                        // 上传/下载改统一文字钮（原「▶ 上传/◀ 下载」字形钮，
+                        // 方向字形弃用，图标语义走队列行首色+文字）。
+                        .child(ui_button(
+                            "sftp-upload",
+                            "上传",
+                            ButtonKind::Secondary,
+                            ui,
+                            false,
+                            {
+                                let view = weak.clone();
+                                move |_event, _window, cx| {
+                                    cx.stop_propagation();
+                                    let _ = view.update(cx, |workspace, cx| {
+                                        workspace.sftp_enqueue(TransferKind::Upload, cx)
+                                    });
+                                }
+                            },
+                        ))
+                        .child(ui_button(
+                            "sftp-download",
+                            "下载",
+                            ButtonKind::Secondary,
+                            ui,
+                            false,
+                            {
+                                let view = weak.clone();
+                                move |_event, _window, cx| {
+                                    cx.stop_propagation();
+                                    let _ = view.update(cx, |workspace, cx| {
+                                        workspace.sftp_enqueue(TransferKind::Download, cx)
+                                    });
+                                }
+                            },
+                        )),
                 )
                 .child(file_pane(
                     weak.clone(),
@@ -1149,13 +1177,14 @@ pub(crate) fn sftp_overlay(
                     PaneSide::Remote,
                     panel.remote.pending.is_some(),
                     panel.remote.truncated,
+                    ui,
                 )),
         )
         // 底部：传输队列
         .child(
             div()
                 .border_t_1()
-                .border_color(rgb(0x343750))
+                .border_color(ui.border_strong)
                 .h(px(150.0))
                 .flex_shrink_0()
                 .flex()
@@ -1166,7 +1195,7 @@ pub(crate) fn sftp_overlay(
                 .child(
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(0x7D829F))
+                        .text_color(ui.text_secondary)
                         .child("传输队列（串行执行，每条传输独立连接，可取消）"),
                 )
                 .child(if transfers.is_empty() {
@@ -1176,7 +1205,7 @@ pub(crate) fn sftp_overlay(
                         .items_center()
                         .justify_center()
                         .text_size(px(12.0))
-                        .text_color(rgb(0x565B79))
+                        .text_color(ui.text_muted)
                         .child("暂无传输任务")
                         .into_any_element()
                 } else {
@@ -1191,18 +1220,19 @@ pub(crate) fn sftp_overlay(
                         .children(
                             transfers
                                 .iter()
-                                .map(|transfer| transfer_row(transfer, cx).into_any_element()),
+                                .map(|transfer| transfer_row(transfer, ui, cx).into_any_element()),
                         )
                         .into_any_element()
                 }),
         )
-        // 状态行：错误（红）/提示（绿）/本地错误（紫）
+        // 状态行：错误（红）/提示（绿）/本地错误（警示黄——原紫色无主题语义
+        // 槽位，映射 warning，4K 走查项确认观感）
         .children(panel.error.clone().map(|error| {
             div()
                 .px_3()
                 .pb_2()
                 .text_size(px(12.0))
-                .text_color(rgb(0xF7768E))
+                .text_color(ui.danger)
                 .child(error)
         }))
         .children(panel.notice.clone().map(|notice| {
@@ -1210,7 +1240,7 @@ pub(crate) fn sftp_overlay(
                 .px_3()
                 .pb_2()
                 .text_size(px(12.0))
-                .text_color(rgb(0x9ECE6A))
+                .text_color(ui.success)
                 .child(notice)
         }))
         .children(panel.local.error.clone().map(|error| {
@@ -1218,7 +1248,7 @@ pub(crate) fn sftp_overlay(
                 .px_3()
                 .pb_2()
                 .text_size(px(12.0))
-                .text_color(rgb(0xBB9AF7))
+                .text_color(ui.warning)
                 .child(error)
         }));
 
@@ -1250,8 +1280,11 @@ fn file_pane(
     side: PaneSide,
     loading: bool,
     truncated: usize,
+    ui: &UiPalette,
 ) -> Div {
     let is_local = side == PaneSide::Local;
+    // uniform_list 渲染闭包要求 'static：捕获 Copy 值而非借用参数引用
+    let ui = *ui;
     let list_id: ElementId = if is_local {
         "sftp-local-list".into()
     } else {
@@ -1269,9 +1302,9 @@ fn file_pane(
         .flex()
         .flex_col()
         .rounded_sm()
-        .bg(rgb(0x161824))
+        .bg(ui.terminal_bg)
         .border_1()
-        .border_color(rgb(0x292D40))
+        .border_color(ui.border_strong)
         // 路径行：上级 / 刷新 /（本机）浏览 + 当前路径
         .child(
             div()
@@ -1281,8 +1314,8 @@ fn file_pane(
                 .px_2()
                 .py_1()
                 .border_b_1()
-                .border_color(rgb(0x292D40))
-                .child(chip("上级", parent_ok, {
+                .border_color(ui.border_strong)
+                .child(chip("上级", parent_ok, &ui, {
                     let view = view.clone();
                     let path = path_text.clone();
                     move |_event, _window, cx| {
@@ -1291,7 +1324,7 @@ fn file_pane(
                             view.update(cx, |workspace, cx| workspace.sftp_go_up(side, &path, cx));
                     }
                 }))
-                .child(chip("刷新", true, {
+                .child(chip("刷新", true, &ui, {
                     let view = view.clone();
                     let path = path_text.clone();
                     move |_event, _window, cx| {
@@ -1301,7 +1334,7 @@ fn file_pane(
                     }
                 }))
                 .children(is_local.then(|| {
-                    chip("浏览…", true, {
+                    chip("浏览…", true, &ui, {
                         let view = view.clone();
                         move |_event, _window, cx| {
                             cx.stop_propagation();
@@ -1317,7 +1350,7 @@ fn file_pane(
                         .truncate()
                         .text_size(px(12.0))
                         .italic()
-                        .text_color(rgb(0x7D829F))
+                        .text_color(ui.text_secondary)
                         .child(path_text.clone()),
                 ),
         )
@@ -1329,7 +1362,7 @@ fn file_pane(
                 .items_center()
                 .justify_center()
                 .text_size(px(12.0))
-                .text_color(rgb(0x565B79))
+                .text_color(ui.text_muted)
                 .child(if loading {
                     "正在读取…"
                 } else {
@@ -1350,6 +1383,7 @@ fn file_pane(
                                 is_local,
                                 row.clone(),
                                 selected.contains(&row.name),
+                                &ui,
                             ))
                         })
                         .collect::<Vec<_>>()
@@ -1364,7 +1398,7 @@ fn file_pane(
                 .px_2()
                 .py_1()
                 .text_size(px(11.0))
-                .text_color(rgb(0xE0AF68))
+                .text_color(ui.warning)
                 .child(format!(
                     "条目过多，仅显示前 {MAX_LIST_ENTRIES} 项（省略 {truncated} 项）"
                 ))
@@ -1378,8 +1412,8 @@ fn file_pane(
                 .px_2()
                 .py_1()
                 .border_t_1()
-                .border_color(rgb(0x292D40))
-                .child(chip("新建目录", true, {
+                .border_color(ui.border_strong)
+                .child(chip("新建目录", true, &ui, {
                     let view = view.clone();
                     move |_event, window, cx| {
                         cx.stop_propagation();
@@ -1388,7 +1422,7 @@ fn file_pane(
                         });
                     }
                 }))
-                .child(text_chip("重命名", {
+                .child(text_chip("重命名", &ui, {
                     let view = view.clone();
                     move |_event, window, cx| {
                         cx.stop_propagation();
@@ -1397,7 +1431,7 @@ fn file_pane(
                         });
                     }
                 }))
-                .child(text_chip("删除", {
+                .child(text_chip("删除", &ui, {
                     let view = view.clone();
                     move |_event, _window, cx| {
                         cx.stop_propagation();
@@ -1414,6 +1448,7 @@ fn file_row(
     is_local: bool,
     row: ListRow,
     selected: bool,
+    ui: &UiPalette,
 ) -> Div {
     let ListRow {
         name,
@@ -1429,8 +1464,18 @@ fn file_row(
         .gap_2()
         .px_2()
         .cursor_pointer()
-        .bg(rgb(if selected { 0x33467C } else { 0x161824 }))
-        .hover(|style| style.bg(rgb(if selected { 0x3D5390 } else { 0x1E2030 })))
+        .bg(if selected {
+            ui.selected_bg
+        } else {
+            ui.terminal_bg
+        })
+        .hover(|style| {
+            style.bg(if selected {
+                ui.selected_bg
+            } else {
+                ui.hover_bg
+            })
+        })
         .on_mouse_down(
             MouseButton::Left,
             move |event: &MouseDownEvent, _window, cx| {
@@ -1446,7 +1491,7 @@ fn file_row(
             div()
                 .w(px(16.0))
                 .text_size(px(12.0))
-                .text_color(rgb(if is_dir { 0x7DCFFF } else { 0x7D829F }))
+                .text_color(if is_dir { ui.accent } else { ui.text_muted })
                 .child(if is_dir { "📁" } else { "📄" }),
         )
         .child(
@@ -1455,14 +1500,14 @@ fn file_row(
                 .min_w(px(0.0))
                 .truncate()
                 .text_size(px(12.0))
-                .text_color(rgb(if selected { 0xE8EEFF } else { 0xC0CAF5 }))
+                .text_color(ui.text)
                 .child(name),
         )
         .child(
             div()
                 .w(px(64.0))
                 .text_size(px(11.0))
-                .text_color(rgb(0x7D829F))
+                .text_color(ui.text_secondary)
                 .child(if is_dir {
                     String::new()
                 } else {
@@ -1473,14 +1518,14 @@ fn file_row(
             div()
                 .w(px(96.0))
                 .text_size(px(11.0))
-                .text_color(rgb(0x565B79))
+                .text_color(ui.text_muted)
                 .child(format_mtime(modified)),
         )
 }
 
 /// 传输队列单行：方向 + 文件名 + 进度条 + 状态 + 取消。
 /// 借用渲染（`&SftpTransfer`）：队列行不再逐帧克隆。
-fn transfer_row(transfer: &SftpTransfer, cx: &mut Context<WorkspaceView>) -> Div {
+fn transfer_row(transfer: &SftpTransfer, ui: &UiPalette, cx: &mut Context<WorkspaceView>) -> Div {
     let id = transfer.id;
     let active = transfer.is_active();
     let unknown_total = transfer.total == 0;
@@ -1496,15 +1541,15 @@ fn transfer_row(transfer: &SftpTransfer, cx: &mut Context<WorkspaceView>) -> Div
     };
     let cancel_view = cx.weak_entity();
     let status_color = match transfer.status {
-        TransferStatus::Done => 0x9ECE6A,
-        TransferStatus::Failed => 0xF7768E,
-        TransferStatus::Cancelled => 0xE0AF68,
-        _ => 0x7D829F,
+        TransferStatus::Done => ui.success,
+        TransferStatus::Failed => ui.danger,
+        TransferStatus::Cancelled => ui.warning,
+        _ => ui.text_secondary,
     };
     let bar_color = match transfer.status {
-        TransferStatus::Done => 0x9ECE6A,
-        TransferStatus::Failed | TransferStatus::Cancelled => 0xE0AF68,
-        _ => 0x7AA2F7,
+        TransferStatus::Done => ui.success,
+        TransferStatus::Failed | TransferStatus::Cancelled => ui.warning,
+        _ => ui.accent,
     };
     div()
         .flex()
@@ -1513,7 +1558,7 @@ fn transfer_row(transfer: &SftpTransfer, cx: &mut Context<WorkspaceView>) -> Div
         .px_2()
         .py_1()
         .rounded_sm()
-        .bg(rgb(0x161824))
+        .bg(ui.terminal_bg)
         .child(
             div()
                 .flex()
@@ -1522,10 +1567,11 @@ fn transfer_row(transfer: &SftpTransfer, cx: &mut Context<WorkspaceView>) -> Div
                 .child(
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(match transfer.kind {
-                            TransferKind::Upload => 0x9ECE6A,
-                            TransferKind::Download => 0x7DCFFF,
-                        }))
+                        .text_color(match transfer.kind {
+                            // 上传=成功绿 / 下载=强调蓝（原 0x7DCFFF 主题化映射 accent）
+                            TransferKind::Upload => ui.success,
+                            TransferKind::Download => ui.accent,
+                        })
                         .child(transfer.kind.arrow()),
                 )
                 .child(
@@ -1534,17 +1580,17 @@ fn transfer_row(transfer: &SftpTransfer, cx: &mut Context<WorkspaceView>) -> Div
                         .min_w(px(0.0))
                         .truncate()
                         .text_size(px(12.0))
-                        .text_color(rgb(0xC0CAF5))
+                        .text_color(ui.text)
                         .child(transfer.file_name.clone()),
                 )
                 .child(
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(status_color))
+                        .text_color(status_color)
                         .child(transfer.status.label()),
                 )
                 .children((!active).then(|| {
-                    div().text_size(px(11.0)).text_color(rgb(0x565B79)).child(
+                    div().text_size(px(11.0)).text_color(ui.text_muted).child(
                         match (&transfer.error, transfer.status) {
                             (Some(error), TransferStatus::Failed) => error.clone(),
                             _ => progress_line.clone(),
@@ -1552,7 +1598,7 @@ fn transfer_row(transfer: &SftpTransfer, cx: &mut Context<WorkspaceView>) -> Div
                     )
                 }))
                 .children(active.then(|| {
-                    chip("取消", true, move |_event, _window, cx| {
+                    chip("取消", true, ui, move |_event, _window, cx| {
                         cx.stop_propagation();
                         let _ = cancel_view
                             .update(cx, |workspace, cx| workspace.sftp_cancel_transfer(id, cx));
@@ -1560,23 +1606,18 @@ fn transfer_row(transfer: &SftpTransfer, cx: &mut Context<WorkspaceView>) -> Div
                 })),
         )
         .child(
-            div()
-                .w_full()
-                .h(px(5.0))
-                .rounded_sm()
-                .bg(rgb(0x24273A))
-                .child(
-                    div()
-                        .h_full()
-                        .rounded_sm()
-                        .w(relative(transfer.fraction()))
-                        .bg(rgb(bar_color)),
-                ),
+            div().w_full().h(px(5.0)).rounded_sm().bg(ui.card_bg).child(
+                div()
+                    .h_full()
+                    .rounded_sm()
+                    .w(relative(transfer.fraction()))
+                    .bg(bar_color),
+            ),
         )
         .child(
             div()
                 .text_size(px(10.0))
-                .text_color(rgb(0x565B79))
+                .text_color(ui.text_muted)
                 .child(progress_line),
         )
 }
@@ -1955,7 +1996,7 @@ mod tests {
         ] {
             assert!(!status.label().is_empty());
         }
-        assert_eq!(TransferKind::Upload.arrow(), "▶ 上传");
-        assert_eq!(TransferKind::Download.arrow(), "◀ 下载");
+        assert_eq!(TransferKind::Upload.arrow(), "上传");
+        assert_eq!(TransferKind::Download.arrow(), "下载");
     }
 }

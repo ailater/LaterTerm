@@ -15,8 +15,36 @@ const LOGO_BYTES: &[u8] = include_bytes!("../../../assets/icons/png/laterterm-12
 /// 渲染色由 `svg().text_color()` 统一染（文件内 stroke 颜色仅占位）。
 const ICONS: &[(&str, &[u8])] = &[
     (
+        "icons/arrow-down.svg",
+        include_bytes!("../../../assets/icons/svg/arrow-down.svg"),
+    ),
+    (
+        "icons/arrow-up.svg",
+        include_bytes!("../../../assets/icons/svg/arrow-up.svg"),
+    ),
+    (
+        "icons/chevron-down.svg",
+        include_bytes!("../../../assets/icons/svg/chevron-down.svg"),
+    ),
+    (
+        "icons/chevron-right.svg",
+        include_bytes!("../../../assets/icons/svg/chevron-right.svg"),
+    ),
+    (
         "icons/close.svg",
         include_bytes!("../../../assets/icons/svg/close.svg"),
+    ),
+    (
+        "icons/columns-2.svg",
+        include_bytes!("../../../assets/icons/svg/columns-2.svg"),
+    ),
+    (
+        "icons/download.svg",
+        include_bytes!("../../../assets/icons/svg/download.svg"),
+    ),
+    (
+        "icons/maximize-2.svg",
+        include_bytes!("../../../assets/icons/svg/maximize-2.svg"),
     ),
     (
         "icons/maximize.svg",
@@ -51,6 +79,10 @@ const ICONS: &[(&str, &[u8])] = &[
         include_bytes!("../../../assets/icons/svg/plus.svg"),
     ),
     (
+        "icons/server.svg",
+        include_bytes!("../../../assets/icons/svg/server.svg"),
+    ),
+    (
         "icons/settings.svg",
         include_bytes!("../../../assets/icons/svg/settings.svg"),
     ),
@@ -65,6 +97,10 @@ const ICONS: &[(&str, &[u8])] = &[
     (
         "icons/trash.svg",
         include_bytes!("../../../assets/icons/svg/trash.svg"),
+    ),
+    (
+        "icons/upload.svg",
+        include_bytes!("../../../assets/icons/svg/upload.svg"),
     ),
 ];
 

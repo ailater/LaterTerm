@@ -11,6 +11,8 @@ gpui.workspace = true
 alacritty_terminal.workspace = true
 anyhow.workspace = true
 laterterm-core.workspace = true
+# UI 设计 token 与共享控件单一真值（地基线）：供后续线统一取色口径。
+laterterm-ui.workspace = true
 ropey.workspace = true
 parking_lot.workspace = true
 flume.workspace = true

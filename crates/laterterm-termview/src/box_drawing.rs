@@ -14,6 +14,14 @@
 //! - Rounded corners
 //! - Dashed lines
 //!
+//! # 绘制路径
+//!
+//! 水平/垂直直线段（含双线的两条平行边）走 `window.paint_quad` 直绘，零
+//! tessellation；圆角曲线（╭╮╯╰）与斜线防御分支保留 `PathBuilder`。
+//! 竖直方向另有 [`draw_vertical_span`] 供渲染层把跨行竖线合并为单段绘制
+//! （端点收缩见 [`vertical_run_extent`]），[`draw_horizontal_components`]
+//! 为合并后格子的水平残段补画入口。
+//!
 //! # Example
 //!
 //! ```ignore
@@ -26,7 +34,10 @@
 //! }
 //! ```
 
-use gpui::{Bounds, Hsla, PathBuilder, Pixels, Point, Window, point, px};
+use gpui::{
+    Bounds, Edges, Hsla, PathBuilder, Pixels, Point, Window, point, px, quad, size,
+    transparent_black,
+};
 
 /// Calculate line thicknesses rounded to integer pixels to avoid aliasing.
 fn calculate_thickness(cell_width: Pixels) -> (Pixels, Pixels) {
@@ -150,6 +161,24 @@ pub fn get_vertical_weight(ch: char) -> Option<LineWeight> {
         (Some(t), Some(b)) if t == b => Some(t),
         _ => None,
     }
+}
+
+/// 竖直 run 的首末端点收缩比例（纯几何函数，paint 合并与单测共用）。
+///
+/// 参数为首格 `segments.top` 与末格 `segments.bottom` 是否存在：
+/// - `top = true`（首格向上贯通，如 ├/│）→ 起点贴首格上缘，返回 0；
+/// - `top = false`（首格只向下，如 ┌/┬/╷）→ 起点退到首格中心，收缩半格；
+/// - `bottom = true`（末格向下贯通，如 ├/│）→ 终点贴末格下缘，返回 1；
+/// - `bottom = false`（末格只向上，如 └/┴/╵）→ 终点退到末格中心，收缩半格。
+///
+/// 返回值以「格高的倍数」表示（用 `Pixels` 承载比例值，调用方乘 `cell_height`）。
+/// 合并段 `[首格上缘 + start × 格高, 末格上缘 + end × 格高]` 与逐格绘制的
+/// 墨迹并集逐像素相等（几何对照见
+/// `run_geometry_tests::vertical_run_matches_per_cell_union`）。
+pub fn vertical_run_extent(top: bool, bottom: bool) -> (Pixels, Pixels) {
+    let start = if top { px(0.0) } else { px(0.5) };
+    let end = if bottom { px(1.0) } else { px(0.5) };
+    (start, end)
 }
 
 /// Returns true if the character extends to the left edge.
@@ -364,7 +393,7 @@ pub fn get_box_segments(ch: char) -> Option<BoxSegments> {
 
 /// Returns true if the character is a rounded corner (U+256D-U+2570).
 #[inline]
-fn is_rounded_corner(ch: char) -> bool {
+pub fn is_rounded_corner(ch: char) -> bool {
     let code = ch as u32;
     (0x256D..=0x2570).contains(&code)
 }
@@ -496,6 +525,95 @@ pub fn draw_vertical_components(
                 weight,
                 thickness,
                 false,
+                color,
+                window,
+            );
+        }
+    }
+}
+
+/// Draws only the horizontal components of a box-drawing character.
+///
+/// 竖直 run 合并的补段入口：参与竖直合并的格子，其竖直分量由整段 span
+/// 承担；若水平残段未被第一遍水平 span 覆盖（如 ┌ 的右短横、异粗横段），
+/// 在此按格内范围补画。与 [`draw_vertical_components`] 同口径：贴边到
+/// 中心，不做相邻格外扩（相邻段共享整像素对齐的端点，见 [`draw_line`]）。
+pub fn draw_horizontal_components(
+    ch: char,
+    bounds: Bounds<Pixels>,
+    color: Hsla,
+    cell_width: Pixels,
+    window: &mut Window,
+) {
+    let Some(segments) = get_box_segments(ch) else {
+        return;
+    };
+
+    // Skip if no horizontal components
+    if segments.left.is_none() && segments.right.is_none() {
+        return;
+    }
+
+    let cx = bounds.origin.x + bounds.size.width / 2.0;
+    let cy = bounds.origin.y + bounds.size.height / 2.0;
+
+    let (light_thickness, heavy_thickness) = calculate_thickness(cell_width);
+
+    let left_edge = bounds.origin.x;
+    let right_edge = bounds.origin.x + bounds.size.width;
+
+    // Check if horizontal segments have same weight
+    let h_weight = match (segments.left, segments.right) {
+        (Some(l), Some(r)) if l == r => Some(l),
+        (Some(l), None) => Some(l),
+        (None, Some(r)) => Some(r),
+        _ => None,
+    };
+
+    if let Some(weight) = h_weight {
+        let thickness = get_thickness(weight, light_thickness, heavy_thickness);
+        let start_x = if segments.left.is_some() {
+            left_edge
+        } else {
+            cx
+        };
+        let end_x = if segments.right.is_some() {
+            right_edge
+        } else {
+            cx
+        };
+
+        draw_continuous_line(
+            point(start_x, cy),
+            point(end_x, cy),
+            weight,
+            thickness,
+            true,
+            color,
+            window,
+        );
+    } else {
+        // Different weights - draw separately
+        if let Some(weight) = segments.left {
+            let thickness = get_thickness(weight, light_thickness, heavy_thickness);
+            draw_continuous_line(
+                point(left_edge, cy),
+                point(cx, cy),
+                weight,
+                thickness,
+                true,
+                color,
+                window,
+            );
+        }
+        if let Some(weight) = segments.right {
+            let thickness = get_thickness(weight, light_thickness, heavy_thickness);
+            draw_continuous_line(
+                point(cx, cy),
+                point(right_edge, cy),
+                weight,
+                thickness,
+                true,
                 color,
                 window,
             );
@@ -730,7 +848,13 @@ fn draw_continuous_line(
     }
 }
 
-/// Draws a single line using PathBuilder.
+/// Draws a single line.
+///
+/// 水平/垂直直线段改走 `window.paint_quad`（零 tessellation，tmux 边框/
+/// 树形的 │├└ 不再逐段构建路径）：bounds = 沿轴长度 × thickness，起点
+/// floor、终点 ceil 做整像素对齐——相邻共线段在共享端点处重叠而非留缝
+/// （thickness 已由 `calculate_thickness` 取整，与该口径一致）。斜线
+///（段模型当前不产生，防御保留）仍走 PathBuilder tessellation。
 fn draw_line(
     from: Point<Pixels>,
     to: Point<Pixels>,
@@ -738,11 +862,46 @@ fn draw_line(
     color: Hsla,
     window: &mut Window,
 ) {
-    let mut builder = PathBuilder::stroke(thickness);
-    builder.move_to(from);
-    builder.line_to(to);
-    if let Ok(path) = builder.build() {
-        window.paint_path(path, color);
+    if from.y == to.y {
+        // 水平段：thickness 居中对齐 cy
+        let x0 = from.x.min(to.x).floor();
+        let x1 = from.x.max(to.x).ceil();
+        let y = (from.y - thickness / 2.0).floor();
+        window.paint_quad(quad(
+            Bounds {
+                origin: point(x0, y),
+                size: size(x1 - x0, thickness),
+            },
+            px(0.0),
+            color,
+            Edges::<Pixels>::default(),
+            transparent_black(),
+            Default::default(),
+        ));
+    } else if from.x == to.x {
+        // 垂直段：thickness 居中对齐 cx
+        let y0 = from.y.min(to.y).floor();
+        let y1 = from.y.max(to.y).ceil();
+        let x = (from.x - thickness / 2.0).floor();
+        window.paint_quad(quad(
+            Bounds {
+                origin: point(x, y0),
+                size: size(thickness, y1 - y0),
+            },
+            px(0.0),
+            color,
+            Edges::<Pixels>::default(),
+            transparent_black(),
+            Default::default(),
+        ));
+    } else {
+        // 斜线：tessellation 路径（防御分支）
+        let mut builder = PathBuilder::stroke(thickness);
+        builder.move_to(from);
+        builder.line_to(to);
+        if let Ok(path) = builder.build() {
+            window.paint_path(path, color);
+        }
     }
 }
 
@@ -889,5 +1048,156 @@ mod tests {
     fn test_get_box_segments_invalid() {
         assert!(get_box_segments('A').is_none());
         assert!(get_box_segments(' ').is_none());
+    }
+
+    #[test]
+    fn vertical_run_extent_endpoint_insets() {
+        // 表驱动：首格 top / 末格 bottom → (起点比例, 终点比例)
+        let cases: [(bool, bool, f32, f32); 4] = [
+            (true, true, 0.0, 1.0),   // ├…├ 贯通：贴首格上缘到末格下缘
+            (false, true, 0.5, 1.0),  // ┌…├：起点退首格中心
+            (true, false, 0.0, 0.5),  // ├…└：终点退末格中心
+            (false, false, 0.5, 0.5), // ┌…└：两端各退半格
+        ];
+        for (top, bottom, start, end) in cases {
+            let (s, e) = vertical_run_extent(top, bottom);
+            assert_eq!(f32::from(s), start, "top={top}");
+            assert_eq!(f32::from(e), end, "bottom={bottom}");
+        }
+    }
+}
+
+/// 逐格绘制的竖直墨迹区间（格高单位，行 r 的格子贡献 [r, r+1] 内的区间）。
+///
+/// 与 `draw_box_character` / `draw_vertical_components` 的竖直几何同口径：
+/// 上下等粗 → 整格；只有 top → 上半格；只有 bottom → 下半格。
+#[cfg(test)]
+fn per_cell_vertical_extent(ch: char, row: f32) -> Option<(f32, f32)> {
+    let seg = get_box_segments(ch)?;
+    match (seg.top, seg.bottom) {
+        (Some(t), Some(b)) if t == b => Some((row, row + 1.0)),
+        (Some(_), None) => Some((row, row + 0.5)),
+        (None, Some(_)) => Some((row + 0.5, row + 1.0)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod run_geometry_tests {
+    use super::*;
+
+    /// 渲染层竖直 run 合并的单格「可并入粗细」判定（与 render.rs 第二遍
+    /// 扫描同口径）：上下等粗取该粗细，半线取单边粗细，异粗返回 None。
+    /// 注意与 [`get_vertical_weight`]（要求上下均为 Some）不同——角格/半线
+    /// 可作为 run 的首末格参与合并。
+    fn mergeable_vertical_weight(ch: char) -> Option<LineWeight> {
+        let seg = get_box_segments(ch)?;
+        match (seg.top, seg.bottom) {
+            (Some(t), Some(b)) if t == b => Some(t),
+            (Some(t), None) => Some(t),
+            (None, Some(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// 几何对照：「连续竖线合并覆盖像素区间 == 逐格绘制墨迹并集」。
+    ///
+    /// 纯几何断言，不依赖 GPUI 运行时。覆盖现实 TUI 内容（tmux 边框/
+    /// 树形）的列形态：首格向下接入（bottom=Some）、中段上下贯通
+    /// （top&bottom 同粗细）、末格向上接入（top=Some）、整列粗细一致——
+    /// 该约束下合并单段必须与逐格并集逐像素相等。中段含半线（╵╷）或
+    /// 异粗（╿）的列不满足「延长」资格：渲染层冲刷旧段后，半线自起一段
+    ///（端点收缩后仍与逐格等值）、异粗走逐格原路径，均不在本断言范围。
+    #[test]
+    fn vertical_run_matches_per_cell_union() {
+        const EPS: f32 = 1e-6;
+        let starts = ['│', '┃', '║', '┌', '┐', '├', '┤', '┬', '┼', '╷'];
+        let mids = ['│', '┃', '║', '├', '┼', '╠', '╬']; // 均上下贯通
+        let ends = ['│', '┃', '║', '└', '┘', '├', '┤', '┴', '┼', '╵'];
+        for &s in &starts {
+            for &m in &mids {
+                for &e in &ends {
+                    let column = [s, m, e];
+                    // 前置：整列可并入粗细一致（run 合并资格），否则跳过
+                    let weights: Vec<Option<LineWeight>> = column
+                        .iter()
+                        .map(|&c| mergeable_vertical_weight(c))
+                        .collect();
+                    let Some(w) = weights[0] else {
+                        continue;
+                    };
+                    if !weights.iter().all(|&x| x == Some(w)) {
+                        continue;
+                    }
+                    // 逐格墨迹并集：首格起点 … 末格终点（约束下必然连续）
+                    let union = (
+                        per_cell_vertical_extent(s, 0.0).unwrap().0,
+                        per_cell_vertical_extent(e, 2.0).unwrap().1,
+                    );
+                    // 合并段：vertical_run_extent 端点收缩
+                    let (sf, ef) = vertical_run_extent(
+                        get_box_segments(s).unwrap().top.is_some(),
+                        get_box_segments(e).unwrap().bottom.is_some(),
+                    );
+                    let merged = (f32::from(sf), 2.0 + f32::from(ef));
+                    assert!(
+                        (merged.0 - union.0).abs() < EPS,
+                        "列 {column:?} 起点应一致: 合并 {} vs 逐格 {}",
+                        merged.0,
+                        union.0
+                    );
+                    assert!(
+                        (merged.1 - union.1).abs() < EPS,
+                        "列 {column:?} 终点应一致: 合并 {} vs 逐格 {}",
+                        merged.1,
+                        union.1
+                    );
+                }
+            }
+        }
+
+        // 单格与多格列的显式用例（含半线端点、双线粗细、角格端点）；
+        // 用例列先自证墨迹连续（相邻区间首尾相接），再断言合并等值
+        let columns: [&[char]; 7] = [
+            &['│'],
+            &['╵'],
+            &['╷'],
+            &['┌'],
+            &['│', '│'],
+            &['║', '║'],
+            &['┌', '│', '└'],
+        ];
+        for column in columns {
+            let n = column.len();
+            let weights: Vec<Option<LineWeight>> = column
+                .iter()
+                .map(|&c| mergeable_vertical_weight(c))
+                .collect();
+            let Some(w) = weights[0] else {
+                panic!("用例列应均有可并入竖直分量: {column:?}");
+            };
+            assert!(
+                weights.iter().all(|&x| x == Some(w)),
+                "用例列粗细应一致: {column:?}"
+            );
+            let extents: Vec<(f32, f32)> = column
+                .iter()
+                .enumerate()
+                .map(|(r, &c)| per_cell_vertical_extent(c, r as f32).unwrap())
+                .collect();
+            for pair in extents.windows(2) {
+                assert_eq!(pair[0].1, pair[1].0, "用例列墨迹应连续: {column:?}");
+            }
+            let union = (extents[0].0, extents[n - 1].1);
+            let (sf, ef) = vertical_run_extent(
+                get_box_segments(column[0]).unwrap().top.is_some(),
+                get_box_segments(column[n - 1]).unwrap().bottom.is_some(),
+            );
+            let merged = (f32::from(sf), (n - 1) as f32 + f32::from(ef));
+            assert!(
+                (merged.0 - union.0).abs() < EPS && (merged.1 - union.1).abs() < EPS,
+                "列 {column:?} 应等值: 合并 {merged:?} vs 逐格 {union:?}"
+            );
+        }
     }
 }

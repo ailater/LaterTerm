@@ -1,6 +1,6 @@
 use gpui::{
-    Context, EventEmitter, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, Render, Styled, Window, div, prelude::FluentBuilder, px,
+    AnimationExt as _, Context, EventEmitter, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, ParentElement, Render, Styled, Window, div, prelude::FluentBuilder,
 };
 use laterterm_config::normalize_shortcut;
 
@@ -134,6 +134,9 @@ impl ShortcutRecorder {
 
 impl Render for ShortcutRecorder {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use laterterm_ui::tokens::{DUR_UI_PULSE, gap_1, gap_2};
+        use laterterm_ui::{ButtonKind, UiPalette, active_palette, tint_hsla, ui_button};
+
         self.observe_focus(window, cx);
         let focus = self.focus_handle.clone();
         let label = if self.recording {
@@ -142,72 +145,92 @@ impl Render for ShortcutRecorder {
             self.value.clone().unwrap_or_else(|| "未设置".to_string())
         };
         let error = self.error.clone();
+        // 色板经 gpui Global 读取（workspace 每帧写入）；独立测试窗口回落 TN。
+        let ui: UiPalette = active_palette(cx);
+        // 值框三态：录制中 = accent 提示底 + accent 边（呼吸脉动）；错误 =
+        // danger 边 + danger 文字；常态 = 提亮档边（约定④）+ 主文字。
+        let (value_bg, value_border, value_text) = if self.recording {
+            (tint_hsla(ui.accent, 0x26), ui.accent, ui.text)
+        } else if error.is_some() {
+            (tint_hsla(ui.danger, 0x1A), ui.danger, ui.danger)
+        } else {
+            (ui.card_bg, ui.border_strong, ui.text)
+        };
+        let recording = self.recording;
+        let accent = ui.accent; // 闭包要求 'static：捕获 Copy 值而非字段借用
         div()
             .track_focus(&focus)
             .flex()
             .flex_col()
-            .gap(px(6.0))
+            .gap(gap_1()) // 有意统一：原 6px → 4px 间距栅格（SPACE_1）
             .w_full()
             .on_key_down(cx.listener(Self::handle_key_down))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(8.0))
+                    .gap(gap_2())
                     .w_full()
-                    .child(
-                        div()
+                    .child({
+                        let box_el = div()
                             .flex_1()
                             .min_w_0()
                             .px_2()
                             .py_1()
                             .rounded_sm()
                             .border_1()
-                            .border_color(gpui::rgb(if self.recording {
-                                0x7aa2f7
-                            } else {
-                                0x343750
-                            }))
-                            .bg(gpui::rgb(0x292b3d))
-                            .text_color(gpui::rgb(0xc0caf5))
-                            .child(label),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(gpui::rgb(0x343750))
-                            .child("录制")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.start(window, cx);
-                                }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(gpui::rgb(0x343750))
-                            .child("清空")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.focus_handle.focus(window);
-                                    this.clear(cx);
-                                }),
-                            ),
-                    ),
+                            .border_color(value_border)
+                            .bg(value_bg)
+                            .text_color(value_text)
+                            .child(label);
+                        // 录制中呼吸：accent 边 alpha 在 15%~100% 间脉动
+                        //（pulsating_between(0.15,1.0) 输出 delta，×255 满幅；
+                        // 旧实现 0x26 基准压到 2%~15%，accent 边几乎不可见）。
+                        // 循环时长 DUR_UI_PULSE≈1.2s/圈，接近静息呼吸。
+                        // with_animation 是包装器须收链尾，且 when 闭包必须
+                        // 返回 Self（AnimationElement 非 Div），故条件分支收 AnyElement。
+                        if recording {
+                            box_el
+                                .with_animation(
+                                    "rec-pulse",
+                                    gpui::Animation::new(DUR_UI_PULSE)
+                                        .repeat()
+                                        .with_easing(gpui::pulsating_between(0.15, 1.0)),
+                                    move |el, delta| {
+                                        el.border_color(tint_hsla(accent, (255.0 * delta) as u8))
+                                    },
+                                )
+                                .into_any_element()
+                        } else {
+                            box_el.into_any_element()
+                        }
+                    })
+                    .child(ui_button(
+                        "shortcut-rec-start",
+                        "录制",
+                        ButtonKind::Secondary,
+                        &ui,
+                        false,
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.start(window, cx);
+                        }),
+                    ))
+                    .child(ui_button(
+                        "shortcut-rec-clear",
+                        "清空",
+                        ButtonKind::Secondary,
+                        &ui,
+                        false,
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.focus_handle.focus(window);
+                            this.clear(cx);
+                        }),
+                    )),
             )
             .when_some(error, |this, error| {
-                this.child(div().text_color(gpui::rgb(0xf7768e)).child(error))
+                this.child(div().text_color(ui.danger).child(error))
             })
     }
 }

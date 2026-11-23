@@ -60,6 +60,7 @@ use gpui::{
     Edges, ElementInputHandler, EntityInputHandler, UTF16Selection, prelude::FluentBuilder, *,
 };
 use laterterm_core::{BackendKind, TerminalSession};
+use laterterm_ui::{UiPalette, tint_hsla};
 use std::io::{Read, Write};
 use std::ops::Range;
 use std::sync::Arc;
@@ -562,6 +563,24 @@ pub struct TerminalView {
     _sync_task: Task<()>,
     /// 已渲染的数据版本号（主线程侧），与 state.data_epoch() 对账。
     rendered_epoch: u64,
+    /// 最近一次渲染的时刻（UNIX 毫秒；与 rendered_epoch 同款的主线程字段
+    /// 模式，blink tick 在实体更新内读取，无需原子量）：blink 停摆门控的
+    /// 依据——隐藏标签/最小化期间不翻转相位、不产生无效重绘。
+    last_paint: u64,
+
+    /// UI 语义色板（搜索栏/选区/URL 覆盖层/兜底底色的取色源）：由宿主经
+    /// [`Self::set_ui_palette`] 注入（app-unified 线在创建视图时下发、主题
+    /// 热更新时随 update_config 链刷新）；注入前用 [`fallback_ui_palette`]
+    /// 兜底（Tokyo Night 字面值，稳态下不可见）。终端 16 色体系不归它管
+    ///（走 TerminalConfig.colors / renderer.palette），两套体系互不覆盖。
+    ui: UiPalette,
+
+    /// URL 悬停探测去重键 `(行, 列, display_offset)`：与上轮全等则跳过
+    /// 本轮 resolve_url_span_at（持 term 锁逐列扫行的热点前置短路，同格
+    /// 重复 move 零锁开销）。滚动改变 display_offset → 键变化 → 天然失效
+    /// 重探。display_offset 用 usize（与 [`ScrollSummary`] 同型）：scrollback
+    /// 经 config sanitize clamp(1_000, 1_000_000)，u16 会截断致滚动后漏探测。
+    last_url_probe: Option<(usize, usize, usize)>,
     /// 光标闪烁当前相位（true=可见）。
     blink_on: Arc<std::sync::atomic::AtomicBool>,
     /// 平滑滚动残差：不足一行的像素滚动累积于此（单位：行，可为小数）。
@@ -638,6 +657,17 @@ pub struct TerminalView {
     /// 回滚搜索状态；打开时终端按键被拦截为搜索输入，不再写入 PTY。
     search: Option<SearchState>,
 
+    /// 回滚搜索世代号：每次真正发起后台扫描自增；扫描完成仅世代相等才
+    /// 写回（过期结果丢弃——空查询清空与关开搜索靠 bump 作废在飞扫描）。
+    search_generation: u64,
+    /// 搜索扫描单飞在飞标记：true 期间新查询只记 pending，在飞完成后补发
+    ///（同屏至多一份快照，不随防抖连发叠加内存）。
+    search_inflight: bool,
+    /// Shift+Enter 消费挂起时记下的「写回落首命中后补跳上一条」诉求，
+    /// 携带发起时的世代号：仅该代写回时补跳（世代推进即作废，无需手动
+    /// 清理——后台化把同步版「先出结果再上移」拆为两步）。
+    search_prev_after_write: Option<u64>,
+
     /// 终端内文件传输的键盘接管 gate：Some(flavor) = 协议传输进行中，
     /// stdin 全部写点经 [`Self::pty_write`] 被吞（Esc 特判取消序列除外）。
     /// 由宿主工作区在传输 Started/Finished/Failed 事件时经
@@ -698,30 +728,96 @@ fn search_counter_text(search: &SearchState) -> String {
     }
 }
 
+/// 搜索栏方钮边长（24px）。地基线 tokens 暂未落地 H_CTRL_SM 档位 token，
+/// 先以命名常量承接（唯一消费点：[`search_bar_button`]）；token 补齐后换绑。
+const SEARCH_BUTTON_EDGE: f32 = 24.0;
+
+/// blink 停摆门控阈值（毫秒）：约 3 个闪烁周期（530ms/次）无渲染即视为
+/// 视图不可见，冻结相位（见 blink 任务的注记）。
+const BLINK_IDLE_GATE_MS: u64 = 1500;
+
+/// PTY 消费端单批上限（64KiB）：drain 合批的累计上限（见 reader_task 注记）。
+const PTY_BATCH_LIMIT: usize = 64 * 1024;
+
+/// UNIX 毫秒时间戳（last_paint 停摆门控用）。系统时钟回拨的最坏后果是
+/// 闪烁多冻结一个周期，实时性不敏感场景可接受。
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
+}
+
+/// blink 停摆判定（纯函数供单测）：启用闪烁且距上次渲染超过阈值 → 冻结。
+fn blink_frozen(enabled: bool, last_paint_ms: u64, now_ms: u64) -> bool {
+    enabled && now_ms.saturating_sub(last_paint_ms) > BLINK_IDLE_GATE_MS
+}
+
+/// 兜底色板：`UiPalette::from_theme` 依赖 laterterm-config 的 ThemeColors，
+/// 而 termview 不依赖 config（后续 SSH 线的依赖方向约束），故按地基线
+/// laterterm-ui `palette_tests::tokyo_night_palette_pinned` 锁定的
+/// Tokyo Night 值字面构造（两侧注释交叉引用：该测试改动需同步此处）。
+/// 仅作 [`TerminalView::set_ui_palette`] 注入前的过渡初值——app 层创建
+/// 视图即下发真实主题色板，本值在稳态下不可见。
+fn fallback_ui_palette() -> UiPalette {
+    UiPalette {
+        base_bg: Hsla::from(rgb(0x0E0E14)),
+        terminal_bg: Hsla::from(rgb(0x1A1B26)),
+        panel_bg: Hsla::from(rgb(0x222432)),
+        card_bg: Hsla::from(rgb(0x2B2C3E)),
+        elevated_bg: Hsla::from(rgb(0x2F3144)),
+        hover_bg: Hsla::from(rgb(0x33354A)),
+        active_bg: Hsla::from(rgb(0x3B3D56)),
+        selected_bg: Hsla::from(rgb(0x354161)),
+        border: Hsla::from(rgb(0x1A1D29)),
+        border_strong: Hsla::from(rgb(0x59628E)),
+        text: Hsla::from(rgb(0xC0CAF5)),
+        text_secondary: Hsla::from(rgb(0x888CA0)),
+        text_muted: Hsla::from(rgb(0x414868)),
+        text_disabled: Hsla::from(rgb(0x31374F)),
+        accent: Hsla::from(rgb(0x7AA2F7)),
+        accent_hover: Hsla::from(rgb(0xAAC4FA)),
+        danger: Hsla::from(rgb(0xF7768E)),
+        warning: Hsla::from(rgb(0xE0AF68)),
+        success: Hsla::from(rgb(0x9ECE6A)),
+        hover_tint: Hsla::from(gpui::rgba(0xA9B1D61F)),
+        overlay_scrim: Hsla::from(rgb(0x161720)).opacity(0.96),
+    }
+}
+
 /// 搜索栏 24px 方钮工厂（Aa / .* / W / ▲ / ▼）。
 ///
-/// termview 本地实现：ui_button / icon_button 是 app 层（workspace.rs）私有
-/// 函数，termview 反向依赖成环，故按 ui_button 体系（描边 + hover 底色）
-/// 对齐做 24px 紧凑版；色值沿用本搜索栏既定的 Tokyo Night 内联值。
+/// termview 本地实现：laterterm-ui 控件工厂的 ui_button / icon_button 是
+/// 30px 大档，与本搜索栏的紧凑档不符，且按钮需接入 `Context<TerminalView>`
+/// 监听器，故按同一 token 体系做 24px 紧凑版；
+/// 色值全部取 UiPalette 语义槽（disable 退隐档口径见 tokens 约定④）。
 /// 所有钮 on_mouse_down 首句 `cx.stop_propagation()`（先例 workspace.rs
 /// 右键菜单项）：点击不落入底层网格建选区；禁用钮只吞点击不动作。
+///
+/// 字形钮（▲▼/Aa/.*/W）保留文本实现：SVG 图标经 AssetSource 挂在 app 层，
+/// termview 无资产源可解析路径。
 fn search_bar_button(
     cx: &mut Context<TerminalView>,
+    ui: &UiPalette,
+    disabled_text: Hsla,
     label: &'static str,
     active: bool,
     disabled: bool,
     on_click: impl Fn(&mut TerminalView, &mut Context<TerminalView>) + 'static,
 ) -> Div {
-    // 开启 = 主题黄描边高亮；关闭 = 暗色可点；禁用 = 更暗无 hover
+    // 开启 = accent 描边高亮；关闭 = 弱化文字 + 提亮档边（有意变更：
+    // 0x363B54 游离值统一到 border_strong，见 laterterm-ui 约定④）；
+    // 禁用 = 字 text_disabled + 边 border_strong（同提亮档，约定④）无 hover
     let (text, border) = if disabled {
-        (rgb(0x363B54), rgb(0x24283B))
+        // 禁用边同 border_strong：border 暗档压黑 scrim 底上近隐形
+        (disabled_text, ui.border_strong)
     } else if active {
-        (rgb(0xE0AF68), rgb(0xE0AF68))
+        (ui.accent, ui.accent)
     } else {
-        (rgb(0x565A78), rgb(0x363B54))
+        (ui.text_muted, ui.border_strong)
     };
+    let hover_bg = ui.hover_bg;
     let base = div()
-        .size(px(24.0))
+        .size(px(SEARCH_BUTTON_EDGE))
         .flex()
         .items_center()
         .justify_center()
@@ -737,7 +833,7 @@ fn search_bar_button(
             cx.listener(|_, _, _, cx| cx.stop_propagation()),
         )
     } else {
-        base.hover(|style| style.bg(rgb(0x2F3147))).on_mouse_down(
+        base.hover(move |style| style.bg(hover_bg)).on_mouse_down(
             MouseButton::Left,
             cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
@@ -761,7 +857,7 @@ pub struct TerminalMenuRequested {
 
 /// 滚动位置变化回调：调用方按需读取 [`TerminalView::scroll_summary`]，
 /// 并用传入的上下文通知宿主刷新（如工作区的滚动条指示器）。
-pub type ScrollCallback = Box<dyn Fn(&mut Context<TerminalView>)>;
+pub type ScrollCallback = Box<dyn Fn(ScrollSummary, &mut Context<TerminalView>)>;
 
 /// 滚动状态摘要，用于外部绘制滚动条指示器。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -887,7 +983,16 @@ impl TerminalView {
         });
 
         // Spawn async task that awaits on the channel and notifies the view
-        // This is push-based: the task blocks until bytes arrive, then immediately notifies
+        // Push-based: 读线程每读到一块（≤4KiB）即 send（现状语义，零改动——
+        // 不在读线程做累积：4096 阈值后的静默等待会阻塞内层 read 造成冻结，
+        // poll(fd,0) 探测跨平台不可移植且泛型 R: Read 无 fd）。
+        // 合批在消费端：本任务收到首块后把 channel 里已就绪的字节一次排干
+        //（至多 PTY_BATCH_LIMIT）才执行单次 process_bytes + notify + refresh
+        // ——executor 唤醒频次不变（读线程每 4KB 一次 send，单次唤醒仅
+        // try_recv 循环、代价极小），term 锁 + VTE 解析 + 窗口派发从
+        // 「每 4KB 一次」降为「每批一次」，输出洪峰下约一个数量级。flume
+        // 单消费者顺序 drain 保证字节序；无界 channel 保留（drain 即时
+        // 消费，队列不积压）。
         let reader_task = cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             loop {
                 // 等待字节；用 GPUI 定时器与 flume 唤醒竞争——GPUI Linux 后台任务的
@@ -900,7 +1005,16 @@ impl TerminalView {
                 .await;
                 match wakeup {
                     futures::future::Either::Left((result, _timer)) => match result {
-                        Ok(bytes) => {
+                        Ok(first_block) => {
+                            // 消费端 drain：继续 try_recv 至 channel 排干或达单批上限。
+                            // Disconnected 只在缓冲排干后才出现，EOF 尾批不会被丢。
+                            let mut batch = first_block;
+                            while batch.len() < PTY_BATCH_LIMIT {
+                                match bytes_rx.try_recv() {
+                                    Ok(more) => batch.extend_from_slice(&more),
+                                    Err(_) => break,
+                                }
+                            }
                             // Process bytes and notify the view.
                             // 优先走窗口上下文: 后台任务的 cx.notify() 只标记实体 dirty,
                             // 不保证平台请求新帧(X11 由 60Hz 定时器检查 is_dirty, Wayland 靠
@@ -912,7 +1026,7 @@ impl TerminalView {
                             let result = match window_handle {
                                 Some(handle) => cx.update_window(handle, |_root, window, app| {
                                     this.update(app, |view, cx| {
-                                        view.state.process_bytes(&bytes);
+                                        view.state.process_bytes(&batch);
                                         cx.notify();
                                         window.refresh();
                                     })
@@ -920,7 +1034,7 @@ impl TerminalView {
                                 None => Ok(this.update(
                                     cx,
                                     |view: &mut Self, cx: &mut Context<Self>| {
-                                        view.state.process_bytes(&bytes);
+                                        view.state.process_bytes(&batch);
                                         cx.notify();
                                     },
                                 )),
@@ -949,6 +1063,10 @@ impl TerminalView {
         });
 
         // 光标闪烁：每 530ms 翻转相位；关闭闪烁时不产生多余重绘。
+        // 停摆门控：视图长时间未被渲染（隐藏标签/最小化）时冻结相位——
+        // 翻转与 notify 一并跳过（隐藏期本就不可见，省无效重绘）。恢复
+        // 渲染会刷新 last_paint，下一 tick 自然续闪；自持链条
+        // tick→notify→render→last_paint 更新保证活跃期永不误停。
         let blink_task = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -957,6 +1075,9 @@ impl TerminalView {
                 let changed = this
                     .update(cx, |view, cx| {
                         let enabled = view.config.cursor_blink;
+                        if blink_frozen(enabled, view.last_paint, now_millis()) {
+                            return false;
+                        }
                         let next = if enabled {
                             !view.blink_on.load(std::sync::atomic::Ordering::Relaxed)
                         } else {
@@ -1016,6 +1137,9 @@ impl TerminalView {
             scroll_residual: 0.0,
             snapshot_cache: Arc::new(parking_lot::Mutex::new(None)),
             rendered_epoch: 0,
+            last_paint: 0,
+            ui: fallback_ui_palette(),
+            last_url_probe: None,
             blink_on: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             // 默认 resize 回调转发给会话；with_resize_callback 可整体覆盖
             resize_callback: {
@@ -1053,6 +1177,9 @@ impl TerminalView {
             last_motion_report: None,
             marked_text: String::new(),
             search: None,
+            search_generation: 0,
+            search_inflight: false,
+            search_prev_after_write: None,
             transfer_gate: parking_lot::Mutex::new(None),
             window_handle: None,
         }
@@ -1337,7 +1464,8 @@ impl TerminalView {
                 "enter" | "return" => {
                     // Enter 双分支（语义钉死）：
                     // - 有挂起防抖（150ms 窗口内「刚改完查询就按 Enter」）：
-                    //   同步提交挂起的搜索（落首命中）并消费本次按键——
+                    //   消费挂起并按新查询发起后台扫描（落首命中延迟到
+                    //   写回，见 run_pending_search 的单飞/世代注记）——
                     //   消除「在滞后结果上跳 → 防抖刷新又被重置回首命中」
                     //   的双重定位；
                     // - 无挂起防抖：与历史行为逐字一致——在既有 matches
@@ -1347,11 +1475,20 @@ impl TerminalView {
                         .as_ref()
                         .is_some_and(|search| search.search_pending)
                     {
-                        // 防抖窗口内先出结果（落首命中）；Shift+Enter 再从
-                        // 首命中循环往上（wrap 到末条）——方向语义不丢。
+                        // 防抖窗口内先消费挂起并发起扫描（后台化后「落首命中」
+                        // 延迟到写回）；Shift+Enter 记补跳诉求——写回落首命中
+                        // 后循环往上（wrap 到末条），终态与同步版「先出结果
+                        // 再上移」一致。
+                        let was_inflight = self.search_inflight;
                         self.run_pending_search(cx);
                         if keystroke.modifiers.shift {
-                            self.search_select_prev(cx);
+                            if was_inflight {
+                                // 在飞：新结果落地前先在既有（滞后）matches
+                                // 上跳（瞬态取舍，写回后落首命中）
+                                self.search_select_prev(cx);
+                            } else {
+                                self.search_prev_after_write = Some(self.search_generation);
+                            }
                         }
                     } else if keystroke.modifiers.shift {
                         self.search_select_prev(cx);
@@ -1778,8 +1915,13 @@ impl TerminalView {
     }
 
     /// 更新 URL 悬停状态：命中时记录范围并切小手光标 + 重绘下划线；离开清空。
+    ///
+    /// 先判等后扫描：组「(行, 列, display_offset)」探测键，与上轮全等则
+    /// 直接返回——resolve_url_span_at 要持 term 锁逐列扫行，悬停热路径
+    /// 高频触发，前置短路省掉重复扫描。滚动改变 display_offset → 键变化
+    /// → 天然失效重探，正确性与逐次解析同现状。
     fn update_url_hover(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
-        let span = self.last_content_origin.and_then(|origin| {
+        let probe = self.last_content_origin.map(|origin| {
             let cell = crate::mouse::pixel_to_cell(
                 position,
                 origin,
@@ -1787,12 +1929,21 @@ impl TerminalView {
                 self.renderer.cell_height,
             );
             let row = cell.line.0.max(0) as usize;
+            let display_offset = self.state.with_term(|term| term.grid().display_offset());
+            (row, cell.column.0, display_offset)
+        });
+        // 同格且未滚动：上轮解析结果仍然有效，零锁开销直接返回
+        if probe.is_some() && self.last_url_probe == probe {
+            return;
+        }
+        self.last_url_probe = probe;
+        let span = probe.and_then(|(row, col, _)| {
             // OSC 8 显式超链接优先，回落 URL 文本自动检测（悬停下划线
             // 覆盖层与小手光标管道原样复用）
-            self.resolve_url_span_at(row, cell.column.0)
+            self.resolve_url_span_at(row, col)
                 .map(|(url, start, end)| (url, row, start, end))
         });
-        // 比较位置元组（String 不参与比较）；同格重复 move 不重绘
+        // 比较位置元组（String 不参与比较）；跨格/滚动后重探才可能重绘
         let changed = match (&span, &self.url_hover) {
             (None, None) => false,
             (Some(a), Some(b)) => a.1 != b.1 || a.2 != b.2 || a.3 != b.3,
@@ -2070,9 +2221,11 @@ impl TerminalView {
     }
 
     /// Set a callback to be invoked when the scroll position or history size changes.
+    /// 回调直接收到 [`ScrollSummary`]：触发点在实体 update 内，调用方若再
+    /// read 实体会 panic（borrow-while-updating），故摘要随参下发。
     pub fn with_scroll_callback(
         mut self,
-        callback: impl Fn(&mut Context<TerminalView>) + 'static,
+        callback: impl Fn(ScrollSummary, &mut Context<TerminalView>) + 'static,
     ) -> Self {
         self.scroll_callback = Some(Box::new(callback));
         self
@@ -2097,7 +2250,7 @@ impl TerminalView {
                     this.last_scroll = Some(summary);
                     this.last_failed = failed;
                     if let Some(callback) = &this.scroll_callback {
-                        callback(cx);
+                        callback(summary, cx);
                     }
                 }
             });
@@ -2164,6 +2317,9 @@ impl TerminalView {
     /// 关闭搜索并恢复终端输入。
     pub fn close_search(&mut self, cx: &mut Context<Self>) {
         if self.search.take().is_some() {
+            // bump 世代：作废在飞扫描——防其完成后把旧会话的命中写进
+            // 重新打开的新搜索态（同步实现无此窗口，后台化特有竞态）
+            self.search_generation += 1;
             self.marked_text.clear();
             cx.notify();
         }
@@ -2310,8 +2466,9 @@ impl TerminalView {
     }
 
     /// 查询变化后的 150ms 防抖搜索（先例 schedule_scroll_report）：合并
-    /// 快速连击，洪峰期只跑最后一次。挂起期间按 Enter 会同步提交（见
-    /// on_key_down 的 Enter 双分支），届时本任务醒来发现无挂起直接丢弃。
+    /// 快速连击，洪峰期只跑最后一次。挂起期间按 Enter 会消费挂起并发起
+    /// 后台扫描（见 on_key_down 的 Enter 双分支），届时本任务醒来发现无
+    /// 挂起直接丢弃。
     fn schedule_search(&mut self, cx: &mut Context<Self>) {
         if self
             .search
@@ -2343,29 +2500,128 @@ impl TerminalView {
 
     /// 执行挂起的搜索（防抖任务与 Enter 提交共用）。
     ///
-    /// 完整 refresh 语义：更新 matches、current=0、滚到首命中；非法正则
-    /// 只写 regex_error（红字内联报错），上次有效结果保留不动不滚动。
+    /// 写回语义与同步版严格一致：更新 matches、current=0、滚到首命中；
+    /// 非法正则只写 regex_error（红字内联报错），上次有效结果保留不动
+    /// 不滚动。实现为「快照（主线程单次持锁）→ 后台扫描 → 世代门禁写回」：
+    /// - **单飞**：在飞期间新查询只记 pending，在飞完成后补发（同屏至多
+    ///   一份快照，不随防抖连发叠加内存）；
+    /// - **过期丢弃**：仅世代相等才写回——空查询清空与 close_search 均会
+    ///   bump 世代作废在飞扫描（防旧命中复活到已清空/新开的搜索态上）；
+    ///   扫描期间
+    ///   终端有新输出**不做任何丢弃**，写回无条件执行。语义论证：同步
+    ///   实现的 matches 同样只反映「扫描完成时刻」的网格（锁释放后 PTY
+    ///   新输出立即使结果过时、absolute 行号随环形缓冲推移），后台版只是
+    ///   把该时刻延后几十毫秒，最终一致性/定位漂移表现与现状严格等同。
     fn run_pending_search(&mut self, cx: &mut Context<Self>) {
-        if let Some(search) = &mut self.search {
+        // 先摘出查询与选项（借用收窄到最短，后续分段重借）
+        let (query, options) = match self.search.as_ref() {
+            Some(search) => (
+                search.query.clone(),
+                crate::terminal::SearchOptions {
+                    case_sensitive: search.case_sensitive,
+                    regex: search.regex,
+                    whole_word: search.whole_word,
+                },
+            ),
+            None => return,
+        };
+        // 消费挂起标记（防抖任务与 Enter 的「已提交」凭证）
+        if let Some(search) = self.search.as_mut() {
             search.search_pending = false;
-            let query = search.query.clone();
-            let options = crate::terminal::SearchOptions {
-                case_sensitive: search.case_sensitive,
-                regex: search.regex,
-                whole_word: search.whole_word,
-            };
-            match self.state.search_with_options(&query, options) {
-                Ok(matches) => {
-                    search.matches = matches;
-                    search.current = 0;
-                    search.regex_error = None;
-                    self.scroll_to_current_match();
-                }
-                Err(message) => {
-                    // 非法正则：内联报错，matches/current 不动
-                    search.regex_error = Some(message);
+        }
+        // 空查询：与同步实现一致地同步清空（无需快照/后台）
+        if query.is_empty() {
+            self.search_generation += 1;
+            if let Some(search) = self.search.as_mut() {
+                search.matches.clear();
+                search.current = 0;
+                search.regex_error = None;
+            }
+            self.scroll_to_current_match();
+            cx.notify();
+            return;
+        }
+        // 单飞：在飞时记 pending，在飞完成后由 finish_pending_search 补发
+        if self.search_inflight {
+            if let Some(search) = self.search.as_mut() {
+                search.search_pending = true;
+            }
+            return;
+        }
+        // needle 备料与 scan_snapshot 契约一致（正则传原样、子串按大小写
+        // 预 lowercase；与同步入口 search_with_options 同式）
+        let needle: Vec<char> = if options.regex || options.case_sensitive {
+            query.chars().collect()
+        } else {
+            query.to_lowercase().chars().collect()
+        };
+        // 快照在主线程构建（原子性：锁窗口内同帧网格状态）；匹配全部移后台
+        let snapshot = self.state.snapshot_for_search();
+        self.search_generation += 1;
+        let generation = self.search_generation;
+        self.search_inflight = true;
+        cx.spawn(async move |this, cx| {
+            // 后台扫描：纯函数，快照与 needle 均为 owned 数据（Send+'static）
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::terminal::scan_snapshot(&snapshot, &needle, options) })
+                .await;
+            let _ = this.update(cx, |view, cx| {
+                view.finish_pending_search(generation, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    /// 扫描完成写回（世代门禁 + 单飞补发）；完成回调与单测共用。
+    ///
+    /// 世代相等才写回（过期结果整体丢弃、不滚动）；写回后消费
+    /// Shift+Enter 的补跳诉求，最后补发挂起的新查询（单飞链）。
+    fn finish_pending_search(
+        &mut self,
+        generation: u64,
+        result: Result<Vec<crate::terminal::SearchMatch>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.search_inflight = false;
+        if self.search_generation == generation {
+            let jump_prev = self.search_prev_after_write.take() == Some(generation);
+            let mut wrote_matches = false;
+            if let Some(search) = self.search.as_mut() {
+                match result {
+                    Ok(matches) => {
+                        search.matches = matches;
+                        search.current = 0;
+                        search.regex_error = None;
+                        wrote_matches = true;
+                    }
+                    Err(message) => {
+                        // 非法正则：内联报错，matches/current 不动也不滚动
+                        //（与同步版一致：上次有效结果保留原地）
+                        search.regex_error = Some(message);
+                    }
                 }
             }
+            // 落首命中（仅成功路径；同步版 Err 路径不滚动）
+            if wrote_matches {
+                self.scroll_to_current_match();
+            }
+            // Shift+Enter 补跳：wrap 到末条（同步版「先出结果再上移」的
+            // 后台化两步；非法正则时在保留的旧结果上跳，同同步版）
+            if jump_prev && !self.search.as_ref().is_some_and(|s| s.matches.is_empty()) {
+                if let Some(search) = self.search.as_mut() {
+                    search.current = search.matches.len() - 1;
+                }
+                self.scroll_to_current_match();
+            }
+        }
+        // 补发挂起的新查询（单飞链：在飞期间到达的查询在此续跑）
+        if self
+            .search
+            .as_ref()
+            .is_some_and(|search| search.search_pending)
+        {
+            self.run_pending_search(cx);
         }
         cx.notify();
     }
@@ -2471,6 +2727,17 @@ impl TerminalView {
     /// A reference to the focus handle.
     pub fn focus_handle(&self) -> &FocusHandle {
         &self.focus_handle
+    }
+
+    /// 注入 UI 语义色板（主题接线入口）：搜索栏/选区/URL 覆盖层/兜底底色
+    /// 随之整体换肤。调用方（app-unified 线）在创建视图时初始下发、主题
+    /// 热更新时随 update_config 链再次下发；注入后 notify 立即重绘。
+    ///
+    /// 仅替换 UI chrome 用色：终端 16 色体系走 [`TerminalConfig::colors`] /
+    /// `update_config`，两套体系互不覆盖。
+    pub fn set_ui_palette(&mut self, ui: UiPalette, cx: &mut Context<Self>) {
+        self.ui = ui;
+        cx.notify();
     }
 
     /// Update the terminal configuration.
@@ -2668,6 +2935,9 @@ impl Render for TerminalView {
         }
         // 本帧已渲染到当前数据版本
         self.rendered_epoch = self.state.data_epoch();
+        // 渲染时刻（blink 停摆门控的时间源）：tick→notify→render→last_paint
+        // 自持链条保证活跃期门控永不误停
+        self.last_paint = now_millis();
         // Process any pending events
         self.process_events(window, cx);
         // 滚动位置/历史行数变化时通知宿主（防抖定时器，不在 render 期直接 notify）
@@ -2725,13 +2995,18 @@ impl Render for TerminalView {
         let marked_text = self.marked_text.clone();
         // URL 悬停快照（canvas 闭包绘制下划线用）
         let url_hover = self.url_hover.clone();
+        // UI 语义色板快照（UiPalette 为 Copy）：搜索栏与 canvas 覆盖层共用
+        let ui = self.ui;
+        // 禁用态退隐字色：UiPalette::text_disabled 槽位（palette.rs 口径
+        // darken(bright_black, 0.08)）
+        let disabled_text = ui.text_disabled;
         let search_bar = self.search.as_ref().map(|search| {
             let counter_text = search_counter_text(search);
-            // 非法正则时计数槽位换红字报错（0xF7768E = 主题 red）
+            // 非法正则 → danger 红字报错；正常计数 → 主题 warning 槽
             let counter_color = if search.regex_error.is_some() {
-                rgb(0xF7768E)
+                ui.danger
             } else {
-                rgb(0xE0AF68)
+                ui.warning
             };
             div()
                 .absolute()
@@ -2743,15 +3018,23 @@ impl Render for TerminalView {
                 .items_center()
                 .gap_3()
                 .px_3()
+                // scrim 语义半透明黑底：盖在终端内容之上的浮层遮罩，有
+                // 意保留 gpui::black 不随主题亮暗翻转（任何主题下压暗内容）
                 .bg(gpui::black().opacity(0.8))
                 .text_size(px(12.0))
-                .text_color(rgb(0xC0CAF5))
-                .child(div().text_color(rgb(0x7DCFFF)).child("搜索"))
+                .text_color(ui.text)
+                // 「搜索」标签：0x7DCFFF → accent（有意变更：标签类语义
+                // 与 chrome 其他位置统一走 accent，原青色为 TN 专属游离值）
+                .child(div().text_color(ui.accent).child("搜索"))
                 .child(div().child(format!("{}▏", search.query)))
                 // Aa / .* / W 三开关钮 + ▲▼ 跳转钮（24px 方钮，见
-                // search_bar_button：点击 stop_propagation 不建选区）
+                // search_bar_button：点击 stop_propagation 不建选区；
+                // ▲▼/Aa/.*/W 保留文本字形——SVG 图标经 AssetSource 挂
+                // app 层，termview 无资产源可解析）
                 .child(search_bar_button(
                     cx,
+                    &ui,
+                    disabled_text,
                     "Aa",
                     search.case_sensitive,
                     false,
@@ -2759,6 +3042,8 @@ impl Render for TerminalView {
                 ))
                 .child(search_bar_button(
                     cx,
+                    &ui,
+                    disabled_text,
                     ".*",
                     search.regex,
                     false,
@@ -2766,17 +3051,31 @@ impl Render for TerminalView {
                 ))
                 .child(search_bar_button(
                     cx,
+                    &ui,
+                    disabled_text,
                     "W",
                     search.whole_word,
                     search.regex, // 正则开启时全字置灰（互斥语义）
                     |this, cx| this.toggle_search_whole_word(cx),
                 ))
-                .child(search_bar_button(cx, "▲", false, false, |this, cx| {
-                    this.search_select_prev(cx)
-                }))
-                .child(search_bar_button(cx, "▼", false, false, |this, cx| {
-                    this.search_select_next(cx)
-                }))
+                .child(search_bar_button(
+                    cx,
+                    &ui,
+                    disabled_text,
+                    "▲",
+                    false,
+                    false,
+                    |this, cx| this.search_select_prev(cx),
+                ))
+                .child(search_bar_button(
+                    cx,
+                    &ui,
+                    disabled_text,
+                    "▼",
+                    false,
+                    false,
+                    |this, cx| this.search_select_next(cx),
+                ))
                 .child(
                     div()
                         .ml_auto()
@@ -2785,7 +3084,7 @@ impl Render for TerminalView {
                 )
                 .child(
                     div()
-                        .text_color(rgb(0x565A78))
+                        .text_color(ui.text_muted)
                         .child("Enter↓ Shift+Enter↑ Alt+C 大小写 Alt+R 正则 Alt+W 全字 Esc 关闭"),
                 )
         });
@@ -2793,10 +3092,12 @@ impl Render for TerminalView {
         // 透明模式（background_opacity<1）该 filler 改画全透明：它被下方
         // canvas 满覆盖，保留不透明色会把窗口透明像素盖死（alpha 承载单点
         // 在宿主层，如 LaterTerm 工作区根容器的主题 background 原色@o）。
+        // 不透明模式取 ui.terminal_bg（主题 background 原色）：消除与
+        // 0x1A1B26 主题底的双底色错位（旧值 0x1e1e1e 为游离灰）。
         let root_bg: gpui::Fill = if self.config.background_opacity < 1.0 {
             gpui::transparent_black().into()
         } else {
-            rgb(0x1e1e1e).into()
+            ui.terminal_bg.into()
         };
         let root = div()
             .size_full()
@@ -2987,7 +3288,8 @@ impl Render for TerminalView {
                                     },
                                 },
                                 px(0.0),
-                                gpui::Hsla::from(gpui::rgb(0x7AA2F7)).opacity(0.9),
+                                // 0x7AA2F7@0.9 → accent@0xE6（alpha 与现值一致仅换色源）
+                                tint_hsla(ui.accent, 0xE6),
                                 Edges::<Pixels>::default(),
                                 gpui::transparent_black(),
                                 gpui::BorderStyle::default(),
@@ -3019,7 +3321,8 @@ impl Render for TerminalView {
                             window.paint_quad(gpui::quad(
                                 rect,
                                 px(0.0),
-                                gpui::Hsla::from(gpui::rgb(0xE0AF68)).opacity(0.35),
+                                // 主题 warning 槽 @ 0x59（alpha 与旧字面值一致）
+                                tint_hsla(ui.warning, 0x59),
                                 Edges::<Pixels>::default(),
                                 gpui::transparent_black(),
                                 gpui::BorderStyle::default(),
@@ -3047,7 +3350,8 @@ impl Render for TerminalView {
                                         },
                                     },
                                     px(0.0),
-                                    gpui::Hsla::from(gpui::rgb(0x7AA2F7)).opacity(0.30),
+                                    // 0x7AA2F7@0.30 → accent@0x4D（alpha 与现值一致仅换色源）
+                                    tint_hsla(ui.accent, 0x4D),
                                     Edges::<Pixels>::default(),
                                     gpui::transparent_black(),
                                     gpui::BorderStyle::default(),
@@ -4631,13 +4935,13 @@ mod tests {
                 terminal.search.as_ref().unwrap().search_pending,
                 "输入后挂起 150ms 防抖"
             );
-            // Alt+R 开正则：开关切换即时刷新（唯一绕过防抖路径）
+            // Alt+R 开正则：开关切换即时发起扫描（唯一绕过防抖路径），
+            // 结果经后台写回（下方 run_until_parked 后断言）
             press_key(terminal, "alt-r", window, cx);
             {
                 let search = terminal.search.as_ref().unwrap();
                 assert!(search.regex, "Alt+R 开启正则");
-                assert!(!search.search_pending, "开关切换即时刷新，无挂起");
-                assert_eq!(search.matches.len(), 2, "正则搜索立即生效（xab/ab 各一处）");
+                assert!(!search.search_pending, "开关切换即时消费挂起");
             }
             // 互斥：正则开启时 Alt+W 无效（W 钮置灰同语义）
             press_key(terminal, "alt-w", window, cx);
@@ -4645,13 +4949,29 @@ mod tests {
                 !terminal.search.as_ref().unwrap().whole_word,
                 "正则开启时 Alt+W 无效"
             );
+        });
+        cx.run_until_parked();
+        terminal.read_with(cx, |terminal, _| {
+            assert_eq!(
+                terminal.search.as_ref().unwrap().matches.len(),
+                2,
+                "正则搜索生效（xab/ab 各一处）"
+            );
+        });
+        terminal.update_in(cx, |terminal, window, cx| {
             // 关正则后 Alt+W 生效；全字口径下 xab 的 ab 被排除
             press_key(terminal, "alt-r", window, cx);
             assert!(!terminal.search.as_ref().unwrap().regex);
             press_key(terminal, "alt-w", window, cx);
-            let search = terminal.search.as_ref().unwrap();
-            assert!(search.whole_word, "正则关闭后 Alt+W 生效");
-            assert_eq!(search.matches.len(), 1, "全字排除 xab 中的 ab");
+            assert!(terminal.search.as_ref().unwrap().whole_word);
+        });
+        cx.run_until_parked();
+        terminal.read_with(cx, |terminal, _| {
+            assert_eq!(
+                terminal.search.as_ref().unwrap().matches.len(),
+                1,
+                "全字排除 xab 中的 ab"
+            );
         });
     }
 
@@ -4668,16 +4988,23 @@ mod tests {
             terminal.replace_text_in_range(None, "ab", window, cx);
             press_key(terminal, "alt-r", window, cx);
             assert!(terminal.search.as_ref().unwrap().regex_error.is_none());
-
-            // 追加 "(" 使正则非法（查询 "ab("），Enter 在防抖窗口内同步提交
+        });
+        // 首次正则扫描写回
+        cx.run_until_parked();
+        terminal.update_in(cx, |terminal, window, cx| {
+            // 追加 "(" 使正则非法（查询 "ab("），Enter 在防抖窗口内提交
             terminal.replace_text_in_range(None, "(", window, cx);
             assert!(terminal.search.as_ref().unwrap().search_pending);
             press_key(terminal, "enter", window, cx);
+            // Enter 已消费挂起（结果经后台写回，同步可见的只有挂起态翻转）
+            assert!(!terminal.search.as_ref().unwrap().search_pending);
+        });
+        cx.run_until_parked();
+        terminal.update_in(cx, |terminal, window, cx| {
             {
                 let search = terminal.search.as_ref().unwrap();
                 assert!(search.regex_error.is_some(), "非法正则内联报错");
                 assert_eq!(search.matches.len(), 2, "保留上次有效结果");
-                assert!(!search.search_pending, "Enter 已消费挂起");
                 assert_eq!(
                     super::search_counter_text(search),
                     format!("正则无效：{}", search.regex_error.as_ref().unwrap()),
@@ -4688,6 +5015,9 @@ mod tests {
             // 修正查询（退格弹出括号）后 Enter 再次提交：报错清除
             terminal.search_backspace(cx);
             press_key(terminal, "enter", window, cx);
+        });
+        cx.run_until_parked();
+        terminal.read_with(cx, |terminal, _| {
             let search = terminal.search.as_ref().unwrap();
             assert!(search.regex_error.is_none(), "合法正则刷新后清除报错");
             assert_eq!(search.matches.len(), 2);
@@ -4760,13 +5090,19 @@ mod tests {
                 "跳转不重算 matches"
             );
 
-            // 分支二（有挂起）：改查询后 150ms 内按 Enter → 同步提交挂起搜索
-            // （查询 "aba" 无命中：flush 后 matches 清空、落首命中、消费按键）
+            // 分支二（有挂起）：改查询后 150ms 内按 Enter → 消费挂起并发起
+            // 新扫描（后台化；结果经下方 run_until_parked 写回）
             terminal.replace_text_in_range(None, "a", window, cx);
             assert!(terminal.search.as_ref().unwrap().search_pending);
             press_key(terminal, "enter", window, cx);
+            assert!(
+                !terminal.search.as_ref().unwrap().search_pending,
+                "Enter 同步消费挂起"
+            );
+        });
+        cx.run_until_parked();
+        terminal.update(cx, |terminal, _| {
             let search = terminal.search.as_ref().unwrap();
-            assert!(!search.search_pending, "Enter 同步消费挂起");
             assert_eq!(search.query, "aba");
             assert!(search.matches.is_empty(), "flush 按新查询重算");
             assert_eq!(search.current, 0, "flush 落首命中");
@@ -4780,6 +5116,105 @@ mod tests {
             assert!(!search.search_pending);
             assert!(search.matches.is_empty(), "迟到的防抖任务不得复活旧结果");
         });
+    }
+
+    /// Shift+Enter 在挂起消费时记录补跳诉求：写回落首命中后 wrap 到末条
+    /// （同步版「先出结果再上移」的后台化两步，终态一致）。
+    #[gpui::test]
+    fn shift_enter_flush_applies_prev_after_write_back(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler;
+
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.state.process_bytes(b"ab ab ab\n");
+            terminal.open_search(cx);
+            terminal.replace_text_in_range(None, "ab", window, cx);
+            assert!(terminal.search.as_ref().unwrap().search_pending);
+            // Shift+Enter：消费挂起并发起扫描，记补跳诉求（同步可见的只有挂起态翻转）
+            press_key(terminal, "shift-enter", window, cx);
+            assert!(!terminal.search.as_ref().unwrap().search_pending);
+        });
+        cx.run_until_parked();
+        terminal.read_with(cx, |terminal, _| {
+            let search = terminal.search.as_ref().unwrap();
+            assert_eq!(search.matches.len(), 3, "flush 按新查询重算");
+            assert_eq!(search.current, 2, "补跳诉求：落首命中后 wrap 到末条");
+        });
+    }
+
+    /// 世代门禁：在飞扫描期间关闭搜索（close_search bump 世代作废）再
+    /// 重新打开，完成后旧会话结果不得写进新搜索态——防旧命中复活。
+    #[gpui::test]
+    fn stale_search_completion_does_not_write_back(cx: &mut TestAppContext) {
+        use gpui::EntityInputHandler;
+
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
+        });
+        terminal.update_in(cx, |terminal, window, cx| {
+            terminal.state.process_bytes(b"ab ab\n");
+            terminal.open_search(cx);
+            terminal.replace_text_in_range(None, "ab", window, cx);
+            assert!(terminal.search.as_ref().unwrap().search_pending);
+            // Enter 消费挂起并发起后台扫描
+            press_key(terminal, "enter", window, cx);
+            assert!(terminal.search_inflight, "扫描在飞");
+        });
+        // 在飞期间关闭搜索（bump 世代作废）再重新打开
+        terminal.update_in(cx, |terminal, window, cx| {
+            press_key(terminal, "escape", window, cx);
+            assert!(terminal.search.is_none());
+            terminal.open_search(cx);
+            assert_eq!(terminal.search.as_ref().unwrap().query, "");
+        });
+        cx.run_until_parked();
+        terminal.read_with(cx, |terminal, _| {
+            let search = terminal.search.as_ref().unwrap();
+            assert!(search.matches.is_empty(), "旧会话扫描结果不得写进新搜索态");
+            assert!(!terminal.search_inflight, "在飞标记已释放");
+        });
+    }
+
+    /// blink 停摆门控（纯函数）：启用闪烁且 >1500ms 未渲染 → 冻结；阈值
+    /// 边界（恰 1500ms）不冻结；禁用闪烁不受门控。
+    #[test]
+    fn blink_frozen_gates_only_when_enabled_and_idle() {
+        use super::blink_frozen;
+        assert!(!blink_frozen(true, 1_000, 1_000 + 1_499));
+        assert!(!blink_frozen(true, 1_000, 1_000 + 1_500), "阈值边界不冻结");
+        assert!(blink_frozen(true, 1_000, 1_000 + 1_501));
+        assert!(blink_frozen(true, 0, 10_000));
+        assert!(!blink_frozen(false, 0, 10_000), "关闭闪烁不受门控");
+    }
+
+    /// 兜底色板钉值：与地基线 laterterm-ui `palette_tests::
+    /// tokyo_night_palette_pinned` 锁定的 Tokyo Night 值逐一对应
+    /// （该测试改动需同步 fallback_ui_palette 的字面值，反之亦然）。
+    #[test]
+    fn fallback_ui_palette_pins_foundation_values() {
+        use gpui::Hsla;
+        let ui = super::fallback_ui_palette();
+        assert_eq!(ui.base_bg, Hsla::from(gpui::rgb(0x0E0E14)));
+        assert_eq!(ui.terminal_bg, Hsla::from(gpui::rgb(0x1A1B26)));
+        assert_eq!(ui.panel_bg, Hsla::from(gpui::rgb(0x222432)));
+        assert_eq!(ui.card_bg, Hsla::from(gpui::rgb(0x2B2C3E)));
+        assert_eq!(ui.hover_bg, Hsla::from(gpui::rgb(0x33354A)));
+        assert_eq!(ui.selected_bg, Hsla::from(gpui::rgb(0x354161)));
+        assert_eq!(ui.border, Hsla::from(gpui::rgb(0x1A1D29)));
+        assert_eq!(ui.border_strong, Hsla::from(gpui::rgb(0x59628E)));
+        assert_eq!(ui.text, Hsla::from(gpui::rgb(0xC0CAF5)));
+        assert_eq!(ui.text_secondary, Hsla::from(gpui::rgb(0x888CA0)));
+        assert_eq!(ui.text_muted, Hsla::from(gpui::rgb(0x414868)));
+        assert_eq!(ui.accent, Hsla::from(gpui::rgb(0x7AA2F7)));
+        assert_eq!(ui.danger, Hsla::from(gpui::rgb(0xF7768E)));
+        assert_eq!(ui.success, Hsla::from(gpui::rgb(0x9ECE6A)));
+        assert_eq!(ui.hover_tint, Hsla::from(gpui::rgba(0xA9B1D61F)));
+        assert_eq!(
+            ui.overlay_scrim,
+            Hsla::from(gpui::rgb(0x161720)).opacity(0.96)
+        );
     }
 
     #[gpui::test]
@@ -4919,7 +5354,7 @@ mod tests {
         let observed = calls.clone();
         let terminal = cx.new(|cx| {
             TerminalView::new(Arc::new(FinishedSession), TerminalConfig::default(), cx)
-                .with_scroll_callback(move |_| {
+                .with_scroll_callback(move |_, _| {
                     observed.fetch_add(1, Ordering::SeqCst);
                 })
         });

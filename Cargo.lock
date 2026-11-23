@@ -3766,6 +3766,7 @@ dependencies = [
  "laterterm-ssh",
  "laterterm-termview",
  "laterterm-transfer",
+ "laterterm-ui",
  "laterterm-xshell",
  "notify",
  "parking_lot",
@@ -3841,6 +3842,7 @@ dependencies = [
  "futures",
  "gpui",
  "laterterm-core",
+ "laterterm-ui",
  "parking_lot",
  "regex",
  "ropey",
@@ -3859,6 +3861,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "laterterm-ui"
+version = "0.0.1"
+dependencies = [
+ "gpui",
+ "laterterm-config",
 ]
 
 [[package]]

@@ -224,13 +224,14 @@ impl QuakePortalStatus {
         }
     }
 
-    /// 状态行配色：绿=就绪、黄=等待、红=异常。
-    pub(crate) fn text_color(&self) -> u32 {
+    /// 状态行配色：绿=就绪、黄=等待、红=异常、灰=未启用。
+    /// 色板由调用方传入（随主题换肤）；唯一消费点 settings_ui Quake 卡状态行。
+    pub(crate) fn text_color(&self, ui: &laterterm_ui::UiPalette) -> gpui::Hsla {
         match self {
-            Self::Disabled => 0x565A78,
-            Self::AwaitingConsent => 0xE0AF68,
-            Self::Ready(_) => 0x9ECE6A,
-            Self::Failed(_) => 0xF7768E,
+            Self::Disabled => ui.text_muted,
+            Self::AwaitingConsent => ui.warning,
+            Self::Ready(_) => ui.success,
+            Self::Failed(_) => ui.danger,
         }
     }
 }

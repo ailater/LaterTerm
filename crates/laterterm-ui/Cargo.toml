@@ -1,0 +1,13 @@
+[package]
+name = "laterterm-ui"
+description = "LaterTerm UI 设计 token 与共享控件单一真值"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+# 仅做 UI 渲染与事件装配，不依赖 gpui test-support（纯值构造无运行时需求）。
+gpui.workspace = true
+# 只消费 theme::ThemeColors 的 19 个 pub u32 字段；config 不依赖本 crate，无环。
+laterterm-config = { path = "../laterterm-config" }

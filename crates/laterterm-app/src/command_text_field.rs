@@ -2,8 +2,10 @@ use gpui::{
     Bounds, Context, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Render, Styled, UTF16Selection, Window, anchored, canvas,
-    deferred, div, prelude::FluentBuilder, px, rgb,
+    deferred, div, prelude::FluentBuilder, px,
 };
+use laterterm_ui::tokens::{H_CTRL, TEXT_BODY_SM};
+use laterterm_ui::{UiPalette, active_palette, menu_item, overlay_shadow, tint_hsla};
 use std::cell::Cell;
 use std::ops::Range;
 use std::rc::Rc;
@@ -42,6 +44,9 @@ pub(crate) struct CommandTextField {
     /// 拖拽中鼠标移出元素后松键收不到 on_mouse_up，靠 on_mouse_move 的
     /// `pressed_button == None` 兜底复位。
     drag_anchor: Option<usize>,
+    /// 就地错误提示（保存校验失败等）：Some 时边框/底色转 danger 态，
+    /// 并在框下渲染提示文字。纯样式能力，接线由调用方按需驱动。
+    error: Option<String>,
 }
 
 impl EventEmitter<CommandTextChanged> for CommandTextField {}
@@ -69,6 +74,18 @@ impl CommandTextField {
             caret_on: true,
             blink_scheduled: false,
             drag_anchor: None,
+            error: None,
+        }
+    }
+
+    /// 就地错误提示（None 清除）：Some 时边框/底色转 danger 态并在框下
+    /// 显示提示文字。纯样式能力，业务侧按需接线（保存校验等）；当前尚无
+    /// 调用方，显式豁免 dead_code 以保 lint 干净。
+    #[allow(dead_code)]
+    pub(crate) fn set_error(&mut self, error: Option<String>, cx: &mut Context<Self>) {
+        if self.error != error {
+            self.error = error;
+            cx.notify();
         }
     }
 
@@ -483,27 +500,31 @@ impl Render for CommandTextField {
         let sel_start = self.selection.start.min(self.selection.end);
         let sel_end = self.selection.start.max(self.selection.end);
 
+        // 色板经 gpui Global 读取（workspace 每帧写入）；独立测试窗口回落 TN。
+        let ui: UiPalette = active_palette(cx);
+        // 三态：聚焦 = 提亮底 + accent 边（焦点环）；错误 = danger 提示底 +
+        // danger 边（错误优先于聚焦色，校验信息不该被聚焦色盖掉）；常态 =
+        // 卡片底 + 提亮档边（约定④，有意较旧 0x343750 提亮，走查项③）。
+        let (box_bg, box_border) = if self.error.is_some() {
+            (tint_hsla(ui.danger, 0x1A), ui.danger)
+        } else if focused {
+            (ui.elevated_bg, ui.accent)
+        } else {
+            (ui.card_bg, ui.border_strong)
+        };
         let bounds_cell = self.bounds.clone();
         let mut field = div()
             .track_focus(&focus)
             .relative()
-            .h(px(30.0))
+            .h(px(H_CTRL))
             .w_full()
             .px_2()
             .flex()
             .items_center()
             .border_1()
             .rounded_sm()
-            .bg(if focused {
-                rgb(0x2F3147)
-            } else {
-                rgb(0x292B3D)
-            })
-            .border_color(if focused {
-                rgb(0x7AA2F7)
-            } else {
-                rgb(0x343750)
-            })
+            .bg(box_bg)
+            .border_color(box_border)
             .child(
                 div().absolute().inset_0().child(
                     canvas(
@@ -527,27 +548,22 @@ impl Render for CommandTextField {
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_field_right_click));
 
         if let Some(pos) = self.context_menu {
+            // 右键菜单项统一走 controls::menu_item（与全局右键菜单同观感）；
+            // 收菜单动作并入 listener（工厂不感知视图状态）。
             let item = |cx: &mut Context<Self>,
                         label: &'static str,
                         action: fn(&mut Self, &mut Context<Self>)| {
-                div()
-                    .h(px(26.0))
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .text_size(px(12.0))
-                    .text_color(rgb(0xC0CAF5))
-                    .hover(|style| style.bg(rgb(0x2F3147)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |field, _event, _window, cx| {
-                            cx.stop_propagation();
-                            action(field, cx);
-                            field.context_menu = None;
-                            cx.notify();
-                        }),
-                    )
-                    .child(label)
+                menu_item(
+                    label,
+                    &ui,
+                    false,
+                    false,
+                    cx.listener(move |field, _event, _window, cx| {
+                        action(field, cx);
+                        field.context_menu = None;
+                        cx.notify();
+                    }),
+                )
             };
             field = field.child(
                 deferred(
@@ -557,10 +573,11 @@ impl Render for CommandTextField {
                             .flex()
                             .flex_col()
                             .py_1()
-                            .bg(rgb(0x252837))
+                            .bg(ui.card_bg)
                             .border_1()
-                            .border_color(rgb(0x3B3F5C))
+                            .border_color(ui.border_strong)
                             .rounded_md()
+                            .shadow(overlay_shadow())
                             .on_mouse_down_out(cx.listener(|field, _, _, cx| {
                                 field.close_context_menu(cx);
                             }))
@@ -585,12 +602,12 @@ impl Render for CommandTextField {
 
         if self.text.is_empty() {
             if show_caret {
-                field = field.child(caret_bar());
+                field = field.child(caret_bar(&ui));
             }
             field = field
-                .text_color(rgb(0x565A78))
+                .text_color(ui.text_muted)
                 .child(self.placeholder.clone());
-            return field;
+            return self.with_error_hint(field, &ui);
         }
 
         // 三段式：选区前 / 选区（高亮底色）/ 选区后；光标位置由选区方向决定。
@@ -614,24 +631,47 @@ impl Render for CommandTextField {
             self.text[end_byte..].to_string()
         };
         let caret_leading = self.reversed || collapsed;
-        field = field.text_color(rgb(0xC0CAF5)).child(head);
+        field = field.text_color(ui.text).child(head);
         if show_caret && caret_leading {
-            field = field.child(caret_bar());
+            field = field.child(caret_bar(&ui));
         }
         if !collapsed {
-            field = field.child(div().bg(rgb(0x3B4661)).text_color(rgb(0xE0E6F5)).child(mid));
+            // 选区：accent 低透明底 + 主文字（原 0x3B4661/0xE0E6F5 固定色的
+            // 主题化等值迁移）。
+            field = field.child(
+                div()
+                    .bg(tint_hsla(ui.accent, 0x3A))
+                    .text_color(ui.text)
+                    .child(mid),
+            );
         }
         if show_caret && !caret_leading {
-            field = field.child(caret_bar());
+            field = field.child(caret_bar(&ui));
         }
         field = field.child(tail);
-        field
+        self.with_error_hint(field, &ui)
     }
 }
 
-/// 光标条：细竖线，闪烁由外层控制是否渲染。
-fn caret_bar() -> gpui::Div {
-    div().w(px(2.0)).h(px(16.0)).bg(rgb(0x7DCFFF))
+/// 错误提示：`error` 非空时在输入框下追加一行 danger 小字（纯样式能力，
+/// 文案随 `set_error` 由业务侧给出）。
+impl CommandTextField {
+    fn with_error_hint(&self, field: gpui::Div, ui: &UiPalette) -> gpui::Div {
+        match &self.error {
+            Some(error) => div().flex().flex_col().gap_1().child(field).child(
+                div()
+                    .text_size(px(TEXT_BODY_SM))
+                    .text_color(ui.danger)
+                    .child(error.clone()),
+            ),
+            None => field,
+        }
+    }
+}
+
+/// 光标条：细竖线，闪烁由外层控制是否渲染（accent 随主题，原 0x7DCFFF）。
+fn caret_bar(ui: &UiPalette) -> gpui::Div {
+    div().w(px(2.0)).h(px(16.0)).bg(ui.accent)
 }
 
 impl EntityInputHandler for CommandTextField {

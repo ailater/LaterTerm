@@ -17,56 +17,31 @@
 //! （面板/命令/服务器/动态码编辑），不在设置面板内；本模块里的「编辑快捷键」
 //! 按钮只是弹窗入口，原样平移。
 
-use super::{
-    BindingOwner, ButtonKind, ShortcutBinding, UiColors, WebDavOutcome, WorkspaceView,
-    dialog_error_line, ui_button,
-};
+use super::{BindingOwner, ShortcutBinding, WebDavOutcome, WorkspaceView, dialog_error_line};
 use crate::command_text_field::CommandTextField;
 use crate::onboarding::FONT_PRESETS;
 use crate::update_check::{self, Outcome};
 use crate::webdav_sync::{WebDavTaskKind, WebDavTaskState};
 use gpui::{
-    App, AppContext, Context, Div, InteractiveElement, MouseButton, MouseDownEvent, ParentElement,
-    SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px, rgb, rgba,
+    AnyElement, App, AppContext, Context, Div, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled,
+    Window, div, prelude::FluentBuilder, px, rgb,
 };
 use laterterm_config::theme::ThemeColors;
 use laterterm_config::{Appearance, ReconnectSettings, TriggerRule};
+use laterterm_ui::tokens::{H_CTRL, H_NAV};
+use laterterm_ui::{ButtonKind, IconButtonSpec, UiPalette, icon_button, tint_hsla, ui_button};
 
 // ---------------------------------------------------------------------------
-// Tokyo Night 色板收敛（评审硬伤5：逐处替换、只动本模块，不按色值全局替换
-// ——0x35415B/0x343750 等值横跨右侧面板与标题栏分隔线，全局替换必误伤）
+// 色板口径（原 Tokyo Night 固定常量组已删，全量改走 UiPalette 参数）：
+// 面板底/内凹底=terminal_bg（主题背景原色，TN 下与原 0x1A1B26 等值）、
+// 导航底=base_bg（比面板深一档，TN 下 0x0E0E14 略深于原 0x16161E，有意）、
+// 卡底=card_bg、描边/分隔线=border_strong（提亮档，约定④，有意提亮）、
+// 次级/弱化文字=text_secondary/text_muted（TN 下 0x888CA0/0x414868，较原
+// 0xA9B1D6/0x565A78 有意变暗，4K 走查项②）。若需回固定深色，仅需在
+// workspace 调用侧传 `UiPalette::from_theme(&ThemeColors::tokyo_night())`。
 // ---------------------------------------------------------------------------
 
-/// 面板底 / 芯片内凹底。
-const COLOR_OVERLAY_BG: u32 = 0x1A1B26;
-/// 导航底（比面板深一档，融入页框）。
-const COLOR_NAV_BG: u32 = 0x16161E;
-/// 卡片底。
-const COLOR_CARD_BG: u32 = 0x24283B;
-/// 卡片描边 / 分隔线。
-const COLOR_STROKE: u32 = 0x2F334D;
-/// 强调色。
-const COLOR_ACCENT: u32 = 0x7AA2F7;
-/// 主文字。
-const COLOR_TEXT: u32 = 0xC0CAF5;
-/// 次级文字。
-const COLOR_TEXT_SECONDARY: u32 = 0xA9B1D6;
-/// 弱化文字。
-const COLOR_TEXT_MUTED: u32 = 0x565A78;
-/// 危险 / 冲突。
-const COLOR_DANGER: u32 = 0xF7768E;
-/// 危险横幅底：danger 半透明 tint（alpha 同 COLOR_ACCENT_TINT 口径，≈10%）。
-const COLOR_DANGER_TINT: u32 = 0xF7768E26;
-/// 选中态 accent 半透明 tint（gpui::rgba 低 8 位是 alpha，26/255 ≈ 10%）。
-/// 注：LaterScreen 暗色模式用「中性提亮」（压暗的红在暗底上发闷）；这里
-/// 有意保留品牌色选中态——Tokyo Night 的蓝在深底上不闷，红/蓝气质不同。
-/// 属与参照相反的决策，留 4K 实机走查复核。
-const COLOR_ACCENT_TINT: u32 = 0x7AA2F726;
-/// 选中态 hover：tint 加深一档。
-const COLOR_ACCENT_TINT_HOVER: u32 = 0x7AA2F733;
-/// 未选中 hover：中性提亮（半透明次级色，31/255 ≈ 12%）。
-const COLOR_HOVER_TINT: u32 = 0xA9B1D61F;
 /// 字体 / 备选芯片固定宽度：内容区两列对齐，避免按文字长短流式换行参差。
 const FONT_CHIP_WIDTH: f32 = 184.0;
 
@@ -251,7 +226,9 @@ pub(crate) fn palette_preview(colors: &ThemeColors) -> PalettePreview {
 // ---------------------------------------------------------------------------
 
 /// 设置覆盖层：遮罩 + 居中面板（头部 52 / 导航+内容 / 底部 44，几何不变只换令牌）。
+/// `ui` 由 workspace render 传入（随主题换肤）。
 pub(crate) fn settings_overlay(
+    ui: &UiPalette,
     scrim_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     close_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     navigation: Div,
@@ -278,9 +255,9 @@ pub(crate) fn settings_overlay(
                 .flex_col()
                 .overflow_hidden()
                 .rounded_md()
-                .bg(rgb(COLOR_OVERLAY_BG))
+                .bg(ui.terminal_bg)
                 .border_1()
-                .border_color(rgb(COLOR_STROKE))
+                .border_color(ui.border_strong)
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .child(
                     div()
@@ -291,19 +268,21 @@ pub(crate) fn settings_overlay(
                         .justify_between()
                         .px_5()
                         .border_b_1()
-                        .border_color(rgb(COLOR_STROKE))
-                        .child(div().text_color(rgb(COLOR_TEXT)).child("设置"))
-                        .child(
-                            div()
-                                .h(px(30.0))
-                                .w(px(30.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_color(rgb(COLOR_DANGER))
-                                .on_mouse_down(MouseButton::Left, close_listener)
-                                .child("×"),
-                        ),
+                        .border_color(ui.border_strong)
+                        .child(div().text_color(ui.text).child("设置"))
+                        // 关闭钮统一图标钮（原文本「×」，danger 悬停警示）
+                        .child(icon_button(
+                            "settings-close",
+                            "icons/close.svg",
+                            ui,
+                            IconButtonSpec {
+                                size: 22.0,
+                                reveal_on_group: None,
+                                danger_hover: true,
+                                disabled: false,
+                            },
+                            close_listener,
+                        )),
                 )
                 .child(
                     div()
@@ -322,8 +301,8 @@ pub(crate) fn settings_overlay(
                         .justify_between()
                         .px_5()
                         .border_t_1()
-                        .border_color(rgb(COLOR_STROKE))
-                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .border_color(ui.border_strong)
+                        .text_color(ui.text_secondary)
                         .child(format!(
                             "修改即时生效 · 共 {} 节，上下滚动查看全部设置",
                             SettingsSection::ALL.len()
@@ -334,42 +313,43 @@ pub(crate) fn settings_overlay(
 }
 
 /// 左导航：当前分区指示 + 点击跳转（滚动跟随由 workspace 的 scroll-spy 驱动）。
-pub(crate) fn settings_navigation(active: SettingsSection, cx: &mut Context<WorkspaceView>) -> Div {
+pub(crate) fn settings_navigation(
+    ui: &UiPalette,
+    active: SettingsSection,
+    cx: &mut Context<WorkspaceView>,
+) -> Div {
     div()
         .w(px(150.0))
         .h_full()
         .p_3()
-        .bg(rgb(COLOR_NAV_BG))
+        .bg(ui.base_bg)
         .flex()
         .flex_col()
         .gap_1()
         .children(
             SettingsSection::ALL
                 .into_iter()
-                .map(|section| settings_nav_item(section, section == active, cx)),
+                .map(|section| settings_nav_item(section, section == active, ui, cx)),
         )
 }
 
-/// 导航项：32px 行高 + 选中 accent tint 底 + 左侧 3px accent 指示条 +
+/// 导航项：H_NAV（32px）行高 + 选中 accent tint 底 + 左侧 3px accent 指示条 +
 /// 主文字色，未选中悬停中性提亮。（行高有意比 LaterScreen 参照 34px 紧凑，
 /// 设置面板只有文字无图标，32px 足够点击目标。）
 fn settings_nav_item(
     section: SettingsSection,
     selected: bool,
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
 ) -> Div {
     let (bg, hover_bg, text) = if selected {
         (
-            rgba(COLOR_ACCENT_TINT),
-            rgba(COLOR_ACCENT_TINT_HOVER),
-            rgb(COLOR_TEXT),
+            tint_hsla(ui.accent, 0x26),
+            tint_hsla(ui.accent, 0x33),
+            ui.text,
         )
     } else {
-        (
-            rgba(COLOR_NAV_BG),
-            rgba(COLOR_HOVER_TINT),
-            rgb(COLOR_TEXT_SECONDARY),
-        )
+        (ui.base_bg, ui.hover_tint, ui.text_secondary)
     };
     div()
         .debug_selector(move || {
@@ -380,7 +360,7 @@ fn settings_nav_item(
             }
         })
         .w_full()
-        .h(px(32.0))
+        .h(px(H_NAV))
         .relative()
         .flex()
         .items_center()
@@ -405,7 +385,7 @@ fn settings_nav_item(
                     .bottom(px(6.0))
                     .w(px(3.0))
                     .rounded_full()
-                    .bg(rgb(COLOR_ACCENT)),
+                    .bg(ui.accent),
             )
         })
         .child(section.label())
@@ -420,21 +400,48 @@ fn settings_nav_item(
 /// 子元素记录，索引对位是 scroll_to_top_of_item 与 scroll-spy 的硬约束。
 pub(crate) fn settings_content(
     workspace: &mut WorkspaceView,
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
 ) -> Stateful<Div> {
     let appearance = workspace.settings.appearance.clone();
     let mut children = Vec::with_capacity(SettingsSection::ALL.len());
     for section in SettingsSection::ALL {
-        let body: Vec<Div> = match section {
-            SettingsSection::Appearance => settings_appearance_body(&appearance, cx),
-            SettingsSection::Font => settings_font_body(&appearance, cx),
-            SettingsSection::Scrolling => settings_scrolling_body(workspace, &appearance, cx),
-            SettingsSection::Shortcuts => settings_shortcuts_body(workspace, cx),
-            SettingsSection::Terminal => settings_terminal_body(workspace, &appearance, cx),
-            SettingsSection::Servers => settings_servers_body(&workspace.settings.reconnect, cx),
-            SettingsSection::ConfigSync => settings_config_sync_body(workspace, cx),
-            SettingsSection::About => settings_about_body(cx),
-            SettingsSection::UpdateCheck => settings_update_body(workspace, cx),
+        let body: Vec<AnyElement> = match section {
+            SettingsSection::Appearance => settings_appearance_body(&appearance, ui, cx)
+                .into_iter()
+                .map(IntoElement::into_any_element)
+                .collect(),
+            SettingsSection::Font => settings_font_body(&appearance, ui, cx)
+                .into_iter()
+                .map(IntoElement::into_any_element)
+                .collect(),
+            SettingsSection::Scrolling => settings_scrolling_body(workspace, &appearance, ui, cx),
+            SettingsSection::Shortcuts => settings_shortcuts_body(workspace, ui, cx)
+                .into_iter()
+                .map(IntoElement::into_any_element)
+                .collect(),
+            SettingsSection::Terminal => settings_terminal_body(workspace, &appearance, ui, cx)
+                .into_iter()
+                .map(IntoElement::into_any_element)
+                .collect(),
+            SettingsSection::Servers => {
+                settings_servers_body(&workspace.settings.reconnect, ui, cx)
+                    .into_iter()
+                    .map(IntoElement::into_any_element)
+                    .collect()
+            }
+            SettingsSection::ConfigSync => settings_config_sync_body(workspace, ui, cx)
+                .into_iter()
+                .map(IntoElement::into_any_element)
+                .collect(),
+            SettingsSection::About => settings_about_body(ui, cx)
+                .into_iter()
+                .map(IntoElement::into_any_element)
+                .collect(),
+            SettingsSection::UpdateCheck => settings_update_body(workspace, ui, cx)
+                .into_iter()
+                .map(IntoElement::into_any_element)
+                .collect(),
         };
         let block = div()
             .debug_selector(move || format!("settings-section-{}", section.debug_key()))
@@ -443,7 +450,7 @@ pub(crate) fn settings_content(
             .flex()
             .flex_col()
             .gap_3()
-            .child(section_title(section.anchor_title()))
+            .child(section_title(ui, section.anchor_title()))
             .children(body);
         children.push(block);
     }
@@ -457,19 +464,25 @@ pub(crate) fn settings_content(
         .track_scroll(&workspace.settings_scroll)
         .flex()
         .flex_col()
-        .text_color(rgb(COLOR_TEXT))
+        .text_color(ui.text)
         .children(children)
 }
 
 /// 「终端外观」卡：字号 / 行高 / 内边距 / 背景不透明度 / 背景模糊。
-fn settings_appearance_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) -> Vec<Div> {
+fn settings_appearance_body(
+    appearance: &Appearance,
+    ui: &UiPalette,
+    cx: &mut Context<WorkspaceView>,
+) -> Vec<Div> {
     // Linux 下的透明降级提示会追加到 card；其他平台无可变消费方。
     #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
-    let mut card = setting_card()
+    let mut card = setting_card(ui)
         .child(setting_row(
+            ui,
             "字号",
-            value_chip(&format!("{:.0} px", appearance.font_size)),
+            value_chip(ui, &format!("{:.0} px", appearance.font_size)),
             stepper_controls(
+                ui,
                 cx,
                 "font-size",
                 |s: &mut Appearance| s.font_size = (s.font_size - 1.0).max(8.0),
@@ -477,9 +490,11 @@ fn settings_appearance_body(appearance: &Appearance, cx: &mut Context<WorkspaceV
             ),
         ))
         .child(setting_row(
+            ui,
             "行高",
-            value_chip(&format!("{:.1}", appearance.line_height)),
+            value_chip(ui, &format!("{:.1}", appearance.line_height)),
             stepper_controls(
+                ui,
                 cx,
                 "line-height",
                 |s: &mut Appearance| {
@@ -493,9 +508,11 @@ fn settings_appearance_body(appearance: &Appearance, cx: &mut Context<WorkspaceV
             ),
         ))
         .child(setting_row(
+            ui,
             "内边距",
-            value_chip(&format!("{:.0} px", appearance.padding)),
+            value_chip(ui, &format!("{:.0} px", appearance.padding)),
             stepper_controls(
+                ui,
                 cx,
                 "padding",
                 |s: &mut Appearance| s.padding = (s.padding - 1.0).max(0.0),
@@ -504,12 +521,14 @@ fn settings_appearance_body(appearance: &Appearance, cx: &mut Context<WorkspaceV
         ))
         .child(setting_row(
             // ±5% 步进，两位小数取整防浮点尾巴；钳制与配置层 sanitize 同口径
+            ui,
             "背景不透明度",
-            value_chip(&format!(
-                "{:.0}%",
-                (appearance.background_opacity * 100.0).round()
-            )),
+            value_chip(
+                ui,
+                &format!("{:.0}%", (appearance.background_opacity * 100.0).round()),
+            ),
             stepper_controls(
+                ui,
                 cx,
                 "background-opacity",
                 |s: &mut Appearance| {
@@ -523,10 +542,13 @@ fn settings_appearance_body(appearance: &Appearance, cx: &mut Context<WorkspaceV
             ),
         ))
         .child(setting_row(
+            ui,
             "背景模糊",
             div(),
             toggle_controls(
+                ui,
                 cx,
+                "背景模糊",
                 ("开", true),
                 ("关", false),
                 appearance.background_blur,
@@ -542,7 +564,7 @@ fn settings_appearance_body(appearance: &Appearance, cx: &mut Context<WorkspaceV
             div()
                 .pt_1()
                 .text_size(px(11.0))
-                .text_color(rgb(COLOR_TEXT_MUTED))
+                .text_color(ui.text_muted)
                 .child(hint),
         );
     }
@@ -580,9 +602,13 @@ fn transparency_hint(appearance: &Appearance) -> Option<&'static str> {
 }
 
 /// 「字体」卡：字体族 / 连字 / 光标闪烁 / 光标样式 / 平滑滚动 / 选中即复制 / 备选。
-fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) -> Vec<Div> {
+fn settings_font_body(
+    appearance: &Appearance,
+    ui: &UiPalette,
+    cx: &mut Context<WorkspaceView>,
+) -> Vec<Div> {
     vec![
-        setting_card()
+        setting_card(ui)
             .child(
                 div()
                     .flex()
@@ -593,16 +619,19 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
                         div()
                             .w(px(64.0))
                             .pt_1()
-                            .text_color(rgb(COLOR_TEXT_SECONDARY))
+                            .text_color(ui.text_secondary)
                             .child("字体"),
                     )
-                    .child(font_family_controls(cx, &appearance.font_family)),
+                    .child(font_family_controls(ui, cx, &appearance.font_family)),
             )
             .child(setting_row(
+                ui,
                 "连字",
                 div(),
                 toggle_controls(
+                    ui,
                     cx,
+                    "连字",
                     ("开", true),
                     ("关", false),
                     appearance.ligatures,
@@ -610,10 +639,13 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
                 ),
             ))
             .child(setting_row(
+                ui,
                 "光标闪烁",
                 div(),
                 toggle_controls(
+                    ui,
                     cx,
+                    "光标闪烁",
                     ("开", true),
                     ("关", false),
                     appearance.cursor_blink,
@@ -621,15 +653,19 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
                 ),
             ))
             .child(setting_row(
+                ui,
                 "光标样式",
                 div(),
-                cursor_style_controls(cx, appearance.cursor_style),
+                cursor_style_controls(ui, cx, appearance.cursor_style),
             ))
             .child(setting_row(
+                ui,
                 "平滑滚动",
                 div(),
                 toggle_controls(
+                    ui,
                     cx,
+                    "平滑滚动",
                     ("开", true),
                     ("关", false),
                     appearance.smooth_scrolling,
@@ -638,10 +674,13 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
             ))
             .child(setting_row(
                 // 拖拽/双击/三击出选区松开即复制（Deepin 同款），不只限拖拽
+                ui,
                 "选中即复制",
                 div(),
                 toggle_controls(
+                    ui,
                     cx,
+                    "选中即复制",
                     ("开", true),
                     ("关", false),
                     appearance.copy_on_select,
@@ -650,10 +689,13 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
             ))
             .child(setting_row(
                 // 剪贴板内容含换行（含单行命令+尾回车）时先弹确认，防误粘贴即执行
+                ui,
                 "多行粘贴确认",
                 div(),
                 toggle_controls(
+                    ui,
                     cx,
+                    "多行粘贴确认",
                     ("开", true),
                     ("关", false),
                     appearance.confirm_multiline_paste,
@@ -663,10 +705,13 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
             .child(setting_row(
                 // 关闭窗格/标签/窗口时若探测到会话内仍有前台或子进程在运行，
                 // 先弹确认再执行关闭（防误杀 sleep/编辑器/后台 job）
+                ui,
                 "关闭运行中确认",
                 div(),
                 toggle_controls(
+                    ui,
                     cx,
+                    "关闭运行中确认",
                     ("开", true),
                     ("关", false),
                     appearance.confirm_close_running,
@@ -675,10 +720,13 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
             ))
             .child(setting_row(
                 // 复制成功后窗口右下角短暂显示「已复制 N 字符」
+                ui,
                 "复制提示",
                 div(),
                 toggle_controls(
+                    ui,
                     cx,
+                    "复制提示",
                     ("开", true),
                     ("关", false),
                     appearance.copy_toast,
@@ -687,10 +735,13 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
             ))
             .child(setting_row(
                 // 终端 bell 响铃时弹系统桌面通知；默认关（只视觉提示，测试不外发）
+                ui,
                 "响铃系统通知",
                 div(),
                 toggle_controls(
+                    ui,
                     cx,
+                    "响铃系统通知",
                     ("开", true),
                     ("关", false),
                     appearance.bell_notification,
@@ -698,9 +749,10 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
                 ),
             ))
             .child(setting_row(
-                // bash 提示符集成（OSC 133/7）：经环境注入 PROMPT_COMMAND/PS0，
-                // 只对新开的本地 bash 会话生效；best-effort——用户 .bashrc
-                // 重赋值这两个变量即静默失效（zsh/fish 自装片段见 README）
+                // bash 提示符集成（OSC 133/7）：经环境注入 PROMPT_COMMAND/PS0，只对新开的
+                // 本地 bash 会话生效；best-effort——用户 .bashrc 重赋值这两个变量即静默失效
+                //（zsh/fish 自装片段见 README）
+                ui,
                 "Shell 集成",
                 div(),
                 // 开关旁提示文案（行内追加，不占独立行）
@@ -709,7 +761,9 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
                     .items_center()
                     .gap_2()
                     .child(toggle_controls(
+                        ui,
                         cx,
+                        "Shell 集成",
                         ("开", true),
                         ("关", false),
                         appearance.shell_integration,
@@ -718,13 +772,14 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
                     .child(
                         div()
                             .text_size(px(11.0))
-                            .text_color(rgb(COLOR_TEXT_MUTED))
+                            .text_color(ui.text_muted)
                             .child("仅 bash（提示符跳转/失败标记）"),
                     ),
             ))
             .child(setting_row(
-                // kitty keyboard protocol（CSI > 1u / CSI ? u 协商）：默认关
-                // ——手写编码面未经真实应用验证前不默认开启
+                // kitty keyboard protocol（CSI > 1u / CSI ? u 协商）：默认关——手写编码面
+                // 未经真实应用验证前不默认开启
+                ui,
                 "kitty 键盘协议",
                 div(),
                 // 开关旁提示文案：开启只是「允许」应用协商，应用经 ?u 查询
@@ -734,7 +789,9 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
                     .items_center()
                     .gap_2()
                     .child(toggle_controls(
+                        ui,
                         cx,
+                        "kitty 键盘协议",
                         ("开", true),
                         ("关", false),
                         appearance.kitty_keyboard,
@@ -743,7 +800,7 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
                     .child(
                         div()
                             .text_size(px(11.0))
-                            .text_color(rgb(COLOR_TEXT_MUTED))
+                            .text_color(ui.text_muted)
                             .child("开启后应用经 ?u 查询自动启用"),
                     ),
             ))
@@ -757,10 +814,10 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
                         div()
                             .w(px(64.0))
                             .pt_1()
-                            .text_color(rgb(COLOR_TEXT_SECONDARY))
+                            .text_color(ui.text_secondary)
                             .child("备选"),
                     )
-                    .child(font_fallback_controls(cx, &appearance.font_fallbacks)),
+                    .child(font_fallback_controls(ui, cx, &appearance.font_fallbacks)),
             ),
     ]
 }
@@ -775,13 +832,14 @@ fn settings_font_body(appearance: &Appearance, cx: &mut Context<WorkspaceView>) 
 fn settings_scrolling_body(
     workspace: &WorkspaceView,
     appearance: &Appearance,
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
-) -> Vec<Div> {
+) -> Vec<AnyElement> {
     // 生效主题唯一读口（预览优先）：芯片选中态、色板卡、窗格颜色三处同源。
     let effective = workspace.effective_theme_name().to_string();
     let preview = palette_preview(&workspace.themes.resolve(&effective).colors);
     let previewing = workspace.theme_preview.is_some();
-    let mut theme_card = setting_card()
+    let mut theme_card = setting_card(ui)
         .child(
             div()
                 .flex()
@@ -791,14 +849,14 @@ fn settings_scrolling_body(
                 .child(
                     div()
                         .w(px(64.0))
-                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .text_color(ui.text_secondary)
                         .child("回滚"),
                 )
                 .child(
                     div()
                         .flex()
                         .gap_1()
-                        .child(scrollback_controls(cx, appearance)),
+                        .child(scrollback_controls(ui, cx, appearance)),
                 ),
         )
         .child(
@@ -810,12 +868,12 @@ fn settings_scrolling_body(
                 .child(
                     div()
                         .w(px(64.0))
-                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .text_color(ui.text_secondary)
                         .child("主题"),
                 )
-                .child(theme_controls(cx, &workspace.themes, &effective)),
+                .child(theme_controls(ui, cx, &workspace.themes, &effective)),
         )
-        .child(theme_preview_card(&preview));
+        .child(theme_preview_card(&preview, ui));
     // 预览激活才出现的提交/放弃控件与提示行——全部塞进本分区块内部，
     // 不得新增滚动容器直接子元素（settings_content 六节对位硬约束）。
     if previewing {
@@ -824,7 +882,7 @@ fn settings_scrolling_body(
                 div()
                     .pt_1()
                     .text_size(px(11.0))
-                    .text_color(rgb(COLOR_ACCENT))
+                    .text_color(ui.accent)
                     .child("预览中：保存后生效，关面板自动还原"),
             )
             .child(
@@ -833,6 +891,7 @@ fn settings_scrolling_body(
                     .flex()
                     .gap_1()
                     .child(setting_button(
+                        ui,
                         "保存主题",
                         true,
                         cx.listener(|this, event, window, cx| {
@@ -840,6 +899,7 @@ fn settings_scrolling_body(
                         }),
                     ))
                     .child(setting_button(
+                        ui,
                         "还原",
                         false,
                         cx.listener(|this, _event, window, cx| {
@@ -850,12 +910,14 @@ fn settings_scrolling_body(
             );
     }
     vec![
-        theme_card,
+        theme_card.into_any_element(),
         setting_button(
+            ui,
             "恢复默认",
             false,
             cx.listener(WorkspaceView::reset_settings),
-        ),
+        )
+        .into_any_element(),
     ]
 }
 
@@ -863,7 +925,7 @@ fn settings_scrolling_body(
 /// 数据全部来自 `palette_preview`（生效主题；预览期间即预览主题）。中文名
 /// 以小字标签直接排在色块下——gpui tooltip 需要 AnyView 工厂无字符串糖
 /// （评审建议2），全仓尚无 .tooltip( 先例，不为此 UI 卡引入首例。
-fn theme_preview_card(preview: &PalettePreview) -> Div {
+fn theme_preview_card(preview: &PalettePreview, ui: &UiPalette) -> Div {
     let color_chip = |name: &'static str, color: u32| {
         div()
             .flex()
@@ -876,13 +938,13 @@ fn theme_preview_card(preview: &PalettePreview) -> Div {
                     .h(px(14.0))
                     .rounded_sm()
                     .border_1()
-                    .border_color(rgb(COLOR_STROKE))
+                    .border_color(ui.border_strong)
                     .bg(rgb(color)),
             )
             .child(
                 div()
                     .text_size(px(9.0))
-                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .text_color(ui.text_muted)
                     .child(name),
             )
     };
@@ -893,9 +955,9 @@ fn theme_preview_card(preview: &PalettePreview) -> Div {
         .flex()
         .flex_col()
         .gap_2()
-        .bg(rgb(COLOR_OVERLAY_BG))
+        .bg(ui.terminal_bg)
         .border_1()
-        .border_color(rgb(COLOR_STROKE))
+        .border_color(ui.border_strong)
         .rounded_sm()
         .child(
             div()
@@ -950,6 +1012,7 @@ fn theme_preview_card(preview: &PalettePreview) -> Div {
 fn settings_terminal_body(
     workspace: &WorkspaceView,
     appearance: &Appearance,
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
 ) -> Vec<Div> {
     // 目录行如实显示解析结果（定位失败给提示而非假路径）；目录本体由审计
@@ -965,18 +1028,18 @@ fn settings_terminal_body(
         appearance.downloads_dir.clone()
     };
     vec![
-        setting_card()
-            .child(info_row("Shell", "$SHELL / bash"))
-            .child(info_row("TERM", "xterm-256color"))
-            .child(info_row("COLORTERM", "truecolor"))
-            .child(info_row("滚动", "自然滚动，支持历史回看"))
+        setting_card(ui)
+            .child(info_row(ui, "Shell", "$SHELL / bash"))
+            .child(info_row(ui, "TERM", "xterm-256color"))
+            .child(info_row(ui, "COLORTERM", "truecolor"))
+            .child(info_row(ui, "滚动", "自然滚动，支持历史回看"))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
                     .py_2()
-                    .text_color(rgb(COLOR_TEXT_SECONDARY))
+                    .text_color(ui.text_secondary)
                     .child("下载目录")
                     .child(
                         div()
@@ -986,10 +1049,11 @@ fn settings_terminal_body(
                             .child(
                                 div()
                                     .text_size(px(12.0))
-                                    .text_color(rgb(COLOR_TEXT))
+                                    .text_color(ui.text)
                                     .child(downloads_text),
                             )
                             .child(setting_button(
+                                ui,
                                 "选择目录",
                                 false,
                                 cx.listener(|this, event, window, cx| {
@@ -1001,18 +1065,21 @@ fn settings_terminal_body(
             .child(
                 div()
                     .text_size(px(11.0))
-                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .text_color(ui.text_muted)
                     .child("终端内传输（trz/sz/rz）的落盘位置，留空 = ~/Downloads；改动仅对新连接的会话生效（已连接会话不热切）"),
             ),
         // 会话日志卡：全局默认只约束「新会话初值」，运行中窗格在标签右键
         // 菜单逐标签热开/热关。默认关——PTY 输出含潜在敏感内容（回显型
         // 密码提示仍可能入盘），安全优先（change_setting 即时落盘生效）。
-        setting_card()
+        setting_card(ui)
             .child(setting_row(
+                ui,
                 "会话日志",
-                value_chip("新会话默认"),
+                value_chip(ui, "新会话默认"),
                 toggle_controls(
+                    ui,
                     cx,
+                    "会话日志",
                     ("开", true),
                     ("关", false),
                     appearance.session_logging,
@@ -1035,42 +1102,40 @@ fn settings_terminal_body(
                             .child(
                                 div()
                                     .text_size(px(11.0))
-                                    .text_color(rgb(COLOR_TEXT_SECONDARY))
+                                    .text_color(ui.text_secondary)
                                     .child("逐会话开关：标签右键 → 会话日志"),
                             )
                             .child(
                                 div()
                                     .text_size(px(11.0))
-                                    .text_color(rgb(COLOR_TEXT_MUTED))
+                                    .text_color(ui.text_muted)
                                     .child(dir_text),
                             ),
                     )
                     .child(setting_button(
+                        ui,
                         "打开日志目录",
                         false,
                         // 后台线程文件管理器进程，失败只 eprintln 不阻塞 UI
                         |_, _, _| crate::audit::open_logs_dir(),
                     )),
             ),
-        trigger_card(workspace, cx),
+        trigger_card(workspace, ui, cx),
     ]
 }
 
 /// 触发器卡：规则行（名称/模式/动作/启用开关/删除，点名称进编辑）+
 /// 「新增」弹窗入口。保存/启停/删除即时落盘并热替换审计规则集。
-fn trigger_card(workspace: &WorkspaceView, cx: &mut Context<WorkspaceView>) -> Div {
-    let mut card = setting_card().child(
+fn trigger_card(workspace: &WorkspaceView, ui: &UiPalette, cx: &mut Context<WorkspaceView>) -> Div {
+    let mut card = setting_card(ui).child(
         div()
             .flex()
             .items_center()
             .justify_between()
             .py_1()
-            .child(
-                div()
-                    .text_color(rgb(COLOR_TEXT_SECONDARY))
-                    .child("输出触发器"),
-            )
+            .child(div().text_color(ui.text_secondary).child("输出触发器"))
             .child(setting_button(
+                ui,
                 "新增",
                 false,
                 cx.listener(|this, _event, window, cx| {
@@ -1079,13 +1144,13 @@ fn trigger_card(workspace: &WorkspaceView, cx: &mut Context<WorkspaceView>) -> D
             )),
     );
     for rule in &workspace.settings.triggers {
-        card = card.child(trigger_row(workspace, rule, cx));
+        card = card.child(trigger_row(workspace, rule, ui, cx));
     }
     if workspace.settings.triggers.is_empty() {
         card = card.child(
             div()
                 .text_size(px(11.0))
-                .text_color(rgb(COLOR_TEXT_MUTED))
+                .text_color(ui.text_muted)
                 .child("暂无规则：输出命中正则时可发桌面通知或点亮标签"),
         );
     }
@@ -1093,7 +1158,7 @@ fn trigger_card(workspace: &WorkspaceView, cx: &mut Context<WorkspaceView>) -> D
     // 不在此重复）；command_error 先例的就地可见口径
     card.when(workspace.trigger_dialog.is_none(), |card| {
         card.when_some(workspace.trigger_error.clone(), |card, error| {
-            card.child(dialog_error_line(error))
+            card.child(dialog_error_line(ui, error))
         })
     })
 }
@@ -1103,6 +1168,7 @@ fn trigger_card(workspace: &WorkspaceView, cx: &mut Context<WorkspaceView>) -> D
 fn trigger_row(
     workspace: &WorkspaceView,
     rule: &TriggerRule,
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
 ) -> Div {
     let name = rule.name.clone();
@@ -1121,9 +1187,9 @@ fn trigger_row(
                 .flex_shrink_0()
                 .max_w(px(96.0))
                 .overflow_hidden()
-                .text_color(rgb(COLOR_TEXT))
+                .text_color(ui.text)
                 .cursor_pointer()
-                .hover(|style| style.text_color(rgb(COLOR_ACCENT)))
+                .hover(|style| style.text_color(ui.accent))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _event, window, cx| {
@@ -1139,20 +1205,23 @@ fn trigger_row(
                 .min_w(px(0.0))
                 .overflow_hidden()
                 .text_size(px(11.0))
-                .text_color(rgb(COLOR_TEXT_SECONDARY))
+                .text_color(ui.text_secondary)
                 .child(pattern),
         )
         .child(
             div()
                 .flex_shrink_0()
                 .text_size(px(11.0))
-                .text_color(rgb(COLOR_TEXT_MUTED))
+                .text_color(ui.text_muted)
                 .child(action_label),
         )
         // 启用开关：启停即落盘 + 规则集热替换（toggle_trigger）
         .child({
             let name = rule.name.clone();
-            setting_button(
+            // 行级重复 label：id 按规则名拼唯一（见 setting_button_keyed）
+            setting_button_keyed(
+                ui,
+                format!("trigger-{name}-toggle"),
                 if rule.enabled {
                     "已启用"
                 } else {
@@ -1167,7 +1236,9 @@ fn trigger_row(
         // 删除：二次确认（command_delete_confirm 同款，首击变「确认删除」）
         .child({
             let name = rule.name.clone();
-            setting_button(
+            setting_button_keyed(
+                ui,
+                format!("trigger-{name}-delete"),
                 if confirming { "确认删除" } else { "删除" },
                 false,
                 cx.listener(move |this, _event, _window, cx| {
@@ -1181,17 +1252,21 @@ fn trigger_row(
 /// （语义不变，随单页平移）。
 fn settings_servers_body(
     reconnect: &ReconnectSettings,
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
 ) -> Vec<Div> {
     vec![
         // 自动重连卡：断线自动重拨（指数退避 1s/2s/4s…）；密钥环命中免补输，
         // 缺失走既有补输对话框。改设置只影响后续新触发的重连。
-        setting_card()
+        setting_card(ui)
             .child(setting_row(
+                ui,
                 "自动重连",
-                value_chip("SSH 断线"),
+                value_chip(ui, "SSH 断线"),
                 reconnect_toggle_controls(
+                    ui,
                     cx,
+                    "自动重连",
                     ("开", true),
                     ("关", false),
                     reconnect.enabled,
@@ -1199,21 +1274,23 @@ fn settings_servers_body(
                 ),
             ))
             .child(setting_row(
+                ui,
                 "重试次数",
-                value_chip(&reconnect.max_attempts.to_string()),
-                reconnect_stepper_controls(cx, reconnect.max_attempts),
+                value_chip(ui, &reconnect.max_attempts.to_string()),
+                reconnect_stepper_controls(ui, cx, reconnect.max_attempts),
             ))
             .child(
                 div()
                     .text_size(px(11.0))
-                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .text_color(ui.text_muted)
                     .child("0 = 断线后只提示不自动重试；重连中窗格标题显示进度"),
             ),
-        setting_card()
-            .child(info_row("本地 Shell", "已内置"))
-            .child(info_row("SSH", "已接入（断线自动重连，见上方设置）"))
+        setting_card(ui)
+            .child(info_row(ui, "本地 Shell", "已内置"))
+            .child(info_row(ui, "SSH", "已接入（断线自动重连，见上方设置）"))
             // SOCKS5 动态转发 defer 说明（v1 只落本地/远程两类隧道）
             .child(info_row(
+                ui,
                 "端口转发",
                 "服务器编辑弹窗内配置本地/远程隧道，随连接建立；SOCKS5 动态转发规划在后续版本",
             )),
@@ -1223,7 +1300,9 @@ fn settings_servers_body(
 /// ReconnectSettings 二值开关控件：与 `toggle_controls` 同形，落点换
 /// ReconnectSettings（change_reconnect_setting 分路，quake_toggle_controls 先例）。
 fn reconnect_toggle_controls(
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
+    key: &'static str,
     on: (&'static str, bool),
     off: (&'static str, bool),
     current: bool,
@@ -1238,7 +1317,9 @@ fn reconnect_toggle_controls(
                 .map(|((label, value), _)| {
                     let selected = value == current;
                     let apply = apply.clone();
-                    setting_button(
+                    setting_button_keyed(
+                        ui,
+                        format!("{key}-{label}"),
                         label,
                         selected,
                         cx.listener(move |this, event, window, cx| {
@@ -1251,25 +1332,41 @@ fn reconnect_toggle_controls(
 
 /// 重试次数步进控件（−/+）：与 stepper_controls 同规格（icon_button），
 /// 落点换 ReconnectSettings；上限由载入期 sanitize（0..=10）双保险。
-fn reconnect_stepper_controls(cx: &mut Context<WorkspaceView>, current: u32) -> Div {
+fn reconnect_stepper_controls(
+    ui: &UiPalette,
+    cx: &mut Context<WorkspaceView>,
+    current: u32,
+) -> Div {
     div()
         .flex()
         .items_center()
         .gap_1()
-        .child(super::icon_button(
+        .child(icon_button(
             "reconnect-attempts-decrease",
             "icons/minus.svg",
-            panel_ui(),
+            ui,
+            IconButtonSpec {
+                size: 30.0,
+                reveal_on_group: None,
+                danger_hover: false,
+                disabled: false,
+            },
             cx.listener(|this, event, window, cx| {
                 this.change_reconnect_setting(event, window, cx, |s| {
                     s.max_attempts = s.max_attempts.saturating_sub(1);
                 });
             }),
         ))
-        .child(super::icon_button(
+        .child(icon_button(
             "reconnect-attempts-increase",
             "icons/plus.svg",
-            panel_ui(),
+            ui,
+            IconButtonSpec {
+                size: 30.0,
+                reveal_on_group: None,
+                danger_hover: false,
+                disabled: false,
+            },
             cx.listener(|this, event, window, cx| {
                 this.change_reconnect_setting(event, window, cx, |s| {
                     s.max_attempts = s.max_attempts.saturating_add(1).min(10);
@@ -1280,7 +1377,7 @@ fn reconnect_stepper_controls(cx: &mut Context<WorkspaceView>, current: u32) -> 
             div()
                 .min_w(px(24.0))
                 .text_size(px(12.0))
-                .text_color(rgb(COLOR_TEXT))
+                .text_color(ui.text)
                 .child(format!("{current} 次")),
         )
 }
@@ -1288,9 +1385,9 @@ fn reconnect_stepper_controls(cx: &mut Context<WorkspaceView>, current: u32) -> 
 /// 「关于」节：品牌卡（40px logo + 名称 + 版本芯片 + 一句话简介）与
 /// 仓库链接 / 许可行。版本号读 workspace 单一真源 CARGO_PKG_VERSION；
 /// 简介取自仓库 AGENTS.md 的定位一句话。
-fn settings_about_body(cx: &mut Context<WorkspaceView>) -> Vec<Div> {
+fn settings_about_body(ui: &UiPalette, cx: &mut Context<WorkspaceView>) -> Vec<Div> {
     vec![
-        setting_card()
+        setting_card(ui)
             .child(
                 div()
                     .debug_selector(|| "about-brand".into())
@@ -1312,18 +1409,18 @@ fn settings_about_body(cx: &mut Context<WorkspaceView>) -> Vec<Div> {
                                     .child(
                                         div()
                                             .text_size(px(15.0))
-                                            .text_color(rgb(COLOR_TEXT))
+                                            .text_color(ui.text)
                                             .child("LaterTerm"),
                                     )
-                                    .child(value_chip(&format!("v{}", env!("CARGO_PKG_VERSION")))),
+                                    .child(value_chip(
+                                        ui,
+                                        &format!("v{}", env!("CARGO_PKG_VERSION")),
+                                    )),
                             )
                             .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(COLOR_TEXT_MUTED))
-                                    .child(
-                                        "跨平台 GPU 终端：Deepin 终端功能 × Tabby 颜值 × 原生性能",
-                                    ),
+                                div().text_size(px(12.0)).text_color(ui.text_muted).child(
+                                    "跨平台 GPU 终端：Deepin 终端功能 × Tabby 颜值 × 原生性能",
+                                ),
                             ),
                     ),
             )
@@ -1334,9 +1431,9 @@ fn settings_about_body(cx: &mut Context<WorkspaceView>) -> Vec<Div> {
                     .items_center()
                     .py_1()
                     .text_size(px(12.0))
-                    .text_color(rgb(COLOR_ACCENT))
+                    .text_color(ui.accent)
                     .cursor_pointer()
-                    .hover(|style| style.text_color(rgb(COLOR_TEXT)))
+                    .hover(|style| style.text_color(ui.text))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|_, _event, _window, cx| {
@@ -1346,7 +1443,7 @@ fn settings_about_body(cx: &mut Context<WorkspaceView>) -> Vec<Div> {
                     )
                     .child("github.com/ailater/LaterTerm"),
             )
-            .child(info_row("许可", "MIT OR Apache-2.0")),
+            .child(info_row(ui, "许可", "MIT OR Apache-2.0")),
     ]
 }
 
@@ -1354,10 +1451,14 @@ fn settings_about_body(cx: &mut Context<WorkspaceView>) -> Vec<Div> {
 /// 手动触发而非后台自动联网（静默外连是黑盒行为）；网络 IO 在后台执行器
 /// （workspace.rs check_for_update），失败一律「未能确认」静默文案不弹窗，
 /// 绝不把失败说成「已是最新」。
-fn settings_update_body(workspace: &WorkspaceView, cx: &mut Context<WorkspaceView>) -> Vec<Div> {
+fn settings_update_body(
+    workspace: &WorkspaceView,
+    ui: &UiPalette,
+    cx: &mut Context<WorkspaceView>,
+) -> Vec<Div> {
     let check = &workspace.update_check;
     let checking = check.checking();
-    let mut card = setting_card();
+    let mut card = setting_card(ui);
     // 新版本横幅：只在确实查到更新时出现，紧贴按钮上方——检查动作发生在
     // 哪，结果就出现在哪；放页顶会落在滚动视野外（LaterScreen v0.11.4 教训）
     if let Some(Ok(Outcome::Newer(tag))) = check.result() {
@@ -1369,20 +1470,21 @@ fn settings_update_body(workspace: &WorkspaceView, cx: &mut Context<WorkspaceVie
                 .gap_2()
                 .px_2()
                 .py_1()
-                .bg(rgba(COLOR_ACCENT_TINT))
+                .bg(tint_hsla(ui.accent, 0x26))
                 .border_1()
-                .border_color(rgb(COLOR_ACCENT))
+                .border_color(ui.accent)
                 .rounded_sm()
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
                         .text_size(px(12.0))
-                        .text_color(rgb(COLOR_ACCENT))
+                        .text_color(ui.accent)
                         .child(format!("发现新版本 {tag}")),
                 )
                 .child(
                     setting_button(
+                        ui,
                         "去下载",
                         true,
                         cx.listener(|_, _event, _window, cx| {
@@ -1393,6 +1495,7 @@ fn settings_update_body(workspace: &WorkspaceView, cx: &mut Context<WorkspaceVie
                     .debug_selector(|| "update-download-btn".into()),
                 )
                 .child(setting_button(
+                    ui,
                     "知道了",
                     false,
                     cx.listener(|this, _event, _window, cx| {
@@ -1407,6 +1510,7 @@ fn settings_update_body(workspace: &WorkspaceView, cx: &mut Context<WorkspaceVie
     // 渲染用 muted 色 + 文案区分禁用感——不给 setting_button 扩禁用签名，
     // 避免波及全部既有调用点（评审风险4）
     let mut check_button = setting_button(
+        ui,
         if checking {
             "检查中…"
         } else {
@@ -1416,7 +1520,7 @@ fn settings_update_body(workspace: &WorkspaceView, cx: &mut Context<WorkspaceVie
         cx.listener(|this, _event, _window, cx| this.check_for_update(cx)),
     );
     if checking {
-        check_button = check_button.text_color(rgb(COLOR_TEXT_MUTED));
+        check_button = check_button.text_color(ui.text_muted);
     }
     let mut row = div().flex().items_center().gap_3().py_1().child(
         check_button
@@ -1431,7 +1535,7 @@ fn settings_update_body(workspace: &WorkspaceView, cx: &mut Context<WorkspaceVie
                 div()
                     .debug_selector(|| "update-status-idle".into())
                     .text_size(px(12.0))
-                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .text_color(ui.text_muted)
                     .child(format!("当前 v{}", env!("CARGO_PKG_VERSION"))),
             );
         }
@@ -1440,7 +1544,7 @@ fn settings_update_body(workspace: &WorkspaceView, cx: &mut Context<WorkspaceVie
                 div()
                     .debug_selector(|| "update-status-uptodate".into())
                     .text_size(px(12.0))
-                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .text_color(ui.text_muted)
                     .child(format!("当前 v{}，已是最新", env!("CARGO_PKG_VERSION"))),
             );
         }
@@ -1449,7 +1553,7 @@ fn settings_update_body(workspace: &WorkspaceView, cx: &mut Context<WorkspaceVie
                 div()
                     .debug_selector(|| "update-status-error".into())
                     .text_size(px(12.0))
-                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .text_color(ui.text_muted)
                     .child(format!("未能确认：{message}")),
             );
         }
@@ -1465,6 +1569,7 @@ fn settings_update_body(workspace: &WorkspaceView, cx: &mut Context<WorkspaceVie
 /// 密码框只写不读（永不从密钥环回显，留空 = 保持已存密码，TOTP 密钥框同款）。
 fn settings_config_sync_body(
     workspace: &mut WorkspaceView,
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
 ) -> Vec<Div> {
     // 输入框懒建（分区首帧按当前 [sync] 值初始化；totp_fields 同构）
@@ -1494,27 +1599,24 @@ fn settings_config_sync_body(
         .map(|(_, field)| field.read(cx).value().trim().to_string())
         .unwrap_or_default();
     let task = workspace.webdav_task;
-    let mut card = setting_card()
+    let mut card = setting_card(ui)
         // 固定说明行：合并语义的四类 local-only 特判（方案红线，恒本地）
         .child(
             div()
                 .text_size(px(11.0))
-                .text_color(rgb(COLOR_TEXT_MUTED))
+                .text_color(ui.text_muted)
                 .child("本机专属项不参与合并：WebDAV 账户配置、shell、接收目录"),
         )
-        .child(
-            div()
-                .text_size(px(11.0))
-                .text_color(rgb(COLOR_TEXT_MUTED))
-                .child("备份在 WebDAV 目录累积保留档（laterterm-config-snapshot-<时间>.toml），可手动清理"),
-        )
+        .child(div().text_size(px(11.0)).text_color(ui.text_muted).child(
+            "备份在 WebDAV 目录累积保留档（laterterm-config-snapshot-<时间>.toml），可手动清理",
+        ))
         .children(fields.into_iter().map(|(name, field)| {
             div()
                 .pt_2()
                 .child(
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(COLOR_TEXT_SECONDARY))
+                        .text_color(ui.text_secondary)
                         .child(name),
                 )
                 .child(field)
@@ -1530,16 +1632,16 @@ fn settings_config_sync_body(
                 .gap_2()
                 .px_2()
                 .py_1()
-                .bg(rgba(COLOR_DANGER_TINT))
+                .bg(tint_hsla(ui.danger, 0x26))
                 .border_1()
-                .border_color(rgb(COLOR_DANGER))
+                .border_color(ui.danger)
                 .rounded_sm()
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
                         .text_size(px(12.0))
-                        .text_color(rgb(COLOR_DANGER))
+                        .text_color(ui.danger)
                         .child("地址未使用 https://：账号与密码将明文传输，存在被截获风险"),
                 ),
         );
@@ -1554,6 +1656,7 @@ fn settings_config_sync_body(
     ] {
         let active = task.busy() && webdav_task_matches(task, kind);
         let mut button = setting_button(
+            ui,
             if active {
                 task.busy_label()
             } else {
@@ -1573,7 +1676,7 @@ fn settings_config_sync_body(
             )
         });
         if task.busy() {
-            button = button.text_color(rgb(COLOR_TEXT_MUTED));
+            button = button.text_color(ui.text_muted);
         }
         buttons = buttons.child(button);
     }
@@ -1590,7 +1693,7 @@ fn settings_config_sync_body(
             status = status.child(
                 div()
                     .text_size(px(12.0))
-                    .text_color(rgb(COLOR_TEXT_MUTED))
+                    .text_color(ui.text_muted)
                     .child("尚未同步：备份会把本机设置与自定义主题打包为单文件快照上传"),
             );
         }
@@ -1598,7 +1701,7 @@ fn settings_config_sync_body(
             status = status.child(
                 div()
                     .text_size(px(12.0))
-                    .text_color(rgb(COLOR_TEXT_SECONDARY))
+                    .text_color(ui.text_secondary)
                     .child("连接成功：服务器与凭据可用"),
             );
         }
@@ -1610,7 +1713,7 @@ fn settings_config_sync_body(
             status = status.child(
                 div()
                     .text_size(px(12.0))
-                    .text_color(rgb(COLOR_TEXT_SECONDARY))
+                    .text_color(ui.text_secondary)
                     .child(text),
             );
         }
@@ -1619,7 +1722,7 @@ fn settings_config_sync_body(
                 .child(
                     div()
                         .text_size(px(12.0))
-                        .text_color(rgb(COLOR_TEXT))
+                        .text_color(ui.text)
                         .child("合并完成（已落盘并生效）"),
                 )
                 .children(
@@ -1666,25 +1769,22 @@ fn settings_config_sync_body(
                     .map(|line| {
                         div()
                             .text_size(px(11.0))
-                            .text_color(rgb(COLOR_TEXT_MUTED))
+                            .text_color(ui.text_muted)
                             .child(line)
                     }),
                 )
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(rgb(COLOR_TEXT_MUTED))
-                        .child(match report.settings_backup.as_deref() {
-                            Some(name) => format!("已备份：{name}；本机独有主题未改动"),
-                            None => "本机独有主题未改动（本机此前无配置文件）".to_string(),
-                        }),
-                );
+                .child(div().text_size(px(11.0)).text_color(ui.text_muted).child(
+                    match report.settings_backup.as_deref() {
+                        Some(name) => format!("已备份：{name}；本机独有主题未改动"),
+                        None => "本机独有主题未改动（本机此前无配置文件）".to_string(),
+                    },
+                ));
         }
         Some(Err(message)) => {
             status = status.child(
                 div()
                     .text_size(px(12.0))
-                    .text_color(rgb(COLOR_DANGER))
+                    .text_color(ui.danger)
                     .child(format!("同步失败：{message}")),
             );
         }
@@ -1710,8 +1810,11 @@ fn webdav_task_matches(state: WebDavTaskState, kind: WebDavTaskKind) -> bool {
 /// 的派生缓存（settings 变化才重算），条目行按借用渲染、点击时才取整条。
 fn settings_shortcuts_body(
     workspace: &mut WorkspaceView,
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
 ) -> Vec<Div> {
+    // 快捷键键帽与终端等宽同源（A7）；下方 shortcut_row 全部复用
+    let mono = laterterm_ui::tokens::mono_family(&workspace.settings.appearance.font_family);
     let cache = workspace.shortcut_bindings_cache();
     let row = |binding: &ShortcutBinding| {
         let conflicted = cache
@@ -1720,7 +1823,9 @@ fn settings_shortcuts_body(
             .copied()
             .unwrap_or(1)
             > 1;
-        setting_card().child(shortcut_row(
+        setting_card(ui).child(shortcut_row(
+            ui,
+            &mono,
             &binding.label,
             &binding.normalized,
             conflicted,
@@ -1733,14 +1838,17 @@ fn settings_shortcuts_body(
     {
         let quake = workspace.settings.quake.clone();
         let status = workspace.quake_status.clone();
-        body.push(group_title("系统级热键（Quake）"));
+        body.push(group_title(ui, "系统级热键（Quake）"));
         body.push(
-            setting_card()
+            setting_card(ui)
                 .child(setting_row(
+                    ui,
                     "全局呼出",
                     div(),
                     quake_toggle_controls(
+                        ui,
                         cx,
+                        "全局呼出",
                         ("开", true),
                         ("关", false),
                         quake.enabled,
@@ -1748,10 +1856,13 @@ fn settings_shortcuts_body(
                     ),
                 ))
                 .child(setting_row(
+                    ui,
                     "失焦收起",
                     div(),
                     quake_toggle_controls(
+                        ui,
                         cx,
+                        "失焦收起",
                         ("开", true),
                         ("关", false),
                         quake.auto_hide_on_blur,
@@ -1761,14 +1872,14 @@ fn settings_shortcuts_body(
                 .child(
                     div()
                         .py_1()
-                        .text_color(rgb(status.text_color()))
+                        .text_color(status.text_color(ui))
                         .child(status.text()),
                 )
                 .child(
                     div()
                         .pt_1()
                         .text_size(px(11.0))
-                        .text_color(rgb(COLOR_TEXT_MUTED))
+                        .text_color(ui.text_muted)
                         .child(
                             "首次启用会弹出系统确认对话框，请在桌面环境快捷键设置中授权；\
                              实际键位可在桌面快捷键设置中修改。窗口的 Quake 几何（全屏宽 × \
@@ -1777,7 +1888,7 @@ fn settings_shortcuts_body(
                 ),
         );
     }
-    body.push(group_title("内置"));
+    body.push(group_title(ui, "内置"));
     for binding in cache
         .bindings
         .iter()
@@ -1785,7 +1896,7 @@ fn settings_shortcuts_body(
     {
         body.push(row(binding));
     }
-    body.push(group_title("面板"));
+    body.push(group_title(ui, "面板"));
     // 归一化读缓存（下标与 panel_normalized 对位），不再每帧 normalize。
     // 第四元 = 未设置时的行内文案：窗格缩放永远有生效键（None = 默认
     // Ctrl+Shift+Z，清空 = 恢复默认），文案注明以区别于面板项的「未设置」。
@@ -1818,13 +1929,17 @@ fn settings_shortcuts_body(
             .as_deref()
             .is_some_and(|key| cache.counts.get(key).copied().unwrap_or(0) > 1);
         body.push(
-            setting_card()
+            setting_card(ui)
                 .child(shortcut_row(
+                    ui,
+                    &mono,
                     label,
                     shortcut.unwrap_or(unset_text),
                     invalid || conflicted,
                 ))
-                .child(setting_button(
+                .child(setting_button_keyed(
+                    ui,
+                    format!("shortcut-panel-{index}-edit"),
                     "编辑快捷键",
                     false,
                     cx.listener(move |this, _, window, cx| {
@@ -1836,7 +1951,7 @@ fn settings_shortcuts_body(
     }
     // 直接从配置渲染，保留未绑定和无效历史值的修复入口。
     // 行内只借用渲染 + 持有名称，点击时才查整条（免每帧深拷贝全表）。
-    body.push(group_title("命令"));
+    body.push(group_title(ui, "命令"));
     for (index, command) in workspace.settings.commands.iter().enumerate() {
         let normalized = cache.command_normalized.get(index).cloned().flatten();
         let shortcut = command.shortcut.as_deref().unwrap_or("未绑定");
@@ -1846,9 +1961,17 @@ fn settings_shortcuts_body(
             .is_some_and(|key| cache.counts.get(key).copied().unwrap_or(0) > 1);
         let name = command.name.clone();
         body.push(
-            setting_card()
-                .child(shortcut_row(&command.name, shortcut, invalid || conflicted))
-                .child(setting_button(
+            setting_card(ui)
+                .child(shortcut_row(
+                    ui,
+                    &mono,
+                    &command.name,
+                    shortcut,
+                    invalid || conflicted,
+                ))
+                .child(setting_button_keyed(
+                    ui,
+                    format!("shortcut-command-{name}-edit"),
                     "编辑快捷键",
                     false,
                     cx.listener(move |this, _, window, cx| {
@@ -1867,7 +1990,7 @@ fn settings_shortcuts_body(
                 )),
         );
     }
-    body.push(group_title("服务器"));
+    body.push(group_title(ui, "服务器"));
     for (index, entry) in workspace.settings.servers.iter().enumerate() {
         let normalized = cache.server_normalized.get(index).cloned().flatten();
         let shortcut = entry.shortcut.as_deref().unwrap_or("未绑定");
@@ -1877,9 +2000,17 @@ fn settings_shortcuts_body(
             .is_some_and(|key| cache.counts.get(key).copied().unwrap_or(0) > 1);
         let name = entry.name.clone();
         body.push(
-            setting_card()
-                .child(shortcut_row(&entry.name, shortcut, invalid || conflicted))
-                .child(setting_button(
+            setting_card(ui)
+                .child(shortcut_row(
+                    ui,
+                    &mono,
+                    &entry.name,
+                    shortcut,
+                    invalid || conflicted,
+                ))
+                .child(setting_button_keyed(
+                    ui,
+                    format!("shortcut-server-{name}-edit"),
                     "编辑快捷键",
                     false,
                     cx.listener(move |this, _, window, cx| {
@@ -1898,7 +2029,7 @@ fn settings_shortcuts_body(
                 )),
         );
     }
-    body.push(group_title("动态码"));
+    body.push(group_title(ui, "动态码"));
     for (index, entry) in workspace.settings.totp.iter().enumerate() {
         let normalized = cache.totp_normalized.get(index).cloned().flatten();
         let shortcut = entry.shortcut.as_deref().unwrap_or("未绑定");
@@ -1908,9 +2039,17 @@ fn settings_shortcuts_body(
             .is_some_and(|key| cache.counts.get(key).copied().unwrap_or(0) > 1);
         let name = entry.name.clone();
         body.push(
-            setting_card()
-                .child(shortcut_row(&entry.name, shortcut, invalid || conflicted))
-                .child(setting_button(
+            setting_card(ui)
+                .child(shortcut_row(
+                    ui,
+                    &mono,
+                    &entry.name,
+                    shortcut,
+                    invalid || conflicted,
+                ))
+                .child(setting_button_keyed(
+                    ui,
+                    format!("shortcut-totp-{name}-edit"),
                     "编辑快捷键",
                     false,
                     cx.listener(move |this, _, window, cx| {
@@ -1932,18 +2071,18 @@ fn settings_shortcuts_body(
     let has_conflict = cache.counts.values().any(|count| *count > 1);
     let invalid = &cache.invalid_rows;
     if !invalid.is_empty() {
-        body.push(group_title("无效快捷键"));
+        body.push(group_title(ui, "无效快捷键"));
         for (label, key) in invalid.iter() {
-            body.push(setting_card().child(shortcut_row(label, key, true)));
+            body.push(setting_card(ui).child(shortcut_row(ui, &mono, label, key, true)));
         }
     }
     body.push(
         div()
             .pt_2()
             .text_color(if has_conflict || !invalid.is_empty() {
-                rgb(COLOR_DANGER)
+                ui.danger
             } else {
-                rgb(COLOR_TEXT_MUTED)
+                ui.text_muted
             })
             .child(if has_conflict || !invalid.is_empty() {
                 "存在冲突或无效绑定：请在对应编辑弹窗里修改（方向切换优先）"
@@ -1962,6 +2101,7 @@ fn settings_shortcuts_body(
 /// `group` 为实例前缀：三个步进行（字号/行高/内边距）各自唯一，
 /// group 名窗口级解析，同名会互相覆盖 hover。
 fn stepper_controls(
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
     group: &'static str,
     decrease: impl Fn(&mut Appearance) + Clone + 'static,
@@ -1970,31 +2110,48 @@ fn stepper_controls(
     div()
         .flex()
         .gap_1()
-        .child(super::icon_button(
+        .child(icon_button(
             format!("{group}-decrease"),
             "icons/minus.svg",
-            panel_ui(),
+            ui,
+            IconButtonSpec {
+                size: 30.0,
+                reveal_on_group: None,
+                danger_hover: false,
+                disabled: false,
+            },
             cx.listener(move |this, event, window, cx| {
                 this.change_setting(event, window, cx, decrease.clone());
             }),
         ))
-        .child(super::icon_button(
+        .child(icon_button(
             format!("{group}-increase"),
             "icons/plus.svg",
-            panel_ui(),
+            ui,
+            IconButtonSpec {
+                size: 30.0,
+                reveal_on_group: None,
+                danger_hover: false,
+                disabled: false,
+            },
             cx.listener(move |this, event, window, cx| {
                 this.change_setting(event, window, cx, increase.clone());
             }),
         ))
 }
 
-fn scrollback_controls(cx: &mut Context<WorkspaceView>, settings: &Appearance) -> Div {
+fn scrollback_controls(
+    ui: &UiPalette,
+    cx: &mut Context<WorkspaceView>,
+    settings: &Appearance,
+) -> Div {
     div().flex().gap_1().children(
         [(10_000usize, "10k"), (50_000, "50k"), (100_000, "100k")]
             .into_iter()
             .map(|(value, label)| {
                 let selected = settings.scrollback == value;
                 setting_button(
+                    ui,
                     label,
                     selected,
                     cx.listener(move |this, event, window, cx| {
@@ -2010,7 +2167,7 @@ const FALLBACK_PRESETS: [&str; 3] = ["Sarasa Mono SC", "Noto Sans Mono CJK SC", 
 
 /// 字体族芯片：固定等宽 + flex_wrap，按内容区自然排成整齐两列。
 /// 原实现芯片宽度随字长变化，6 个预设换行成 1/2/2/1，视觉上参差。
-fn font_family_controls(cx: &mut Context<WorkspaceView>, current: &str) -> Div {
+fn font_family_controls(ui: &UiPalette, cx: &mut Context<WorkspaceView>, current: &str) -> Div {
     div()
         .flex()
         .flex_wrap()
@@ -2018,6 +2175,7 @@ fn font_family_controls(cx: &mut Context<WorkspaceView>, current: &str) -> Div {
         .children(FONT_PRESETS.into_iter().map(|name| {
             let selected = name == current;
             setting_button(
+                ui,
                 name,
                 selected,
                 cx.listener(move |this, event, window, cx| {
@@ -2030,7 +2188,11 @@ fn font_family_controls(cx: &mut Context<WorkspaceView>, current: &str) -> Div {
 
 /// 备选字体是多选（可同时启用多个回退），用 `multi_select_button` 的
 /// 勾选语义，不再复用单选芯片——避免两个蓝框看起来像「两个单选都选中」。
-fn font_fallback_controls(cx: &mut Context<WorkspaceView>, current: &[String]) -> Div {
+fn font_fallback_controls(
+    ui: &UiPalette,
+    cx: &mut Context<WorkspaceView>,
+    current: &[String],
+) -> Div {
     div()
         .flex()
         .flex_wrap()
@@ -2042,6 +2204,7 @@ fn font_fallback_controls(cx: &mut Context<WorkspaceView>, current: &[String]) -
                 current.iter().any(|entry| entry == name)
             };
             multi_select_button(
+                ui,
                 name,
                 selected,
                 cx.listener(move |this, event, window, cx| {
@@ -2063,8 +2226,13 @@ fn font_fallback_controls(cx: &mut Context<WorkspaceView>, current: &[String]) -
 }
 
 /// 二值开关控件（选中侧高亮），如连字开/关。
+/// `key` = 所在行的行键（如 "连字"）：开/关 label 全面板重复，元素 id 以
+/// 行键拼唯一（`{key}-{label}`），否则按压态跨行串扰（A6，见
+/// setting_button_keyed）。
 fn toggle_controls(
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
+    key: &'static str,
     on: (&'static str, bool),
     off: (&'static str, bool),
     current: bool,
@@ -2079,7 +2247,9 @@ fn toggle_controls(
                 .map(|((label, value), _)| {
                     let selected = value == current;
                     let apply = apply.clone();
-                    setting_button(
+                    setting_button_keyed(
+                        ui,
+                        format!("{key}-{label}"),
                         label,
                         selected,
                         cx.listener(move |this, event, window, cx| {
@@ -2092,9 +2262,12 @@ fn toggle_controls(
 
 /// Quake 设置的二值开关控件：与 `toggle_controls` 同形，但落点是
 /// `QuakeSettings` 并联动 worker 生命周期（change_quake_setting）。
+/// `key` = 行键，同 toggle_controls（开/关 id 去重）。
 #[cfg(target_os = "linux")]
 fn quake_toggle_controls(
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
+    key: &'static str,
     on: (&'static str, bool),
     off: (&'static str, bool),
     current: bool,
@@ -2109,7 +2282,9 @@ fn quake_toggle_controls(
                 .map(|((label, value), _)| {
                     let selected = value == current;
                     let apply = apply.clone();
-                    setting_button(
+                    setting_button_keyed(
+                        ui,
+                        format!("{key}-{label}"),
                         label,
                         selected,
                         cx.listener(move |this, event, window, cx| {
@@ -2125,6 +2300,7 @@ fn quake_toggle_controls(
 /// 芯片列表每次 render 从 `themes.names()` 现取——热加载删掉的自定义主题
 /// 自然不再渲染，预览态残留名字由 commit 的严格 get 校验兜底。
 fn theme_controls(
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
     themes: &laterterm_config::ThemeRegistry,
     current: &str,
@@ -2136,6 +2312,7 @@ fn theme_controls(
         .children(themes.names().into_iter().map(|name| {
             let selected = name == current;
             setting_button(
+                ui,
                 name.clone(),
                 selected,
                 cx.listener(move |this, event, window, cx| {
@@ -2148,6 +2325,7 @@ fn theme_controls(
 /// 光标形状三选一（选中侧高亮）；点击经 change_setting 自动保存并热更新全部窗格。
 /// 光标样式枚举一律写全路径——`use gpui::CursorStyle` 是指针样式，不能裸名撞车。
 fn cursor_style_controls(
+    ui: &UiPalette,
     cx: &mut Context<WorkspaceView>,
     current: laterterm_config::CursorStyle,
 ) -> Div {
@@ -2161,6 +2339,7 @@ fn cursor_style_controls(
         .map(|(label, style)| {
             let selected = style == current;
             setting_button(
+                ui,
                 label,
                 selected,
                 cx.listener(move |this, event, window, cx| {
@@ -2171,79 +2350,73 @@ fn cursor_style_controls(
     )
 }
 
-fn shortcut_row(label: &str, keys: &str, conflicted: bool) -> Div {
+fn shortcut_row(ui: &UiPalette, mono: &str, label: &str, keys: &str, conflicted: bool) -> Div {
     div()
         .flex()
         .items_center()
         .justify_between()
         .py_2()
         .text_color(if conflicted {
-            rgb(COLOR_DANGER)
+            ui.danger
         } else {
-            rgb(COLOR_TEXT_SECONDARY)
+            ui.text_secondary
         })
         .child(format!(
             "{}{}",
             label,
             if conflicted { " ⚠ 冲突" } else { "" }
         ))
-        .child(value_chip(keys))
+        .child(value_chip(ui, keys).font_family(mono.to_string()))
 }
 
-fn info_row(label: &str, value: &str) -> Div {
+fn info_row(ui: &UiPalette, label: &str, value: &str) -> Div {
     div()
         .flex()
         .items_center()
         .justify_between()
         .py_2()
-        .text_color(rgb(COLOR_TEXT_SECONDARY))
+        .text_color(ui.text_secondary)
         .child(label.to_string())
         .child(value.to_string())
 }
 
 /// 分区锚点标题：accent 竖条 + 14px 主文字（骨架沿用原 section_title）。
-fn section_title(text: &str) -> Div {
+fn section_title(ui: &UiPalette, text: &str) -> Div {
     div()
         .flex()
         .items_center()
         .gap_2()
-        .child(
-            div()
-                .w(px(3.0))
-                .h(px(16.0))
-                .bg(rgb(COLOR_ACCENT))
-                .rounded_sm(),
-        )
+        .child(div().w(px(3.0)).h(px(16.0)).bg(ui.accent).rounded_sm())
         .child(
             div()
                 .text_size(px(14.0))
-                .text_color(rgb(COLOR_TEXT))
+                .text_color(ui.text)
                 .child(text.to_string()),
         )
 }
 
 /// 组内子标题：比分区锚点低一级（快捷键节的内置/面板/命令等分组）。
-fn group_title(text: &str) -> Div {
+fn group_title(ui: &UiPalette, text: &str) -> Div {
     div()
         .pt_1()
         .text_size(px(12.0))
-        .text_color(rgb(COLOR_TEXT_MUTED))
+        .text_color(ui.text_muted)
         .child(text.to_string())
 }
 
-fn setting_card() -> Div {
+fn setting_card(ui: &UiPalette) -> Div {
     div()
         .flex()
         .flex_col()
         .p_3()
         .gap_1()
-        .bg(rgb(COLOR_CARD_BG))
+        .bg(ui.card_bg)
         .border_1()
-        .border_color(rgb(COLOR_STROKE))
+        .border_color(ui.border_strong)
         .rounded_md()
 }
 
-fn setting_row(label: &str, chip: Div, controls: Div) -> Div {
+fn setting_row(ui: &UiPalette, label: &str, chip: Div, controls: Div) -> Div {
     div()
         .flex()
         .items_center()
@@ -2252,69 +2425,89 @@ fn setting_row(label: &str, chip: Div, controls: Div) -> Div {
         .child(
             div()
                 .w(px(64.0))
-                .text_color(rgb(COLOR_TEXT_SECONDARY))
+                .text_color(ui.text_secondary)
                 .child(label.to_string()),
         )
         .child(chip)
         .child(controls)
 }
 
-fn value_chip(text: &str) -> Div {
+fn value_chip(ui: &UiPalette, text: &str) -> Div {
     div()
         .min_w(px(64.0))
-        .h(px(30.0))
+        .h(px(H_CTRL))
         .flex()
         .items_center()
         .justify_center()
         .px_3()
-        .bg(rgb(COLOR_OVERLAY_BG))
+        .bg(ui.terminal_bg)
         .border_1()
-        .border_color(rgb(COLOR_STROKE))
+        .border_color(ui.border_strong)
         .rounded_sm()
-        .text_color(rgb(COLOR_TEXT))
+        .text_color(ui.text)
         .child(text.to_string())
 }
 
-/// 设置面板/对话框按钮的统一色系：面板是固定深色 overlay（不随终端主题
-/// 换肤），按钮色固定由内置 Tokyo Night 派生，与面板底色自洽；几何与语义
-/// 则全部走 workspace 的 ui_button 工厂（标题栏/边栏按钮同源）。
-/// 传输进度浮条的取消钮同源复用（窗格 overlay 属同族固定深色 chrome）。
-pub(crate) fn panel_ui() -> UiColors {
-    UiColors::from_theme(&ThemeColors::tokyo_night())
-}
-
-/// 面板/对话框共用的按钮芯片（对话框沿用同一观感，随本模块收敛为
-/// Tokyo Night——sftp_panel 的注释「对齐 setting_button 观感」即此约定）。
-/// 选中态 = 主操作（实心 accent + 反色文字）：单选组里只应有一个实心块，
-/// 与未选中的中性描边一眼可分；对话框的主按钮（保存主题 / 去下载 / 保存）
-/// 复用同一语义。多选语义走 `multi_select_button`，不要复用本控件——
-/// 否则「多个蓝框」会被误读成多个单选同时高亮。
+/// 面板/对话框共用的按钮芯片（对话框沿用同一观感；色板随主题——若需回
+/// 固定深色，仅调用侧传 `UiPalette::from_theme(&ThemeColors::tokyo_night())`
+/// 一处可切）。选中态 = 主操作（实心 accent + 反色文字）：单选组里只应有
+/// 一个实心块，与未选中的中性描边一眼可分；对话框的主按钮（保存主题 /
+/// 去下载 / 保存）复用同一语义。多选语义走 `multi_select_button`，不要复用
+/// 本控件——否则「多个蓝框」会被误读成多个单选同时高亮。
+///
+/// 元素 id 取 label：**仅当同帧元素树内没有第二个同 label 实例时才安全**
+/// （匿名 div 不产生 GlobalElementId 路径分量，跨行/跨区同名 label 会共享
+/// id，按压态互相串扰）。行级重复 label（开/关、删除、每行同款按钮）必须
+/// 走 [`setting_button_keyed`] 传行唯一键。
 pub(crate) fn setting_button(
+    ui: &UiPalette,
     label: impl Into<SharedString>,
     selected: bool,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> Div {
+) -> Stateful<Div> {
+    let label: SharedString = label.into();
+    setting_button_keyed(ui, label.clone(), label, selected, listener)
+}
+
+/// [`setting_button`] 的带键变体：id 由调用方拼出行/组唯一键（如
+/// `format!("tunnel-{index}-delete")`，同 server-connect-{name} 做法），
+/// 行级重复 label 的按钮各自持有独立 GlobalElementId，按压态（A6 依赖
+/// InteractiveElementState 按 GlobalElementId 寻址）不再跨行串扰。
+pub(crate) fn setting_button_keyed(
+    ui: &UiPalette,
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Stateful<Div> {
     let kind = if selected {
         ButtonKind::Primary
     } else {
         ButtonKind::Secondary
     };
-    ui_button(label, kind, panel_ui(), listener)
+    // A6：按压态（.active）依赖跨帧稳定的 ElementId（InteractiveElementState
+    // 按 GlobalElementId 寻址、只结转本帧被访问的键）；逐帧自增 id 会让按
+    // 压态永远 miss——id 必须由调用方给出行/组稳定键。
+    ui_button(id, label, kind, ui, false, listener)
 }
 
 /// 多选芯片：选中 = 中性提亮底 + ✓ + 主文字，描边始终中性，不带 accent。
 /// 用于「备选字体」这类可同时选中多项的组，与单选的实心 accent 明确区分。
 fn multi_select_button(
+    ui: &UiPalette,
     label: impl Into<SharedString>,
     selected: bool,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> Div {
+) -> Stateful<Div> {
     let label: SharedString = label.into();
+    // id 用去 ✓ 前缀的原 label：选中态切换不改 id，按压 stateful 状态不重置
+    //（A6，同 setting_button 注记）
+    let chip_id = label.clone();
     // ✓ 直接并入文字（前缀），保持「先勾后名」的阅读顺序
     let label: SharedString = if selected {
         format!("✓ {label}").into()
     } else {
         label
     };
-    ui_button(label, ButtonKind::Secondary, panel_ui(), listener)
+    ui_button(chip_id, label, ButtonKind::Secondary, ui, false, listener)
 }
