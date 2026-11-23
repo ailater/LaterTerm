@@ -2708,11 +2708,12 @@ impl Render for TerminalView {
         let cursor_visible =
             !self.config.cursor_blink || self.blink_on.load(std::sync::atomic::Ordering::Relaxed);
         let entity = cx.entity();
-        let scroll_offset = if self.config.smooth_scrolling {
-            self.scroll_residual
-        } else {
-            0.0
-        };
+        // 平滑滚动残差只用于滚轮行量化累积（触控板像素增量凑整行，不丢行），
+        // 不再作为绘制偏移：残差在滚动结束后长期残留（-1..1 行），把文本整体
+        // 推移最多一行，而鼠标取格、选区高亮、搜索命中、URL 悬停全部按整数
+        // 网格行锚定——曾致选区高亮盖住 A 行、复制却产出上一行（触控板滚动
+        // 后选中即复现）。绘制一律网格对齐，残差仅留在累计器里凑下一整行。
+        let scroll_offset = 0.0;
         let padding = self.config.padding;
         // 搜索快照：canvas 闭包在绘制阶段执行，不能借用 self
         let search_open = self.search.is_some();
