@@ -12516,22 +12516,42 @@ fn create_terminal_view(
                     });
                 }
             })
-            // 视图内粘贴快捷键（Ctrl+Shift+V / Shift+Insert）→ 粘贴护栏流程
+            // 视图内粘贴快捷键（Ctrl+Shift+V / Shift+Insert）→ 粘贴护栏流程。
+            // 必须 defer：回调在 TerminalView::on_key_down 内触发，此时该实体
+            // 正被 lease；同步 workspace.update→paste_to_pane 再 update 同一
+            // 实体即 double lease（panic 沿 doCommandBySelector 的 extern "C"
+            // 重派发边界硬 abort——粘贴快捷键即闪退）。推迟到本次更新结束后
+            // 经窗口句柄重入，实体 lease 已释放。
             .with_paste_request_callback({
                 let workspace = workspace.clone();
                 move |window, cx| {
-                    let _ = workspace.update(cx, |workspace, cx| {
-                        workspace.begin_paste(id, window, cx);
+                    let workspace = workspace.clone();
+                    let window_handle = window.window_handle();
+                    cx.defer(move |cx| {
+                        let _ = window_handle.update(cx, |_view, window, cx| {
+                            let _ = workspace.update(cx, |workspace, cx| {
+                                workspace.begin_paste(id, window, cx);
+                            });
+                        });
                     });
                 }
             })
-            // 滚动/输出变化时唤醒工作区，让滚动条指示器跟手
+            // 滚动/输出变化时唤醒工作区：滚动摘要写入窗格缓存（render 只读，
+            // A8），OSC133 失败态变化同经本回调失效 tab_labels 缓存 epoch。
             .with_scroll_callback({
                 let workspace = workspace.clone();
-                move |cx| {
-                    let _ = workspace.update(cx, |_, cx| cx.notify());
+                move |summary, cx| {
+                    let _ = workspace.update(cx, |workspace, cx| {
+                        workspace.scroll_summaries.insert(id, summary);
+                        workspace.bump_pane_state_epoch();
+                        cx.notify();
+                    });
                 }
-            })
+            });
+        // 链式装配完成后立即注入（set_ui_palette 内部 notify）；
+        // 终端 16 色体系走 config.colors，两套体系互不覆盖（见 termview 注记）。
+        view.set_ui_palette(initial_palette, cx);
+        view
     })
 }
 
