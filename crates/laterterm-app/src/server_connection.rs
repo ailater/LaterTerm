@@ -93,6 +93,12 @@ pub(crate) enum SftpOutcome {
 /// `jump_entries` 是 UI 侧用 `resolve_jump_chain` 预先解析好的跳板条目快照
 /// （由外到内），与目标机 `entry` 同进同出：补输凭据重试路径必须原样带回，
 /// 否则重连会退化成直连。
+///
+/// `initial_size` = (cols, rows)：远端 shell 的初始 PTY 尺寸。新标签/分屏
+/// 在连接发起时就能预估落位网格（工作区 `new_pane_grid`），传真实值让
+/// 远程 shell 启动读到的就是最终列宽——占位 110×30 起步再靠首帧 resize
+/// 变窄时，远端 zsh `PROMPT_SP` 的擦除标记会折行，首行残留裸 `%`（与本地
+/// 分屏同因，见 workspace `new_pane_grid` 注记）。
 pub(crate) fn connect(
     entry: &ServerEntry,
     jump_entries: Vec<ServerEntry>,
@@ -100,6 +106,7 @@ pub(crate) fn connect(
     remember: bool,
     store: Arc<dyn SecretStore>,
     active: Arc<AtomicBool>,
+    initial_size: (u16, u16),
 ) -> Result<ConnectionOutcome> {
     // typed 句柄暂存槽：establish 闭包在 connect_with 内部构造 SshSession，
     // 无法经 `Arc<dyn TerminalSession>` 透出具体类型——闭包把 typed Arc 存
@@ -120,8 +127,8 @@ pub(crate) fn connect(
                 jump: hops,
                 // 隧道只取 enabled 项（停用的仅保留配置）；SFTP 路径不带隧道
                 tunnels: tunnel_specs(entry),
-                cols: 110,
-                rows: 30,
+                cols: initial_size.0.max(1),
+                rows: initial_size.1.max(1),
             };
             let session = Arc::new(SshSession::spawn(options)?);
             *slot.lock().unwrap() = Some(Arc::clone(&session));

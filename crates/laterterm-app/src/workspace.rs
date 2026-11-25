@@ -3,6 +3,7 @@ use crate::branding::titlebar_logo;
 use crate::command_text_field::{CommandTextChanged, CommandTextField, FieldSubmit};
 use crate::onboarding::{self, FONT_PRESETS, OnboardingState, ProbeResults};
 use crate::pane_navigation::{Direction as PaneDirection, PaneRect, neighbor};
+use crate::paste_text_area::PasteTextArea;
 use crate::quake::{QuakeAction, QuakeInput, QuakePortalEvent, QuakePortalStatus};
 use crate::server_connection::{self, ConnectionOutcome, CredentialKind, SftpOutcome};
 use crate::sftp_panel::{
@@ -66,6 +67,12 @@ pub(crate) use self::settings_ui::{PalettePreview, palette_preview};
 
 const TITLEBAR_HEIGHT: f32 = 34.0;
 const PANEL_WIDTH: f32 = 240.0;
+/// 分屏分隔线粗细（px）。render_layout 画线与新建窗格的落位估算
+/// （split_second_size）共用——各写一份的话估算会悄悄偏离实际布局。
+const SPLIT_DIVIDER_SIZE: f32 = 3.0;
+/// 新建分屏时首子树的占比：second（新窗格）吃扣掉分隔线后的余量。
+/// render_layout 的 relative() 与落位估算同源。
+const NEW_SPLIT_RATIO: f32 = 0.5;
 
 /// WebDAV 同步任务结果（展示模型，workspace.webdav_result 的载荷）。
 /// 与 webdav_sync::SyncOutcome 一一对应；合并载荷中的 Settings 已被应用链路
@@ -157,12 +164,77 @@ struct SplitDrag {
 }
 
 /// 当前完成绘制的可见窗格几何；同一帧内的坐标不会与其他窗口混用。
+#[derive(Clone)]
 struct PaneGeometry {
     tab_id: TabId,
     viewport: gpui::Size<gpui::Pixels>,
     panels: (bool, bool),
     layout: LayoutNode,
     panes: Vec<PaneRect>,
+}
+
+/// 新建窗格的落位方式（首帧网格预估用，见 `WorkspaceView::new_pane_grid`）。
+#[derive(Clone, Copy)]
+enum NewPane {
+    /// 新标签：占满标签的终端区。
+    Tab,
+    /// 在 `from` 窗格处对半分屏，新窗格是分割节点的第二个子树。
+    Split {
+        from: PaneId,
+        direction: SplitDirection,
+    },
+}
+
+/// 分屏后新窗格（分割节点第二个子树）的容器尺寸：首子树占
+/// [`NEW_SPLIT_RATIO`]、分隔线 [`SPLIT_DIVIDER_SIZE`]、余量归新窗格——与
+/// `render_layout` 的 flex 布局同式（taffy round_layout：各边按累计坐标
+/// 四舍五入到整像素，宽度 = 右缘 − 左缘）。`rect` 取自实际绘制快照：
+/// 整像素窗口下预估与分屏后的真实尺寸逐位相等；分数缩放（逻辑尺寸带
+/// 小数）时至多少 1px、不会多——偏小只是首帧长出一列（干净），偏大才会
+/// 触发变窄 resize 残留 `%`。
+fn split_second_size(rect: &PaneRect, direction: SplitDirection) -> gpui::Size<gpui::Pixels> {
+    // 主轴扣掉首子树与分隔线，交叉轴原样
+    let (width, height) = match direction {
+        SplitDirection::Horizontal => {
+            let first = (rect.width * NEW_SPLIT_RATIO).round();
+            (
+                (rect.width - first - SPLIT_DIVIDER_SIZE).max(1.0),
+                rect.height.max(1.0),
+            )
+        }
+        SplitDirection::Vertical => {
+            let first = (rect.height * NEW_SPLIT_RATIO).round();
+            (
+                rect.width.max(1.0),
+                (rect.height - first - SPLIT_DIVIDER_SIZE).max(1.0),
+            )
+        }
+    };
+    gpui::Size {
+        width: px(width),
+        height: px(height),
+    }
+}
+
+/// 一组窗格矩形的外接矩形尺寸（它们无缝铺满所在标签的终端区）。
+fn bounding_size(rects: &[PaneRect]) -> Option<gpui::Size<gpui::Pixels>> {
+    let mut left = f32::MAX;
+    let mut top = f32::MAX;
+    let mut right = f32::MIN;
+    let mut bottom = f32::MIN;
+    for rect in rects {
+        left = left.min(rect.x);
+        top = top.min(rect.y);
+        right = right.max(rect.x + rect.width);
+        bottom = bottom.max(rect.y + rect.height);
+    }
+    if rects.is_empty() {
+        return None;
+    }
+    Some(gpui::Size {
+        width: px((right - left).max(1.0)),
+        height: px((bottom - top).max(1.0)),
+    })
 }
 
 thread_local! {
@@ -464,11 +536,22 @@ enum ServerDialog {
     },
 }
 
-/// 连接去向：shell 新标签，或 SFTP 双栏面板（凭据解析同流程，产物不同）。
+/// 连接去向：shell 新标签、SFTP 双栏面板（凭据解析同流程，产物不同），或
+/// 分屏打开（连接成功后落在锚点窗格旁的新分屏子窗格，不建新标签）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConnectDest {
     Shell,
     SftpPanel,
+    SplitPane {
+        /// 分屏锚点（连接发起时的焦点窗格）：落位按它**所属标签**算，与
+        /// 发起后用户切到哪个标签无关；锚点窗格已关 → 回退新标签。
+        from: PaneId,
+        direction: SplitDirection,
+        /// 连接发起时的落位网格预估（`new_pane_grid`）：PTY 与终端视图以
+        /// 同一尺寸起步，远程 shell 读到的就是最终列宽（不经历占位→首帧
+        /// resize，规避 zsh PROMPT_SP 首行残留 `%`，成因见 new_pane_grid）。
+        grid: (usize, usize, u16, u16),
+    },
 }
 
 struct SshRequest {
@@ -883,12 +966,20 @@ struct TerminalMenuState {
 /// 右键菜单动作：拿到工作区、窗口与上下文执行具体操作。
 type TerminalMenuAction = Box<dyn Fn(&mut WorkspaceView, &mut Window, &mut Context<WorkspaceView>)>;
 
-/// 粘贴确认弹窗状态：text 是弹窗打开瞬间的剪贴板快照（确认时写快照而非
-/// 重读剪贴板，防弹窗期间剪贴板被改的 TOCTOU）；pane 是粘贴目标窗格。
+/// 逐行编辑的行数上限：≤ 上限 = 单个 textarea 可编辑；超过则退回只读
+/// 预览（超长粘贴全量渲染成本不受控，且超长内容逐行改本就罕见——真要改
+/// 可取消后编辑剪贴板）。
+const PASTE_EDITABLE_LINE_CAP: usize = 100;
+
+/// 粘贴确认弹窗状态：text 是弹窗打开瞬间的剪贴板快照（确认粘貼的是快照
+/// 或其**编辑结果**，全程不重读剪贴板，防弹窗期间剪贴板被改的 TOCTOU）；
+/// pane 是粘贴目标窗格；text_area 是多行编辑区（None = 行数超上限的只读
+/// 预览）。textarea 语义：Enter 换行，确认走「粘贴」按钮。
 #[derive(Clone)]
 struct PasteConfirmState {
     text: String,
     pane: PaneId,
+    text_area: Option<Entity<PasteTextArea>>,
 }
 
 /// 关闭二次确认的作用域：确认后按 scope 分派回既有关闭路径
@@ -1073,6 +1164,12 @@ pub struct WorkspaceView {
     next_split_id: u64,
     /// 窗口级可见窗格的最近一帧几何，仅供方向导航使用。
     pane_geometry: Rc<RefCell<Option<PaneGeometry>>>,
+    /// 标签**真实布局树**下的窗格几何：仅当 render_layout 喂的是真实树
+    /// （未放大）的帧才提交，放大期间保留放大前的最后一份——从放大窗格
+    /// 分屏时要靠它拿到该窗格在真实布局里的矩形（见 `new_pane_size`）。
+    /// 口径与 `pane_geometry` 的快照守卫一致，但方向导航仍只读 `pane_geometry`
+    /// （放大态保持 no-op，见 `toggle_zoom` 注记）。
+    pane_geometry_real: Rc<RefCell<Option<PaneGeometry>>>,
     /// 进行中的分割线拖拽（None = 空闲）。
     split_drag: Option<SplitDrag>,
     /// 终端右键菜单状态（None = 关闭）。
@@ -1416,6 +1513,7 @@ impl WorkspaceView {
             quake_worker: None,
             next_split_id: 1,
             pane_geometry: Rc::new(RefCell::new(None)),
+            pane_geometry_real: Rc::new(RefCell::new(None)),
             split_drag: None,
             terminal_menu: None,
             tab_menu: None,
@@ -2154,17 +2252,10 @@ impl WorkspaceView {
     ) {
         let tab = self.active_tab();
         let geometry = self.pane_geometry.borrow();
-        let Some(snapshot) = geometry.as_ref().filter(|snapshot| {
-            snapshot.tab_id == tab.id
-                && snapshot.layout == tab.layout
-                && snapshot.viewport == window.viewport_size()
-                && snapshot.panels == (self.left_panel, self.right_panel_docked())
-                && snapshot.panes.len() == tab.layout.leaf_count()
-                && snapshot
-                    .panes
-                    .iter()
-                    .all(|pane| tab.layout.contains(pane.id))
-        }) else {
+        let Some(snapshot) = geometry
+            .as_ref()
+            .filter(|snapshot| self.pane_geometry_is_current(snapshot, window))
+        else {
             return;
         };
         let target = neighbor(tab.focused_pane, direction, &snapshot.panes);
@@ -2172,6 +2263,25 @@ impl WorkspaceView {
         if let Some(id) = target {
             self.focus_pane(id, window, cx);
         }
+    }
+
+    /// 几何快照是否仍是「当前帧」的：标签、真实布局树、窗口视口、两侧面板
+    /// 占位状态全部对得上，且矩形恰好一一覆盖布局树的叶子。方向导航（读
+    /// `pane_geometry`）与新建窗格的落位估算（读 `pane_geometry_real`）共用
+    /// 这一份口径——放宽任一条两边同时受影响，需一并复核。
+    fn pane_geometry_is_current(&self, snapshot: &PaneGeometry, window: &Window) -> bool {
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == self.active_tab) else {
+            return false;
+        };
+        snapshot.tab_id == tab.id
+            && snapshot.layout == tab.layout
+            && snapshot.viewport == window.viewport_size()
+            && snapshot.panels == (self.left_panel, self.right_panel_docked())
+            && snapshot.panes.len() == tab.layout.leaf_count()
+            && snapshot
+                .panes
+                .iter()
+                .all(|pane| tab.layout.contains(pane.id))
     }
 
     /// 窗格缩放开关：true = 只布局焦点窗格（渲染层合成单叶树喂 render_layout，
@@ -2213,10 +2323,34 @@ impl WorkspaceView {
 
     /// 统一窗格装配：建视图、订阅退出事件、登记 Pane，返回 pane id。
     /// 本地 PTY 与 SSH 会话共用；调用方自行决定挂到新标签还是分屏。
+    /// 落位尺寸未知的会话（SSH 连接成功后才装配）走这里：初始网格按整窗
+    /// 内容区粗估，首帧 prepaint 再校正。
     fn attach_pane(
         &mut self,
         title: String,
         session: Arc<dyn TerminalSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> PaneId {
+        // 新窗格继承当前窗口的估算网格尺寸（与首窗格同一口径）。
+        let viewport = window.viewport_size();
+        let terminal_area = gpui::Size {
+            width: viewport.width,
+            height: viewport.height - px(TITLEBAR_HEIGHT),
+        };
+        let (cols, rows) = estimate_grid_size(&self.settings.appearance, terminal_area);
+        self.attach_pane_at_grid(title, session, cols, rows, window, cx)
+    }
+
+    /// [`Self::attach_pane`] 的定尺版本：初始网格由调用方给出。本地新标签/
+    /// 分屏经 [`Self::new_pane_grid`] 算出——PTY 与视图以同一尺寸起步，首帧
+    /// 之前网格与 PTY 就是一致的（首帧前若已有输出，也按最终列宽折行）。
+    fn attach_pane_at_grid(
+        &mut self,
+        title: String,
+        session: Arc<dyn TerminalSession>,
+        cols: usize,
+        rows: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> PaneId {
@@ -2236,13 +2370,6 @@ impl WorkspaceView {
             &self.audit_hub,
         );
         let session_control = Arc::new(SessionControl::new(Arc::clone(&session)));
-        // 新窗格继承当前窗口的估算网格尺寸（与首窗格同一口径）。
-        let viewport = window.viewport_size();
-        let terminal_area = gpui::Size {
-            width: viewport.width,
-            height: viewport.height - px(TITLEBAR_HEIGHT),
-        };
-        let (cols, rows) = estimate_grid_size(&self.settings.appearance, terminal_area);
         let terminal = create_terminal_view(
             pane_id,
             session,
@@ -2292,15 +2419,110 @@ impl WorkspaceView {
             .map(PathBuf::from)
     }
 
+    /// 标签真实布局树下的窗格矩形（见 `pane_geometry_real`）；与当前标签/
+    /// 布局/窗口状态对不上 → None。
+    fn real_pane_rects(&self, window: &Window) -> Option<Vec<PaneRect>> {
+        let geometry = self.pane_geometry_real.borrow();
+        geometry
+            .as_ref()
+            .filter(|snapshot| self.pane_geometry_is_current(snapshot, window))
+            .map(|snapshot| snapshot.panes.clone())
+    }
+
+    /// 终端区尺寸的粗估（拿不到几何快照时的兜底）：窗口内容区扣掉标题栏与
+    /// 占布局的侧栏/固定右面板（悬浮右面板不占位，见 `right_panel_docked`）。
+    fn terminal_area_estimate(&self, window: &Window) -> gpui::Size<gpui::Pixels> {
+        let viewport = window.viewport_size();
+        let mut width = viewport.width;
+        if self.left_panel {
+            width -= px(PANEL_WIDTH);
+        }
+        if self.right_panel_docked() {
+            width -= px(PANEL_WIDTH);
+        }
+        gpui::Size {
+            width: width.max(px(1.0)),
+            height: (viewport.height - px(TITLEBAR_HEIGHT)).max(px(1.0)),
+        }
+    }
+
+    /// 新建窗格落位后的容器尺寸——PTY 与终端视图的初始网格由它换算。
+    ///
+    /// 几何快照可用时按实际矩形推算：新标签 = 当前标签全部窗格的外接矩形
+    /// （即终端区）；分屏 = 焦点窗格矩形经 [`split_second_size`]。快照不可用
+    /// （尚未绘制过、或放大期间布局已变）回落到按窗口内容区粗估，分屏再对
+    /// 半折——此时尺寸只是近似，首帧仍会 resize 一次（兜底，不影响功能）。
+    fn new_pane_size(&self, target: NewPane, window: &Window) -> gpui::Size<gpui::Pixels> {
+        let rects = self.real_pane_rects(window);
+        match target {
+            NewPane::Tab => rects
+                .as_deref()
+                .and_then(bounding_size)
+                .unwrap_or_else(|| self.terminal_area_estimate(window)),
+            NewPane::Split { from, direction } => rects
+                .as_deref()
+                .and_then(|rects| rects.iter().find(|rect| rect.id == from))
+                .map(|rect| split_second_size(rect, direction))
+                .unwrap_or_else(|| {
+                    let area = self.terminal_area_estimate(window);
+                    split_second_size(
+                        &PaneRect {
+                            id: from,
+                            x: 0.0,
+                            y: 0.0,
+                            width: area.width.into(),
+                            height: area.height.into(),
+                        },
+                        direction,
+                    )
+                }),
+        }
+    }
+
+    /// 新建本地窗格的首帧网格 `(cols, rows, pixel_width, pixel_height)`：PTY
+    /// 与终端视图都以它起步。
+    ///
+    /// 为什么较真：PTY 先按占位尺寸起、首帧再 resize 的话，shell 已在初始化
+    /// 时读过旧尺寸，首个提示符仍按旧列宽排——zsh `PROMPT_SP`（默认开）每次
+    /// 出提示符前写「`%` + (列数−1) 个空格 + `\r` + 空格」，靠末尾那个空格
+    /// 擦掉 `%`；PTY 一旦变窄，空格溢出折行、`\r` 落到下一行，首行就残留
+    /// 一个 `%`（新分屏首行那个 `%` 即此）。只有变窄出问题，变宽是干净的，
+    /// 所以落位预估宁可偏小（[`split_second_size`] 保证不偏大）。
+    ///
+    /// 单格度量取任一已渲染视图的实测值（同设置下所有窗格同字体同度量），
+    /// 与首帧 prepaint 同一换算——几何估准时与首帧逐位相等，PTY 全程不
+    /// resize。度量未就绪（视图都没渲染过，仅测试/极端时序会走到）回落
+    /// [`estimate_grid_size`] 近似，与首窗格（`create_local_terminal`）同口径。
+    fn new_pane_grid(
+        &self,
+        target: NewPane,
+        window: &Window,
+        cx: &App,
+    ) -> (usize, usize, u16, u16) {
+        let size = self.new_pane_size(target, window);
+        if let Some(grid) = self
+            .panes
+            .iter()
+            .find_map(|pane| pane.terminal.read(cx).grid_size_for(size))
+        {
+            return grid;
+        }
+        let (cols, rows) = estimate_grid_size(&self.settings.appearance, size);
+        let (pixel_width, pixel_height) = grid_pixel_size(&self.settings.appearance, cols, rows);
+        (cols, rows, pixel_width, pixel_height)
+    }
+
     /// 新建标签：一个标签一个全新窗格与分屏树根。
     fn spawn_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let title = format!("终端 {}", self.next_pane_id);
+        let grid = self.new_pane_grid(NewPane::Tab, window, cx);
         let session = spawn_local_session(
             self.settings.shell.as_deref(),
             self.settings.appearance.shell_integration,
             self.focused_pane_cwd(cx),
+            grid,
         );
-        let pane_id = self.attach_pane(title, session, window, cx);
+        let pane_id = self.attach_pane_at_grid(title, session, grid.0, grid.1, window, cx);
         let tab_id = TabId(self.next_tab_id);
         self.next_tab_id += 1;
         self.tabs.push(WorkspaceTab {
@@ -2329,19 +2551,28 @@ impl WorkspaceView {
         self.tabs[tab_index].zoomed = false;
         let old = self.focused_pane_id();
         let title = format!("终端 {}", self.next_pane_id);
+        let grid = self.new_pane_grid(
+            NewPane::Split {
+                from: old,
+                direction,
+            },
+            window,
+            cx,
+        );
         let session = spawn_local_session(
             self.settings.shell.as_deref(),
             self.settings.appearance.shell_integration,
             self.focused_pane_cwd(cx),
+            grid,
         );
-        let pane_id = self.attach_pane(title, session, window, cx);
+        let pane_id = self.attach_pane_at_grid(title, session, grid.0, grid.1, window, cx);
         let tab_index = self.active_tab_index();
         let split_id = self.next_split_id;
         self.next_split_id += 1;
         let replacement = LayoutNode::Split {
             id: split_id,
             direction,
-            ratio: 0.5,
+            ratio: NEW_SPLIT_RATIO,
             first: Box::new(LayoutNode::Leaf(old)),
             second: Box::new(LayoutNode::Leaf(pane_id)),
         };
@@ -2354,6 +2585,63 @@ impl WorkspaceView {
             return;
         }
         self.focus_pane(pane_id, window, cx);
+    }
+
+    /// `from` 窗格所属标签的下标（分屏打开服务器的落位锚点）；窗格已回收
+    /// （任一标签的树里都找不到）→ None，调用方回退新标签。
+    fn split_pane_target(&self, from: PaneId) -> Option<usize> {
+        self.tabs.iter().position(|tab| tab.layout.contains(from))
+    }
+
+    /// 按 SplitPane 去向分屏落位一个新窗格（分屏打开服务器用，与
+    /// `split_focused` 同一套布局语义）：退该标签的放大态 → 按去向里的
+    /// `grid` 装配新窗格 → 锚点叶子替换成对半 Split（新窗格 = second，
+    /// `split_focused` 同款不改既有比例语义）。非 SplitPane 去向或布局替换
+    /// 失败（锚点与查到的标签不同步，仅理论可能）返回 None（后者已回滚
+    /// 登记的窗格并杀会话），由调用方回退新标签。
+    fn attach_split_pane(
+        &mut self,
+        dest: ConnectDest,
+        title: String,
+        session: Arc<dyn TerminalSession>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<PaneId> {
+        let ConnectDest::SplitPane {
+            from,
+            direction,
+            grid,
+        } = dest
+        else {
+            return None;
+        };
+        let tab_index = self.split_pane_target(from)?;
+        let (cols, rows, ..) = grid;
+        let pane_id =
+            self.attach_pane_at_grid(title, session, cols.max(1), rows.max(1), window, cx);
+        // 用户按分屏的意图是看到两个窗格：退出锚点标签的放大态（与
+        // split_focused 同理，不退会出现旧窗格隐藏、放大对象跳变的怪态）。
+        self.tabs[tab_index].zoomed = false;
+        let split_id = self.next_split_id;
+        self.next_split_id += 1;
+        let replacement = LayoutNode::Split {
+            id: split_id,
+            direction,
+            ratio: NEW_SPLIT_RATIO,
+            first: Box::new(LayoutNode::Leaf(from)),
+            second: Box::new(LayoutNode::Leaf(pane_id)),
+        };
+        self.bump_layout_epoch();
+        if !self.tabs[tab_index].layout.replace_leaf(from, replacement) {
+            if let Some(pane) = self.pane(pane_id) {
+                pane.session.close();
+            }
+            if let Some(index) = self.panes.iter().position(|pane| pane.id == pane_id) {
+                self.panes.remove(index);
+            }
+            return None;
+        }
+        Some(pane_id)
     }
 
     /// 按下分割线：记录目标节点与容器几何，进入拖拽。
@@ -3004,7 +3292,7 @@ impl WorkspaceView {
 
     /// 开始粘贴流程：读剪贴板 → 多行（含尾回车）判定 → 单行直接写 /
     /// 多行弹确认弹窗。快捷键、右键菜单共用本入口。
-    fn begin_paste(&mut self, pane: PaneId, _window: &mut Window, cx: &mut Context<Self>) {
+    fn begin_paste(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
         // 粘贴模态与其它模态互斥：任一打开即静默放弃（模态期间用户注意力
         // 在弹窗，无反馈属可接受简化）。粘贴确认弹窗自身打开时同样忽略。
         if self.paste_confirm.is_some()
@@ -3033,18 +3321,53 @@ impl WorkspaceView {
         if self.settings.appearance.confirm_multiline_paste
             && (text.contains('\n') || text.contains('\r'))
         {
-            self.paste_confirm = Some(PasteConfirmState { text, pane });
+            // 单个多行编辑区（textarea）：整块编辑，无逐行框；行数超上限
+            // 退只读预览（渲染成本不受控且超长内容逐行改罕见）。
+            let text_area = (text.lines().count() <= PASTE_EDITABLE_LINE_CAP).then(|| {
+                cx.new(|cx| {
+                    PasteTextArea::new(&text, cx)
+                        .font_family(mono_family(&self.settings.appearance.font_family))
+                })
+            });
+            self.paste_confirm = Some(PasteConfirmState {
+                text,
+                pane,
+                text_area,
+            });
+            // 编辑区直接持有焦点：弹窗即改即粘
+            if let Some(field) = self
+                .paste_confirm
+                .as_ref()
+                .and_then(|state| state.text_area.as_ref())
+            {
+                field.read(cx).focus_handle().focus(window);
+            }
             cx.notify();
         } else {
             self.paste_to_pane(pane, &text, cx);
         }
     }
 
-    /// 确认粘贴：写弹窗快照文本（不重读剪贴板，防 TOCTOU）。
+    /// 确认粘贴：编辑模式粘 textarea 现值（换行结构即用户所见，无需补尾），
+    /// 只读模式粘快照原文——全程不重读剪贴板，防 TOCTOU。
     fn confirm_paste(&mut self, cx: &mut Context<Self>) {
         if let Some(state) = self.paste_confirm.take() {
-            self.paste_to_pane(state.pane, &state.text, cx);
+            let text = match state.text_area {
+                Some(area) => area.read(cx).value().to_string(),
+                None => state.text,
+            };
+            self.paste_to_pane(state.pane, &text, cx);
         }
+    }
+
+    /// 焦点是否在多行编辑区（模态吞键的放行判据）。
+    fn paste_field_focused(&self, window: &Window, cx: &Context<Self>) -> bool {
+        self.paste_confirm.as_ref().is_some_and(|state| {
+            state
+                .text_area
+                .as_ref()
+                .is_some_and(|area| area.read(cx).focus_handle().is_focused(window))
+        })
     }
 
     /// 取消粘贴：仅清状态，不写任何字节。
@@ -6130,6 +6453,25 @@ impl WorkspaceView {
         self.begin_ssh_connect(name, ConnectDest::Shell, cx);
     }
 
+    /// 分屏打开服务器：以当前焦点窗格为锚快照 SplitPane 去向，连接成功后
+    /// SSH 会话落在该窗格旁的新分屏子窗格（横向对半）。落位网格在发起时
+    /// 预估（finish 期 SSH 已 spawn，之后再想算就晚了）；锚点窗格中途被关
+    /// 则 finish 期回退新标签。shell 面板/快捷键路径仍走 connect_server。
+    fn connect_server_split(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let from = self.focused_pane_id();
+        let direction = SplitDirection::Horizontal;
+        let grid = self.new_pane_grid(NewPane::Split { from, direction }, window, cx);
+        self.begin_ssh_connect(
+            name,
+            ConnectDest::SplitPane {
+                from,
+                direction,
+                grid,
+            },
+            cx,
+        );
+    }
+
     /// 打开服务器的 SFTP 双栏面板：与 shell 连接同一套请求槽/补输流程
     /// （复用 ServerDialog::Connect 弹窗，仅标题按去向区分），成功后建面板。
     fn open_sftp_panel(&mut self, name: &str, cx: &mut Context<Self>) {
@@ -6230,7 +6572,17 @@ impl WorkspaceView {
         let store = self.secret_store.clone();
         let jump_entries = request.jump.clone();
         match request.dest {
-            ConnectDest::Shell => {
+            // Shell 新标签与 SplitPane 分屏同一管道：产物都是终端会话，仅
+            // 初始 PTY 尺寸与落位不同（分屏的尺寸在发起时已预估进 dest）。
+            ConnectDest::Shell | ConnectDest::SplitPane { .. } => {
+                let initial_size = match request.dest {
+                    ConnectDest::SplitPane {
+                        grid: (cols, rows, ..),
+                        ..
+                    } => (cols.max(1) as u16, rows.max(1) as u16),
+                    // 新标签拿不到窗格落位（历史占位值）：首帧 resize 兜底
+                    _ => (110, 30),
+                };
                 let (tx, rx) = flume::bounded(1);
                 std::thread::spawn(move || {
                     let result = server_connection::connect(
@@ -6240,6 +6592,7 @@ impl WorkspaceView {
                         remember,
                         store,
                         active,
+                        initial_size,
                     );
                     if let Err(error) = tx.send((request_id, entry, result))
                         && let Ok(ConnectionOutcome::Connected { session, .. }) = error.0.2
@@ -6349,6 +6702,8 @@ impl WorkspaceView {
             .as_ref()
             .map(|request| request.jump.clone())
             .unwrap_or_default();
+        // 去向随请求带走（Connected 分支清空请求槽前取出）
+        let dest = self.ssh_request.as_ref().map(|request| request.dest);
         match result {
             Ok(ConnectionOutcome::Connected {
                 session,
@@ -6364,45 +6719,79 @@ impl WorkspaceView {
                     self.show_server_notice_toast(warning, cx);
                 }
                 let server_name = entry.name.clone();
-                let pane_id = self.attach_pane(entry.name.clone(), session, window, cx);
-                // SSH 链路快照挂到窗格（本地窗格恒 None）
-                if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
-                    pane.ssh_link = Some(SshLink {
-                        entry: entry.clone(),
-                        jump: request_jump,
-                    });
-                    pane.tunnel_session = tunnel_session.clone();
-                }
-                // 隧道事件 watcher：每秒 drain 转发事件收敛进 pane.tunnel_states
-                if let Some(typed) = tunnel_session {
-                    self.start_tunnel_watcher(pane_id, typed, cx);
-                }
-                let tab_id = TabId(self.next_tab_id);
-                self.next_tab_id += 1;
-                // 服务器条目默认标签色（"#RRGGBB"，坏值按 None 忽略）；
-                // 标题不动——保持 OSC/窗格自动标题
-                let server_color = entry
-                    .tab_color
-                    .as_deref()
-                    .and_then(laterterm_config::theme::parse_hex_color);
-                self.tabs.push(WorkspaceTab {
-                    id: tab_id,
-                    layout: LayoutNode::Leaf(pane_id),
-                    focused_pane: pane_id,
-                    zoomed: false,
-                    custom_title: None,
-                    color: server_color,
-                });
-                self.bump_layout_epoch();
-                // 会话恢复挂起的外观：自身自定义色优先，缺省回落服务器默认色
-                if let Some((custom_title, snapshot_color)) =
-                    self.pending_server_tab_restore.remove(&server_name)
-                    && let Some(tab_ref) = self.tabs.last_mut()
+                // 分屏去向优先：锚点窗格仍在 → 在其所属标签内落位，不建新
+                // 标签；锚点已关/落位失败回退下方新标签路径（连接白发起不了
+                // ——会话已经建好，总得有地方放）。
+                let mut placed_split = false;
+                if let Some(dest @ ConnectDest::SplitPane { from, .. }) = dest
+                    && self.split_pane_target(from).is_some()
+                    && let Some(pane_id) = self.attach_split_pane(
+                        dest,
+                        entry.name.clone(),
+                        // 落位失败回退新标签：克隆持有，原值留给回落路径
+                        session.clone(),
+                        window,
+                        cx,
+                    )
                 {
-                    tab_ref.custom_title = custom_title;
-                    tab_ref.color = Self::restore_tab_color(snapshot_color, server_color);
+                    if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
+                        pane.ssh_link = Some(SshLink {
+                            entry: entry.clone(),
+                            jump: request_jump.clone(),
+                        });
+                        pane.tunnel_session = tunnel_session.clone();
+                    }
+                    if let Some(typed) = tunnel_session.clone() {
+                        self.start_tunnel_watcher(pane_id, typed, cx);
+                    }
+                    // 会话恢复的挂起外观只服务新标签路径，分屏不消费（标签
+                    // 是用户既有的，颜色/标题不该被一次分屏连接改写）
+                    self.pending_server_tab_restore.remove(&server_name);
+                    self.focus_pane(pane_id, window, cx);
+                    placed_split = true;
                 }
-                self.focus_pane(pane_id, window, cx);
+                if !placed_split {
+                    // 新标签路径（Shell 去向，或分屏锚点已失的回退）
+                    let pane_id = self.attach_pane(entry.name.clone(), session, window, cx);
+                    // SSH 链路快照挂到窗格（本地窗格恒 None）
+                    if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
+                        pane.ssh_link = Some(SshLink {
+                            entry: entry.clone(),
+                            jump: request_jump,
+                        });
+                        pane.tunnel_session = tunnel_session.clone();
+                    }
+                    // 隧道事件 watcher：每秒 drain 转发事件收敛进 pane.tunnel_states
+                    if let Some(typed) = tunnel_session {
+                        self.start_tunnel_watcher(pane_id, typed, cx);
+                    }
+                    let tab_id = TabId(self.next_tab_id);
+                    self.next_tab_id += 1;
+                    // 服务器条目默认标签色（"#RRGGBB"，坏值按 None 忽略）；
+                    // 标题不动——保持 OSC/窗格自动标题
+                    let server_color = entry
+                        .tab_color
+                        .as_deref()
+                        .and_then(laterterm_config::theme::parse_hex_color);
+                    self.tabs.push(WorkspaceTab {
+                        id: tab_id,
+                        layout: LayoutNode::Leaf(pane_id),
+                        focused_pane: pane_id,
+                        zoomed: false,
+                        custom_title: None,
+                        color: server_color,
+                    });
+                    self.bump_layout_epoch();
+                    // 会话恢复挂起的外观：自身自定义色优先，缺省回落服务器默认色
+                    if let Some((custom_title, snapshot_color)) =
+                        self.pending_server_tab_restore.remove(&server_name)
+                        && let Some(tab_ref) = self.tabs.last_mut()
+                    {
+                        tab_ref.custom_title = custom_title;
+                        tab_ref.color = Self::restore_tab_color(snapshot_color, server_color);
+                    }
+                    self.focus_pane(pane_id, window, cx);
+                }
             }
             Ok(ConnectionOutcome::Prompt { kind, warning }) => {
                 self.present_credential_prompt(request_id, &entry, kind, warning, window, cx);
@@ -7686,16 +8075,15 @@ impl WorkspaceView {
             cx.stop_propagation();
             return;
         }
-        // 粘贴确认弹窗：Esc 取消 / Enter 确认写入；其余按键吞掉（模态语义）。
-        // 位于模态弹窗分支之后、sftp 面板之前——粘贴模态与其它模态互斥不并开，
-        // 但比 sftp 面板（非模态浮层）后开先关：同屏时 Esc 先关本弹窗。
+        // 粘贴确认弹窗：Esc 取消（textarea 未拦 Esc，冒泡到此）；焦点在
+        // 多行编辑区时其余按键全部放行给 textarea（Enter 换行、输入/选区/
+        // 剪贴板），无焦点则吞掉（模态语义）。确认走「粘贴」按钮——Enter
+        // 在 textarea 里是换行，不再绑定确认。
         if self.paste_confirm.is_some() {
-            let plain_enter = matches!(event.keystroke.key.as_str(), "enter" | "return")
-                && event.keystroke.modifiers == gpui::Modifiers::default();
             if plain_escape {
                 self.cancel_paste(window, cx);
-            } else if plain_enter {
-                self.confirm_paste(cx);
+            } else if self.paste_field_focused(window, cx) {
+                return;
             }
             cx.stop_propagation();
             return;
@@ -8029,6 +8417,16 @@ impl WorkspaceView {
                 let jump = state.link.jump.clone();
                 let thread_store = Arc::clone(&store);
                 let thread_active = Arc::new(AtomicBool::new(true));
+                // 初始尺寸 = 窗格当前网格（重连会话原位替换，PTY 应与视图
+                // 所见一致；窗格已亡按占位值，结果反正会被丢弃）
+                let initial_size = this
+                    .read_with(cx, |ws, cx| {
+                        ws.pane(pane_id)
+                            .map(|pane| pane.terminal.read(cx).dimensions())
+                            .unwrap_or((110, 30))
+                    })
+                    .unwrap_or((110, 30));
+                let initial_size = (initial_size.0.max(1) as u16, initial_size.1.max(1) as u16);
                 std::thread::spawn(move || {
                     let result = server_connection::connect(
                         &entry,
@@ -8037,6 +8435,7 @@ impl WorkspaceView {
                         false,
                         thread_store,
                         thread_active,
+                        initial_size,
                     );
                     let _ = tx.send(result);
                 });
@@ -8362,6 +8761,7 @@ impl Render for WorkspaceView {
         };
         let pane_rects = Rc::new(RefCell::new(Vec::new()));
         let geometry_cache = self.pane_geometry.clone();
+        let real_geometry_cache = self.pane_geometry_real.clone();
         let geometry_layout = active_layout.clone();
         let geometry_rects = pane_rects.clone();
         let focused_pane = self.active_tab().focused_pane;
@@ -8980,13 +9380,19 @@ impl Render for WorkspaceView {
             .child(canvas(
                 |_, _, _| (),
                 move |_, _, window, _| {
-                    *geometry_cache.borrow_mut() = Some(PaneGeometry {
+                    let snapshot = || PaneGeometry {
                         tab_id: active_tab_id,
                         viewport: window.viewport_size(),
                         panels: (left_panel, right_panel_docked),
                         layout: geometry_layout.clone(),
                         panes: geometry_rects.borrow().clone(),
-                    });
+                    };
+                    // 未放大帧喂的是真实布局树：同一帧也是真实布局几何，
+                    // 顺手刷新（放大帧不碰，保留放大前的最后一份）。
+                    if !pane_zoomed {
+                        *real_geometry_cache.borrow_mut() = Some(snapshot());
+                    }
+                    *geometry_cache.borrow_mut() = Some(snapshot());
                 },
             ))
             // 分割线拖拽：窗口级鼠标监听仅对下一帧有效，paint 期逐帧重挂
@@ -9550,14 +9956,17 @@ fn render_layout(
                 (
                     div().w(relative(*ratio)),
                     div()
-                        .w(px(3.0))
+                        .w(px(SPLIT_DIVIDER_SIZE))
                         .h_full()
                         .cursor(CursorStyle::ResizeLeftRight),
                 )
             } else {
                 (
                     div().h(relative(*ratio)),
-                    div().h(px(3.0)).w_full().cursor(CursorStyle::ResizeRow),
+                    div()
+                        .h(px(SPLIT_DIVIDER_SIZE))
+                        .w_full()
+                        .cursor(CursorStyle::ResizeRow),
                 )
             };
             container
@@ -10448,45 +10857,78 @@ fn render_active_dialog(
     if let Some(ServerDialog::Connect { name, remember, .. }) = workspace.server_dialog.clone() {
         return Some(server_connect_modal(workspace, ui, name, remember, cx));
     }
-    // 粘贴确认弹窗（链尾）：text 是弹窗打开时的剪贴板快照，确认写快照
-    // 而非重读剪贴板。预览前 5 行、每行截 60 字符（行数/字符数仅作显示，
-    // 多行判定本身按「含换行符」口径在 begin_paste 完成）。
+    // 粘贴确认弹窗（链尾）：text 是弹窗打开时的剪贴板快照，确认粘快照或
+    // 其编辑结果，全程不重读剪贴板。行数 ≤ PASTE_EDITABLE_LINE_CAP 时用
+    // 单个 textarea 编辑（Enter 换行，确认走「粘贴」按钮）；超出只读预览。
     if let Some(state) = workspace.paste_confirm.clone() {
         let total_lines = state.text.lines().count().max(1);
-        let mut preview = String::new();
-        for line in state.text.lines().take(5) {
-            let truncated: String = line.chars().take(60).collect();
-            preview.push_str(&truncated);
-            preview.push('\n');
+        // 说明行显式主文字色：不设色会继承到近 muted 的暗灰，tokyo-night
+        // 下「粘贴即执行请留意」这句关键警示几乎不可见（用户反馈）
+        let mut body = div().p_4().text_color(ui.text).child(format!(
+            "即将粘贴 {} 行内容（含换行，粘贴即执行的命令请留意）：",
+            total_lines
+        ));
+        if let Some(area) = state.text_area.clone() {
+            body = body
+                .child(
+                    div()
+                        .id("paste-area-scroll")
+                        .mt_2()
+                        .max_h(px(240.0))
+                        .overflow_y_scroll()
+                        .child(area),
+                )
+                .child(
+                    div()
+                        .mt_2()
+                        .text_size(px(12.0))
+                        // 次要说明用 text_secondary：text_muted 在 tokyo-night
+                        // 卡底上对比度过低，几乎不可见（用户反馈）
+                        .text_color(ui.text_secondary)
+                        .child("内容可直接修改，Enter 换行；点「粘贴」确认，Esc 取消"),
+                );
+        } else {
+            let mut preview = String::new();
+            for line in state.text.lines().take(5) {
+                let truncated: String = line.chars().take(60).collect();
+                preview.push_str(&truncated);
+                preview.push('\n');
+            }
+            body = body
+                .child(
+                    div()
+                        .mt_2()
+                        .p_2()
+                        .text_size(px(12.0))
+                        // 待粘贴内容是用户要审查的对象，用主文字色（曾用
+                        // text_muted，tokyo-night 下与卡底几乎同明度看不清）
+                        .text_color(ui.text)
+                        .child(preview),
+                )
+                .child(
+                    div()
+                        .mt_2()
+                        .text_size(px(12.0))
+                        .text_color(ui.text_secondary)
+                        .child(format!(
+                            "行数超过 {PASTE_EDITABLE_LINE_CAP}，仅预览；如需修改请取消后编辑剪贴板"
+                        )),
+                );
         }
-        let body = div()
-            .p_4()
-            .child(format!(
-                "即将粘贴 {} 行内容（含换行，粘贴即执行的命令请留意）：",
-                total_lines
-            ))
-            .child(
-                div()
-                    .mt_2()
-                    .p_2()
-                    .text_size(px(12.0))
-                    .text_color(ui.text_muted)
-                    .child(preview),
-            )
-            .child(dialog_footer(vec![
-                setting_button(
-                    ui,
-                    "粘贴",
-                    true,
-                    cx.listener(|this, _, _, cx| this.confirm_paste(cx)),
-                ),
-                setting_button(
-                    ui,
-                    "取消",
-                    false,
-                    dismiss_listener(cx, WorkspaceView::cancel_paste),
-                ),
-            ]));
+        body = body.child(dialog_footer(vec![
+            setting_button(
+                ui,
+                "粘贴",
+                true,
+                cx.listener(|this, _, _, cx| this.confirm_paste(cx)),
+            ),
+            setting_button(
+                ui,
+                "取消",
+                false,
+                dismiss_listener(cx, WorkspaceView::cancel_paste),
+            ),
+        ]));
         return Some(modal_dialog(
             ui,
             "确认多行粘贴",
@@ -12020,7 +12462,11 @@ fn server_entry_row(
                             .child(label),
                     )
                 })
-                // 连接=主操作（选中态实心 accent）/文件=次操作（A4 统一 ui_button）
+                // 连接=主操作（选中态实心 accent）；分屏/文件=图标钮（三连
+                // 文本钮会把 240px 面板里的名称挤成两三个字符，图标省下的
+                // 宽度还给名称）。分屏=在当前焦点窗格旁打开远程会话（不建
+                // 新标签），split-h 与快捷键分屏语义一致；文件=columns-2
+                // 呼应 SFTP 双栏面板。
                 .child(ui_button(
                     format!("server-connect-{}", entry.name),
                     "连接",
@@ -12033,19 +12479,38 @@ fn server_entry_row(
                     }),
                 ))
                 .child(
-                    ui_button(
-                        format!("server-sftp-{}", entry.name),
-                        "文件",
-                        ButtonKind::Secondary,
+                    sidebar_icon_button(
+                        format!("server-split-{}", entry.name),
+                        "icons/split-h.svg",
+                        ui.accent,
+                        Some("server-split"),
                         ui,
-                        false,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener({
+                            let name = entry.name.clone();
+                            move |this, _event, window, cx| {
+                                this.connect_server_split(&name, window, cx)
+                            }
+                        }),
+                    ),
+                )
+                .child(
+                    sidebar_icon_button(
+                        format!("server-sftp-{}", entry.name),
+                        "icons/columns-2.svg",
+                        ui.accent,
+                        Some("server-sftp"),
+                        ui,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
                         cx.listener({
                             let name = entry.name.clone();
                             move |this, _event, _window, cx| this.open_sftp_panel(&name, cx)
                         }),
-                    )
-                    // 选择器供测试/走查定位（原 debug_selector 保留）
-                    .debug_selector(|| "server-sftp".into()),
+                    ),
                 ),
         )
         // 优先展示连接目标；快捷键属于次要操作。
@@ -12600,23 +13065,27 @@ where
 /// 只对新标签/分屏生效。`shell_integration` 开启时按 laterterm-local 的
 /// bash 最小注入追加 OSC 133/7 钩子环境（best-effort，见该函数注记）；
 /// `cwd` 为继承的初始目录（焦点窗格 OSC 7 上报，None = 不继承）。
+/// `grid` = 新窗格落位后的首帧网格（`WorkspaceView::new_pane_grid`）——PTY
+/// 一启动就是最终尺寸。此前写死占位 110×30 等首帧 resize，新分屏因此变窄，
+/// zsh 首行残留 `%`（成因见 new_pane_grid 注记）。
 fn spawn_local_session(
     shell: Option<&str>,
     shell_integration: bool,
     cwd: Option<PathBuf>,
+    grid: (usize, usize, u16, u16),
 ) -> Arc<dyn TerminalSession> {
     let shell = resolve_shell(shell);
+    let (cols, rows, pixel_width, pixel_height) = grid;
     Arc::new(
         LocalSession::spawn(LocalOptions {
             env: local_session_env(&shell, shell_integration),
             shell,
             args: vec![],
             cwd,
-            cols: 110,
-            rows: 30,
-            // 占位值：此处拿不到设置度量，首帧 canvas 按实测单格像素校正
-            pixel_width: 0,
-            pixel_height: 0,
+            cols: cols.max(1) as u16,
+            rows: rows.max(1) as u16,
+            pixel_width,
+            pixel_height,
         })
         .expect("启动本地会话失败"),
     )
@@ -14063,8 +14532,11 @@ mod exit_regression_tests {
     fn paste_guard_single_line_writes_multiline_confirms(cx: &mut TestAppContext) {
         inject_default_startup_settings(cx);
         let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
-        workspace.update_in(cx, |view, window, cx| {
+        // spy 写入缓冲由闭包内 attach 产出、提升到闭包外供各阶段断言共享。
+        let mut written_slot: Option<Arc<std::sync::Mutex<Vec<u8>>>> = None;
+        let pane = workspace.update_in(cx, |view, window, cx| {
             let (pane, written) = attach_paste_spy(view, window, cx);
+            written_slot = Some(Arc::clone(&written));
 
             // 单行：不弹弹窗，直接写入
             cx.write_to_clipboard(gpui::ClipboardItem::new_string("echo ok".into()));
@@ -14072,7 +14544,7 @@ mod exit_regression_tests {
             assert!(view.paste_confirm.is_none(), "单行粘贴不应弹确认弹窗");
             assert_eq!(*written.lock().unwrap(), b"echo ok".to_vec());
 
-            // 多行：弹弹窗且未写入
+            // 多行：弹弹窗且未写入；编辑区自动持有焦点（供下方真实键派发）
             written.lock().unwrap().clear();
             let multiline = "echo a\nrm -rf /tmp/x\n";
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(multiline.into()));
@@ -14081,21 +14553,41 @@ mod exit_regression_tests {
             assert_eq!(state.text, multiline, "弹窗必须快照剪贴板文本");
             assert_eq!(state.pane, pane);
             assert!(written.lock().unwrap().is_empty(), "弹窗打开期间不得写 PTY");
-
-            // Enter（走 on_key_down 模态分支）确认 → 写入快照文本
-            view.on_key_down(
-                &KeyDownEvent {
-                    keystroke: Keystroke::parse("enter").unwrap(),
-                    is_held: false,
-                },
-                window,
-                cx,
+            window.activate_window();
+            pane
+        });
+        let written = written_slot.expect("闭包内已挂载 spy 缓冲");
+        // Enter（textarea 语义）：编辑区持有焦点，按键经真实焦点链到达
+        // textarea 插换行，弹窗不关；确认走「粘贴」按钮（confirm_paste）
+        cx.simulate_keystrokes("enter");
+        workspace.read_with(cx, |view, cx| {
+            assert!(
+                view.paste_confirm.is_some(),
+                "Enter 在编辑区是换行，不关弹窗"
             );
-            assert!(view.paste_confirm.is_none(), "Enter 应确认并关弹窗");
-            assert_eq!(*written.lock().unwrap(), multiline.as_bytes().to_vec());
+            let area = view
+                .paste_confirm
+                .as_ref()
+                .and_then(|state| state.text_area.as_ref())
+                .expect("编辑区应存在");
+            assert_eq!(
+                area.read(cx).value(),
+                "echo a\nrm -rf /tmp/x\n\n",
+                "Enter 应在光标处（文末）插入换行"
+            );
+        });
+        workspace.update_in(cx, |view, _, cx| view.confirm_paste(cx));
+        workspace.read_with(cx, |view, _| {
+            assert!(view.paste_confirm.is_none(), "「粘贴」按钮确认并关弹窗");
+        });
+        assert_eq!(
+            *written.lock().unwrap(),
+            b"echo a\nrm -rf /tmp/x\n\n".to_vec(),
+            "确认粘的是编辑后的 textarea 现值"
+        );
 
+        workspace.update_in(cx, |view, window, cx| {
             // 尾回车单行命令（"rm -rf x\n"）：lines()==1 但含换行，是护栏核心场景
-            written.lock().unwrap().clear();
             cx.write_to_clipboard(gpui::ClipboardItem::new_string("rm -rf x\n".into()));
             view.begin_paste(pane, window, cx);
             assert!(
@@ -14136,6 +14628,86 @@ mod exit_regression_tests {
             view.begin_paste(pane, window, cx);
             assert!(view.paste_confirm.is_none(), "开关关闭不弹弹窗");
             assert_eq!(*written.lock().unwrap(), b"echo a\n".to_vec());
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    /// textarea 编辑：弹窗预填多行编辑区，改内容后确认粘贴的是**编辑结果**；
+    /// 不动内容时逐字节还原原文（含尾回车，textarea 编辑本身不会丢结构）。
+    #[gpui::test]
+    fn paste_dialog_is_editable_and_preserves_unedited_text(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            let (pane, written) = attach_paste_spy(view, window, cx);
+
+            // 编辑整块内容后确认 → 粘编辑结果
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                "echo a\necho b\necho c".into(),
+            ));
+            view.begin_paste(pane, window, cx);
+            let state = view.paste_confirm.as_ref().expect("多行粘贴应弹弹窗");
+            let area = state.text_area.as_ref().expect("行数 ≤ 上限应有编辑区");
+            assert!(
+                area.read(cx).focus_handle().is_focused(window),
+                "编辑区应自动持有焦点"
+            );
+            area.update(cx, |area, cx| {
+                area.set_value("echo only-this\nrm -rf /tmp/x", cx)
+            });
+            view.confirm_paste(cx);
+            assert_eq!(
+                *written.lock().unwrap(),
+                b"echo only-this\nrm -rf /tmp/x".to_vec(),
+                "确认应粘贴编辑结果"
+            );
+
+            // 有尾回车：不编辑时确认 = 原文逐字节（textarea 编辑保真，不丢结构）
+            written.lock().unwrap().clear();
+            view.begin_paste(pane, window, cx);
+            view.confirm_paste(cx);
+            assert_eq!(*written.lock().unwrap(), b"echo a\necho b\necho c".to_vec());
+
+            // 用户手动删掉尾回车 → 尊重编辑结果，不补尾
+            written.lock().unwrap().clear();
+            view.begin_paste(pane, window, cx);
+            let area = view
+                .paste_confirm
+                .as_ref()
+                .and_then(|state| state.text_area.as_ref())
+                .expect("编辑区应存在");
+            area.update(cx, |area, cx| area.set_value("echo a\necho b", cx));
+            view.confirm_paste(cx);
+            assert_eq!(*written.lock().unwrap(), b"echo a\necho b".to_vec());
+            view.cancel_paste(window, cx);
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    /// 行数超上限 → 只读预览（无编辑区），确认粘原文。
+    #[gpui::test]
+    fn paste_dialog_over_cap_falls_back_to_readonly(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        workspace.update_in(cx, |view, window, cx| {
+            let (pane, written) = attach_paste_spy(view, window, cx);
+            let big: String = (0..150).map(|index| format!("echo {index}\n")).collect();
+            cx.write_to_clipboard(gpui::ClipboardItem::new_string(big.clone()));
+            view.begin_paste(pane, window, cx);
+            assert!(
+                view.paste_confirm
+                    .as_ref()
+                    .expect("超限仍弹弹窗")
+                    .text_area
+                    .is_none(),
+                "超上限应退回只读预览，不实例化多行编辑区"
+            );
+            view.confirm_paste(cx);
+            assert_eq!(*written.lock().unwrap(), big.as_bytes().to_vec());
             for pane in &view.panes {
                 pane.session.close();
             }
@@ -16439,7 +17011,571 @@ mod pane_zoom_tests {
     }
 }
 
-/// 关闭运行中终端的二次确认：request 门卫 + 聚合弹窗 + 确认后走既有
+/// 新建窗格首帧网格预估（`WorkspaceView::new_pane_grid`）：PTY 与终端视图以
+/// 预估尺寸起步，预估必须等于首帧实测——否则 shell 在初始化时读过旧尺寸后
+/// PTY 又被变窄 resize，zsh `PROMPT_SP` 的擦除标记折行，首行残留 `%`
+/// （修复前新标签/分屏写死占位 110×30，首帧才 resize 成真实尺寸）。
+#[cfg(test)]
+mod new_pane_grid_tests {
+    use super::{NewPane, PaneId, SplitDirection, WorkspaceView, bounding_size, split_second_size};
+    use crate::pane_navigation::PaneRect;
+    use gpui::{App, TestAppContext, px};
+
+    fn inject_default_startup_settings(cx: &mut TestAppContext) {
+        use crate::Settings;
+        cx.set_global(crate::StartupSettings(Settings::default()));
+    }
+
+    /// 模式同 pane_zoom_tests：会话泄漏会让测试进程收尾告警。
+    fn close_sessions(workspace: &gpui::Entity<WorkspaceView>, cx: &gpui::TestAppContext) {
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("laterterm-grid-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 开一个已过首帧的窗口：单窗格、已量出单格度量、几何快照就绪。
+    fn drawn_workspace<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+    ) -> (gpui::Entity<WorkspaceView>, &'a mut gpui::VisualTestContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let dir = test_dir(name);
+        workspace.update_in(cx, |view, window, _| {
+            view.settings.commands.clear();
+            view.settings.servers.clear();
+            view.settings.totp.clear();
+            view.settings.shortcuts = Default::default();
+            view.settings.restore_session = false;
+            view.settings_save_path = Some(dir.join("settings.toml"));
+            window.activate_window();
+        });
+        cx.simulate_resize(gpui::size(px(1280.0), px(760.0)));
+        cx.run_until_parked();
+        (workspace, cx)
+    }
+
+    fn grid(view: &WorkspaceView, pane: PaneId, cx: &App) -> (usize, usize) {
+        view.pane(pane)
+            .expect("窗格应存活")
+            .terminal
+            .read(cx)
+            .dimensions()
+    }
+
+    fn rect(id: PaneId, x: f32, y: f32, width: f32, height: f32) -> PaneRect {
+        PaneRect {
+            id,
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    type Predicted = (gpui::Size<gpui::Pixels>, (usize, usize, u16, u16));
+
+    /// 预估 → 新建 → 过帧，三件事一起断言：视图初始网格 = 预估、首帧后
+    /// 仍 = 预估（PTY 未被 resize）、新窗格实际绘制矩形 = 落位预估。
+    fn assert_starts_at_predicted(
+        workspace: &gpui::Entity<WorkspaceView>,
+        cx: &mut TestAppContext,
+        pane: PaneId,
+        predicted: Predicted,
+    ) {
+        let (predicted_size, (cols, rows, ..)) = predicted;
+        assert_eq!(
+            workspace.read_with(cx, |view, cx| grid(view, pane, cx)),
+            (cols, rows),
+            "视图初始网格应等于预估（PTY 同尺寸起步）"
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |view, cx| grid(view, pane, cx)),
+            (cols, rows),
+            "首帧实测与预估不一致：PTY 会在 shell 读过旧尺寸后被 resize"
+        );
+        workspace.read_with(cx, |view, _| {
+            let snapshot = view.pane_geometry.borrow();
+            let snapshot = snapshot.as_ref().expect("过帧后应有几何快照");
+            let drawn = snapshot
+                .panes
+                .iter()
+                .find(|rect| rect.id == pane)
+                .expect("新窗格应有绘制矩形");
+            assert_eq!(
+                (drawn.width, drawn.height),
+                (
+                    f32::from(predicted_size.width),
+                    f32::from(predicted_size.height)
+                ),
+                "落位预估应等于实际绘制尺寸"
+            );
+        });
+    }
+
+    /// 落位换算纯函数：余量 = 容器 − 首子树 − 分隔线；奇数长度首子树四舍五入
+    /// 偏大，余量只会偏小；只动主轴。
+    #[test]
+    fn split_second_size_takes_remainder_after_divider() {
+        let even = split_second_size(
+            &rect(PaneId(1), 0.0, 0.0, 650.0, 420.0),
+            SplitDirection::Horizontal,
+        );
+        assert_eq!((even.width, even.height), (px(322.0), px(420.0)));
+        // 651 − round(325.5) − 3 = 322：偏小而非 323
+        let odd = split_second_size(
+            &rect(PaneId(1), 0.0, 0.0, 651.0, 420.0),
+            SplitDirection::Horizontal,
+        );
+        assert_eq!(odd.width, px(322.0));
+        // 421 − round(210.5) − 3 = 207
+        let vertical = split_second_size(
+            &rect(PaneId(1), 0.0, 0.0, 650.0, 421.0),
+            SplitDirection::Vertical,
+        );
+        assert_eq!((vertical.width, vertical.height), (px(650.0), px(207.0)));
+    }
+
+    /// 外接矩形：覆盖全部窗格；空集无外接。
+    #[test]
+    fn bounding_size_covers_all_panes() {
+        assert!(bounding_size(&[]).is_none());
+        let rects = [
+            rect(PaneId(1), 240.0, 34.0, 500.0, 300.0),
+            rect(PaneId(2), 743.0, 34.0, 497.0, 150.0),
+            rect(PaneId(3), 743.0, 187.0, 497.0, 147.0),
+        ];
+        assert_eq!(
+            bounding_size(&rects),
+            Some(gpui::size(px(1000.0), px(300.0)))
+        );
+    }
+
+    /// 核心：水平分屏、垂直分屏、新标签三条路径的预估都等于首帧实测。
+    #[gpui::test]
+    fn new_panes_start_at_their_first_frame_grid_size(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = drawn_workspace(cx, "grid-size");
+
+        // ① 水平分屏
+        let (right, original_cols, predicted) = workspace.update_in(cx, |view, window, cx| {
+            let from = view.focused_pane_id();
+            let original_cols = grid(view, from, cx).0;
+            let target = NewPane::Split {
+                from,
+                direction: SplitDirection::Horizontal,
+            };
+            let predicted: Predicted = {
+                let size = view.new_pane_size(target, window);
+                (size, view.new_pane_grid(target, window, cx))
+            };
+            assert!(
+                view.panes.iter().all(|pane| pane
+                    .terminal
+                    .read(cx)
+                    .grid_size_for(predicted.0)
+                    .is_some()),
+                "首窗格过帧后应有实测单格度量（走实测口径而非近似兜底）"
+            );
+            view.split_focused(SplitDirection::Horizontal, window, cx);
+            (view.focused_pane_id(), original_cols, predicted)
+        });
+        assert!(
+            predicted.1.0 < original_cols,
+            "分屏预估应窄于原窗格，而非占位的整窗尺寸"
+        );
+        assert_starts_at_predicted(&workspace, cx, right, predicted);
+
+        // ② 在新窗格上再垂直分屏
+        let (bottom, predicted) = workspace.update_in(cx, |view, window, cx| {
+            let target = NewPane::Split {
+                from: view.focused_pane_id(),
+                direction: SplitDirection::Vertical,
+            };
+            let predicted: Predicted = {
+                let size = view.new_pane_size(target, window);
+                (size, view.new_pane_grid(target, window, cx))
+            };
+            view.split_focused(SplitDirection::Vertical, window, cx);
+            (view.focused_pane_id(), predicted)
+        });
+        let split_rows = predicted.1.1;
+        assert_starts_at_predicted(&workspace, cx, bottom, predicted);
+
+        // ③ 新标签：终端区 = 当前标签全部窗格的外接矩形，比分屏窗格高
+        let (tab_pane, predicted) = workspace.update_in(cx, |view, window, cx| {
+            let predicted: Predicted = {
+                let size = view.new_pane_size(NewPane::Tab, window);
+                (size, view.new_pane_grid(NewPane::Tab, window, cx))
+            };
+            view.spawn_tab(window, cx);
+            (view.focused_pane_id(), predicted)
+        });
+        assert!(
+            predicted.1.1 > split_rows,
+            "新标签占满终端区，应高于分屏窗格"
+        );
+        assert_starts_at_predicted(&workspace, cx, tab_pane, predicted);
+        close_sessions(&workspace, cx);
+    }
+
+    /// 从放大窗格分屏：放大帧不刷新真实布局几何（`pane_geometry_real` 保留
+    /// 放大前的矩形），预估按该窗格在真实布局里的宽度算，而非放大后的整区。
+    #[gpui::test]
+    fn split_from_zoomed_pane_uses_real_layout_geometry(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = drawn_workspace(cx, "zoomed-grid");
+        workspace.update_in(cx, |view, window, cx| {
+            view.split_focused(SplitDirection::Horizontal, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |view, _, cx| view.toggle_zoom(cx));
+        cx.run_until_parked();
+        let zoomed_width = workspace.read_with(cx, |view, _| {
+            assert!(view.tabs[0].zoomed);
+            let visible = view.pane_geometry.borrow();
+            let visible = visible.as_ref().expect("放大帧应有几何快照");
+            assert_eq!(visible.panes.len(), 1, "放大帧只画焦点窗格");
+            let real = view.pane_geometry_real.borrow();
+            let real = real.as_ref().expect("放大期间应保留真实布局几何");
+            assert_eq!(real.layout, view.tabs[0].layout, "真实几何对应真实布局树");
+            assert_eq!(real.panes.len(), 2);
+            real.panes
+                .iter()
+                .find(|rect| rect.id == view.active_tab().focused_pane)
+                .expect("放大窗格应在真实布局里")
+                .width
+        });
+        let (new_pane, predicted) = workspace.update_in(cx, |view, window, cx| {
+            let target = NewPane::Split {
+                from: view.focused_pane_id(),
+                direction: SplitDirection::Vertical,
+            };
+            let predicted: Predicted = {
+                let size = view.new_pane_size(target, window);
+                (size, view.new_pane_grid(target, window, cx))
+            };
+            view.split_focused(SplitDirection::Vertical, window, cx);
+            (view.focused_pane_id(), predicted)
+        });
+        assert_eq!(
+            predicted.0.width,
+            px(zoomed_width),
+            "宽度沿用真实布局里的窗格宽"
+        );
+        assert_starts_at_predicted(&workspace, cx, new_pane, predicted);
+        close_sessions(&workspace, cx);
+    }
+}
+
+/// 分屏打开服务器（ConnectDest::SplitPane）：连接成功后 SSH 会话落在锚点
+/// 窗格旁的新分屏子窗格（不建新标签）；锚点窗格已关回退新标签；视图初始
+/// 网格 = 发起时预估的落位网格。
+#[cfg(test)]
+mod ssh_split_tests {
+    use super::{ConnectDest, PaneId, SplitDirection, SshRequest, WorkspaceView};
+    use crate::server_connection::ConnectionOutcome;
+    use gpui::TestAppContext;
+    use laterterm_core::{BackendKind, SessionStreams, TerminalSession};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    fn inject_default_startup_settings(cx: &mut TestAppContext) {
+        use crate::Settings;
+        cx.set_global(crate::StartupSettings(Settings::default()));
+    }
+
+    /// 模式同 pane_zoom_tests：会话泄漏会让测试进程收尾告警。
+    fn close_sessions(workspace: &gpui::Entity<WorkspaceView>, cx: &gpui::TestAppContext) {
+        workspace.read_with(cx, |view, _| {
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
+    fn test_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("laterterm-ssh-split-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 阻塞 reader：recv 挂起（窗格保持 Running）；发送端随会话存活，会话
+    /// 被 drop 才 EOF 走真实回收。io::empty() 会在断言前把窗格读到退出。
+    struct HoldReader(std::sync::mpsc::Receiver<u8>);
+    impl std::io::Read for HoldReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.recv() {
+                Ok(byte) => {
+                    buf[0] = byte;
+                    Ok(1)
+                }
+                Err(_) => Ok(0),
+            }
+        }
+    }
+
+    /// SSH 假会话：reader 挂在永不喂食的管道上（发送端存在自身里）。
+    struct DeadSession {
+        sender: std::sync::mpsc::Sender<u8>,
+        receiver: std::sync::Mutex<Option<std::sync::mpsc::Receiver<u8>>>,
+    }
+    impl DeadSession {
+        fn new() -> Self {
+            let (tx, rx) = std::sync::mpsc::channel();
+            DeadSession {
+                sender: tx,
+                receiver: std::sync::Mutex::new(Some(rx)),
+            }
+        }
+    }
+    impl TerminalSession for DeadSession {
+        fn backend(&self) -> BackendKind {
+            BackendKind::Ssh
+        }
+        fn title(&self) -> String {
+            "假 SSH".into()
+        }
+        fn take_streams(&self) -> std::io::Result<SessionStreams> {
+            let receiver = self
+                .receiver
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| std::io::Error::other("会话字节流已被取走"))?;
+            Ok(SessionStreams {
+                reader: Box::new(HoldReader(receiver)),
+                writer: Box::new(std::io::sink()),
+            })
+        }
+        fn resize(&self, _: u16, _: u16, _: u16, _: u16) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn kill(&self) {
+            // kill 即断流：发一个字节（读到后发送端随会话尽出，HoldReader
+            // 下一次 recv EOF，读泵走真实回收路径）
+            let _ = self.sender.send(0);
+        }
+    }
+
+    /// 装配：隔离设置 + 一个服务器条目 + 直设 SplitPane 请求槽。
+    fn workspace_with_split_request<'a>(
+        cx: &'a mut TestAppContext,
+        name: &str,
+        from: PaneId,
+        grid: (usize, usize, u16, u16),
+    ) -> (gpui::Entity<WorkspaceView>, &'a mut gpui::VisualTestContext) {
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let dir = test_dir(name);
+        workspace.update_in(cx, |view, window, _| {
+            view.settings.commands.clear();
+            view.settings.servers.clear();
+            view.settings.totp.clear();
+            view.settings.shortcuts = Default::default();
+            view.settings.restore_session = false;
+            view.settings_save_path = Some(dir.join("settings.toml"));
+            let entry = laterterm_config::ServerEntry {
+                name: "测试服务器".into(),
+                host: "example.com".into(),
+                username: "user".into(),
+                ..Default::default()
+            };
+            view.settings.servers = vec![entry.clone()];
+            view.ssh_request = Some(SshRequest {
+                id: 7,
+                entry,
+                jump: Vec::new(),
+                dest: ConnectDest::SplitPane {
+                    from,
+                    direction: SplitDirection::Horizontal,
+                    grid,
+                },
+                active: Arc::new(AtomicBool::new(true)),
+                running: true,
+            });
+            window.activate_window();
+        });
+        (workspace, cx)
+    }
+
+    /// 直连 finish 的公共段：消费请求槽里的 SplitPane 去向。
+    fn finish_with_fake_session(
+        view: &mut WorkspaceView,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<WorkspaceView>,
+    ) {
+        let entry = view
+            .ssh_request
+            .as_ref()
+            .expect("请求槽应就位")
+            .entry
+            .clone();
+        view.finish_ssh_connect(
+            7,
+            entry,
+            Ok(ConnectionOutcome::Connected {
+                session: Arc::new(DeadSession::new()),
+                warning: None,
+                tunnel_session: None,
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// 连接成功 → SSH 会话落在锚点窗格旁的新分屏子窗格：不建新标签、树是
+    /// 对半 Split、焦点随新窗格、ssh_link 已挂、视图初始网格 = 预估网格。
+    #[gpui::test]
+    fn finish_ssh_connect_places_split_pane(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = workspace_with_split_request(cx, "split", PaneId(1), (80, 24, 0, 0));
+        workspace.update_in(cx, |view, window, cx| {
+            assert_eq!(view.tabs.len(), 1);
+            finish_with_fake_session(view, window, cx);
+            assert_eq!(view.tabs.len(), 1, "分屏去向不得新建标签");
+            assert_eq!(view.panes.len(), 2);
+            let new_pane = view.focused_pane_id();
+            assert_ne!(new_pane, PaneId(1), "焦点应随新窗格");
+            let super::LayoutNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+                ..
+            } = &view.tabs[0].layout
+            else {
+                panic!("锚点叶子应替换成 Split 节点");
+            };
+            assert_eq!(**first, super::LayoutNode::Leaf(PaneId(1)));
+            assert_eq!(**second, super::LayoutNode::Leaf(new_pane));
+            assert_eq!(*direction, SplitDirection::Horizontal);
+            assert!((ratio - 0.5).abs() < f32::EPSILON, "对半分屏");
+            let pane = view.pane(new_pane).expect("新窗格应已登记");
+            assert!(
+                pane.ssh_link
+                    .as_ref()
+                    .is_some_and(|link| link.entry.name == "测试服务器"),
+                "分屏窗格应挂 SSH 链路快照"
+            );
+            assert_eq!(
+                pane.terminal.read(cx).dimensions(),
+                (80, 24),
+                "视图初始网格应等于发起时的落位预估"
+            );
+        });
+        close_sessions(&workspace, cx);
+    }
+
+    /// 锚点窗格已关（任一标签树里都找不到）→ 回退既有新标签路径，会话不丢。
+    #[gpui::test]
+    fn finish_ssh_connect_falls_back_to_new_tab_when_anchor_gone(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) =
+            workspace_with_split_request(cx, "fallback", PaneId(999), (80, 24, 0, 0));
+        workspace.update_in(cx, |view, window, cx| {
+            finish_with_fake_session(view, window, cx);
+            assert_eq!(view.tabs.len(), 2, "锚点已失应回退新标签");
+            assert_eq!(view.panes.len(), 2);
+            let pane = view
+                .pane(view.focused_pane_id())
+                .expect("新标签窗格应已登记");
+            assert!(pane.ssh_link.is_some(), "回退路径同样要挂链路快照");
+        });
+        close_sessions(&workspace, cx);
+    }
+
+    /// 从放大窗格分屏打开服务器：锚点标签先退出放大态再落位（用户要看到
+    /// 两个窗格），叶数 +1。
+    #[gpui::test]
+    fn finish_ssh_connect_exits_zoom_before_splitting(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = workspace_with_split_request(cx, "zoom", PaneId(1), (80, 24, 0, 0));
+        workspace.update_in(cx, |view, window, cx| {
+            view.split_focused(SplitDirection::Horizontal, window, cx);
+            view.toggle_zoom(cx);
+            assert!(view.tabs[0].zoomed);
+            finish_with_fake_session(view, window, cx);
+            assert!(!view.tabs[0].zoomed, "落位前应退出放大态");
+            assert_eq!(view.tabs.len(), 1, "仍不新建标签");
+            assert_eq!(view.tabs[0].layout.leaf_count(), 3);
+        });
+        close_sessions(&workspace, cx);
+    }
+
+    /// 按钮链路：connect_server_split 必须把 SplitPane 去向写进请求槽
+    /// （锚点 = 点击时焦点窗格），且结果经生产同款 pump
+    /// （pending_ssh_results → process_ssh_results）落地后仍是分屏落位。
+    #[gpui::test]
+    fn split_request_flows_through_pump_to_split_pane(cx: &mut TestAppContext) {
+        inject_default_startup_settings(cx);
+        let (workspace, cx) = cx.add_window_view(WorkspaceView::new);
+        let dir = test_dir("pump");
+        workspace.update_in(cx, |view, window, cx| {
+            view.settings.commands.clear();
+            view.settings.servers.clear();
+            view.settings.totp.clear();
+            view.settings.shortcuts = Default::default();
+            view.settings.restore_session = false;
+            view.settings_save_path = Some(dir.join("settings.toml"));
+            view.settings.servers = vec![laterterm_config::ServerEntry {
+                name: "泵测试".into(),
+                host: "invalid.test".into(),
+                username: "user".into(),
+                ..Default::default()
+            }];
+            window.activate_window();
+            let anchor = view.focused_pane_id();
+            view.connect_server_split("泵测试", window, cx);
+            let request = view.ssh_request.as_ref().expect("点击后请求槽应占用");
+            assert!(
+                request.running,
+                "begin 后应立即进入后台连接（running=true）"
+            );
+            let super::ConnectDest::SplitPane {
+                from, direction, ..
+            } = request.dest
+            else {
+                panic!("去向应为 SplitPane，实际 {:?}", request.dest);
+            };
+            assert_eq!(from, anchor);
+            assert_eq!(direction, SplitDirection::Horizontal);
+            // 模拟后台线程的产物经 pump 落地（与 render 头部 process_ssh_results
+            // 同一条路径，而非直连 finish）
+            view.pending_ssh_results.push((
+                request.id,
+                request.entry.clone(),
+                Ok(ConnectionOutcome::Connected {
+                    session: Arc::new(DeadSession::new()),
+                    warning: None,
+                    tunnel_session: None,
+                }),
+            ));
+            view.process_ssh_results(window, cx);
+            assert_eq!(view.tabs.len(), 1, "pump 路径同样不得新建标签");
+            assert_eq!(view.tabs[0].layout.leaf_count(), 2);
+            let new_pane = view.focused_pane_id();
+            assert_ne!(new_pane, anchor);
+            assert!(
+                view.pane(new_pane)
+                    .is_some_and(|pane| pane.ssh_link.is_some())
+            );
+        });
+        close_sessions(&workspace, cx);
+    }
+}
+
 /// Closing 回收。FakeSession 注入 attach_pane（经 wrap_session 组合包装
 /// = 审计 tap 内层 + 传输拦截外层，装饰器转发链路一并被测）。
 #[cfg(test)]

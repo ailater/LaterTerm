@@ -752,6 +752,24 @@ fn blink_frozen(enabled: bool, last_paint_ms: u64, now_ms: u64) -> bool {
     enabled && now_ms.saturating_sub(last_paint_ms) > BLINK_IDLE_GATE_MS
 }
 
+/// 容器尺寸 → 网格行列：首帧 prepaint 与宿主预估
+/// ([`TerminalView::grid_size_for`]) 的**唯一**换算口径——两侧各写一份的话，
+/// 预估与实测只要差一列，PTY 就会在 shell 读过窗口尺寸之后、画出首个提示符
+/// 之前被 resize（zsh `PROMPT_SP` 擦除标记因此折行，首行残留一个 `%`）。
+/// 扣内边距后按单格像素向下取整；极小窗口钳到 1 行 1 列。
+fn grid_size_within(
+    size: Size<Pixels>,
+    padding: Edges<Pixels>,
+    cell_width: Pixels,
+    cell_height: Pixels,
+) -> (usize, usize) {
+    let available_width: f32 = (size.width - padding.left - padding.right).into();
+    let available_height: f32 = (size.height - padding.top - padding.bottom).into();
+    let cols = ((available_width.max(0.0) / f32::from(cell_width).max(1.0)) as usize).max(1);
+    let rows = ((available_height.max(0.0) / f32::from(cell_height).max(1.0)) as usize).max(1);
+    (cols, rows)
+}
+
 /// 兜底色板：`UiPalette::from_theme` 依赖 laterterm-config 的 ThemeColors，
 /// 而 termview 不依赖 config（后续 SSH 线的依赖方向约束），故按地基线
 /// laterterm-ui `palette_tests::tokyo_night_palette_pinned` 锁定的
@@ -2178,6 +2196,34 @@ impl TerminalView {
         (self.state.cols(), self.state.rows())
     }
 
+    /// 预估本视图若放进 `size` 大小的容器，首帧会量出的网格尺寸。
+    ///
+    /// 返回 `(cols, rows, pixel_width, pixel_height)`，行列与首帧 prepaint
+    /// 同一换算（[`grid_size_within`]）、同一份实测单格度量，像素与 resize
+    /// 回调同式——几何估准的前提下与首帧实测**逐位相等**。宿主据此在新建
+    /// 窗格、尚未起 PTY 时定初始尺寸：shell 启动读到的就是最终尺寸，不再
+    /// 经历「占位尺寸 → 首帧 resize」（变窄方向会让 zsh `PROMPT_SP` 的擦除
+    /// 标记折行，首行残留 `%`）。
+    ///
+    /// 单格度量未就绪（视图尚未渲染过首帧、或字体/缩放变更后待重测）时
+    /// 返回 None——此时 cell 尺寸是构造期的粗略近似，拿它预估等于放任偏差。
+    pub fn grid_size_for(&self, size: Size<Pixels>) -> Option<(usize, usize, u16, u16)> {
+        if self.renderer.needs_measurement() {
+            return None;
+        }
+        let cell_width: f32 = self.renderer.cell_width.into();
+        let cell_height: f32 = self.renderer.cell_height.into();
+        let (cols, rows) = grid_size_within(
+            size,
+            self.config.padding,
+            self.renderer.cell_width,
+            self.renderer.cell_height,
+        );
+        let pixel_width = (cols as f32 * cell_width).round().max(0.0) as u16;
+        let pixel_height = (rows as f32 * cell_height).round().max(0.0) as u16;
+        Some((cols, rows, pixel_width, pixel_height))
+    }
+
     /// 按比例设置滚动位置：0.0 = 最老历史，1.0 = 底部。
     /// 用于宿主滚动条点击/拖拽；变化会立即请求终端重绘。
     pub fn set_scroll_fraction(&mut self, fraction: f32, cx: &mut Context<Self>) {
@@ -3137,19 +3183,17 @@ impl Render for TerminalView {
                         // Vec + palette ~4.4KB 白拷贝）本体仍在每帧路径——量级 µs 级
                         // 非瓶颈，独立复核 2026-11-07 确认；如需消除可改 Arc 共享。
 
-                        // Calculate available space after padding, clamping tiny windows safely.
-                        let available_width: f32 =
-                            (bounds.size.width - padding.left - padding.right).into();
-                        let available_height: f32 =
-                            (bounds.size.height - padding.top - padding.bottom).into();
                         let cell_width_f32: f32 = renderer.cell_width.into();
                         let cell_height_f32: f32 = renderer.cell_height.into();
 
-                        let cols =
-                            ((available_width.max(0.0) / cell_width_f32.max(1.0)) as usize).max(1);
-                        let rows = ((available_height.max(0.0) / cell_height_f32.max(1.0))
-                            as usize)
-                            .max(1);
+                        // 行列换算与宿主预估（grid_size_for）共用唯一口径：
+                        // 扣内边距后按单格像素向下取整，极小窗口钳到 1。
+                        let (cols, rows) = grid_size_within(
+                            bounds.size,
+                            padding,
+                            renderer.cell_width,
+                            renderer.cell_height,
+                        );
 
                         // Helper struct implementing Dimensions for resize
                         struct TermSize {
@@ -4107,6 +4151,99 @@ mod tests {
                 "回退 family 不得等于缺失的配置值"
             );
             assert!(view.renderer.cell_width > gpui_px(0.0), "回退后应测得列宽");
+        });
+    }
+
+    /// 网格换算纯函数（首帧 prepaint 与宿主预估共用）：扣内边距、向下取整、
+    /// 极小容器钳到 1。
+    #[test]
+    fn grid_size_within_subtracts_padding_floors_and_clamps() {
+        use super::grid_size_within;
+        use gpui::{Edges, px};
+
+        let padding = Edges::all(px(8.0));
+        // (645−16)/7.83 = 80.3 → 80 列；(436−16)/18.16 = 23.1 → 23 行
+        let size = gpui::size(px(645.0), px(436.0));
+        assert_eq!(
+            grid_size_within(size, padding, px(7.83), px(18.16)),
+            (80, 23)
+        );
+        // 恰好整除：正好 22 列 2 行，不多算
+        let exact = gpui::size(px(176.0), px(40.0));
+        assert_eq!(
+            grid_size_within(exact, Edges::all(px(0.0)), px(8.0), px(20.0)),
+            (22, 2)
+        );
+        // 容器比内边距还小 → 钳到 1×1
+        let tiny = gpui::size(px(4.0), px(0.0));
+        assert_eq!(grid_size_within(tiny, padding, px(7.83), px(18.16)), (1, 1));
+    }
+
+    /// resize 参数录制器（`(cols, rows, pixel_width, pixel_height)`）。
+    type ResizeLog = Arc<std::sync::Mutex<Vec<(usize, usize, u16, u16)>>>;
+    struct ResizeProbe(ResizeLog);
+    impl TerminalSession for ResizeProbe {
+        fn backend(&self) -> BackendKind {
+            BackendKind::Local
+        }
+        fn title(&self) -> String {
+            String::new()
+        }
+        fn take_streams(&self) -> std::io::Result<SessionStreams> {
+            Ok(SessionStreams {
+                reader: Box::new(std::io::empty()),
+                writer: Box::new(std::io::sink()),
+            })
+        }
+        fn resize(
+            &self,
+            cols: u16,
+            rows: u16,
+            pixel_width: u16,
+            pixel_height: u16,
+        ) -> std::io::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((cols as usize, rows as usize, pixel_width, pixel_height));
+            Ok(())
+        }
+        fn kill(&self) {}
+    }
+
+    /// 宿主预估接口：视图占满给定尺寸的容器时，预估应**逐位等于**首帧实际
+    /// 报给会话的 resize 参数——宿主拿它当 PTY 初始尺寸，PTY 才不会被首帧
+    /// resize。度量置脏（字体/缩放变更待重测）时不给数。
+    #[gpui::test]
+    fn grid_size_for_matches_first_frame_resize(cx: &mut TestAppContext) {
+        let resizes: ResizeLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (terminal, cx) = cx.add_window_view(|_, cx| {
+            let config = TerminalConfig {
+                padding: gpui::Edges::all(gpui::px(8.0)),
+                ..Default::default()
+            };
+            TerminalView::new(Arc::new(ResizeProbe(Arc::clone(&resizes))), config, cx)
+        });
+        use gpui::px;
+        cx.simulate_resize(gpui::size(px(645.0), px(436.0)));
+        cx.run_until_parked();
+        let asked = *resizes
+            .lock()
+            .unwrap()
+            .last()
+            .expect("首帧应向会话报网格尺寸");
+        terminal.update_in(cx, |view, _, _| {
+            let size = gpui::size(px(645.0), px(436.0));
+            assert_eq!(
+                view.grid_size_for(size),
+                Some(asked),
+                "预估应逐位等于首帧报给会话的尺寸"
+            );
+            view.renderer.invalidate_measurement();
+            assert!(
+                view.grid_size_for(size).is_none(),
+                "度量置脏期间不得拿过期度量预估"
+            );
         });
     }
 

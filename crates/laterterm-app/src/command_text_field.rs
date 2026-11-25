@@ -774,7 +774,7 @@ impl EntityInputHandler for CommandTextField {
 }
 
 /// 返回光标之前一个 Unicode 标量的 UTF-8 起点。
-fn previous_char_start(text: &str, end: usize) -> usize {
+pub(crate) fn previous_char_start(text: &str, end: usize) -> usize {
     text[..end]
         .char_indices()
         .next_back()

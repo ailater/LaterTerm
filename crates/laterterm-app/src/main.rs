@@ -6,6 +6,7 @@ mod command_text_field;
 mod import;
 mod onboarding;
 mod pane_navigation;
+mod paste_text_area;
 mod quake;
 mod server_connection;
 mod sftp_panel;
