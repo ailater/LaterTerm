@@ -1,7 +1,7 @@
 # LaterTerm release：tag → 三平台构建 → GitHub Release
 #
 # 由 auto-tag.yml 在版本号变化时自动 dispatch，也可手动 workflow_dispatch / 推 tag 触发。
-# 产物：Linux x64 tar.xz + deb + AppImage、macOS 双架构 dmg、Windows zip。
+# 产物：Linux x64 tar.xz + deb + AppImage、macOS 双架构 dmg、Windows zip + msi。
 #
 # 预演口径（不要对旧 tag dispatch）：workflow_dispatch 按指定 ref 取该 ref 上的
 # workflow 文件——对 v0.1.0 这类旧 tag dispatch 只会跑旧 release.yml，验不到新文件；
@@ -113,16 +113,13 @@ jobs:
             laterterm_*.AppImage
             laterterm*.sha256
 
-  # Windows msi 拆为后续任务（评审定级，2026-11-07）：zip 已可发（ssh agent
-  # 认证 2026-11-14 平台分派修复：Unix socket / Windows 命名管道，全量编译
-  # 已进 ci.yml windows-check 门禁）。msi 接线时启用 packaging/windows/laterterm.wxs
-  # （dotnet tool wix v4 钉版 + msvc-dev-cmd/GPUI_FXC_PATH 配方，见 wxs 头注释）。
-  # 保留 continue-on-error：Windows/macOS 首跑仍可能暴露新环境问题，静默缺包
-  # 优于整条发版链必红（Linux 产物始终可发）。
+  # Windows 交付物 = zip + msi（2026-11-28 msi 接线：WiX v4 CLI 钉版，配方见
+  # packaging/windows/laterterm.wxs 头注释）。Windows 编译自 ci.yml windows-check
+  # 门禁后已持续验证（agent 平台分派修复），故去掉 continue-on-error——msi 成为
+  # 交付物后静默缺平台比挂链更糟。签名占位见 wxs 头注释。
   build-windows:
-    name: Windows x64 构建（尽力而为）
+    name: Windows x64 构建（zip + msi）
     runs-on: windows-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -148,26 +145,50 @@ jobs:
         with:
           key: release-windows
 
+      - name: 读取版本号（tomllib + SemVer 校验）
+        # 与 build-linux 同款健壮口径（tomllib 不依赖字段行序）；windows runner
+        # 的 python 可用（python3 别名不保证存在）
+        shell: bash
+        run: |
+          VERSION=$(python -c "import tomllib; print(tomllib.load(open('Cargo.toml','rb'))['workspace']['package']['version'])")
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "Cargo.toml 版本号 $VERSION 不是合法 SemVer，中止" >&2
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
       - name: 构建
         run: cargo build --release -p laterterm-app --bin laterterm
 
       - name: 打包 zip
         shell: bash
-        # 版本读取沿用 grep：windows runner 的 python3 别名不保证存在（通常只有 python），
-        # tomllib 健壮化随 msi 后续任务一并做
         run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           mkdir -p laterterm-${VERSION}
           cp target/release/laterterm.exe laterterm-${VERSION}/
           cp README.md laterterm-${VERSION}/
           7z a -tzip laterterm-${VERSION}-x86_64-pc-windows-msvc.zip laterterm-${VERSION}/
           sha256sum laterterm-${VERSION}-x86_64-pc-windows-msvc.zip > laterterm-${VERSION}-x86_64-pc-windows-msvc.zip.sha256
 
+      - name: 打包 msi（WiX v4 CLI，钉版）
+        shell: bash
+        # 配方 = wxs 头注释接线三步；wix 钉具体版本（追 latest 会在上游换
+        # 行为时静默翻车，同 linuxdeploy 口径）。runner 预装 .NET SDK，
+        # wix 工具全局安装后进 PATH。
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix build -arch x64 \
+            -dLaterTermVersion="$VERSION" \
+            -dLaterTermExe="$PWD/target/release/laterterm.exe" \
+            -dLaterTermIco="$PWD/assets/icons/laterterm.ico" \
+            -o "laterterm_${VERSION}_x64.msi" packaging/windows/laterterm.wxs
+          sha256sum laterterm_${VERSION}_x64.msi > laterterm_${VERSION}_x64.msi.sha256
+
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x86_64
           path: |
             *.zip
+            *.msi
             *.sha256
 
   build-macos:
@@ -265,7 +286,6 @@ jobs:
           mkdir -p release-assets
           find artifacts -type f \( -name "*.tar.xz" -o -name "*.deb" -o -name "*.AppImage" -o -name "*.dmg" -o -name "*.zip" -o -name "*.msi" -o -name "*.sha256" \) \
             -exec cp {} release-assets/ \;
-          # *.msi 为后续任务预留（laterterm-ssh Windows 兼容修复后接线，当前无产物不会命中）
           ls -la release-assets/
 
       - name: 提取 CHANGELOG 小节作为 Release 正文
