@@ -76,7 +76,10 @@ fn is_valid_shell_path(value: &str) -> bool {
 pub struct LocalOptions {
     /// shell 可执行文件路径（如 $SHELL 解析结果）。
     pub shell: String,
-    /// 传给 shell 的额外参数。
+    /// 传给 shell 的额外参数。为空且 shell 支持 login 语义时，spawn 前置
+    /// `-l` 按 login shell 启动（与 Terminal.app/iTerm2 惯例一致，用户在
+    /// `~/.zprofile` 等 login 专属 rc 里的 PATH/环境才会生效）；非空视为
+    /// 调用方显式指定启动方式，原样透传、不插手。
     pub args: Vec<String>,
     /// 额外环境变量（TERM/COLORTERM 由本 crate 注入默认值）。
     pub env: Vec<(String, String)>,
@@ -157,6 +160,36 @@ fn is_bash(shell: &str) -> bool {
         .is_some_and(|name| name == "bash")
 }
 
+/// 支持 `-l`（login shell）选项的常见 shell（按文件名判定，覆盖任意安装
+/// 路径）。zsh/bash/fish/mksh/nu/dash 官方文档明载 `-l`；macOS `/bin/sh`
+/// 为 bash posix 模式、Debian 系为 dash，均支持。**ksh93/csh/tcsh 无
+/// `-l` 选项，elvish/pwsh（<7.4）不认会报错退出**（PTY 里即黑屏），
+/// 宁可不起 login（行为同旧版裸起）也不放进白名单。Windows 无 login
+/// shell 惯例，白名单恒空。
+#[cfg(unix)]
+const LOGIN_SHELLS: &[&str] = &["zsh", "bash", "sh", "dash", "fish", "mksh", "nu"];
+
+#[cfg(windows)]
+const LOGIN_SHELLS: &[&str] = &[];
+
+/// 交互终端的 login shell 默认（unix 惯例，Terminal.app/iTerm2 同款）：
+/// 调用方未传任何 shell 参数时，给 [`LOGIN_SHELLS`] 内的 shell 前置
+/// `-l`——用户在 `~/.zprofile`/`~/.bash_profile` 等 login 专属 rc 里的
+/// PATH/环境（如 Homebrew `shellenv`）才能生效；args 非空（选项或脚本
+/// 位置参数）视为调用方显式指定启动方式，原样透传不插手。`-l` 前置还
+/// 保证 dash 系「选项先于操作数」的解析顺序。
+fn with_login_flag(shell: &str, args: &[String]) -> Vec<String> {
+    let capable = Path::new(shell)
+        .file_name()
+        .is_some_and(|name| LOGIN_SHELLS.contains(&name.to_string_lossy().as_ref()));
+    if !args.is_empty() || !capable {
+        return args.to_vec();
+    }
+    let mut login = vec!["-l".to_owned()];
+    login.extend_from_slice(args);
+    login
+}
+
 /// 本地 PTY 会话。
 pub struct LocalSession {
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -177,6 +210,9 @@ impl LocalSession {
     ///
     /// 同时启动子进程回收线程；`slave` 端在取完读写流后立即关闭，
     /// 保证 shell 退出后 master 读端能收到 EOF。
+    ///
+    /// `options.args` 为空且 shell 支持 login 语义时按 login shell 启动
+    /// （前置 `-l`，见 `with_login_flag`）——交互终端的默认行为。
     pub fn spawn(options: LocalOptions) -> io::Result<Self> {
         let pair = portable_pty::native_pty_system()
             .openpty(PtySize {
@@ -188,7 +224,7 @@ impl LocalSession {
             .map_err(io::Error::other)?;
 
         let mut command = CommandBuilder::new(&options.shell);
-        command.args(&options.args);
+        command.args(with_login_flag(&options.shell, &options.args));
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
         for (key, value) in &options.env {
@@ -659,12 +695,115 @@ mod tests {
         session.kill();
     }
 
+    /// 回归钉子：默认参数启动的本地会话必须是 login shell——这是 dotfiles
+    /// 只配 login rc（如 `~/.zprofile` 里的 Homebrew `shellenv`）的用户的
+    /// PATH 通道。HOME 指向空目录隔离用户 rc 干扰；bash 判定 login：
+    /// `shopt -q login_shell` 退出码（静默，无输出污染）。
+    #[cfg(unix)]
+    #[test]
+    fn default_args_session_starts_login_shell() {
+        use std::io::Write;
+        use std::time::{Duration, Instant};
+
+        let home =
+            std::env::temp_dir().join(format!("laterterm-login-home-{}", std::process::id()));
+        std::fs::create_dir_all(&home).expect("建临时 HOME");
+        let session = LocalSession::spawn(LocalOptions {
+            shell: "/bin/bash".into(),
+            args: vec![], // 空 args = 自动 login 的被测路径
+            env: vec![("HOME".into(), home.to_string_lossy().into_owned())],
+            cwd: None,
+            cols: 80,
+            rows: 24,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("spawn 失败");
+        let mut streams = session.take_streams().expect("take_streams");
+        // PTY 缓冲输入：bash login 初始化完成前写入也不丢
+        streams
+            .writer
+            .write_all(b"shopt -q login_shell; printf 'LTLOGIN-%s\\n' \"$?\"\r")
+            .expect("写入 login 探测");
+
+        // 轮询读输出直到出现 LTLOGIN-0 或 EOF/超时（时序敏感路径不做固定 sleep）
+        let mut output = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let read = streams.reader.read(&mut chunk).expect("读 PTY");
+            if read == 0 {
+                break;
+            }
+            output.extend_from_slice(&chunk[..read]);
+            if String::from_utf8_lossy(&output).contains("LTLOGIN-0") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "未等到 LTLOGIN-0（非 login shell 或探测未执行），实际输出: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("LTLOGIN-0"),
+            "空 args 启动必须是 login shell（shopt login_shell 应为 0），实际输出: {text}"
+        );
+
+        session.kill();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[cfg(unix)]
     #[test]
     fn default_shell_rejects_invalid_values() {
         assert_eq!(default_shell_from_env(None), "/bin/bash");
         assert_eq!(default_shell_from_env(Some("bash -l")), "/bin/bash");
         assert_eq!(default_shell_from_env(Some("relative-shell")), "/bin/bash");
+    }
+
+    /// login 语义钉死：空 args + 支持 `-l` 的 shell 才前置 `-l`（按文件名
+    /// 判定，任意安装路径命中）；调用方传了任何参数（选项 `-c`/`--norc`、
+    /// 脚本位置参数）视为显式指定启动方式，不插手；白名单外的 shell
+    /// （ksh93/csh 系无 `-l`、elvish 传了报错退出会黑屏）原样透传。
+    #[cfg(unix)]
+    #[test]
+    fn login_flag_prepended_only_for_capable_shells_with_empty_args() {
+        for shell in [
+            "/bin/zsh",
+            "/bin/bash",
+            "/bin/sh",
+            "/bin/dash",
+            "/usr/local/bin/fish",
+            "/opt/homebrew/bin/mksh",
+            "/usr/bin/nu",
+        ] {
+            assert_eq!(
+                with_login_flag(shell, &[]),
+                vec!["-l".to_owned()],
+                "{shell} 应前置 -l"
+            );
+        }
+        let custom = vec!["--norc".to_owned(), "-i".to_owned()];
+        assert_eq!(with_login_flag("/bin/bash", &custom), custom);
+        let command = vec!["-c".to_owned(), "sleep 30".to_owned()];
+        assert_eq!(with_login_flag("/bin/sh", &command), command);
+        let script = vec!["setup.zsh".to_owned()];
+        assert_eq!(with_login_flag("/bin/zsh", &script), script);
+        for shell in [
+            "/bin/csh",
+            "/bin/tcsh",
+            "/usr/bin/ksh",
+            "/usr/bin/elvish",
+            "/usr/bin/pwsh",
+        ] {
+            assert_eq!(
+                with_login_flag(shell, &[]),
+                Vec::<String>::new(),
+                "{shell} 不应加 -l"
+            );
+        }
     }
 
     #[cfg(windows)]
