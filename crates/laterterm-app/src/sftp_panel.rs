@@ -8,9 +8,10 @@
 //! 传输执行模型：队列串行（v1 同时 1 条 active），每条传输一个专属
 //! `SftpHandle::spawn`（独立 SSH 连接）——sftp.rs 网络线程逐条串行处理
 //! 指令是硬约束，浏览通道绝不能被大传输阻塞。取消 = 置位传输的
-//! cancel 标志 → 传输循环下一次分块检查以 Interrupted 返回 → 标
-//! Cancelled → 本地/远端半成品尽力清理。`close()` 无法打断在途传输
-//! （Shutdown 只是排队），仅用于整体关闭通道。
+//! cancel 标志 → 传输循环下一次分块检查以 Interrupted 返回 → 半成品
+//! **保留**，重传同目标路径自动从断点续传（传输层按对端大小防护，见
+//! sftp.rs resume_offset）。`close()` 无法打断在途传输（Shutdown 只是
+//! 排队），仅用于整体关闭通道。
 //!
 //! 纯逻辑件（节流、状态机、路径拼接、排序、格式化）与 UI 分离，
 //! 全部可无 GPUI 运行时单测。
@@ -930,34 +931,27 @@ pub(crate) fn spawn_transfer_worker(
                     let _ = progress_events.send(SftpEvent::TransferProgress { id, transferred });
                 }
             });
+            // 断点续传：重传同目标路径自动从半成品续（传输层按对端大小防护，
+            // 对端已换内容自动回退全量，半成品已完整则幂等跳过）
             let result = match kind {
                 TransferKind::Upload => handle.upload(
                     &local_path,
                     &remote_path,
                     Some(progress),
                     Some(Arc::clone(&cancel)),
+                    true,
                 ),
                 TransferKind::Download => handle.download(
                     &remote_path,
                     &local_path,
                     Some(progress),
                     Some(Arc::clone(&cancel)),
+                    true,
                 ),
             };
             let cancelled = cancel.load(Ordering::Relaxed);
-            // 取消半成品清理（尽力而为）：下载删本地半成品；上传用专属连接
-            // 删远端半成品（此刻连接仍活着，比绕道浏览通道更可靠——浏览通道
-            // 可能已被面板关闭）。
-            if cancelled {
-                match kind {
-                    TransferKind::Upload => {
-                        let _ = handle.remove_file(&remote_path);
-                    }
-                    TransferKind::Download => {
-                        let _ = std::fs::remove_file(&local_path);
-                    }
-                }
-            }
+            // 取消后半成品保留（断点续传：重传同路径自动续传，传输层兜底
+            // 对端大小异常），不再像旧版那样删除——旧「尽力清理」语义废弃。
             // 无论成败/取消，专属连接即用即关（每条传输一条独立 SSH 连接
             // 是既定口径：浏览通道不被传输阻塞；v1 串行队列下重建成本可接受）
             handle.close();

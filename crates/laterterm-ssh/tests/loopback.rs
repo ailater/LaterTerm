@@ -1303,7 +1303,7 @@ fn sftp_direct_roundtrip_upload_download_stat_realpath() {
         seen_cb.store(total as usize, Ordering::SeqCst);
     });
     let uploaded = handle
-        .upload(&local_src, "/数据 文件.bin", Some(progress), None)
+        .upload(&local_src, "/数据 文件.bin", Some(progress), None, false)
         .expect("上传");
     assert_eq!(uploaded as usize, payload.len(), "上传返回总字节数");
     assert_eq!(
@@ -1320,7 +1320,7 @@ fn sftp_direct_roundtrip_upload_download_stat_realpath() {
     // 下载：原路读回并逐字节比对
     let local_dst = src_dir.path().join("下载回来.bin");
     let downloaded = handle
-        .download("/数据 文件.bin", &local_dst, None, None)
+        .download("/数据 文件.bin", &local_dst, None, None, false)
         .expect("下载");
     assert_eq!(downloaded as usize, payload.len());
     assert_eq!(std::fs::read(&local_dst).expect("读本地"), payload);
@@ -1394,7 +1394,7 @@ fn sftp_via_jump_chain_reaches_sftp_target() {
     )
     .expect("经单跳跳板连 SFTP");
     handle
-        .upload(&local_src, "/one-hop.bin", None, None)
+        .upload(&local_src, "/one-hop.bin", None, None, false)
         .expect("单跳上传");
     handle.close();
     assert_eq!(bastion_count.load(Ordering::SeqCst), 1, "跳板恰好 1 次转发");
@@ -1412,10 +1412,10 @@ fn sftp_via_jump_chain_reaches_sftp_target() {
     .expect("经两跳跳板连 SFTP");
     let local_dst = src_dir.path().join("两跳下载.bin");
     handle
-        .upload(&local_src, "/两跳文件.bin", None, None)
+        .upload(&local_src, "/两跳文件.bin", None, None, false)
         .expect("两跳上传");
     let downloaded = handle
-        .download("/两跳文件.bin", &local_dst, None, None)
+        .download("/两跳文件.bin", &local_dst, None, None, false)
         .expect("两跳下载");
     assert_eq!(downloaded as usize, payload.len());
     assert_eq!(std::fs::read(&local_dst).expect("读本地"), payload);
@@ -1465,6 +1465,7 @@ fn sftp_upload_cancel_flag_stops_mid_transfer_and_partial_is_cleanable() {
             "/big.bin",
             Some(progress),
             Some(Arc::clone(&cancel)),
+            false,
         )
         .expect_err("取消必须以错误返回");
     assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
@@ -1933,4 +1934,167 @@ fn set_tunnels_revokes_local_tunnel_and_shell_survives() {
     // kill 走 hub.shutdown（同样要拿 self.inner 锁）——死锁残留会卡死 EOF
     session.kill();
     wait_eof(&mut streams);
+}
+
+// ───────── 断点续传（W2）─────────
+
+/// 上传中断后续传：取消留半成品 → resume 重传 → 远端与源字节级一致。
+#[test]
+fn sftp_upload_resume_after_cancel_yields_identical_bytes() {
+    let (server, root) = MockServer::start_sftp(0);
+    let known_hosts = temp_known_hosts("sftp-up-resume");
+    let handle = SftpHandle::spawn(
+        sftp_endpoint_for(server.port, known_hosts.path()),
+        Vec::new(),
+        None,
+    )
+    .expect("连接 SFTP mock");
+
+    let payload = pattern_bytes(2 * 1024 * 1024);
+    let src_dir = tempfile::tempdir().expect("本地临时目录");
+    let local_src = src_dir.path().join("resume.bin");
+    std::fs::write(&local_src, &payload).expect("写本地源文件");
+
+    // 第一趟：256KB 处置位取消（确定性，同取消测试口径）
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let cancel_cb = Arc::clone(&cancel);
+    let progress: ProgressFn = Arc::new(move |total| {
+        if total >= 256 * 1024 {
+            cancel_cb.store(true, Ordering::Relaxed);
+        }
+    });
+    let error = handle
+        .upload(
+            &local_src,
+            "/resume.bin",
+            Some(Arc::clone(&progress)),
+            Some(Arc::clone(&cancel)),
+            false,
+        )
+        .expect_err("首趟取消");
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+    let partial = std::fs::metadata(root.join("resume.bin"))
+        .expect("半成品应保留")
+        .len() as usize;
+    // 取消时写句柄缓冲可能未落盘（russh-sftp AsyncWrite 内部缓冲），半成品
+    // 允许为 0——续传按实际文件大小 stat，语义不受影响
+    assert!(partial < payload.len(), "半成品 {partial} 应小于源");
+
+    // 第二趟：resume 从断点续（progress 断点起算，不会再次触发取消）
+    let transferred = handle
+        .upload(&local_src, "/resume.bin", None, None, true)
+        .expect("续传应成功");
+    assert_eq!(
+        std::fs::read(root.join("resume.bin")).expect("读远端结果"),
+        payload,
+        "续传后远端必须与源字节级一致"
+    );
+    assert_eq!(
+        transferred as usize,
+        payload.len() - partial,
+        "返回值应为本次续传的字节数"
+    );
+
+    // 第三趟：再次 resume（远端已完整）→ 幂等返回 0
+    let again = handle
+        .upload(&local_src, "/resume.bin", None, None, true)
+        .expect("幂等续传应成功");
+    assert_eq!(again, 0, "半成品已完整时应幂等返回 0");
+    handle.close();
+}
+
+/// 下载中断后续传：取消留本地半成品 → resume 续传 → 本地与源字节级一致。
+#[test]
+fn sftp_download_resume_after_cancel_yields_identical_bytes() {
+    let (server, root) = MockServer::start_sftp(0);
+    let known_hosts = temp_known_hosts("sftp-down-resume");
+    let handle = SftpHandle::spawn(
+        sftp_endpoint_for(server.port, known_hosts.path()),
+        Vec::new(),
+        None,
+    )
+    .expect("连接 SFTP mock");
+
+    let payload = pattern_bytes(2 * 1024 * 1024);
+    std::fs::write(root.join("resume.bin"), &payload).expect("播种远端源文件");
+    let dst_dir = tempfile::tempdir().expect("本地临时目录");
+    let local_dst = dst_dir.path().join("resume.bin");
+
+    let cancel: CancelFlag = Arc::new(AtomicBool::new(false));
+    let cancel_cb = Arc::clone(&cancel);
+    let progress: ProgressFn = Arc::new(move |total| {
+        if total >= 256 * 1024 {
+            cancel_cb.store(true, Ordering::Relaxed);
+        }
+    });
+    let error = handle
+        .download(
+            "/resume.bin",
+            &local_dst,
+            Some(Arc::clone(&progress)),
+            Some(Arc::clone(&cancel)),
+            false,
+        )
+        .expect_err("首趟取消");
+    assert_eq!(error.kind(), std::io::ErrorKind::Interrupted, "{error}");
+    let partial = std::fs::metadata(&local_dst)
+        .expect("本地半成品应保留")
+        .len() as usize;
+    assert!(
+        partial > 0 && partial < payload.len(),
+        "半成品 {partial} 应介于 0 与源之间"
+    );
+
+    let transferred = handle
+        .download("/resume.bin", &local_dst, None, None, true)
+        .expect("续传应成功");
+    assert_eq!(
+        std::fs::read(&local_dst).expect("读本地结果"),
+        payload,
+        "续传后本地必须与源字节级一致"
+    );
+    assert_eq!(
+        transferred as usize,
+        payload.len() - partial,
+        "返回值应为本次续传的字节数"
+    );
+    handle.close();
+}
+
+/// 回退全量防护：远端半成品大于源（源被换小）→ 上传报「已变化」错误而非
+/// 损坏写入；本地大于远端对下载同理（回环以上传侧验证，两侧判定同一函数）。
+#[test]
+fn sftp_upload_resume_with_stale_larger_partial_fails_cleanly() {
+    let (server, root) = MockServer::start_sftp(0);
+    let known_hosts = temp_known_hosts("sftp-up-stale");
+    let handle = SftpHandle::spawn(
+        sftp_endpoint_for(server.port, known_hosts.path()),
+        Vec::new(),
+        None,
+    )
+    .expect("连接 SFTP mock");
+
+    // 远端残留一个比新源更长的旧半成品
+    std::fs::write(root.join("stale.bin"), pattern_bytes(1024)).expect("写旧半成品");
+    let src_dir = tempfile::tempdir().expect("本地临时目录");
+    let local_src = src_dir.path().join("small.bin");
+    std::fs::write(&local_src, pattern_bytes(512)).expect("写新源（更小）");
+
+    let error = handle
+        .upload(&local_src, "/stale.bin", None, None, true)
+        .expect_err("半成品大于源必须报错");
+    assert!(
+        error.to_string().contains("已变化"),
+        "错误文案应点名对端已变化: {error}"
+    );
+    // 改为全量（resume=false）后正常覆盖写入，远端与源一致
+    handle
+        .upload(&local_src, "/stale.bin", None, None, false)
+        .expect("全量重传应成功");
+    assert_eq!(
+        std::fs::read(root.join("stale.bin")).expect("读远端"),
+        pattern_bytes(512),
+        "全量重传后不得残留旧尾"
+    );
+    handle.close();
 }

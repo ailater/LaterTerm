@@ -98,6 +98,7 @@ enum SftpCmd {
         local_path: PathBuf,
         progress: Option<ProgressFn>,
         cancel: Option<CancelFlag>,
+        resume: bool,
         reply: std_mpsc::Sender<io::Result<u64>>,
     },
     Upload {
@@ -105,6 +106,7 @@ enum SftpCmd {
         remote_path: String,
         progress: Option<ProgressFn>,
         cancel: Option<CancelFlag>,
+        resume: bool,
         reply: std_mpsc::Sender<io::Result<u64>>,
     },
     Shutdown,
@@ -240,40 +242,53 @@ impl SftpHandle {
 
     /// 下载远端文件到本地（返回总字节数；progress 按累计字节触发）。
     ///
-    /// `cancel` 置位后循环在下一次分块检查时以
-    /// [`ErrorKind::Interrupted`] 返回，本地半成品由调用方删除。
+    /// `cancel` 置位后循环在下一次分块检查时以 [`ErrorKind::Interrupted`]
+    /// 返回，本地半成品**保留**（`resume=true` 重传同路径即从断点续传）。
+    ///
+    /// `resume`：本地已有半成品时从其字节数继续（远端 seek 读、本地追加
+    /// 写）；对端大小异常（半成品大于源）自动回退全量重传，半成品恰为
+    /// 完整大小时幂等返回 0。
     pub fn download(
         &self,
         remote_path: &str,
         local_path: impl Into<PathBuf>,
         progress: Option<ProgressFn>,
         cancel: Option<CancelFlag>,
+        resume: bool,
     ) -> io::Result<u64> {
         self.call(|reply| SftpCmd::Download {
             remote_path: remote_path.to_string(),
             local_path: local_path.into(),
             progress,
             cancel,
+            resume,
             reply,
         })
     }
 
     /// 上传本地文件到远端（返回总字节数；progress 按累计字节触发）。
     ///
-    /// `cancel` 置位后循环在下一次分块检查时以
-    /// [`ErrorKind::Interrupted`] 返回，远端半成品由调用方删除。
+    /// `cancel` 置位后循环在下一次分块检查时以 [`ErrorKind::Interrupted`]
+    /// 返回，远端半成品**保留**（`resume=true` 重传同路径即从断点续传）。
+    ///
+    /// `resume`：远端已有半成品时以其字节数继续（本地 seek 读、远端 seek
+    /// 写——SFTPv3 的 APPEND 位是 hint 服务器可忽略，按 offset 写是唯一
+    /// 可靠口径）；本地小于半成品（源被换小）自动回退全量覆盖，恰好完整
+    /// 时幂等返回 0。
     pub fn upload(
         &self,
         local_path: impl Into<PathBuf>,
         remote_path: &str,
         progress: Option<ProgressFn>,
         cancel: Option<CancelFlag>,
+        resume: bool,
     ) -> io::Result<u64> {
         self.call(|reply| SftpCmd::Upload {
             local_path: local_path.into(),
             remote_path: remote_path.to_string(),
             progress,
             cancel,
+            resume,
             reply,
         })
     }
@@ -426,6 +441,7 @@ async fn sftp_network_main(
                     local_path,
                     progress,
                     cancel,
+                    resume,
                     reply,
                 } => {
                     let _ = reply.send(
@@ -435,6 +451,7 @@ async fn sftp_network_main(
                             &local_path,
                             progress.as_ref(),
                             cancel.as_ref(),
+                            resume,
                         )
                         .await,
                     );
@@ -444,6 +461,7 @@ async fn sftp_network_main(
                     remote_path,
                     progress,
                     cancel,
+                    resume,
                     reply,
                 } => {
                     let _ = reply.send(
@@ -453,6 +471,7 @@ async fn sftp_network_main(
                             &remote_path,
                             progress.as_ref(),
                             cancel.as_ref(),
+                            resume,
                         )
                         .await,
                     );
@@ -490,24 +509,76 @@ fn basename_of(path: &str) -> String {
 /// 传输循环的块大小：SFTP 报文上限内的甜点值，进度粒度也够细。
 const CHUNK: usize = 64 * 1024;
 
+/// 断点定位（续传口径）：`offset = 半成品大小`，与 `full`（源总大小）比较
+/// 决定——半成品大于源（对端已换内容）回退全量重传（truncate 语义，返回
+/// `None`），恰好等于源视为已完成（幂等，返回 `Some(源大小)` 且不再传输），
+/// 小于源从断点续（`Some(半成品大小)`）。半成品不存在断点为 0。两侧传输
+/// 共用同一判定，只差 offset 的观测方向（下载看本地、上传看远端）。
+fn resume_offset(partial: Option<u64>, full: u64) -> Option<u64> {
+    match partial {
+        Some(offset) if offset > full => None, // 对端已换：回退全量
+        Some(offset) if offset == full => Some(full), // 已完整：幂等
+        Some(offset) => Some(offset),          // 从断点续
+        None => Some(0),                       // 无半成品：全量
+    }
+}
+
 async fn download_file(
     sftp: &russh_sftp::client::SftpSession,
     remote_path: &str,
     local_path: &std::path::Path,
     progress: Option<&ProgressFn>,
     cancel: Option<&CancelFlag>,
+    resume: bool,
 ) -> io::Result<u64> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+    let partial = if resume {
+        tokio::fs::metadata(local_path)
+            .await
+            .ok()
+            .map(|meta| meta.len())
+    } else {
+        None
+    };
     let mut remote = sftp
         .open(remote_path)
         .await
         .map_err(|e| io::Error::other(format!("打开远端 {remote_path}: {e}")))?;
-    let mut local = tokio::io::BufWriter::new(
+    let remote_len = remote
+        .metadata()
+        .await
+        .ok()
+        .and_then(|meta| meta.size)
+        // stat 失败按未知处理：断点防护退化（u64::MAX 恒不触发「大于源」
+        // 回退与幂等短路，有半成品即续——极端竞态多传无害，字节仍一致）
+        .unwrap_or(u64::MAX);
+    let offset = resume_offset(partial, remote_len)
+        .ok_or_else(|| io::Error::other("远端文件已变化（半成品大于源），请重新传输"))?;
+    if offset > 0 && offset == remote_len {
+        // 半成品已完整：幂等返回（不重复传输）
+        return Ok(0);
+    }
+    if offset > 0 {
+        remote
+            .seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| io::Error::other(format!("远端 seek 到断点 {offset}: {e}")))?;
+    }
+    // offset=0（全新/回退全量）走 create 截断覆盖（旧版语义，防旧长文件
+    // 残留尾部）；offset>0 走 append 追加续传
+    let local_file = if offset == 0 {
         tokio::fs::File::create(local_path)
             .await
-            .map_err(|e| io::Error::other(format!("创建本地 {}: {e}", local_path.display())))?,
-    );
-    let mut total = 0u64;
+            .map_err(|e| io::Error::other(format!("创建本地 {}: {e}", local_path.display())))?
+    } else {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(local_path)
+            .await
+            .map_err(|e| io::Error::other(format!("打开本地 {}: {e}", local_path.display())))?
+    };
+    let mut local = tokio::io::BufWriter::new(local_file);
+    let mut total = offset;
     let mut buf = vec![0u8; CHUNK];
     loop {
         // 逐块取消检查：网络线程串行，close() 无法打断在途传输
@@ -538,7 +609,7 @@ async fn download_file(
         .map_err(|e| io::Error::other(format!("落盘: {e}")))?;
     // SFTP 句柄是服务器配额，用毕即还
     let _ = remote.close().await;
-    Ok(total)
+    Ok(total - offset)
 }
 
 async fn upload_file(
@@ -547,22 +618,66 @@ async fn upload_file(
     remote_path: &str,
     progress: Option<&ProgressFn>,
     cancel: Option<&CancelFlag>,
+    resume: bool,
 ) -> io::Result<u64> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
     let mut local = tokio::fs::File::open(local_path)
         .await
         .map_err(|e| io::Error::other(format!("打开本地 {}: {e}", local_path.display())))?;
-    let mut remote = sftp
-        .create(remote_path)
+    let local_len = local
+        .metadata()
         .await
-        .map_err(|e| io::Error::other(format!("创建远端 {remote_path}: {e}")))?;
-    let mut total = 0u64;
+        .map_err(|e| io::Error::other(format!("本地元数据 {}: {e}", local_path.display())))?
+        .len();
+    let partial = if resume {
+        sftp.metadata(remote_path)
+            .await
+            .ok()
+            .and_then(|meta| meta.size)
+    } else {
+        None
+    };
+    let offset = resume_offset(partial, local_len)
+        .ok_or_else(|| io::Error::other("本地文件已变化（远端半成品大于源），请重新传输"))?;
+    if offset > 0 && offset == local_len {
+        // 远端半成品已完整：幂等返回
+        return Ok(0);
+    }
+    if offset == 0 {
+        // 全量路径：CREATE|WRITE 不 truncate（SFTPv3 语义），旧半成品比源
+        // 长时会残留尾部——先删旧文件再新建（不存在时 remove 报错忽略）
+        let _ = sftp.remove_file(remote_path).await;
+    }
+    let mut remote = sftp
+        .open_with_flags(
+            remote_path,
+            russh_sftp::protocol::OpenFlags::CREATE | russh_sftp::protocol::OpenFlags::WRITE,
+        )
+        .await
+        .map_err(|e| io::Error::other(format!("打开远端 {remote_path}: {e}")))?;
+    if offset > 0 {
+        // 本地与远端都要 seek：读源从断点起、写远端按 offset 写（SFTPv3 的
+        // APPEND 位是 hint，OpenSSH 忽略——按 offset 写是唯一可靠口径）
+        local
+            .seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| io::Error::other(format!("本地 seek 到断点 {offset}: {e}")))?;
+        remote
+            .seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|e| io::Error::other(format!("远端 seek 到断点 {offset}: {e}")))?;
+    }
+    let mut total = offset;
     let mut buf = vec![0u8; CHUNK];
     loop {
         // 逐块取消检查：网络线程串行，close() 无法打断在途传输
         if let Some(cancel) = cancel
             && cancel.load(Ordering::Relaxed)
         {
+            // 排干客户端写缓冲再放弃：russh-sftp 的 AsyncWrite 缓冲挂共享
+            // session，滞留数据会在后续同会话传输中迟到写入（回环实测污染
+            // +256KB 尾巴）；排干同时让半成品字节与进度一致，续传 stat 才准
+            let _ = remote.flush().await;
             return Err(cancelled_error());
         }
         let n = local
@@ -586,12 +701,30 @@ async fn upload_file(
         .await
         .map_err(|e| io::Error::other(format!("远端冲刷: {e}")))?;
     let _ = remote.close().await;
-    Ok(total)
+    Ok(total - offset)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 断点判定：无半成品全量、小于源续传、恰等源幂等、大于源回退全量
+    /// （None 信号「对端已换」）。
+    #[test]
+    fn resume_offset_decides_continue_idempotent_or_full_retry() {
+        assert_eq!(resume_offset(None, 1024), Some(0), "无半成品 → 全量");
+        assert_eq!(
+            resume_offset(Some(512), 1024),
+            Some(512),
+            "小于源 → 从断点续"
+        );
+        assert_eq!(resume_offset(Some(1024), 1024), Some(1024), "恰等源 → 幂等");
+        assert_eq!(
+            resume_offset(Some(2048), 1024),
+            None,
+            "大于源 → 对端已换，回退全量"
+        );
+    }
 
     /// 目录权限位判定（S_IFDIR）；文件/未知属性不该误判。
     #[test]
