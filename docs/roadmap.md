@@ -308,9 +308,9 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 | 1 | laterterm-ssh | russh + russh-sftp；tokio 仅限网络层，PTY 走线程泵（架构既定）；SSH 会话与 SFTP 通道（多跳穿透/取消/stat）均已落地 | ✅
 | 2 | 服务器管理 | 主机分组、连接配置、凭据入 keyring（laterterm-secrets） | ✅
 | 3 | 跳板机链 | ProxyJump 多跳链式穿透（keyboard-interactive 凭跳板条目自身认证复用，逐跳生效） | ✅ |
-| 4 | SFTP 面板 | 双栏文件传输，进度与取消已落地（2026-11-05）；断点续传 defer（open_with_flags + seek 已具备，待后续） | 🚧 |
+| 4 | SFTP 面板 | 双栏文件传输，进度与取消已落地（2026-11-05）；断点续传 2026-11-28 落地（取消/失败保留半成品，重传同路径自动续，对端已换自动回退全量；回环 3 新测字节级一致） | ✅ |
 | 5 | 编码 | GBK 远程会话转码（中文老服务器刚需；SFTP 路径恒 UTF-8 不转码） |
-| 6 | trzsz | rz/sz 兼容协议，ZMODEM 类传输 |
+| 6 | trzsz | rz/sz 兼容协议，ZMODEM 类传输（trzsz.rs 1223 行原生协议：:: 文本帧触发、protocol-1 base64/zlib 帧、ACT/CFG/NUM/NAME/SIZE/DATA/MD5/EXIT 全流程、资源上限三道闸、0x03 中断；9 测覆盖，对照 trzsz-go/py 官方实现核对——2026-11-28 盘点确认完整，此前未勾系文档滞后） | ✅ |
 | 7 | Deepin 配置一键导入 | `command-config.conf` / `server-config.conf` 已逆向（见 architecture.md）；server-config 导入已提前落地（含 Xshell .xsh 来源），命令模板迁移已落地 | ✅
 
 **验收**：从 LaterTerm 完成一次「跳板机 → 内网机 → GBK 环境 → rz 拉文件」全链路操作。
