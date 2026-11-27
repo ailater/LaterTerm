@@ -28,7 +28,9 @@ use laterterm_config::{
     load_deepin_commands, load_deepin_servers, load_xshell_sessions, normalize_shortcut,
     parse_secret_input,
 };
-use laterterm_core::{ProcessSnapshot, TerminalSession};
+use laterterm_core::{
+    BackendKind, ProcessSnapshot, RunningProcess, SessionStreams, TerminalSession,
+};
 use laterterm_local::{LocalOptions, LocalSession};
 use laterterm_secrets::{SecretStore, default_store, totp_account};
 use laterterm_ssh::{PortForwardEvent, TunnelSpec, TunnelState};
@@ -47,8 +49,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // 设置面板 UI 子模块：迁移函数需访问 WorkspaceView 私有字段/方法，按 Rust
@@ -968,11 +970,26 @@ struct Pane {
     /// process_transfer_events 泵消费。Receiver 随窗格回收丢弃，迟到 send
     /// 静默失败（flume 语义）。
     transfer_rx: flume::Receiver<laterterm_transfer::TransferEvent>,
+    /// 登录流运行态（SSH 会话装配时 entry.flow 存在则 Some；Done/中止清
+    /// None）：render 期 process_flow_events 泵消费事件 + 超时驱动，chip
+    /// 显示进度、× 中止。
+    flow: Option<PaneFlowState>,
     /// 进行中的终端内传输（Started 置位 → Finished/Failed 清除）：驱动窗格
     /// 进度浮条 overlay；键盘接管 gate 由同一事件经 view 端
     /// set_transfer_active 开关（无 Started 必无 gate，无锁死路径）。
     transfer: Option<PaneTransfer>,
     status: TabStatus,
+}
+
+/// 窗格登录流运行态：runner 由读线程（feed）与主线程（tick/abort）共享
+/// （Mutex 串行化，两侧都是低频短临界区）；`current`/`total` 供 chip 显示，
+/// 由事件泵推进。
+struct PaneFlowState {
+    server: String,
+    runner: Arc<Mutex<crate::flow::FlowRunner>>,
+    rx: flume::Receiver<crate::flow::FlowEvent>,
+    current: usize,
+    total: usize,
 }
 
 /// 窗格内进行中的终端内传输（进度浮条 overlay 的数据源）。
@@ -1589,6 +1606,7 @@ impl WorkspaceView {
                 tunnel_session: None,
                 tunnel_states: Vec::new(),
                 transfer_rx: first_transfer_rx,
+                flow: None,
                 transfer: None,
                 status: TabStatus::Running,
             }],
@@ -2438,6 +2456,7 @@ impl WorkspaceView {
             tunnel_session: None,
             tunnel_states: Vec::new(),
             transfer_rx,
+            flow: None,
             transfer: None,
             status: TabStatus::Running,
         });
@@ -6875,6 +6894,10 @@ impl WorkspaceView {
                     self.show_server_notice_toast(warning, cx);
                 }
                 let server_name = entry.name.clone();
+                // 登录流（会话层）：条目配置了 flow 时包装饰器，事件经通道
+                // 回主线程（attach 前包装——take_streams 只能一次，读泵在
+                // create_terminal_view 启动）
+                let (session, mut flow_state) = wrap_flow_session(session, &entry);
                 // 分屏去向优先：锚点窗格仍在 → 在其所属标签内落位，不建新
                 // 标签；锚点已关/落位失败回退下方新标签路径（连接白发起不了
                 // ——会话已经建好，总得有地方放）。
@@ -6896,6 +6919,7 @@ impl WorkspaceView {
                             jump: request_jump.clone(),
                         });
                         pane.tunnel_session = tunnel_session.clone();
+                        pane.flow = flow_state.take();
                     }
                     if let Some(typed) = tunnel_session.clone() {
                         self.start_tunnel_watcher(pane_id, typed, cx);
@@ -6916,6 +6940,7 @@ impl WorkspaceView {
                             jump: request_jump,
                         });
                         pane.tunnel_session = tunnel_session.clone();
+                        pane.flow = flow_state;
                     }
                     // 隧道事件 watcher：每秒 drain 转发事件收敛进 pane.tunnel_states
                     if let Some(typed) = tunnel_session {
@@ -7241,6 +7266,187 @@ impl WorkspaceView {
         if changed {
             cx.notify();
         }
+    }
+
+    /// 登录流事件泵（render 头部，process_transfer_events 同款位置）：先做
+    /// 超时驱动（读线程只在有输出时 feed，静默超时靠主线程 tick），再逐窗格
+    /// drain 事件。Action 的发送一律不抢焦点（自动化的发送不该打断用户正在
+    /// 打字的窗格，与手动发送快捷命令的 focus_pane 语义有意不同）。
+    fn process_flow_events(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        // 第一遍：超时驱动（tick 事件直接并入 drain 队列，不经通道）
+        let mut pending: Vec<(PaneId, crate::flow::FlowEvent)> = Vec::new();
+        for pane in &mut self.panes {
+            if let Some(flow) = &pane.flow
+                && let Ok(mut runner) = flow.runner.lock()
+            {
+                for event in runner.tick(now) {
+                    pending.push((pane.id, event));
+                }
+            }
+        }
+        // 第二遍：drain（pane 借用先结束，Action 执行要用 &mut self 的发送
+        // 与 toast 通道）
+        let mut finished: Vec<(PaneId, String)> = Vec::new();
+        for pane in &mut self.panes {
+            loop {
+                // 事件取走在 match 前放行借用（Done 分支要可变 take）
+                let event = {
+                    let Some(flow) = &pane.flow else { break };
+                    flow.rx.try_recv()
+                };
+                let Ok(event) = event else {
+                    break;
+                };
+                match event {
+                    crate::flow::FlowEvent::Action { step, action } => {
+                        pending.push((pane.id, crate::flow::FlowEvent::Action { step, action }));
+                    }
+                    crate::flow::FlowEvent::StepTimeout { step } => {
+                        pending.push((pane.id, crate::flow::FlowEvent::StepTimeout { step }));
+                        if let Some(flow) = &mut pane.flow {
+                            flow.current = (step + 1).min(flow.total);
+                        }
+                    }
+                    crate::flow::FlowEvent::Done => {
+                        if let Some(flow) = pane.flow.take() {
+                            finished.push((pane.id, flow.server));
+                        }
+                    }
+                }
+            }
+            // 步进刷新 chip（advance 已发生于 runner，读回当前步号）
+            if let Some(flow) = &mut pane.flow
+                && let Ok(runner) = flow.runner.lock()
+                && let Some(current) = runner.current_step()
+            {
+                flow.current = current;
+            }
+        }
+        for (pane_id, event) in pending {
+            match event {
+                crate::flow::FlowEvent::Action { step, action } => {
+                    self.execute_flow_action(pane_id, step, action, cx);
+                }
+                crate::flow::FlowEvent::StepTimeout { step } => {
+                    let server = self
+                        .panes
+                        .iter()
+                        .find(|pane| pane.id == pane_id)
+                        .and_then(|pane| pane.flow.as_ref())
+                        .map(|flow| flow.server.clone())
+                        .unwrap_or_default();
+                    self.show_server_notice_toast(
+                        format!(
+                            "登录流第 {} 步超时（{server}），已转人工，后续步骤继续",
+                            step + 1
+                        ),
+                        cx,
+                    );
+                }
+                crate::flow::FlowEvent::Done => {}
+            }
+        }
+        for (pane_id, server) in finished {
+            // 终止残留 chip 状态（Done 时 flow 已 take；此处兜底清旧 current）
+            if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id) {
+                pane.flow = None;
+            }
+            self.show_server_notice_toast(format!("登录流执行完成（{server}）"), cx);
+        }
+    }
+
+    /// 执行登录流动作（主线程）：Text/Command 同步发送；Totp 走后台线程
+    /// 密钥环算码（设计纪律），完成经 cx.spawn 回主线程发送。发送失败
+    /// （命令缺参数/账户无密钥）一律 toast 指明步号，不断流。
+    fn execute_flow_action(
+        &mut self,
+        pane_id: PaneId,
+        step: usize,
+        action: crate::flow::FlowAction,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            crate::flow::FlowAction::Text { text } => {
+                self.flow_send_text(pane_id, &text, cx);
+            }
+            crate::flow::FlowAction::Command { name } => {
+                let template = self
+                    .settings
+                    .commands
+                    .iter()
+                    .find(|command| command.name == name)
+                    .cloned();
+                match template {
+                    Some(template) => match template.expand(&Default::default()) {
+                        Ok(expanded) => self.flow_send_text(pane_id, &expanded, cx),
+                        Err(error) => self.show_server_notice_toast(
+                            format!(
+                                "登录流第 {} 步：命令「{name}」展开失败（{error:#}），已跳过发送",
+                                step + 1
+                            ),
+                            cx,
+                        ),
+                    },
+                    None => self.show_server_notice_toast(
+                        format!("登录流第 {} 步：找不到命令「{name}」，已跳过发送", step + 1),
+                        cx,
+                    ),
+                }
+            }
+            crate::flow::FlowAction::Totp { account } => {
+                let store = self.secret_store.clone();
+                let step = step + 1;
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let key = laterterm_secrets::totp_account(&account)?;
+                            let secret = run_secret_op({
+                                let store = Arc::clone(&store);
+                                move || store.get(&key)
+                            })?
+                            .ok_or_else(|| anyhow::anyhow!("密钥环中没有该条目的密钥"))?;
+                            laterterm_config::generate_code(
+                                &secret,
+                                &laterterm_config::TotpConfig::default(),
+                                std::time::SystemTime::now(),
+                            )
+                            .map(|code| code.code)
+                        })
+                        .await;
+                    let _ = this.update(cx, |workspace, cx| match result {
+                        Ok(code) => workspace.flow_send_text(pane_id, &code, cx),
+                        Err(error) => workspace.show_server_notice_toast(
+                            format!("登录流第 {step} 步：动态码生成失败（{error:#}），已跳过发送"),
+                            cx,
+                        ),
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    /// 登录流发送（不抢焦点）：文本自动补换行执行；窗格退出/已回收静默。
+    fn flow_send_text(&mut self, pane_id: PaneId, text: &str, cx: &mut Context<Self>) {
+        if let Some(pane) = self.pane(pane_id)
+            && matches!(pane.status, TabStatus::Running)
+        {
+            let terminal = pane.terminal.clone();
+            terminal.update(cx, |terminal, _| terminal.send_text(&format!("{text}\n")));
+        }
+    }
+
+    /// 中止登录流（chip ×）：runner.abort 后引擎静默，会话保持不断线。
+    fn abort_server_flow(&mut self, pane_id: PaneId, cx: &mut Context<Self>) {
+        if let Some(pane) = self.panes.iter_mut().find(|pane| pane.id == pane_id)
+            && let Some(flow) = pane.flow.take()
+            && let Ok(mut runner) = flow.runner.lock()
+        {
+            runner.abort();
+        }
+        cx.notify();
     }
 
     // ---------- SFTP 双栏面板 ----------
@@ -8729,6 +8935,9 @@ impl WorkspaceView {
             &self.settings.appearance,
             &self.audit_hub,
         );
+        // 重连 = 重新登录：条目仍配着登录流就重新装配（旧 runner 随旧会话
+        // 失活，其超时事件会自行清场，无需干预）
+        let (session, flow_state) = wrap_flow_session(session, &state.link.entry);
         if was_logging {
             audit.set_logging(true);
         }
@@ -8757,6 +8966,7 @@ impl WorkspaceView {
         pane.session = session_control;
         pane.audit = Some(audit);
         pane.transfer_rx = transfer_rx; // 新会话新通道；旧通道残留事件随旧 Receiver 丢弃
+        pane.flow = flow_state; // 重新登录：旧流状态整体替换
         pane.transfer = None; // 新会话从干净状态开始（旧传输随会话断开已终结）
         pane.status = TabStatus::Running;
         pane.highlighted = false; // 新会话从干净状态开始
@@ -8896,6 +9106,7 @@ impl Render for WorkspaceView {
         self.process_sftp_results(window, cx);
         self.process_trigger_events(window, cx);
         self.process_transfer_events(window, cx);
+        self.process_flow_events(window, cx);
         self.process_reconnect_results(window, cx);
         if let Some(handle) = self.pending_focus.take() {
             handle.focus(window);
@@ -10082,6 +10293,47 @@ fn render_layout(
             // 共用 cancel_transfer，浮条本身随 Finished/Failed 事件统一收口。
             if let Some(active) = &pane.transfer {
                 pane_div = pane_div.child(transfer_progress_overlay(active, close_id, ui, cx));
+            }
+            // 登录流运行 chip（右下角，与传输浮条错开）：当前步/总步 + 中止；
+            // Done/中止随 pane.flow 清 None 自然消失。
+            if let Some(flow) = &pane.flow {
+                let progress = if flow.total > 0 {
+                    format!("{}/{}", (flow.current + 1).min(flow.total), flow.total)
+                } else {
+                    String::new()
+                };
+                let flow_pane = *id;
+                pane_div = pane_div.child(
+                    div()
+                        .absolute()
+                        .bottom_2()
+                        .right_1_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(tint_hsla(ui.card_bg, 0xEB))
+                        .border_1()
+                        .border_color(ui.border_strong)
+                        .child(
+                            div()
+                                .text_size(px(TEXT_BODY_SM))
+                                .text_color(ui.text)
+                                .child(format!("登录流 {progress}")),
+                        )
+                        .child(ui_button(
+                            format!("flow-abort-{}", flow_pane.0),
+                            "中止",
+                            ButtonKind::Secondary,
+                            ui,
+                            false,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.abort_server_flow(flow_pane, cx)
+                            }),
+                        )),
+                );
             }
             pane_div
         }
@@ -13272,6 +13524,142 @@ fn wrap_session(
     let (session, tap) =
         crate::audit::wrap_audit(session, pane, label, settings.session_logging, hub);
     (session, tap, events_rx)
+}
+
+/// SSH 会话装配登录流（登录流 D4b 会话层）：`entry.flow` 存在时包
+/// [`FlowSession`] 装饰器，返回窗格运行态。坏正则 = 该流不启动（eprintln
+/// 指明步号，连接照常——与载入期「宁弃流不丢条目」口径一致）。
+fn wrap_flow_session(
+    session: Arc<dyn TerminalSession>,
+    entry: &ServerEntry,
+) -> (Arc<dyn TerminalSession>, Option<PaneFlowState>) {
+    let Some(flow) = entry.flow.as_ref() else {
+        return (session, None);
+    };
+    let total = flow.steps.len();
+    let steps: Vec<crate::flow::FlowStep> = flow
+        .steps
+        .iter()
+        .map(|step| crate::flow::FlowStep {
+            expect: step.expect().map(str::to_owned),
+            action: match step {
+                laterterm_config::FlowStep::Totp { account, .. } => crate::flow::FlowAction::Totp {
+                    account: account.clone(),
+                },
+                laterterm_config::FlowStep::Text { text, .. } => {
+                    crate::flow::FlowAction::Text { text: text.clone() }
+                }
+                laterterm_config::FlowStep::Command { name, .. } => {
+                    crate::flow::FlowAction::Command { name: name.clone() }
+                }
+            },
+        })
+        .collect();
+    let runner = match crate::flow::FlowRunner::new(
+        steps,
+        std::time::Duration::from_secs(flow.step_timeout_secs),
+        std::time::Instant::now(),
+    ) {
+        Ok(runner) => Arc::new(Mutex::new(runner)),
+        Err(error) => {
+            eprintln!(
+                "服务器 {:?} 登录流未启动：第 {} 步正则不合法（{}）",
+                entry.name,
+                error.step + 1,
+                error.source
+            );
+            return (session, None);
+        }
+    };
+    let (events_tx, rx) = flume::unbounded();
+    let wrapped = Arc::new(FlowSession {
+        inner: session,
+        runner: Arc::clone(&runner),
+        events_tx,
+    });
+    (
+        wrapped,
+        Some(PaneFlowState {
+            server: entry.name.clone(),
+            runner,
+            rx,
+            current: 0,
+            total,
+        }),
+    )
+}
+
+/// 登录流装饰器：读端 tee 给 FlowRunner（**有序**状态机，与审计的无序通知
+/// 不同）。转发纪律同 AuditSession——`TerminalSession` 新增方法必须显式
+/// 转发（probe_running/exit_unexpected 为先例）。
+struct FlowSession {
+    inner: Arc<dyn TerminalSession>,
+    runner: Arc<Mutex<crate::flow::FlowRunner>>,
+    events_tx: flume::Sender<crate::flow::FlowEvent>,
+}
+
+impl TerminalSession for FlowSession {
+    fn backend(&self) -> BackendKind {
+        self.inner.backend()
+    }
+
+    fn title(&self) -> String {
+        self.inner.title()
+    }
+
+    fn take_streams(&self) -> std::io::Result<SessionStreams> {
+        let mut streams = self.inner.take_streams()?;
+        streams.reader = Box::new(FlowReader {
+            inner: streams.reader,
+            runner: Arc::clone(&self.runner),
+            events_tx: self.events_tx.clone(),
+        });
+        Ok(streams)
+    }
+
+    fn resize(
+        &self,
+        cols: u16,
+        rows: u16,
+        pixel_width: u16,
+        pixel_height: u16,
+    ) -> std::io::Result<()> {
+        self.inner.resize(cols, rows, pixel_width, pixel_height)
+    }
+
+    fn kill(&self) {
+        self.inner.kill();
+    }
+
+    fn probe_running(&self, snapshot: &mut Option<ProcessSnapshot>) -> Option<RunningProcess> {
+        self.inner.probe_running(snapshot)
+    }
+
+    fn exit_unexpected(&self) -> bool {
+        self.inner.exit_unexpected()
+    }
+}
+
+/// 读端 tee：termview 读泵阻塞读本 reader；每块输出喂 FlowRunner（无界
+/// 通道 send，事件量极小永不反压读泵）。
+struct FlowReader {
+    inner: Box<dyn std::io::Read + Send>,
+    runner: Arc<Mutex<crate::flow::FlowRunner>>,
+    events_tx: flume::Sender<crate::flow::FlowEvent>,
+}
+
+impl std::io::Read for FlowReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0
+            && let Ok(mut runner) = self.runner.lock()
+        {
+            for event in runner.feed(&buf[..n], std::time::Instant::now()) {
+                let _ = self.events_tx.send(event);
+            }
+        }
+        Ok(n)
+    }
 }
 
 /// 传输协议族 → 展示文案（浮条/通知共用）。
