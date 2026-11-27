@@ -53,6 +53,14 @@ type RemoteListeners = Arc<Mutex<HashMap<(String, u32), tokio::task::JoinHandle<
 /// mock 侧 R 转发 bind 请求记录（断言客户端按 127.0.0.1 原样请求）。
 type RemoteBindRequests = Arc<Mutex<Vec<(String, u32)>>>;
 
+/// keyboard-interactive 动态码挑战配置：`expected` 为正确动态码，
+/// `received` 记录客户端每轮应答（断言自动应答/回退路径用）。
+#[derive(Clone)]
+struct KiChallenge {
+    expected: String,
+    received: Arc<Mutex<Vec<String>>>,
+}
+
 #[derive(Clone)]
 struct MockHandler {
     accepted_key: Option<russh::keys::PublicKey>,
@@ -66,6 +74,8 @@ struct MockHandler {
     remote_forwarding: Option<Arc<AtomicUsize>>,
     remote_listeners: RemoteListeners,
     remote_bind_requests: RemoteBindRequests,
+    /// Some = KI 认证发起动态码挑战；None = KI 一律拒绝（旧行为）。
+    ki_challenge: Option<KiChallenge>,
 }
 
 impl russh::server::Server for MockHandler {
@@ -100,6 +110,43 @@ impl russh::server::Handler for MockHandler {
             Ok(russh::server::Auth::Accept)
         } else {
             Ok(russh::server::Auth::reject())
+        }
+    }
+
+    /// KI 动态码挑战：发起（response=None）时回一个「Opt token: 」提示；
+    /// 客户端应答（response=Some）时逐字节收集并与 expected 比对——答对
+    /// Accept、答错 Reject，收到的答案全部记入 received 供测试断言。
+    async fn auth_keyboard_interactive<'a>(
+        &'a mut self,
+        _: &str,
+        _: &str,
+        response: Option<russh::server::Response<'a>>,
+    ) -> Result<russh::server::Auth, Self::Error> {
+        let Some(challenge) = &self.ki_challenge else {
+            return Ok(russh::server::Auth::reject());
+        };
+        let Some(response) = response else {
+            return Ok(russh::server::Auth::Partial {
+                name: "MFA".into(),
+                instructions: "输入动态口令".into(),
+                prompts: std::borrow::Cow::Owned(vec![("Opt token: ".to_owned().into(), false)]),
+            });
+        };
+        let answers: Vec<String> = response
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+            .collect();
+        challenge
+            .received
+            .lock()
+            .unwrap()
+            .extend(answers.iter().cloned());
+        if answers.len() == 1 && answers[0] == challenge.expected {
+            Ok(russh::server::Auth::Accept)
+        } else {
+            Ok(russh::server::Auth::Reject {
+                proceed_with_methods: None,
+                partial_success: false,
+            })
         }
     }
 
@@ -372,8 +419,40 @@ impl MockServer {
                 remote_forwarding: None,
                 remote_listeners: Arc::new(Mutex::new(HashMap::new())),
                 remote_bind_requests: Arc::new(Mutex::new(Vec::new())),
+                ki_challenge: None,
             },
         )
+    }
+
+    /// 起一台 keyboard-interactive 动态码挑战 mock：KI 发起时要求
+    /// 「Opt token: 」提示，收到的答案记录进 received 供断言；答对 expected
+    /// 才放行（password/publickey 分支照常 Accept，不影响其他用例）。
+    fn start_ki(port: u16, expected: &str) -> (Self, Arc<Mutex<Vec<String>>>) {
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let server = Self {
+            runtime: None,
+            port: 0,
+            sftp_dir: None,
+        }
+        .into_started(
+            port,
+            MockHandler {
+                accepted_key: None,
+                forwarded: None,
+                forwarded_channels: Arc::new(Mutex::new(HashSet::new())),
+                open_channels: Arc::new(Mutex::new(HashMap::new())),
+                sftp_channels: Arc::new(Mutex::new(HashSet::new())),
+                sftp_root: None,
+                remote_forwarding: None,
+                remote_listeners: Arc::new(Mutex::new(HashMap::new())),
+                remote_bind_requests: Arc::new(Mutex::new(Vec::new())),
+                ki_challenge: Some(KiChallenge {
+                    expected: expected.into(),
+                    received: Arc::clone(&received),
+                }),
+            },
+        );
+        (server, received)
     }
 
     /// 起一台允许 direct-tcpip 转发的 mock；返回的计数器记录接受的转发请求数。
@@ -396,6 +475,7 @@ impl MockServer {
                 remote_forwarding: None,
                 remote_listeners: Arc::new(Mutex::new(HashMap::new())),
                 remote_bind_requests: Arc::new(Mutex::new(Vec::new())),
+                ki_challenge: None,
             },
         );
         (server, counter)
@@ -426,6 +506,7 @@ impl MockServer {
                 remote_forwarding: None,
                 remote_listeners: Arc::new(Mutex::new(HashMap::new())),
                 remote_bind_requests: Arc::new(Mutex::new(Vec::new())),
+                ki_challenge: None,
             },
         );
         (server, root)
@@ -453,6 +534,7 @@ impl MockServer {
                 remote_forwarding: Some(Arc::clone(&counter)),
                 remote_listeners: Arc::new(Mutex::new(HashMap::new())),
                 remote_bind_requests: Arc::clone(&binds),
+                ki_challenge: None,
             },
         );
         (server, counter, binds)
@@ -779,6 +861,7 @@ fn options_for(port: u16, auth: SshAuth, dir: &std::path::Path) -> SshOptions {
         },
         jump: Vec::new(),
         tunnels: Vec::new(),
+        otp_answerer: None,
         cols: 110,
         rows: 30,
     }
@@ -875,6 +958,60 @@ fn password_auth_echo_resize_and_kill_eof() {
         .resize(80, 24, 640, 480)
         .expect("kill 后 resize 应静默成功");
     drop(session);
+}
+
+/// KI 动态码挑战 + 自动应答（登录流认证层端到端）：prompt 命中时
+/// otp_answerer 返回动态码，客户端答对后进 shell；mock 侧收到的答案
+/// 恰为动态码一轮（未回退 secret）。
+#[test]
+fn keyboard_interactive_otp_auto_answer_reaches_shell() {
+    let (server, received) = MockServer::start_ki(0, "246813");
+    let known_hosts = temp_known_hosts("ki-otp");
+    let answerer: laterterm_ssh::OtpAnswerer =
+        Arc::new(|prompt: &str| prompt.contains("token").then(|| "246813".to_owned()));
+    let mut options = options_for(
+        server.port,
+        SshAuth::KeyboardInteractive("secret".into()),
+        known_hosts.path(),
+    );
+    options.otp_answerer = Some(answerer);
+
+    let session = SshSession::spawn(options).expect("KI 自动应答连接");
+    let mut streams = session.take_streams().expect("take_streams");
+    streams.writer.write_all(b"via-otp\n").expect("写入");
+    read_until(&mut streams, "Got data: via-otp");
+    session.kill();
+    wait_eof(&mut streams);
+    assert_eq!(
+        *received.lock().unwrap(),
+        vec!["246813".to_owned()],
+        "应恰好一轮动态码应答"
+    );
+}
+
+/// KI 挑战无应答器：全部 prompt 回退固定 secret，答错被拒（连接失败
+/// 文案点名认证失败）——「开关关闭 = 旧行为」的回归口径。
+#[test]
+fn keyboard_interactive_without_answerer_falls_back_to_secret_and_fails() {
+    let (server, received) = MockServer::start_ki(0, "246813");
+    let known_hosts = temp_known_hosts("ki-fallback");
+
+    let error = SshSession::spawn(options_for(
+        server.port,
+        SshAuth::KeyboardInteractive("secret".into()),
+        known_hosts.path(),
+    ))
+    .err()
+    .expect("答错应失败");
+    assert!(
+        error.to_string().contains("认证失败"),
+        "错误文案应点名认证失败: {error}"
+    );
+    assert_eq!(
+        *received.lock().unwrap(),
+        vec!["secret".to_owned()],
+        "无应答器时应回退固定 secret"
+    );
 }
 
 /// 公钥认证全链路：临时生成客户端密钥文件，服务器放行任意公钥。
@@ -1146,6 +1283,7 @@ fn sftp_direct_roundtrip_upload_download_stat_realpath() {
     let handle = SftpHandle::spawn(
         sftp_endpoint_for(server.port, known_hosts.path()),
         Vec::new(),
+        None,
     )
     .expect("连接 SFTP mock");
 
@@ -1252,6 +1390,7 @@ fn sftp_via_jump_chain_reaches_sftp_target() {
     let handle = SftpHandle::spawn(
         sftp_endpoint_for(target.port, known_hosts.path()),
         vec![sftp_endpoint_for(bastion.port, known_hosts.path())],
+        None,
     )
     .expect("经单跳跳板连 SFTP");
     handle
@@ -1268,6 +1407,7 @@ fn sftp_via_jump_chain_reaches_sftp_target() {
             sftp_endpoint_for(bastion.port, known_hosts.path()),
             sftp_endpoint_for(middle.port, known_hosts.path()),
         ],
+        None,
     )
     .expect("经两跳跳板连 SFTP");
     let local_dst = src_dir.path().join("两跳下载.bin");
@@ -1301,6 +1441,7 @@ fn sftp_upload_cancel_flag_stops_mid_transfer_and_partial_is_cleanable() {
     let handle = SftpHandle::spawn(
         sftp_endpoint_for(server.port, known_hosts.path()),
         Vec::new(),
+        None,
     )
     .expect("连接 SFTP mock");
 
@@ -1357,6 +1498,7 @@ fn sftp_close_is_idempotent_and_later_calls_fail_reliably() {
     let handle = SftpHandle::spawn(
         sftp_endpoint_for(server.port, known_hosts.path()),
         Vec::new(),
+        None,
     )
     .expect("连接 SFTP mock");
 
@@ -1397,6 +1539,7 @@ fn sftp_via_jump_rejected_forwarding_fails_actionably() {
     let error = SftpHandle::spawn(
         sftp_endpoint_for(target.port, known_hosts.path()),
         vec![sftp_endpoint_for(bastion.port, known_hosts.path())],
+        None,
     )
     .err()
     .expect("跳板拒转发时 SFTP 必须失败");

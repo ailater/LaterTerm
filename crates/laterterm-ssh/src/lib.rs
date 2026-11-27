@@ -422,6 +422,20 @@ impl SshEndpoint {
     }
 }
 
+/// keyboard-interactive 提示应答器（登录流认证层）：对认证阶段的每个提示
+/// 文本判定——命中验证码/OTP/MFA 类问题时返回动态码答案，返回 `None` =
+/// 不认识该提示（该 prompt 回退固定 secret，旧行为）。由 app 层提供实现
+/// （算码要读密钥环，本 crate 不依赖 config/secrets）；逐跳认证共用一个
+/// 应答器，跳板机与目标机的 KI 提示都会过它，按需在实现侧路由。
+pub type OtpAnswerer = std::sync::Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+
+/// 单个 KI 提示的应答：命中应答器用动态码，否则回退固定 secret。
+fn ki_answer(prompt: &str, secret: &str, otp_answerer: Option<&OtpAnswerer>) -> String {
+    otp_answerer
+        .and_then(|answer| answer(prompt))
+        .unwrap_or_else(|| secret.to_owned())
+}
+
 /// SSH 会话启动参数。
 pub struct SshOptions {
     /// 目标机（最终建立 shell 会话的主机）。
@@ -432,6 +446,9 @@ pub struct SshOptions {
     /// 端口转发隧道（enabled 项；L/R 都打在目标机 Handle 上，跳板穿透自动
     /// 成立）。连接期任一条失败 = 整连硬失败（与 `ssh -L` 一致）。
     pub tunnels: Vec<TunnelSpec>,
+    /// keyboard-interactive 动态码应答器（见 [`OtpAnswerer`]）；
+    /// None = 不自动应答，全部 prompt 回固定 secret（旧行为）。
+    pub otp_answerer: Option<OtpAnswerer>,
     /// 初始列数。
     pub cols: u16,
     /// 初始行数。
@@ -841,6 +858,7 @@ fn client_config() -> std::sync::Arc<russh::client::Config> {
 async fn connect_and_auth(
     endpoint: &SshEndpoint,
     router: Option<Arc<RemoteForwardRouter>>,
+    otp_answerer: Option<&OtpAnswerer>,
 ) -> io::Result<russh::client::Handle<ClientHandler>> {
     let handler = ClientHandler {
         host_key_policy: endpoint.host_key_policy.clone(),
@@ -860,7 +878,7 @@ async fn connect_and_auth(
             endpoint.title()
         ))
     })?;
-    authenticate(&mut handle, endpoint).await?;
+    authenticate(&mut handle, endpoint, otp_answerer).await?;
     Ok(handle)
 }
 
@@ -873,6 +891,7 @@ async fn open_through(
     prev_label: &str,
     endpoint: &SshEndpoint,
     router: Option<Arc<RemoteForwardRouter>>,
+    otp_answerer: Option<&OtpAnswerer>,
 ) -> io::Result<russh::client::Handle<ClientHandler>> {
     let forward = prev
         .channel_open_direct_tcpip(
@@ -903,7 +922,7 @@ async fn open_through(
                 endpoint.title()
             ))
         })?;
-    authenticate(&mut handle, endpoint).await?;
+    authenticate(&mut handle, endpoint, otp_answerer).await?;
     Ok(handle)
 }
 
@@ -934,10 +953,12 @@ async fn connect_agent() -> io::Result<
         })
 }
 
-/// 认证阶段（三种方式，见 [`SshAuth`]）。
+/// 认证阶段（三种方式，见 [`SshAuth`]）。`otp_answerer` 仅作用于
+/// keyboard-interactive 的逐提示应答（见 [`OtpAnswerer`]）。
 async fn authenticate(
     handle: &mut russh::client::Handle<ClientHandler>,
     endpoint: &SshEndpoint,
+    otp_answerer: Option<&OtpAnswerer>,
 ) -> io::Result<()> {
     let authenticated = match &endpoint.auth {
         SshAuth::Password(password) => handle
@@ -996,10 +1017,12 @@ async fn authenticate(
                     }
                     KeyboardInteractiveAuthResponse::Failure { .. } => break,
                     KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => handle
-                        .authenticate_keyboard_interactive_respond(vec![
-                            secret.clone();
-                            prompts.len()
-                        ])
+                        .authenticate_keyboard_interactive_respond(
+                            prompts
+                                .iter()
+                                .map(|prompt| ki_answer(&prompt.prompt, secret, otp_answerer))
+                                .collect(),
+                        )
                         .await
                         .map_err(io::Error::other)?,
                 };
@@ -1085,9 +1108,12 @@ async fn network_main(
             std::time::Duration::from_secs(connect_timeout_secs(options.jump.len())),
             async {
                 // 第一跳：外层跳板直连；无跳板链时第一跳就是目标机（注入路由）
+                let otp_answerer = options.otp_answerer.as_ref();
                 let mut handle = match options.jump.first() {
-                    Some(first) => connect_and_auth(first, None).await?,
-                    None => connect_and_auth(&options.endpoint, router.clone()).await?,
+                    Some(first) => connect_and_auth(first, None, otp_answerer).await?,
+                    None => {
+                        connect_and_auth(&options.endpoint, router.clone(), otp_answerer).await?
+                    }
                 };
                 // 后续跳：跳板链剩余跳 + 目标机，都经上一跳的 direct-tcpip 穿透；
                 // 中间跳 Handle 存入 tunnels 保活（drop 即断流）。
@@ -1105,7 +1131,9 @@ async fn network_main(
                         // 最后一项是目标机：注入 R 转发路由
                         let target_router =
                             (index == chain.len() - 1).then(|| router.clone()).flatten();
-                        let next = open_through(&handle, &label, endpoint, target_router).await?;
+                        let next =
+                            open_through(&handle, &label, endpoint, target_router, otp_answerer)
+                                .await?;
                         tunnels.push(handle);
                         handle = next;
                     }
@@ -1341,9 +1369,32 @@ mod tests {
             endpoint: sample_endpoint("bastion.example.com"),
             jump: Vec::new(),
             tunnels: Vec::new(),
+            otp_answerer: None,
             cols: 110,
             rows: 30,
         }
+    }
+
+    /// KI 提示应答：命中应答器用动态码；未命中/无应答器回退固定 secret。
+    #[test]
+    fn ki_answer_prefers_otp_then_falls_back_to_secret() {
+        let answerer: OtpAnswerer =
+            Arc::new(|prompt: &str| prompt.contains("token").then(|| "246813".to_owned()));
+        assert_eq!(
+            ki_answer("Opt token: ", "secret", Some(&answerer)),
+            "246813",
+            "命中验证码提示应用动态码"
+        );
+        assert_eq!(
+            ki_answer("Password: ", "secret", Some(&answerer)),
+            "secret",
+            "未命中提示回退固定 secret"
+        );
+        assert_eq!(
+            ki_answer("Opt token: ", "secret", None),
+            "secret",
+            "无应答器（开关关闭）全量回退旧行为"
+        );
     }
 
     /// TOFU 三段语义（本 crate 的判定 + russh 的落盘件）：无记录 Unknown →
@@ -1647,6 +1698,7 @@ mod tests {
             endpoint: parse(&spec),
             jump,
             tunnels: Vec::new(),
+            otp_answerer: None,
             cols: 80,
             rows: 24,
         })

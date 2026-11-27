@@ -125,7 +125,11 @@ impl SftpHandle {
     /// `jump` 为跳板链（ProxyJump 语义，由外到内，`ssh -J` 顺序），空 = 直连。
     /// 就绪超时与 shell 会话同公式 [`crate::connect_timeout_secs`] 再 +1s
     /// （多跳握手逐跳串行，超时不随跳数缩放会「能连却被自家超时判死」）。
-    pub fn spawn(endpoint: crate::SshEndpoint, jump: Vec<crate::SshEndpoint>) -> io::Result<Self> {
+    pub fn spawn(
+        endpoint: crate::SshEndpoint,
+        jump: Vec<crate::SshEndpoint>,
+        otp_answerer: Option<crate::OtpAnswerer>,
+    ) -> io::Result<Self> {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<SftpCmd>();
         let (ready_tx, ready_rx) = std_mpsc::channel::<io::Result<()>>();
         let network_endpoint = endpoint.clone();
@@ -139,7 +143,13 @@ impl SftpHandle {
                     .enable_all()
                     .build()
                     .expect("构建 tokio runtime 失败");
-                runtime.block_on(sftp_network_main(network_endpoint, jump, ready_tx, cmd_rx));
+                runtime.block_on(sftp_network_main(
+                    network_endpoint,
+                    jump,
+                    otp_answerer,
+                    ready_tx,
+                    cmd_rx,
+                ));
             })
             .map_err(io::Error::other)?;
         let _ = network;
@@ -289,6 +299,7 @@ impl SftpHandle {
 async fn open_sftp(
     endpoint: &crate::SshEndpoint,
     jump: &[crate::SshEndpoint],
+    otp_answerer: Option<&crate::OtpAnswerer>,
 ) -> io::Result<(
     russh_sftp::client::SftpSession,
     Handle<ClientHandler>,
@@ -297,8 +308,8 @@ async fn open_sftp(
     // 第一跳：外层跳板直连；无跳板链时第一跳就是目标机
     // SFTP 面板不带隧道（per-server 隧道与每传输专属连接语义含混，见 roadmap）
     let mut handle = match jump.first() {
-        Some(first) => connect_and_auth(first, None).await?,
-        None => connect_and_auth(endpoint, None).await?,
+        Some(first) => connect_and_auth(first, None, otp_answerer).await?,
+        None => connect_and_auth(endpoint, None, otp_answerer).await?,
     };
     // 后续跳：跳板链剩余跳 + 目标机，都经上一跳的 direct-tcpip 穿透
     let mut tunnels: Vec<Handle<ClientHandler>> = Vec::new();
@@ -310,7 +321,7 @@ async fn open_sftp(
             // 正在穿过的机器是第 index+1 跳（1 起），如「跳板[1/2] ops@x」
             let through = &jump[index];
             let label = format!("跳板[{}/{}] {}", index + 1, total, through.title());
-            let next = open_through(&handle, &label, next_endpoint, None).await?;
+            let next = open_through(&handle, &label, next_endpoint, None, otp_answerer).await?;
             tunnels.push(handle);
             handle = next;
         }
@@ -333,11 +344,12 @@ async fn open_sftp(
 async fn sftp_network_main(
     endpoint: crate::SshEndpoint,
     jump: Vec<crate::SshEndpoint>,
+    otp_answerer: Option<crate::OtpAnswerer>,
     ready_tx: std_mpsc::Sender<io::Result<()>>,
     mut cmd_rx: tokio::sync::mpsc::UnboundedReceiver<SftpCmd>,
 ) {
     let startup = async {
-        let (sftp, handle, tunnels) = open_sftp(&endpoint, &jump).await?;
+        let (sftp, handle, tunnels) = open_sftp(&endpoint, &jump, otp_answerer.as_ref()).await?;
         let _ = ready_tx.send(Ok(()));
         // 常驻：逐条执行指令直至 Shutdown 或通道失效
         while let Some(cmd) = cmd_rx.recv().await {
