@@ -734,3 +734,62 @@ mod webdav_merge_chain {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+// ───────── 登录流编辑草稿读回映射（保存路径纯函数） ─────────
+
+use super::workspace::flow_step_from_values;
+use laterterm_config::{FlowStep, LoginFlow, servers};
+
+fn totp_step(expect: Option<&str>, account: &str) -> FlowStep {
+    FlowStep::Totp {
+        expect: expect.map(str::to_owned),
+        account: account.to_owned(),
+    }
+}
+
+/// kind 映射到正确变体；expect/content trim；空 expect 降级等提示符。
+#[test]
+fn flow_step_values_map_by_kind_with_trim_and_empty_expect_downgrade() {
+    assert_eq!(
+        flow_step_from_values(
+            super::workspace::FlowStepKind::Totp,
+            "  Opt token:  ",
+            " bastion "
+        ),
+        totp_step(Some("Opt token:"), "bastion"),
+        "totp：expect/content trim 后命中"
+    );
+    assert_eq!(
+        flow_step_from_values(super::workspace::FlowStepKind::Text, "   ", " 1 "),
+        FlowStep::Text {
+            expect: None,
+            text: "1".into(),
+        },
+        "空白 expect 降级 None（等提示符锚点）"
+    );
+    assert_eq!(
+        flow_step_from_values(super::workspace::FlowStepKind::Command, "", " cd /data "),
+        FlowStep::Command {
+            expect: None,
+            name: "cd /data".into(),
+        },
+        "命令映射与 trim"
+    );
+}
+
+/// 空内容步骤照常落值（validate 报错定位到步号，不在此处拦截）；
+/// LoginFlow 默认超时与上限常量对齐 config。
+#[test]
+fn flow_step_values_keep_empty_content_for_validate() {
+    assert_eq!(
+        flow_step_from_values(super::workspace::FlowStepKind::Totp, "", ""),
+        totp_step(None, ""),
+        "空内容照常落值，交给 validate 按步号报错"
+    );
+    assert_eq!(
+        servers::DEFAULT_FLOW_STEP_TIMEOUT_SECS,
+        30,
+        "默认超时与设计口径一致"
+    );
+    assert!(LoginFlow::default().steps.is_empty());
+}

@@ -113,6 +113,9 @@ pub(crate) fn connect(
     // 槽，Connected 返回时随行（窗格 watcher 据此拉隧道事件流）。
     let typed_slot: Arc<Mutex<Option<Arc<SshSession>>>> = Arc::default();
     let slot = Arc::clone(&typed_slot);
+    // 登录流认证层：flow 引用了动态码时自动应答 KI 验证码提示（构造在
+    // move store 之前；Arc 闭包内克隆）
+    let otp_answerer = otp_answerer_for(entry, &store);
     let outcome = connect_with(
         entry,
         jump_entries,
@@ -127,6 +130,7 @@ pub(crate) fn connect(
                 jump: hops,
                 // 隧道只取 enabled 项（停用的仅保留配置）；SFTP 路径不带隧道
                 tunnels: tunnel_specs(entry),
+                otp_answerer: otp_answerer.clone(),
                 cols: initial_size.0.max(1),
                 rows: initial_size.1.max(1),
             };
@@ -199,7 +203,7 @@ pub(crate) fn connect_sftp(
     let (auth, hops, to_remember) = resolved;
     let endpoint = endpoint_for_entry(entry, auth)?;
     anyhow::ensure!(active.load(Ordering::Acquire), "连接已取消");
-    let browse = Arc::new(SftpHandle::spawn(endpoint.clone(), hops.clone())?);
+    let browse = Arc::new(SftpHandle::spawn(endpoint.clone(), hops.clone(), None)?);
     if !active.load(Ordering::Acquire) {
         browse.close();
         bail!("连接已取消");
@@ -288,6 +292,59 @@ fn known_hosts_policy() -> Result<HostKeyPolicy> {
 fn get_secret(store: &Arc<dyn SecretStore>, account: String) -> Result<Option<String>> {
     let store = Arc::clone(store);
     run_secret_op(move || store.get(&account))
+}
+
+/// KI 提示是否是验证码/动态口令类问题（登录流认证层启发式）：大小写不敏感
+/// 子串命中——JumpServer「Opt token:」「MFA」与中文「验证码/动态口令」提示
+/// 均命中。误命中与漏命中的代价对称（各错一次认证、均可重试），v1 取常见
+/// 关键词并集；会话层精确匹配走 flow.steps 的 expect 正则（FlowRunner）。
+fn ki_prompt_looks_like_otp(prompt: &str) -> bool {
+    let lowered = prompt.to_lowercase();
+    ["token", "otp", "mfa", "验证码", "动态口令", "动态密码"]
+        .iter()
+        .any(|keyword| lowered.contains(keyword))
+}
+
+/// 登录流认证层应答器（登录流 D4a）：条目登录流引用了动态码时构造——
+/// keyboard-interactive 提示命中 [`ki_prompt_looks_like_otp`] 时读密钥环
+/// 算码应答。密钥环操作发生在连接后台线程（设计定稿纪律）；算法参数取
+/// RFC 6238 默认（SHA1/6 位/30s，JumpServer 即此配置）。密钥缺失/算码失败
+/// 一律返回 None → 回退固定口令（SshAuth::KeyboardInteractive 语义），认证
+/// 照常可手动补输，不炸连接流程。
+fn otp_answerer_for(
+    entry: &ServerEntry,
+    store: &Arc<dyn SecretStore>,
+) -> Option<laterterm_ssh::OtpAnswerer> {
+    // 多个动态码步骤时取第一个（认证层只有一个 KI 阶段；会话层每步
+    // account 由 FlowRunner 精确下发）
+    let account = entry
+        .flow
+        .as_ref()?
+        .steps
+        .iter()
+        .find_map(|step| match step {
+            laterterm_config::FlowStep::Totp { account, .. } => Some(account.clone()),
+            _ => None,
+        })?;
+    let store = Arc::clone(store);
+    Some(Arc::new(move |prompt: &str| {
+        if !ki_prompt_looks_like_otp(prompt) {
+            return None;
+        }
+        let Ok(account) = laterterm_secrets::totp_account(&account) else {
+            return None;
+        };
+        let Ok(Some(secret)) = get_secret(&store, account) else {
+            return None;
+        };
+        laterterm_config::generate_code(
+            &secret,
+            &laterterm_config::TotpConfig::default(),
+            std::time::SystemTime::now(),
+        )
+        .ok()
+        .map(|code| code.code)
+    }))
 }
 
 fn prompt(kind: CredentialKind, warning: Option<&str>) -> ConnectionOutcome {
@@ -813,6 +870,60 @@ mod tests {
     use laterterm_core::{BackendKind, SessionStreams};
     use std::collections::HashMap;
     use std::sync::Mutex;
+
+    /// KI 验证码提示启发式：JumpServer 英文/中文常见形态命中，普通口令与
+    /// 登录名提示不误命中（大小写不敏感）。
+    #[test]
+    fn ki_prompt_heuristic_matches_otp_and_skips_password() {
+        for prompt in [
+            "Opt token: ",
+            "MFA auth code:",
+            "Please enter OTP",
+            "请输入验证码",
+            "动态口令: ",
+            "TOKEN 大小写混合",
+        ] {
+            assert!(ki_prompt_looks_like_otp(prompt), "{prompt} 应命中");
+        }
+        for prompt in ["Password: ", "密码:", "login:", "username:"] {
+            assert!(!ki_prompt_looks_like_otp(prompt), "{prompt} 不应命中");
+        }
+    }
+
+    /// 条目登录流引用动态码时才构造应答器；纯命令/文本流不注入。
+    #[test]
+    fn otp_answerer_built_only_when_flow_references_totp() {
+        let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
+        let mut entry = ServerEntry {
+            name: "堡垒机".into(),
+            host: "bastion.example.com".into(),
+            username: "ops".into(),
+            ..Default::default()
+        };
+        assert!(otp_answerer_for(&entry, &store).is_none(), "无登录流不注入");
+        entry.flow = Some(laterterm_config::LoginFlow {
+            steps: vec![laterterm_config::FlowStep::Command {
+                expect: None,
+                name: "cd /data".into(),
+            }],
+            step_timeout_secs: 30,
+        });
+        assert!(
+            otp_answerer_for(&entry, &store).is_none(),
+            "纯命令流不需要认证层应答"
+        );
+        entry.flow.as_mut().unwrap().steps.insert(
+            0,
+            laterterm_config::FlowStep::Totp {
+                expect: Some("Opt token:".into()),
+                account: "bastion".into(),
+            },
+        );
+        assert!(
+            otp_answerer_for(&entry, &store).is_some(),
+            "引用动态码即注入"
+        );
+    }
 
     #[derive(Default)]
     struct MemoryStore {

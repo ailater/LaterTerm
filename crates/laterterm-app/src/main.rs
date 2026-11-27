@@ -3,6 +3,7 @@
 mod audit;
 mod branding;
 mod command_text_field;
+mod flow;
 mod import;
 mod onboarding;
 mod pane_navigation;

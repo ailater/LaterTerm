@@ -9,6 +9,18 @@ use std::path::Path;
 /// 单台服务器允许配置的最大隧道数（防手改配置炸出无界列表）。
 pub const MAX_TUNNELS_PER_SERVER: usize = 16;
 
+/// 单条登录流允许的最大步骤数（同隧道封顶口径）。
+pub const MAX_STEPS_PER_FLOW: usize = 16;
+
+/// 登录流单步默认超时秒数（超时放弃该步回人工，流继续——见 app 层 FlowRunner）。
+pub const DEFAULT_FLOW_STEP_TIMEOUT_SECS: u64 = 30;
+
+/// 登录流单步超时上下限秒数（手改配置防炸口径）。
+pub const FLOW_STEP_TIMEOUT_RANGE: (u64, u64) = (1, 600);
+
+/// expect 正则长度上限。
+pub const MAX_FLOW_EXPECT_LEN: usize = 256;
+
 /// SSH 端口转发方向。
 ///
 /// v1 只落 `local` / `remote` 两类：SOCKS5 动态转发 defer（russh 侧零增量，
@@ -116,6 +128,198 @@ pub(crate) fn normalize_tunnels(server: &mut ServerEntry) {
     });
 }
 
+/// 登录流单步（`[[servers.flow.steps]]`，`kind` 拍平区分动作）。
+///
+/// 引用名口径（登录流设计定稿 2026-11-25）：TOTP 走密钥环别名、命令走快捷
+/// 命令名——**真值绝不进 TOML**；`text` 动作仅限菜单序号等非敏感内容
+/// （敏感凭据请走 totp 引用或快捷命令）。expect 为空 = 等提示符锚点
+/// （OSC 133 A，有 shell 集成时最可靠）；非空 = 正则（对剥 ANSI 后的可见
+/// 文本匹配，引擎统一大小写不敏感）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum FlowStep {
+    /// 发送 TOTP 动态码（密钥环 totp_account 别名引用）。
+    Totp {
+        /// expect 正则；留空/缺省 = 等提示符锚点。
+        #[serde(default)]
+        expect: Option<String>,
+        /// TOTP 账户名（密钥环别名）。
+        account: String,
+    },
+    /// 发送字面文本（菜单序号等非敏感内容；自动补回车）。
+    Text {
+        /// expect 正则；留空/缺省 = 等提示符锚点。
+        #[serde(default)]
+        expect: Option<String>,
+        /// 字面文本。
+        text: String,
+    },
+    /// 发送快捷命令（命令名引用，运行时展开模板；自动补回车）。
+    Command {
+        /// expect 正则；留空/缺省 = 等提示符锚点。
+        #[serde(default)]
+        expect: Option<String>,
+        /// 快捷命令名（命令面板条目名）。
+        name: String,
+    },
+}
+
+impl FlowStep {
+    /// 步骤的 expect 正则（None = 等提示符锚点）。
+    pub fn expect(&self) -> Option<&str> {
+        match self {
+            FlowStep::Totp { expect, .. }
+            | FlowStep::Text { expect, .. }
+            | FlowStep::Command { expect, .. } => expect.as_deref(),
+        }
+    }
+
+    /// 步骤的引用名（totp 账户 / text 文本 / command 命令名）。
+    fn reference(&mut self) -> &mut String {
+        match self {
+            FlowStep::Totp { account, .. } => account,
+            FlowStep::Text { text, .. } => text,
+            FlowStep::Command { name, .. } => name,
+        }
+    }
+}
+
+/// 登录流（`[servers.flow]`）：连接建立后的会话层自动化步骤序列——
+/// 「连跳板机 → 自动应答动态码 → 自动跑命令」。运行引擎见 app 层
+/// FlowRunner（expect 引擎，有序推进、边沿触发、单步超时回人工）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoginFlow {
+    /// 步骤序列（有序推进，命中即步进）。
+    pub steps: Vec<FlowStep>,
+    /// 单步超时秒数（超时放弃该步回人工，流继续等后续步）。
+    pub step_timeout_secs: u64,
+}
+
+impl Default for LoginFlow {
+    fn default() -> Self {
+        Self {
+            steps: Vec::new(),
+            step_timeout_secs: DEFAULT_FLOW_STEP_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl LoginFlow {
+    /// UI 保存前严格校验：步数/超时上限、expect 形状、引用名非空。
+    /// 正则合法性在 app 层引擎编译期报（config 不依赖 regex，载入路径
+    /// 由 FlowRunner 构造失败兜底：该流不启动，会话不受影响）。
+    pub fn validate(&self) -> Result<()> {
+        if self.steps.len() > MAX_STEPS_PER_FLOW {
+            bail!("登录流步骤数超过上限（最多 {MAX_STEPS_PER_FLOW} 步）");
+        }
+        if !(FLOW_STEP_TIMEOUT_RANGE.0..=FLOW_STEP_TIMEOUT_RANGE.1)
+            .contains(&self.step_timeout_secs)
+        {
+            bail!(
+                "单步超时须在 {}..={} 秒",
+                FLOW_STEP_TIMEOUT_RANGE.0,
+                FLOW_STEP_TIMEOUT_RANGE.1
+            );
+        }
+        for (index, step) in self.steps.iter().enumerate() {
+            if let Some(expect) = step.expect() {
+                if expect.chars().any(|ch| ch.is_control()) {
+                    bail!("第 {} 步 expect 不能包含控制字符", index + 1);
+                }
+                if expect.chars().count() > MAX_FLOW_EXPECT_LEN {
+                    bail!(
+                        "第 {} 步 expect 过长（最多 {MAX_FLOW_EXPECT_LEN} 字）",
+                        index + 1
+                    );
+                }
+            }
+            let reference = match step {
+                FlowStep::Totp { account, .. } => account,
+                FlowStep::Text { text, .. } => text,
+                FlowStep::Command { name, .. } => name,
+            };
+            if reference.trim().is_empty() {
+                bail!(
+                    "第 {} 步的动作内容不能为空（动态码账户/文本/命令名）",
+                    index + 1
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 登录流类型级宽容解析（同 lenient_tunnels 口径）：steps 逐项反序列化、
+/// 坏项丢弃；超时缺省/类型错补默认。整体形状极端坏（flow 不是表）时
+/// 丢弃为 None——防手改配置炸出**整份** settings.toml 解析失败（解析
+/// 失败即全量回默认，比丢流更糟）。值级坏项由 `normalize_flow` 丢弃。
+/// 两者都绝不丢条目。
+fn lenient_flow<'de, D>(deserializer: D) -> Result<Option<LoginFlow>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<toml::Value>::deserialize(deserializer)?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let mut steps = Vec::new();
+    if let Some(items) = raw.get("steps").and_then(|value| value.as_array()) {
+        for item in items {
+            match FlowStep::deserialize(item.clone()) {
+                Ok(step) => steps.push(step),
+                Err(_) => eprintln!("无效登录流步骤已忽略（kind 未知或字段类型错）"),
+            }
+        }
+    }
+    let step_timeout_secs = raw
+        .get("step_timeout_secs")
+        .and_then(|value| value.as_integer())
+        .filter(|secs| *secs >= 0)
+        .map(|secs| secs as u64)
+        .unwrap_or(DEFAULT_FLOW_STEP_TIMEOUT_SECS);
+    Ok(Some(LoginFlow {
+        steps,
+        step_timeout_secs,
+    }))
+}
+
+/// 登录流值级归一化（幂等）：载入与导入双点挂载（同 normalize_tunnels
+/// 纪律——只丢步骤，绝不丢条目）。trim 各字段；expect 空串降级 None
+/// （等提示符锚点）；引用名 trim 后为空的步骤丢弃；超时钳制上下限；
+/// 归一化后步骤为空的流整体置 None（空流无运行意义）。
+pub(crate) fn normalize_flow(server: &mut ServerEntry) {
+    let Some(flow) = server.flow.as_mut() else {
+        return;
+    };
+    let name = server.name.clone();
+    let timeout_min = FLOW_STEP_TIMEOUT_RANGE.0;
+    let timeout_max = FLOW_STEP_TIMEOUT_RANGE.1;
+    flow.step_timeout_secs = flow.step_timeout_secs.clamp(timeout_min, timeout_max);
+    flow.steps.retain_mut(|step| {
+        // expect 统一先取走再写回：trim 后空串降级 None
+        let trimmed_expect = step
+            .expect()
+            .map(|expect| expect.trim().to_string())
+            .filter(|expect| !expect.is_empty());
+        match step {
+            FlowStep::Totp { expect, .. }
+            | FlowStep::Text { expect, .. }
+            | FlowStep::Command { expect, .. } => *expect = trimmed_expect,
+        }
+        let reference = step.reference();
+        *reference = reference.trim().to_string();
+        if reference.is_empty() {
+            eprintln!("服务器 {name:?} 的空登录流步骤已忽略（动态码账户/文本/命令名为空）");
+            return false;
+        }
+        true
+    });
+    if flow.steps.is_empty() {
+        server.flow = None;
+    }
+}
+
 /// 认证方式元数据；密码/交互口令使用 `laterterm_secrets::ssh_account(name)`，
 /// 私钥 passphrase 使用独立的 `laterterm_secrets::ssh_passphrase_account(name)`。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,6 +372,11 @@ pub struct ServerEntry {
     /// 两层都绝不丢条目。
     #[serde(default, deserialize_with = "lenient_tunnels")]
     pub tunnels: Vec<ServerTunnel>,
+    /// 登录流（`[servers.flow]`）：连接建立后的会话层自动化（自动应答动态码、
+    /// 自动跑命令）。`None` = 不启用。宽容口径同隧道：形状坏整体丢弃、
+    /// 值级坏步骤归一化丢弃，绝不丢条目。
+    #[serde(default, deserialize_with = "lenient_flow")]
+    pub flow: Option<LoginFlow>,
 }
 
 impl Default for ServerEntry {
@@ -186,6 +395,7 @@ impl Default for ServerEntry {
             jump: None,
             tab_color: None,
             tunnels: Vec::new(),
+            flow: None,
         }
     }
 }
@@ -211,6 +421,9 @@ impl ServerEntry {
             validate_group(group).context("分组不合法")?;
         }
         self.validate_tunnels()?;
+        if let Some(flow) = &self.flow {
+            flow.validate().context("登录流不合法")?;
+        }
         Ok(())
     }
 
@@ -327,6 +540,7 @@ impl ServerEntry {
             .filter(|name| !name.is_empty() && validate_ref_name(name).is_ok());
         self.group = normalize_group(self.group.as_deref());
         normalize_tunnels(&mut self);
+        normalize_flow(&mut self);
         if self.validate_connection().is_ok() {
             self.warn_invalid_shortcut();
             Some(self)
@@ -930,6 +1144,7 @@ group = "坏\n组"
             jump: None,
             tab_color: None,
             tunnels: Vec::new(),
+            flow: None,
         }]);
         file.save_to(&path).unwrap();
         let loaded = ServersFile::load_from(&path).unwrap();
@@ -1355,6 +1570,216 @@ bind_port = 1080
             "未知 kind 的隧道被丢弃"
         );
         assert_eq!(settings.servers[0].tunnels[0].target_host, "db");
+    }
+
+    // ───────── 登录流（flow.steps）持久化 ─────────
+
+    /// 带 flow 条目 roundtrip：kind 拍平、expect 缺省补 None、timeout 保真；
+    /// 旧配置无 [servers.flow] → None 不拒载。
+    #[test]
+    fn login_flow_roundtrip_and_legacy_entries_stay_none() {
+        let raw = r#"
+[[servers]]
+name = "跳板"
+host = "jump.example.com"
+username = "ops"
+
+[[servers]]
+name = "堡垒机"
+host = "bastion.example.com"
+username = "ops"
+
+[servers.flow]
+step_timeout_secs = 45
+
+[[servers.flow.steps]]
+kind = "totp"
+expect = "Opt token:"
+account = "bastion"
+
+[[servers.flow.steps]]
+kind = "text"
+text = "1"
+
+[[servers.flow.steps]]
+kind = "command"
+name = "cd /data"
+"#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        let plain = &settings.servers[0];
+        assert!(plain.flow.is_none(), "旧条目无 flow 字段 → None");
+
+        let flow = settings.servers[1].flow.as_ref().expect("flow 应存在");
+        assert_eq!(flow.step_timeout_secs, 45);
+        assert_eq!(flow.steps.len(), 3);
+        assert_eq!(
+            flow.steps[0],
+            FlowStep::Totp {
+                expect: Some("Opt token:".into()),
+                account: "bastion".into(),
+            }
+        );
+        assert_eq!(
+            flow.steps[1],
+            FlowStep::Text {
+                expect: None,
+                text: "1".into(),
+            }
+        );
+        // roundtrip：序列化再反序列化逐字段一致（条目根表，[flow] 为子表）
+        let dumped = toml::to_string(&settings.servers[1]).unwrap();
+        let reparsed: ServerEntry = toml::from_str(&dumped).unwrap();
+        assert_eq!(reparsed, settings.servers[1]);
+        assert!(reparsed.validate().is_ok());
+    }
+
+    /// 坏步骤（未知 kind / 字段类型错）只丢该步骤，绝不让整份 settings.toml
+    /// 解析失败；timeout 类型错补默认。
+    #[test]
+    fn lenient_flow_drops_bad_steps_and_defaults_timeout() {
+        let raw = r#"
+[[servers]]
+name = "堡垒机"
+host = "bastion.example.com"
+username = "ops"
+
+[servers.flow]
+step_timeout_secs = "fast"
+
+[[servers.flow.steps]]
+kind = "totp"
+expect = "Opt token:"
+account = "bastion"
+
+[[servers.flow.steps]]
+kind = "teleport"
+account = "x"
+"#;
+        let settings: Settings = toml::from_str(raw).unwrap();
+        let flow = settings.servers[0].flow.as_ref().expect("流应保留");
+        assert_eq!(
+            flow.step_timeout_secs, DEFAULT_FLOW_STEP_TIMEOUT_SECS,
+            "类型错的 timeout 补默认"
+        );
+        assert_eq!(flow.steps.len(), 1, "未知 kind 步骤被丢弃");
+        assert!(settings.servers[0].validate().is_ok(), "坏步骤绝不丢条目");
+    }
+
+    /// 归一化：trim、空 expect 降级 None、空引用步骤丢弃、timeout 钳制、
+    /// 归一化后空流置 None；幂等。
+    #[test]
+    fn normalize_flow_trims_drops_empty_and_clears_empty_flow() {
+        let mut server = entry("堡垒机", "bastion.example.com");
+        server.flow = Some(LoginFlow {
+            steps: vec![
+                FlowStep::Totp {
+                    expect: Some("  Opt token:  ".into()),
+                    account: "  bastion  ".into(),
+                },
+                // expect 纯空白 → 降级 None（等提示符锚点）
+                FlowStep::Text {
+                    expect: Some("   ".into()),
+                    text: "1".into(),
+                },
+                // 引用名纯空白 → 丢弃
+                FlowStep::Command {
+                    expect: None,
+                    name: "  ".into(),
+                },
+            ],
+            step_timeout_secs: 9999,
+        });
+        normalize_flow(&mut server);
+        let flow = server.flow.as_ref().expect("还有有效步骤");
+        assert_eq!(flow.steps.len(), 2, "空引用步骤被丢弃");
+        assert_eq!(flow.steps[0].expect(), Some("Opt token:"), "expect 应 trim");
+        let FlowStep::Totp { account, .. } = &flow.steps[0] else {
+            panic!("第一步应为 totp");
+        };
+        assert_eq!(account, "bastion", "引用名应 trim");
+        assert_eq!(flow.steps[1].expect(), None, "空白 expect 降级等提示符");
+        assert_eq!(
+            flow.step_timeout_secs, FLOW_STEP_TIMEOUT_RANGE.1,
+            "超时应被钳到上限"
+        );
+        // 幂等
+        let once = server.flow.clone();
+        normalize_flow(&mut server);
+        assert_eq!(server.flow, once);
+
+        // 全部步骤坏 → 整流置 None
+        let mut server = entry("堡垒机", "bastion.example.com");
+        server.flow = Some(LoginFlow {
+            steps: vec![FlowStep::Command {
+                expect: None,
+                name: "".into(),
+            }],
+            step_timeout_secs: 30,
+        });
+        normalize_flow(&mut server);
+        assert!(server.flow.is_none(), "空流无运行意义，置 None");
+    }
+
+    /// 严格校验：步数/超时上限、expect 控制字符、空引用名全部报错留弹窗。
+    #[test]
+    fn login_flow_validate_rejects_bad_shapes() {
+        let base = |steps: Vec<FlowStep>, timeout: u64| LoginFlow {
+            steps,
+            step_timeout_secs: timeout,
+        };
+        let steps: Vec<FlowStep> = (0..=MAX_STEPS_PER_FLOW)
+            .map(|index| FlowStep::Text {
+                expect: None,
+                text: format!("{index}"),
+            })
+            .collect();
+        assert!(base(steps, 30).validate().is_err(), "步数超上限应报错");
+        assert!(
+            base(
+                vec![FlowStep::Text {
+                    expect: None,
+                    text: "1".into()
+                }],
+                0
+            )
+            .validate()
+            .is_err(),
+            "超时 0 应报错"
+        );
+        assert!(
+            base(
+                vec![FlowStep::Totp {
+                    expect: Some("bad\nexpect".into()),
+                    account: "a".into()
+                }],
+                30
+            )
+            .validate()
+            .is_err(),
+            "expect 含控制字符应报错"
+        );
+        assert!(
+            base(
+                vec![FlowStep::Command {
+                    expect: None,
+                    name: "  ".into()
+                }],
+                30
+            )
+            .validate()
+            .is_err(),
+            "空命令名应报错"
+        );
+        // 合法流通过；ServerEntry::validate 级联
+        let mut server = entry("堡垒机", "bastion.example.com");
+        server.flow = Some(base(
+            vec![FlowStep::Totp {
+                expect: None,
+                account: "bastion".into(),
+            }],
+            30,
+        ));
+        assert!(server.validate().is_ok());
     }
 
     #[test]

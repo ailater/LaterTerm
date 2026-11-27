@@ -484,6 +484,43 @@ struct TunnelDraft {
     target_port: Entity<CommandTextField>,
 }
 
+/// 登录流步骤动作类型（编辑草稿态；保存时按 kind 映射 FlowStep 变体）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlowStepKind {
+    Totp,
+    Text,
+    Command,
+}
+
+impl FlowStepKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Totp => "动态码",
+            Self::Text => "文本",
+            Self::Command => "命令",
+        }
+    }
+
+    /// 动作内容输入框的标签与占位提示（随 kind 切换）。
+    fn content_hint(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Totp => ("动态码账户", "密钥环动态码账户名"),
+            Self::Text => ("文本", "菜单序号等非敏感文本"),
+            Self::Command => ("命令名", "快捷命令面板条目名"),
+        }
+    }
+}
+
+/// 服务器编辑弹窗的单条登录流步骤草稿：kind 三选 + expect + 动作内容输入框
+/// （内容框随 kind 复用，标签/占位随切换；保存时读回 `FlowStep`，合法性由
+/// `LoginFlow::validate` 把关，报错留在弹窗内）。
+#[derive(Clone)]
+struct FlowDraft {
+    kind: FlowStepKind,
+    expect: Entity<CommandTextField>,
+    content: Entity<CommandTextField>,
+}
+
 /// 触发器规则编辑弹窗（设置页「终端」节触发器卡的新增入口）。
 /// action 是弹窗内的动作二选状态（通知/高亮），随保存落盘。
 #[derive(Clone, Debug)]
@@ -1269,6 +1306,12 @@ pub struct WorkspaceView {
     /// 编辑弹窗隧道区草稿（Edit 弹窗随开随建，保存时读回 meta.tunnels；
     /// None 语义不需要——空表 = 无隧道行）。
     server_tunnel_drafts: Vec<TunnelDraft>,
+    /// 编辑弹窗登录流区草稿（同隧道随开随建，保存时读回 meta.flow）；
+    /// 空表 = 未启用登录流。
+    server_flow_drafts: Vec<FlowDraft>,
+    /// 登录流单步超时秒数输入框（随弹窗创建；保存时 parse，失败按 0 交
+    /// validate 报错，与隧道端口读回同口径）。
+    server_flow_timeout: Option<Entity<CommandTextField>>,
     server_delete_confirm: Option<String>,
     server_error: Option<String>,
     /// 分组折叠态（键 = 组名，None = 未分组桶；会话级，不持久化）。
@@ -1463,6 +1506,8 @@ impl WorkspaceView {
             right_panel_tab: RightPanelTab::Commands,
             server_dialog: None,
             server_tunnel_drafts: Vec::new(),
+            server_flow_drafts: Vec::new(),
+            server_flow_timeout: None,
             server_fields: Vec::new(),
             server_field_subscriptions: Vec::new(),
             server_advanced_open: false,
@@ -5425,6 +5470,29 @@ impl WorkspaceView {
                 }),
             })
             .collect();
+        // 登录流编辑区草稿随弹窗重建（同隧道口径）：编辑条目按已存 flow
+        // 回填；新建弹窗为空列表，或经「JumpServer 预设」一键起步
+        let flow = self.server_meta_draft.flow.clone();
+        self.server_flow_drafts = flow
+            .as_ref()
+            .map(|flow| {
+                flow.steps
+                    .iter()
+                    .map(|step| flow_draft_of(step, cx))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.server_flow_timeout = Some(cx.new(|cx| {
+            CommandTextField::new(
+                flow.as_ref()
+                    .map(|flow| flow.step_timeout_secs.to_string())
+                    .unwrap_or_else(|| {
+                        laterterm_config::servers::DEFAULT_FLOW_STEP_TIMEOUT_SECS.to_string()
+                    }),
+                "秒",
+                cx,
+            )
+        }));
         let meta = self.server_meta_draft.clone();
         // 编辑时凭据框留空表示不改动；凭据本体只进密钥环
         let secret_placeholder = if entry.is_some() {
@@ -5550,6 +5618,91 @@ impl WorkspaceView {
             draft.enabled = !draft.enabled;
             cx.notify();
         }
+    }
+
+    /// 登录流步骤读回（保存路径）：空步骤表 → None（未启用）。超时文本
+    /// parse 失败按 0 落值——由 LoginFlow::validate 报错留弹窗（同隧道端口
+    /// 读回口径）。字段映射见 [`flow_step_from_values`]。
+    fn read_server_flow(&self, cx: &Context<Self>) -> Option<laterterm_config::LoginFlow> {
+        if self.server_flow_drafts.is_empty() {
+            return None;
+        }
+        let steps = self
+            .server_flow_drafts
+            .iter()
+            .map(|draft| {
+                flow_step_from_values(
+                    draft.kind,
+                    draft.expect.read(cx).value(),
+                    draft.content.read(cx).value(),
+                )
+            })
+            .collect();
+        let step_timeout_secs = self
+            .server_flow_timeout
+            .as_ref()
+            .map(|field| field.read(cx).value().trim().parse().unwrap_or(0))
+            .unwrap_or(laterterm_config::servers::DEFAULT_FLOW_STEP_TIMEOUT_SECS);
+        Some(laterterm_config::LoginFlow {
+            steps,
+            step_timeout_secs,
+        })
+    }
+
+    /// 登录流区：新增一步（默认等提示符发命令）；条数封顶同隧道口径。
+    fn add_server_flow_step(&mut self, cx: &mut Context<Self>) {
+        if self.server_flow_drafts.len() >= laterterm_config::servers::MAX_STEPS_PER_FLOW {
+            self.server_error = Some(format!(
+                "登录流步骤数超过上限（最多 {} 步）",
+                laterterm_config::servers::MAX_STEPS_PER_FLOW
+            ));
+            cx.notify();
+            return;
+        }
+        self.server_flow_drafts.push(empty_flow_draft(cx));
+        cx.notify();
+    }
+
+    fn remove_server_flow_step(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.server_flow_drafts.remove(index);
+        // 步骤删空 = 流未启用：超时框收起
+        if self.server_flow_drafts.is_empty() {
+            self.server_flow_timeout = None;
+        }
+        cx.notify();
+    }
+
+    fn set_server_flow_kind(&mut self, index: usize, kind: FlowStepKind, cx: &mut Context<Self>) {
+        if let Some(draft) = self.server_flow_drafts.get_mut(index) {
+            draft.kind = kind;
+            cx.notify();
+        }
+    }
+
+    /// JumpServer 预设一键起步：等验证码提示发动态码 + 到提示符跑命令，
+    /// 动作内容留空由用户补填（validate 在保存时拦截空内容并指明步号）。
+    fn apply_jumpserver_flow_preset(&mut self, cx: &mut Context<Self>) {
+        let mut steps = Vec::new();
+        let mut totp = empty_flow_draft(cx);
+        totp.kind = FlowStepKind::Totp;
+        totp.expect
+            .update(cx, |field, cx| field.set_value("Opt token:", cx));
+        steps.push(totp);
+        steps.push(empty_flow_draft(cx));
+        if self.server_flow_timeout.is_none() {
+            self.server_flow_timeout = Some(cx.new(|cx| {
+                CommandTextField::new(
+                    laterterm_config::servers::DEFAULT_FLOW_STEP_TIMEOUT_SECS.to_string(),
+                    "秒",
+                    cx,
+                )
+            }));
+        }
+        self.server_flow_drafts = steps;
+        self.server_error = Some(
+            "已填入 JumpServer 预设：请补「动态码账户」（密钥环里的账户名）与命令名后保存".into(),
+        );
+        cx.notify();
     }
 
     /// SSH 命令输入变为合法目标后立即回填；输入过程中不合法属于中间态，
@@ -5685,6 +5838,9 @@ impl WorkspaceView {
                     .unwrap_or(0),
             })
             .collect();
+        // 登录流编辑区读回（空表 = 未启用；合法性由 LoginFlow::validate
+        // 统一报错留弹窗，报文带步号定位）
+        meta.flow = self.read_server_flow(cx);
         let secret = values.get("凭据").cloned().unwrap_or_default();
         if let Some(conflict) = self.check_shortcut_conflict(
             meta.shortcut.as_deref(),
@@ -11525,6 +11681,7 @@ fn server_edit_modal(
         })
         .when_some(workspace.shortcut_editor.as_ref(), |body, editor| body.child(shortcut_editor_row(ui, editor.recorder.clone())))
         .child(server_tunnel_editor(workspace, ui, cx))
+        .child(server_flow_editor(workspace, ui, cx))
         .child(
             div()
                 .pt_2()
@@ -11760,6 +11917,196 @@ fn server_tunnel_draft_row(
                 .gap_2()
                 .child(field("目标主机", draft.target_host))
                 .child(field("目标端口", draft.target_port)),
+        )
+}
+
+/// 草稿值 → FlowStep（保存读回的纯映射）：expect/content trim，expect 空串
+/// 降级 None（等提示符锚点）；合法性由 LoginFlow::validate 把关。
+pub(crate) fn flow_step_from_values(
+    kind: FlowStepKind,
+    expect: &str,
+    content: &str,
+) -> laterterm_config::FlowStep {
+    let expect = expect.trim();
+    let expect = (!expect.is_empty()).then(|| expect.to_owned());
+    let content = content.trim().to_owned();
+    match kind {
+        FlowStepKind::Totp => laterterm_config::FlowStep::Totp {
+            expect,
+            account: content,
+        },
+        FlowStepKind::Text => laterterm_config::FlowStep::Text {
+            expect,
+            text: content,
+        },
+        FlowStepKind::Command => laterterm_config::FlowStep::Command {
+            expect,
+            name: content,
+        },
+    }
+}
+
+/// 已存 FlowStep → 编辑草稿（内容值按变体回填，占位随 kind）。
+fn flow_draft_of(step: &laterterm_config::FlowStep, cx: &mut Context<WorkspaceView>) -> FlowDraft {
+    let (kind, content_value) = match step {
+        laterterm_config::FlowStep::Totp { account, .. } => (FlowStepKind::Totp, account.clone()),
+        laterterm_config::FlowStep::Text { text, .. } => (FlowStepKind::Text, text.clone()),
+        laterterm_config::FlowStep::Command { name, .. } => (FlowStepKind::Command, name.clone()),
+    };
+    FlowDraft {
+        kind,
+        expect: cx.new(|cx| {
+            CommandTextField::new(
+                step.expect().unwrap_or_default().to_owned(),
+                "expect 正则（留空等提示符）",
+                cx,
+            )
+        }),
+        content: cx.new(|cx| CommandTextField::new(content_value, kind.content_hint().1, cx)),
+    }
+}
+
+/// 空白步骤草稿（「添加」与 JumpServer 预设共用起步形态：等提示符发命令）。
+fn empty_flow_draft(cx: &mut Context<WorkspaceView>) -> FlowDraft {
+    FlowDraft {
+        kind: FlowStepKind::Command,
+        expect: cx
+            .new(|cx| CommandTextField::new(String::new(), "expect 正则（留空等提示符）", cx)),
+        content: cx.new(|cx| {
+            CommandTextField::new(String::new(), FlowStepKind::Command.content_hint().1, cx)
+        }),
+    }
+}
+
+/// 服务器编辑弹窗的登录流编辑区：步骤行 + 单步超时 + JumpServer 预设。
+/// expect 引擎语义（剥 ANSI 匹配/大小写不敏感/超时回人工）在说明文字交代；
+/// 引用名口径：动态码走密钥环账户、命令走快捷命令名——真值不进 TOML。
+fn server_flow_editor(
+    workspace: &WorkspaceView,
+    ui: &UiPalette,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let drafts = workspace.server_flow_drafts.clone();
+    let has_steps = !drafts.is_empty();
+    let mut column = div()
+        .pt_3()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().text_color(ui.text_secondary).child("登录流（连接后自动执行）"))
+                .child(div().flex_1())
+                .child(setting_button(
+                    ui,
+                    "JumpServer 预设",
+                    false,
+                    cx.listener(|this, _, _, cx| this.apply_jumpserver_flow_preset(cx)),
+                ))
+                .child(setting_button(
+                    ui,
+                    "+ 添加步骤",
+                    false,
+                    cx.listener(|this, _, _, cx| this.add_server_flow_step(cx)),
+                )),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(ui.text_secondary)
+                .child("连接建立后按序执行：expect 命中（对屏幕可见文本匹配，忽略大小写与颜色码）→ 发送动作。expect 留空 = 等下一个提示符。单步超时后该步转人工，其余步骤继续。"),
+        )
+        .children(
+            drafts
+                .into_iter()
+                .enumerate()
+                .map(|(index, draft)| server_flow_draft_row(index, draft, ui, cx)),
+        );
+    if has_steps && let Some(timeout) = workspace.server_flow_timeout.clone() {
+        column = column.child(
+            div()
+                .mt_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(ui.text_secondary)
+                        .child("单步超时（秒）"),
+                )
+                .child(timeout),
+        );
+    }
+    column
+}
+
+/// 单条登录流步骤草稿行：kind 三选 + 删除，expect/动作内容输入框。
+fn server_flow_draft_row(
+    index: usize,
+    draft: FlowDraft,
+    ui: &UiPalette,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let kind = draft.kind;
+    let (content_label, _) = kind.content_hint();
+    div()
+        .mt_2()
+        .p_2()
+        .rounded_sm()
+        .border_1()
+        .border_color(ui.border_strong)
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .children(
+                    [
+                        FlowStepKind::Totp,
+                        FlowStepKind::Text,
+                        FlowStepKind::Command,
+                    ]
+                    .into_iter()
+                    .map(|candidate| {
+                        setting_button_keyed(
+                            ui,
+                            format!("flow-{index}-{}", candidate.label()),
+                            candidate.label(),
+                            kind == candidate,
+                            cx.listener(move |this, _, _, cx| {
+                                this.set_server_flow_kind(index, candidate, cx)
+                            }),
+                        )
+                    }),
+                )
+                .child(div().flex_1())
+                .child(setting_button_keyed(
+                    ui,
+                    format!("flow-{index}-delete"),
+                    "删除",
+                    false,
+                    cx.listener(move |this, _, _, cx| this.remove_server_flow_step(index, cx)),
+                )),
+        )
+        .child(draft.expect)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(ui.text_secondary)
+                        .child(content_label),
+                )
+                .child(draft.content),
         )
 }
 

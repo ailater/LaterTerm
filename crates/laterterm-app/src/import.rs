@@ -41,6 +41,7 @@ pub fn xshell_to_server(session: &XshellSession) -> Option<ServerEntry> {
         jump: None,
         tab_color: None,
         tunnels: Vec::new(),
+        flow: None,
     })
 }
 

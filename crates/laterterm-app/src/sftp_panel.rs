@@ -901,7 +901,7 @@ pub(crate) fn spawn_transfer_worker(
             }
             let finish_events = events.clone();
             let _ = events.send(SftpEvent::TransferStarted { id });
-            let handle = match SftpHandle::spawn(endpoint, hops) {
+            let handle = match SftpHandle::spawn(endpoint, hops, None) {
                 Ok(handle) => Arc::new(handle),
                 Err(error) => {
                     let cancelled = cancel.load(Ordering::Relaxed);
@@ -1975,6 +1975,7 @@ mod tests {
             endpoint: endpoint.clone(),
             jump: vec![jump],
             tunnels: Vec::new(),
+            otp_answerer: None,
             cols: 1,
             rows: 1,
         };

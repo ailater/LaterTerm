@@ -25,8 +25,8 @@ pub use importers::{
     load_xshell_sessions,
 };
 pub use servers::{
-    ServerAuthKind, ServerEntry, ServerTunnel, ServersFile, TunnelKind, clear_broken_jump_refs,
-    normalize_group, resolve_jump_chain, servers_referencing_jump,
+    FlowStep, LoginFlow, ServerAuthKind, ServerEntry, ServerTunnel, ServersFile, TunnelKind,
+    clear_broken_jump_refs, normalize_group, resolve_jump_chain, servers_referencing_jump,
 };
 // WebDAV 同步元数据类型最常用，随手 re-export；其余走 sync:: 路径。
 pub use sync::WebdavSyncSettings;
@@ -501,6 +501,8 @@ impl Settings {
             server.group = servers::normalize_group(server.group.as_deref());
             // 隧道值级归一化：坏隧道具名 eprintln 丢弃，条目保留
             servers::normalize_tunnels(server);
+            // 登录流值级归一化：坏步骤具名 eprintln 丢弃，条目保留
+            servers::normalize_flow(server);
             if let Some(key_path) = &server.key_path {
                 let trimmed = key_path.trim().to_string();
                 server.key_path = (!trimmed.is_empty()).then_some(trimmed);
