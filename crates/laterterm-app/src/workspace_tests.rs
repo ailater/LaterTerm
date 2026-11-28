@@ -735,61 +735,57 @@ mod webdav_merge_chain {
     }
 }
 
-// ───────── 登录流编辑草稿读回映射（保存路径纯函数） ─────────
+// ───────── 工作流编辑草稿读回映射（保存路径纯函数） ─────────
 
-use super::workspace::flow_step_from_values;
-use laterterm_config::{FlowStep, LoginFlow, servers};
+use super::workspace::{WorkflowDraftKind, workflow_step_from_values};
 
-fn totp_step(expect: Option<&str>, account: &str) -> FlowStep {
-    FlowStep::Totp {
-        expect: expect.map(str::to_owned),
-        account: account.to_owned(),
-    }
-}
+use laterterm_config::WorkflowStep;
 
 /// kind 映射到正确变体；expect/content trim；空 expect 降级等提示符。
 #[test]
-fn flow_step_values_map_by_kind_with_trim_and_empty_expect_downgrade() {
+fn workflow_step_values_map_by_kind_with_trim_and_empty_expect_downgrade() {
     assert_eq!(
-        flow_step_from_values(
-            super::workspace::FlowStepKind::Totp,
-            "  Opt token:  ",
-            " bastion "
-        ),
-        totp_step(Some("Opt token:"), "bastion"),
+        workflow_step_from_values(WorkflowDraftKind::Totp, "  Opt token:  ", " bastion "),
+        WorkflowStep::Totp {
+            expect: Some("Opt token:".into()),
+            account: "bastion".into(),
+        },
         "totp：expect/content trim 后命中"
     );
     assert_eq!(
-        flow_step_from_values(super::workspace::FlowStepKind::Text, "   ", " 1 "),
-        FlowStep::Text {
+        workflow_step_from_values(WorkflowDraftKind::Text, "   ", " 1 "),
+        WorkflowStep::Text {
             expect: None,
             text: "1".into(),
         },
         "空白 expect 降级 None（等提示符锚点）"
     );
     assert_eq!(
-        flow_step_from_values(super::workspace::FlowStepKind::Command, "", " cd /data "),
-        FlowStep::Command {
+        workflow_step_from_values(WorkflowDraftKind::Command, "", " cd /data "),
+        WorkflowStep::Command {
             expect: None,
             name: "cd /data".into(),
         },
         "命令映射与 trim"
     );
+    assert_eq!(
+        workflow_step_from_values(WorkflowDraftKind::Connect, "", " 堡垒机 "),
+        WorkflowStep::Connect {
+            server: "堡垒机".into(),
+        },
+        "connect 步映射（无 expect）"
+    );
 }
 
-/// 空内容步骤照常落值（validate 报错定位到步号，不在此处拦截）；
-/// LoginFlow 默认超时与上限常量对齐 config。
+/// 空内容步骤照常落值（validate 报错定位到步号，不在此处拦截）。
 #[test]
-fn flow_step_values_keep_empty_content_for_validate() {
+fn workflow_step_values_keep_empty_content_for_validate() {
     assert_eq!(
-        flow_step_from_values(super::workspace::FlowStepKind::Totp, "", ""),
-        totp_step(None, ""),
+        workflow_step_from_values(WorkflowDraftKind::Totp, "", ""),
+        WorkflowStep::Totp {
+            expect: None,
+            account: String::new(),
+        },
         "空内容照常落值，交给 validate 按步号报错"
     );
-    assert_eq!(
-        servers::DEFAULT_FLOW_STEP_TIMEOUT_SECS,
-        30,
-        "默认超时与设计口径一致"
-    );
-    assert!(LoginFlow::default().steps.is_empty());
 }

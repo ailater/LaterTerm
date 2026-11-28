@@ -23,8 +23,8 @@ use gpui::{
 };
 use laterterm_config::{
     Appearance, CommandTemplate, ServerAuthKind, ServerEntry, ServersFile, Settings, Theme,
-    ThemeRegistry, TotpAlgorithm, TotpConfig, TotpEntry, TriggerAction, TriggerRule,
-    app_config_dir, deepin_commands_default_path, deepin_default_path, generate_code,
+    ThemeRegistry, TotpAlgorithm, TotpConfig, TotpEntry, TriggerAction, TriggerRule, WorkflowEntry,
+    WorkflowStep, app_config_dir, deepin_commands_default_path, deepin_default_path, generate_code,
     load_deepin_commands, load_deepin_servers, load_xshell_sessions, normalize_shortcut,
     parse_secret_input,
 };
@@ -366,6 +366,9 @@ struct SessionControl {
 struct SshLink {
     entry: ServerEntry,
     jump: Vec<ServerEntry>,
+    /// 发起连接的工作流（None = 手动连接）：断线重连按此重新装配会话层
+    /// expect 引擎（重新登录语义）。
+    workflow: Option<WorkflowEntry>,
 }
 
 /// SSH 重连进行态（挂 Pane.reconnect；None = 不在重连流程）。
@@ -486,43 +489,6 @@ struct TunnelDraft {
     target_port: Entity<CommandTextField>,
 }
 
-/// 登录流步骤动作类型（编辑草稿态；保存时按 kind 映射 FlowStep 变体）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum FlowStepKind {
-    Totp,
-    Text,
-    Command,
-}
-
-impl FlowStepKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Totp => "动态码",
-            Self::Text => "文本",
-            Self::Command => "命令",
-        }
-    }
-
-    /// 动作内容输入框的标签与占位提示（随 kind 切换）。
-    fn content_hint(self) -> (&'static str, &'static str) {
-        match self {
-            Self::Totp => ("动态码账户", "密钥环动态码账户名"),
-            Self::Text => ("文本", "菜单序号等非敏感文本"),
-            Self::Command => ("命令名", "快捷命令面板条目名"),
-        }
-    }
-}
-
-/// 服务器编辑弹窗的单条登录流步骤草稿：kind 三选 + expect + 动作内容输入框
-/// （内容框随 kind 复用，标签/占位随切换；保存时读回 `FlowStep`，合法性由
-/// `LoginFlow::validate` 把关，报错留在弹窗内）。
-#[derive(Clone)]
-struct FlowDraft {
-    kind: FlowStepKind,
-    expect: Entity<CommandTextField>,
-    content: Entity<CommandTextField>,
-}
-
 /// 触发器规则编辑弹窗（设置页「终端」节触发器卡的新增入口）。
 /// action 是弹窗内的动作二选状态（通知/高亮），随保存落盘。
 #[derive(Clone, Debug)]
@@ -533,6 +499,53 @@ enum TriggerDialog {
     },
 }
 
+/// 工作流步骤动作类型（编辑草稿态；保存时按 kind 映射 WorkflowStep 变体）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkflowDraftKind {
+    Connect,
+    Totp,
+    Text,
+    Command,
+}
+
+impl WorkflowDraftKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connect => "连接",
+            Self::Totp => "动态码",
+            Self::Text => "文本",
+            Self::Command => "命令",
+        }
+    }
+
+    /// 引用输入框的标签与占位提示（随 kind 切换）。
+    fn content_hint(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Connect => ("服务器", "服务器面板条目名"),
+            Self::Totp => ("动态码账户", "动态码面板条目名"),
+            Self::Text => ("文本", "菜单序号等非敏感文本"),
+            Self::Command => ("命令名", "命令面板条目名"),
+        }
+    }
+
+    const ALL: [Self; 4] = [Self::Connect, Self::Totp, Self::Text, Self::Command];
+}
+
+/// 工作流编辑弹窗的单步草稿：kind 四选 + expect + 引用输入框
+/// （connect 步只填服务器名，expect 输入框隐藏）。
+#[derive(Clone)]
+struct WorkflowDraft {
+    kind: WorkflowDraftKind,
+    expect: Entity<CommandTextField>,
+    content: Entity<CommandTextField>,
+}
+
+/// 工作流编辑弹窗（右面板「工作流」页签的新建/编辑入口）。
+#[derive(Clone, Debug)]
+enum WorkflowDialog {
+    Edit { original: Option<String> },
+}
+
 /// 右面板分区。三个区各成一页，避免面板无限拉长。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum RightPanelTab {
@@ -540,6 +553,7 @@ enum RightPanelTab {
     Commands,
     Totp,
     Servers,
+    Workflows,
 }
 
 impl RightPanelTab {
@@ -548,10 +562,11 @@ impl RightPanelTab {
             Self::Commands => "命令",
             Self::Totp => "动态码",
             Self::Servers => "服务器",
+            Self::Workflows => "工作流",
         }
     }
 
-    const ALL: [Self; 3] = [Self::Commands, Self::Totp, Self::Servers];
+    const ALL: [Self; 4] = [Self::Commands, Self::Totp, Self::Servers, Self::Workflows];
 }
 
 /// 服务器侧面板对话框。Connect 用于缺凭据时补输（可选择记住入密钥环）；
@@ -602,11 +617,19 @@ struct SshRequest {
     jump: Vec<ServerEntry>,
     /// 去向：决定后台函数（connect vs connect_sftp）与结果管道。
     dest: ConnectDest,
+    /// 发起连接的工作流（None = 手动连接）：认证层应答器与会话层 expect
+    /// 引擎都从它构造；连接成功后随窗格入 SshLink（重连重新装配）。
+    workflow: Option<WorkflowEntry>,
     active: Arc<AtomicBool>,
     running: bool,
 }
 
-type PendingSshResult = (u64, ServerEntry, anyhow::Result<ConnectionOutcome>);
+type PendingSshResult = (
+    u64,
+    ServerEntry,
+    Option<WorkflowEntry>,
+    anyhow::Result<ConnectionOutcome>,
+);
 /// SFTP 连接结果与 shell 分管道：产物类型不同（SftpHandle vs
 /// TerminalSession），迟到取消各自处置（close vs kill）。
 type PendingSftpResult = (u64, ServerEntry, anyhow::Result<SftpOutcome>);
@@ -1292,6 +1315,15 @@ pub struct WorkspaceView {
     pending_shortcuts: Vec<(PaneId, WorkspaceShortcut)>,
     command_values: BTreeMap<String, String>,
     command_dialog: Option<CommandDialog>,
+    /// 工作流编辑弹窗（右面板「工作流」页签）：弹窗随开随建，保存读回
+    /// WorkflowEntry 落盘。
+    workflow_dialog: Option<WorkflowDialog>,
+    workflow_fields: Vec<(String, Entity<CommandTextField>)>,
+    /// 工作流步骤草稿（编辑弹窗内随开随建；保存时读回 steps）。
+    workflow_step_drafts: Vec<WorkflowDraft>,
+    /// 工作流单步超时输入框（保存 parse 失败按 0 交 validate 报错）。
+    workflow_timeout: Option<Entity<CommandTextField>>,
+    workflow_error: Option<String>,
     command_target: Option<PaneId>,
     command_fields: Vec<(String, Entity<CommandTextField>)>,
     command_field_subscriptions: Vec<gpui::Subscription>,
@@ -1323,13 +1355,9 @@ pub struct WorkspaceView {
     /// 编辑弹窗隧道区草稿（Edit 弹窗随开随建，保存时读回 meta.tunnels；
     /// None 语义不需要——空表 = 无隧道行）。
     server_tunnel_drafts: Vec<TunnelDraft>,
-    /// 编辑弹窗登录流区草稿（同隧道随开随建，保存时读回 meta.flow）；
-    /// 空表 = 未启用登录流。
-    server_flow_drafts: Vec<FlowDraft>,
-    /// 登录流单步超时秒数输入框（随弹窗创建；保存时 parse，失败按 0 交
-    /// validate 报错，与隧道端口读回同口径）。
-    server_flow_timeout: Option<Entity<CommandTextField>>,
     server_delete_confirm: Option<String>,
+    /// 工作流行删除确认（键 = 工作流名；点一次变确认态再点真删）。
+    workflow_delete_confirm: Option<String>,
     server_error: Option<String>,
     /// 分组折叠态（键 = 组名，None = 未分组桶；会话级，不持久化）。
     server_groups_collapsed: BTreeSet<Option<String>>,
@@ -1504,6 +1532,11 @@ impl WorkspaceView {
             command_dialog: None,
             command_target: None,
             command_fields: Vec::new(),
+            workflow_dialog: None,
+            workflow_fields: Vec::new(),
+            workflow_step_drafts: Vec::new(),
+            workflow_timeout: None,
+            workflow_error: None,
             command_field_subscriptions: Vec::new(),
             command_delete_confirm: None,
             command_error: None,
@@ -1523,14 +1556,13 @@ impl WorkspaceView {
             right_panel_tab: RightPanelTab::Commands,
             server_dialog: None,
             server_tunnel_drafts: Vec::new(),
-            server_flow_drafts: Vec::new(),
-            server_flow_timeout: None,
             server_fields: Vec::new(),
             server_field_subscriptions: Vec::new(),
             server_advanced_open: false,
             server_save: None,
             server_meta_draft: ServerEntry::default(),
             server_delete_confirm: None,
+            workflow_delete_confirm: None,
             server_error: None,
             server_groups_collapsed: BTreeSet::new(),
             tab_rename_field: None,
@@ -4749,6 +4781,238 @@ impl WorkspaceView {
         self.focus_pane(pane_id, window, cx);
     }
 
+    // ---------- 工作流（右面板第 4 页签：CRUD + 运行） ----------
+
+    fn workflow_draft_of(
+        step: &laterterm_config::WorkflowStep,
+        cx: &mut Context<WorkspaceView>,
+    ) -> WorkflowDraft {
+        let (kind, content_value) = match step {
+            laterterm_config::WorkflowStep::Connect { server } => {
+                (WorkflowDraftKind::Connect, server.clone())
+            }
+            laterterm_config::WorkflowStep::Totp { account, .. } => {
+                (WorkflowDraftKind::Totp, account.clone())
+            }
+            laterterm_config::WorkflowStep::Text { text, .. } => {
+                (WorkflowDraftKind::Text, text.clone())
+            }
+            laterterm_config::WorkflowStep::Command { name, .. } => {
+                (WorkflowDraftKind::Command, name.clone())
+            }
+        };
+        WorkflowDraft {
+            kind,
+            expect: cx.new(|cx| {
+                CommandTextField::new(
+                    step.expect().unwrap_or_default().to_owned(),
+                    "expect 正则（留空等提示符）",
+                    cx,
+                )
+            }),
+            content: cx.new(|cx| CommandTextField::new(content_value, kind.content_hint().1, cx)),
+        }
+    }
+
+    fn empty_workflow_draft(
+        kind: WorkflowDraftKind,
+        cx: &mut Context<WorkspaceView>,
+    ) -> WorkflowDraft {
+        WorkflowDraft {
+            kind,
+            expect: cx
+                .new(|cx| CommandTextField::new(String::new(), "expect 正则（留空等提示符）", cx)),
+            content: cx.new(|cx| CommandTextField::new(String::new(), kind.content_hint().1, cx)),
+        }
+    }
+
+    /// 新建/编辑工作流（弹窗随开随建：字段 + 步骤草稿 + 超时）。
+    fn edit_workflow(
+        &mut self,
+        entry: Option<&laterterm_config::WorkflowEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.workflow_fields.clear();
+        let draft = entry.cloned().unwrap_or_default();
+        for (label, value, placeholder) in [
+            ("名称", draft.name.clone(), "如 跳板全流程"),
+            ("备注", draft.note.clone(), "备注（可选）"),
+        ] {
+            let field = cx.new(|cx| CommandTextField::new(value, placeholder, cx));
+            self.workflow_fields.push((label.into(), field));
+        }
+        self.workflow_step_drafts = draft
+            .steps
+            .iter()
+            .map(|step| Self::workflow_draft_of(step, cx))
+            .collect();
+        if self.workflow_step_drafts.is_empty() {
+            // 新建起步：首步 connect（v1 运行口径）+ 一步命令占位
+            self.workflow_step_drafts
+                .push(Self::empty_workflow_draft(WorkflowDraftKind::Connect, cx));
+            self.workflow_step_drafts
+                .push(Self::empty_workflow_draft(WorkflowDraftKind::Command, cx));
+        }
+        self.workflow_timeout =
+            Some(cx.new(|cx| CommandTextField::new(draft.step_timeout_secs.to_string(), "秒", cx)));
+        self.workflow_dialog = Some(WorkflowDialog::Edit {
+            original: entry.map(|item| item.name.clone()),
+        });
+        self.workflow_error = None;
+        focus_first_field(&self.workflow_fields, window, cx);
+        cx.notify();
+    }
+
+    /// 保存工作流：读回草稿 → upsert（validate 报错留弹窗）→ 落盘。
+    fn save_edit_workflow(&mut self, cx: &mut Context<Self>) {
+        let values = self
+            .workflow_fields
+            .iter()
+            .map(|(name, field)| (name.as_str(), field.read(cx).value().trim().to_string()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let original = match &self.workflow_dialog {
+            Some(WorkflowDialog::Edit { original }) => original.clone(),
+            _ => None,
+        };
+        let steps = self
+            .workflow_step_drafts
+            .iter()
+            .map(|draft| {
+                workflow_step_from_values(
+                    draft.kind,
+                    draft.expect.read(cx).value(),
+                    draft.content.read(cx).value(),
+                )
+            })
+            .collect();
+        let meta = laterterm_config::WorkflowEntry {
+            name: values.get("名称").cloned().unwrap_or_default(),
+            note: values.get("备注").cloned().unwrap_or_default(),
+            shortcut: None,
+            step_timeout_secs: self
+                .workflow_timeout
+                .as_ref()
+                .map(|field| field.read(cx).value().trim().parse().unwrap_or(0))
+                .unwrap_or(laterterm_config::workflows::DEFAULT_STEP_TIMEOUT_SECS),
+            steps,
+        };
+        if let Err(error) = meta.validate() {
+            self.workflow_error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        // 同名冲突（改名撞上既有条目）
+        if original.as_deref() != Some(meta.name.as_str())
+            && self
+                .settings
+                .workflows
+                .iter()
+                .any(|item| item.name == meta.name)
+        {
+            self.workflow_error = Some(format!("已存在同名工作流: {}", meta.name));
+            cx.notify();
+            return;
+        }
+        if let Err(error) = self.settings.upsert_workflow(meta) {
+            self.workflow_error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
+        if self.persist_settings().is_err() {
+            self.workflow_error = Some("保存设置失败".into());
+            cx.notify();
+            return;
+        }
+        self.workflow_dialog = None;
+        self.workflow_fields.clear();
+        self.workflow_step_drafts.clear();
+        self.workflow_timeout = None;
+        self.workflow_error = None;
+        cx.notify();
+    }
+
+    fn close_workflow_dialog(&mut self, cx: &mut Context<Self>) {
+        self.workflow_dialog = None;
+        self.workflow_fields.clear();
+        self.workflow_step_drafts.clear();
+        self.workflow_timeout = None;
+        self.workflow_error = None;
+        cx.notify();
+    }
+
+    fn add_workflow_step(&mut self, cx: &mut Context<Self>) {
+        if self.workflow_step_drafts.len() >= laterterm_config::workflows::MAX_STEPS_PER_WORKFLOW {
+            self.workflow_error = Some(format!(
+                "工作流步骤数超过上限（最多 {} 步）",
+                laterterm_config::workflows::MAX_STEPS_PER_WORKFLOW
+            ));
+            cx.notify();
+            return;
+        }
+        // 新步骤默认命令（首步 connect 由新建起步保证，编辑旧流时用户自调）
+        self.workflow_step_drafts
+            .push(Self::empty_workflow_draft(WorkflowDraftKind::Command, cx));
+        cx.notify();
+    }
+
+    fn remove_workflow_step(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.workflow_step_drafts.remove(index);
+        cx.notify();
+    }
+
+    fn set_workflow_kind(&mut self, index: usize, kind: WorkflowDraftKind, cx: &mut Context<Self>) {
+        if let Some(draft) = self.workflow_step_drafts.get_mut(index) {
+            draft.kind = kind;
+            cx.notify();
+        }
+    }
+
+    /// JumpServer 预设一键起步：连接服务器（留空待填）→ 等验证码提示发
+    /// 动态码 → 等提示符执行命令；内容留空由用户补填（validate 拦截）。
+    fn apply_jumpserver_workflow_preset(&mut self, cx: &mut Context<Self>) {
+        let connect = Self::empty_workflow_draft(WorkflowDraftKind::Connect, cx);
+        let totp = Self::empty_workflow_draft(WorkflowDraftKind::Totp, cx);
+        totp.expect
+            .update(cx, |field, cx| field.set_value("Opt token:", cx));
+        let command = Self::empty_workflow_draft(WorkflowDraftKind::Command, cx);
+        self.workflow_step_drafts = vec![connect, totp, command];
+        self.workflow_error =
+            Some("已填入 JumpServer 预设：请补服务器名、动态码账户与命令名后保存".into());
+        cx.notify();
+    }
+
+    /// 运行工作流：connect 步决定目标服务器，走既有连接流程（认证层应答
+    /// 与会话层引擎随请求带走，见 begin_workflow_connect / finish_ssh_connect）。
+    fn run_workflow(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(workflow) = self
+            .settings
+            .workflows
+            .iter()
+            .find(|item| item.name == name)
+            .cloned()
+        else {
+            return;
+        };
+        let server = workflow
+            .connect_server()
+            .map(str::to_owned)
+            .unwrap_or_default();
+        if server.is_empty() {
+            self.show_server_error_toast(format!("工作流「{name}」没有连接步骤，无法运行"), cx);
+            return;
+        }
+        // 服务器存在性运行期校验（跨面板引用，编辑期不查存在性）
+        if !self.settings.servers.iter().any(|item| item.name == server) {
+            self.show_server_error_toast(
+                format!("工作流「{name}」引用的服务器「{server}」不存在"),
+                cx,
+            );
+            return;
+        }
+        self.begin_workflow_connect(&server, ConnectDest::Shell, Some(workflow), cx);
+    }
+
     fn edit_command(
         &mut self,
         command: Option<CommandTemplate>,
@@ -5489,29 +5753,6 @@ impl WorkspaceView {
                 }),
             })
             .collect();
-        // 登录流编辑区草稿随弹窗重建（同隧道口径）：编辑条目按已存 flow
-        // 回填；新建弹窗为空列表，或经「JumpServer 预设」一键起步
-        let flow = self.server_meta_draft.flow.clone();
-        self.server_flow_drafts = flow
-            .as_ref()
-            .map(|flow| {
-                flow.steps
-                    .iter()
-                    .map(|step| flow_draft_of(step, cx))
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.server_flow_timeout = Some(cx.new(|cx| {
-            CommandTextField::new(
-                flow.as_ref()
-                    .map(|flow| flow.step_timeout_secs.to_string())
-                    .unwrap_or_else(|| {
-                        laterterm_config::servers::DEFAULT_FLOW_STEP_TIMEOUT_SECS.to_string()
-                    }),
-                "秒",
-                cx,
-            )
-        }));
         let meta = self.server_meta_draft.clone();
         // 编辑时凭据框留空表示不改动；凭据本体只进密钥环
         let secret_placeholder = if entry.is_some() {
@@ -5637,91 +5878,6 @@ impl WorkspaceView {
             draft.enabled = !draft.enabled;
             cx.notify();
         }
-    }
-
-    /// 登录流步骤读回（保存路径）：空步骤表 → None（未启用）。超时文本
-    /// parse 失败按 0 落值——由 LoginFlow::validate 报错留弹窗（同隧道端口
-    /// 读回口径）。字段映射见 [`flow_step_from_values`]。
-    fn read_server_flow(&self, cx: &Context<Self>) -> Option<laterterm_config::LoginFlow> {
-        if self.server_flow_drafts.is_empty() {
-            return None;
-        }
-        let steps = self
-            .server_flow_drafts
-            .iter()
-            .map(|draft| {
-                flow_step_from_values(
-                    draft.kind,
-                    draft.expect.read(cx).value(),
-                    draft.content.read(cx).value(),
-                )
-            })
-            .collect();
-        let step_timeout_secs = self
-            .server_flow_timeout
-            .as_ref()
-            .map(|field| field.read(cx).value().trim().parse().unwrap_or(0))
-            .unwrap_or(laterterm_config::servers::DEFAULT_FLOW_STEP_TIMEOUT_SECS);
-        Some(laterterm_config::LoginFlow {
-            steps,
-            step_timeout_secs,
-        })
-    }
-
-    /// 登录流区：新增一步（默认等提示符发命令）；条数封顶同隧道口径。
-    fn add_server_flow_step(&mut self, cx: &mut Context<Self>) {
-        if self.server_flow_drafts.len() >= laterterm_config::servers::MAX_STEPS_PER_FLOW {
-            self.server_error = Some(format!(
-                "登录流步骤数超过上限（最多 {} 步）",
-                laterterm_config::servers::MAX_STEPS_PER_FLOW
-            ));
-            cx.notify();
-            return;
-        }
-        self.server_flow_drafts.push(empty_flow_draft(cx));
-        cx.notify();
-    }
-
-    fn remove_server_flow_step(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.server_flow_drafts.remove(index);
-        // 步骤删空 = 流未启用：超时框收起
-        if self.server_flow_drafts.is_empty() {
-            self.server_flow_timeout = None;
-        }
-        cx.notify();
-    }
-
-    fn set_server_flow_kind(&mut self, index: usize, kind: FlowStepKind, cx: &mut Context<Self>) {
-        if let Some(draft) = self.server_flow_drafts.get_mut(index) {
-            draft.kind = kind;
-            cx.notify();
-        }
-    }
-
-    /// JumpServer 预设一键起步：等验证码提示发动态码 + 到提示符跑命令，
-    /// 动作内容留空由用户补填（validate 在保存时拦截空内容并指明步号）。
-    fn apply_jumpserver_flow_preset(&mut self, cx: &mut Context<Self>) {
-        let mut steps = Vec::new();
-        let mut totp = empty_flow_draft(cx);
-        totp.kind = FlowStepKind::Totp;
-        totp.expect
-            .update(cx, |field, cx| field.set_value("Opt token:", cx));
-        steps.push(totp);
-        steps.push(empty_flow_draft(cx));
-        if self.server_flow_timeout.is_none() {
-            self.server_flow_timeout = Some(cx.new(|cx| {
-                CommandTextField::new(
-                    laterterm_config::servers::DEFAULT_FLOW_STEP_TIMEOUT_SECS.to_string(),
-                    "秒",
-                    cx,
-                )
-            }));
-        }
-        self.server_flow_drafts = steps;
-        self.server_error = Some(
-            "已填入 JumpServer 预设：请补「动态码账户」（密钥环里的账户名）与命令名后保存".into(),
-        );
-        cx.notify();
     }
 
     /// SSH 命令输入变为合法目标后立即回填；输入过程中不合法属于中间态，
@@ -5857,9 +6013,6 @@ impl WorkspaceView {
                     .unwrap_or(0),
             })
             .collect();
-        // 登录流编辑区读回（空表 = 未启用；合法性由 LoginFlow::validate
-        // 统一报错留弹窗，报文带步号定位）
-        meta.flow = self.read_server_flow(cx);
         let secret = values.get("凭据").cloned().unwrap_or_default();
         if let Some(conflict) = self.check_shortcut_conflict(
             meta.shortcut.as_deref(),
@@ -6655,6 +6808,18 @@ impl WorkspaceView {
 
     /// 连接发起的公共前置：请求槽互斥 + 跳板链快照 + Connecting 弹窗。
     fn begin_ssh_connect(&mut self, name: &str, dest: ConnectDest, cx: &mut Context<Self>) {
+        self.begin_workflow_connect(name, dest, None, cx);
+    }
+
+    /// 工作流发起的连接（R2）：`workflow` 的 connect 步骤决定目标服务器，
+    /// 认证层应答器与会话层引擎随请求带走。`workflow` 为 None 即普通连接。
+    fn begin_workflow_connect(
+        &mut self,
+        name: &str,
+        dest: ConnectDest,
+        workflow: Option<WorkflowEntry>,
+        cx: &mut Context<Self>,
+    ) {
         if self.ssh_request.is_some() {
             return;
         }
@@ -6691,6 +6856,7 @@ impl WorkspaceView {
             entry: entry.clone(),
             jump: jump_entries,
             dest,
+            workflow,
             active: Arc::new(AtomicBool::new(true)),
             running: false,
         });
@@ -6746,6 +6912,8 @@ impl WorkspaceView {
         self.server_error = None;
         let store = self.secret_store.clone();
         let jump_entries = request.jump.clone();
+        // 工作流先摘走（结果管道要随行带出；下方 answerer 构造还要借 self）
+        let workflow = request.workflow.clone();
         match request.dest {
             // Shell 新标签与 SplitPane 分屏同一管道：产物都是终端会话，仅
             // 初始 PTY 尺寸与落位不同（分屏的尺寸在发起时已预估进 dest）。
@@ -6758,6 +6926,18 @@ impl WorkspaceView {
                     // 新标签拿不到窗格落位（历史占位值）：首帧 resize 兜底
                     _ => (110, 30),
                 };
+                // 工作流认证层：totp 步骤引用的账户 → KI 验证码自动应答
+                let otp_answerer = workflow
+                    .as_ref()
+                    .and_then(|workflow| {
+                        workflow.steps.iter().find_map(|step| match step {
+                            WorkflowStep::Totp { account, .. } => Some(account.clone()),
+                            _ => None,
+                        })
+                    })
+                    .and_then(|account| {
+                        server_connection::otp_answerer_for(&account, &self.secret_store)
+                    });
                 let (tx, rx) = flume::bounded(1);
                 std::thread::spawn(move || {
                     let result = server_connection::connect(
@@ -6768,9 +6948,10 @@ impl WorkspaceView {
                         store,
                         active,
                         initial_size,
+                        otp_answerer,
                     );
-                    if let Err(error) = tx.send((request_id, entry, result))
-                        && let Ok(ConnectionOutcome::Connected { session, .. }) = error.0.2
+                    if let Err(error) = tx.send((request_id, entry, workflow, result))
+                        && let Ok(ConnectionOutcome::Connected { session, .. }) = error.0.3
                     {
                         session.kill();
                     }
@@ -6786,8 +6967,9 @@ impl WorkspaceView {
                                 cx.notify();
                             })
                             .is_err()
-                            && let Some((_, _, Ok(ConnectionOutcome::Connected { session, .. }))) =
-                                result
+                            && let Some(
+                                (_, _, _, Ok(ConnectionOutcome::Connected { session, .. })),
+                            ) = result
                         {
                             session.kill();
                         }
@@ -6841,6 +7023,7 @@ impl WorkspaceView {
         &mut self,
         request_id: u64,
         entry: ServerEntry,
+        workflow: Option<WorkflowEntry>,
         result: anyhow::Result<ConnectionOutcome>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -6894,10 +7077,13 @@ impl WorkspaceView {
                     self.show_server_notice_toast(warning, cx);
                 }
                 let server_name = entry.name.clone();
-                // 登录流（会话层）：条目配置了 flow 时包装饰器，事件经通道
-                // 回主线程（attach 前包装——take_streams 只能一次，读泵在
-                // create_terminal_view 启动）
-                let (session, mut flow_state) = wrap_flow_session(session, &entry);
+                // 工作流会话层（R2）：请求带了工作流时包装饰器，Connect 之后的
+                // 步骤在新会话字节流上自动推进（attach 前包装——take_streams
+                // 只能一次，读泵在 create_terminal_view 启动）
+                let (session, mut flow_state) = match &workflow {
+                    Some(workflow) => wrap_flow_session(session, workflow),
+                    None => (session, None),
+                };
                 // 分屏去向优先：锚点窗格仍在 → 在其所属标签内落位，不建新
                 // 标签；锚点已关/落位失败回退下方新标签路径（连接白发起不了
                 // ——会话已经建好，总得有地方放）。
@@ -6917,6 +7103,7 @@ impl WorkspaceView {
                         pane.ssh_link = Some(SshLink {
                             entry: entry.clone(),
                             jump: request_jump.clone(),
+                            workflow: workflow.clone(),
                         });
                         pane.tunnel_session = tunnel_session.clone();
                         pane.flow = flow_state.take();
@@ -6938,6 +7125,7 @@ impl WorkspaceView {
                         pane.ssh_link = Some(SshLink {
                             entry: entry.clone(),
                             jump: request_jump,
+                            workflow: workflow.clone(),
                         });
                         pane.tunnel_session = tunnel_session.clone();
                         pane.flow = flow_state;
@@ -7139,8 +7327,8 @@ impl WorkspaceView {
 
     /// 需要 window 的结果在 render 期消费。
     fn process_ssh_results(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        for (request_id, entry, result) in std::mem::take(&mut self.pending_ssh_results) {
-            self.finish_ssh_connect(request_id, entry, result, window, cx);
+        for (request_id, entry, workflow, result) in std::mem::take(&mut self.pending_ssh_results) {
+            self.finish_ssh_connect(request_id, entry, workflow, result, window, cx);
         }
     }
 
@@ -8013,7 +8201,7 @@ impl WorkspaceView {
         if let Some(save) = self.server_save.take() {
             save.store(false, Ordering::Release);
         }
-        for (_, _, result) in self.pending_ssh_results.drain(..) {
+        for (_, _, _, result) in self.pending_ssh_results.drain(..) {
             if let Ok(ConnectionOutcome::Connected { session, .. }) = result {
                 session.kill();
             }
@@ -8789,6 +8977,20 @@ impl WorkspaceView {
                     })
                     .unwrap_or((110, 30));
                 let initial_size = (initial_size.0.max(1) as u16, initial_size.1.max(1) as u16);
+                // 重连 = 重新登录：链接快照带工作流时重建认证层应答器
+                let otp_answerer = state
+                    .link
+                    .workflow
+                    .as_ref()
+                    .and_then(|workflow| {
+                        workflow.steps.iter().find_map(|step| match step {
+                            WorkflowStep::Totp { account, .. } => Some(account.clone()),
+                            _ => None,
+                        })
+                    })
+                    .and_then(|account| {
+                        server_connection::otp_answerer_for(&account, &store)
+                    });
                 std::thread::spawn(move || {
                     let result = server_connection::connect(
                         &entry,
@@ -8798,6 +9000,7 @@ impl WorkspaceView {
                         thread_store,
                         thread_active,
                         initial_size,
+                        otp_answerer,
                     );
                     let _ = tx.send(result);
                 });
@@ -8935,9 +9138,12 @@ impl WorkspaceView {
             &self.settings.appearance,
             &self.audit_hub,
         );
-        // 重连 = 重新登录：条目仍配着登录流就重新装配（旧 runner 随旧会话
-        // 失活，其超时事件会自行清场，无需干预）
-        let (session, flow_state) = wrap_flow_session(session, &state.link.entry);
+        // 重连 = 重新登录：发起连接的工作流仍在链接快照里就重新装配
+        // （旧 runner 随旧会话失活，其超时事件会自行清场，无需干预）
+        let (session, flow_state) = match &state.link.workflow {
+            Some(workflow) => wrap_flow_session(session, workflow),
+            None => (session, None),
+        };
         if was_logging {
             audit.set_logging(true);
         }
@@ -10757,11 +10963,13 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
         RightPanelTab::Commands => workspace.settings.commands.len(),
         RightPanelTab::Totp => workspace.settings.totp.len(),
         RightPanelTab::Servers => workspace.settings.servers.len(),
+        RightPanelTab::Workflows => workspace.settings.workflows.len(),
     };
     let scroll_id = match active_tab {
         RightPanelTab::Commands => "sidebar-commands",
         RightPanelTab::Totp => "sidebar-totp",
         RightPanelTab::Servers => "sidebar-servers",
+        RightPanelTab::Workflows => "sidebar-workflows",
     };
 
     let panel = div().w_full().text_color(ui.text);
@@ -10930,6 +11138,7 @@ fn quick_panel(workspace: &mut WorkspaceView, cx: &mut Context<WorkspaceView>) -
             })),
         RightPanelTab::Totp => render_totp_section(workspace, panel, &ui, cx),
         RightPanelTab::Servers => render_server_section(workspace, panel, &ui, cx),
+        RightPanelTab::Workflows => render_workflow_section(workspace, panel, &ui, cx),
     };
 
     div()
@@ -11231,6 +11440,9 @@ fn render_active_dialog(
     }
     if let Some(ServerDialog::Edit { original }) = workspace.server_dialog.clone() {
         return Some(server_edit_modal(workspace, ui, original, cx));
+    }
+    if let Some(WorkflowDialog::Edit { original }) = workspace.workflow_dialog.clone() {
+        return Some(workflow_edit_modal(workspace, ui, original, cx));
     }
     if let Some(ServerDialog::GroupRename { original }) = workspace.server_dialog.clone() {
         return Some(server_group_rename_modal(workspace, ui, original, cx));
@@ -11933,7 +12145,6 @@ fn server_edit_modal(
         })
         .when_some(workspace.shortcut_editor.as_ref(), |body, editor| body.child(shortcut_editor_row(ui, editor.recorder.clone())))
         .child(server_tunnel_editor(workspace, ui, cx))
-        .child(server_flow_editor(workspace, ui, cx))
         .child(
             div()
                 .pt_2()
@@ -12169,196 +12380,6 @@ fn server_tunnel_draft_row(
                 .gap_2()
                 .child(field("目标主机", draft.target_host))
                 .child(field("目标端口", draft.target_port)),
-        )
-}
-
-/// 草稿值 → FlowStep（保存读回的纯映射）：expect/content trim，expect 空串
-/// 降级 None（等提示符锚点）；合法性由 LoginFlow::validate 把关。
-pub(crate) fn flow_step_from_values(
-    kind: FlowStepKind,
-    expect: &str,
-    content: &str,
-) -> laterterm_config::FlowStep {
-    let expect = expect.trim();
-    let expect = (!expect.is_empty()).then(|| expect.to_owned());
-    let content = content.trim().to_owned();
-    match kind {
-        FlowStepKind::Totp => laterterm_config::FlowStep::Totp {
-            expect,
-            account: content,
-        },
-        FlowStepKind::Text => laterterm_config::FlowStep::Text {
-            expect,
-            text: content,
-        },
-        FlowStepKind::Command => laterterm_config::FlowStep::Command {
-            expect,
-            name: content,
-        },
-    }
-}
-
-/// 已存 FlowStep → 编辑草稿（内容值按变体回填，占位随 kind）。
-fn flow_draft_of(step: &laterterm_config::FlowStep, cx: &mut Context<WorkspaceView>) -> FlowDraft {
-    let (kind, content_value) = match step {
-        laterterm_config::FlowStep::Totp { account, .. } => (FlowStepKind::Totp, account.clone()),
-        laterterm_config::FlowStep::Text { text, .. } => (FlowStepKind::Text, text.clone()),
-        laterterm_config::FlowStep::Command { name, .. } => (FlowStepKind::Command, name.clone()),
-    };
-    FlowDraft {
-        kind,
-        expect: cx.new(|cx| {
-            CommandTextField::new(
-                step.expect().unwrap_or_default().to_owned(),
-                "expect 正则（留空等提示符）",
-                cx,
-            )
-        }),
-        content: cx.new(|cx| CommandTextField::new(content_value, kind.content_hint().1, cx)),
-    }
-}
-
-/// 空白步骤草稿（「添加」与 JumpServer 预设共用起步形态：等提示符发命令）。
-fn empty_flow_draft(cx: &mut Context<WorkspaceView>) -> FlowDraft {
-    FlowDraft {
-        kind: FlowStepKind::Command,
-        expect: cx
-            .new(|cx| CommandTextField::new(String::new(), "expect 正则（留空等提示符）", cx)),
-        content: cx.new(|cx| {
-            CommandTextField::new(String::new(), FlowStepKind::Command.content_hint().1, cx)
-        }),
-    }
-}
-
-/// 服务器编辑弹窗的登录流编辑区：步骤行 + 单步超时 + JumpServer 预设。
-/// expect 引擎语义（剥 ANSI 匹配/大小写不敏感/超时回人工）在说明文字交代；
-/// 引用名口径：动态码走密钥环账户、命令走快捷命令名——真值不进 TOML。
-fn server_flow_editor(
-    workspace: &WorkspaceView,
-    ui: &UiPalette,
-    cx: &mut Context<WorkspaceView>,
-) -> gpui::Div {
-    let drafts = workspace.server_flow_drafts.clone();
-    let has_steps = !drafts.is_empty();
-    let mut column = div()
-        .pt_3()
-        .flex()
-        .flex_col()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().text_color(ui.text_secondary).child("登录流（连接后自动执行）"))
-                .child(div().flex_1())
-                .child(setting_button(
-                    ui,
-                    "JumpServer 预设",
-                    false,
-                    cx.listener(|this, _, _, cx| this.apply_jumpserver_flow_preset(cx)),
-                ))
-                .child(setting_button(
-                    ui,
-                    "+ 添加步骤",
-                    false,
-                    cx.listener(|this, _, _, cx| this.add_server_flow_step(cx)),
-                )),
-        )
-        .child(
-            div()
-                .text_size(px(11.0))
-                .text_color(ui.text_secondary)
-                .child("连接建立后按序执行：expect 命中（对屏幕可见文本匹配，忽略大小写与颜色码）→ 发送动作。expect 留空 = 等下一个提示符。单步超时后该步转人工，其余步骤继续。"),
-        )
-        .children(
-            drafts
-                .into_iter()
-                .enumerate()
-                .map(|(index, draft)| server_flow_draft_row(index, draft, ui, cx)),
-        );
-    if has_steps && let Some(timeout) = workspace.server_flow_timeout.clone() {
-        column = column.child(
-            div()
-                .mt_2()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(ui.text_secondary)
-                        .child("单步超时（秒）"),
-                )
-                .child(timeout),
-        );
-    }
-    column
-}
-
-/// 单条登录流步骤草稿行：kind 三选 + 删除，expect/动作内容输入框。
-fn server_flow_draft_row(
-    index: usize,
-    draft: FlowDraft,
-    ui: &UiPalette,
-    cx: &mut Context<WorkspaceView>,
-) -> gpui::Div {
-    let kind = draft.kind;
-    let (content_label, _) = kind.content_hint();
-    div()
-        .mt_2()
-        .p_2()
-        .rounded_sm()
-        .border_1()
-        .border_color(ui.border_strong)
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .children(
-                    [
-                        FlowStepKind::Totp,
-                        FlowStepKind::Text,
-                        FlowStepKind::Command,
-                    ]
-                    .into_iter()
-                    .map(|candidate| {
-                        setting_button_keyed(
-                            ui,
-                            format!("flow-{index}-{}", candidate.label()),
-                            candidate.label(),
-                            kind == candidate,
-                            cx.listener(move |this, _, _, cx| {
-                                this.set_server_flow_kind(index, candidate, cx)
-                            }),
-                        )
-                    }),
-                )
-                .child(div().flex_1())
-                .child(setting_button_keyed(
-                    ui,
-                    format!("flow-{index}-delete"),
-                    "删除",
-                    false,
-                    cx.listener(move |this, _, _, cx| this.remove_server_flow_step(index, cx)),
-                )),
-        )
-        .child(draft.expect)
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .text_size(px(10.0))
-                        .text_color(ui.text_secondary)
-                        .child(content_label),
-                )
-                .child(draft.content),
         )
 }
 
@@ -12734,6 +12755,359 @@ fn render_totp_section(
 /// 有分组时按组折叠展示（组名升序、未分组殿后）；纯未分组时与旧版平铺外观一致。
 /// 条目行借用渲染（不整表克隆 servers）；分组每帧从借用数据即时重建，
 /// 保证外部直改 settings（含测试注入）也零陈旧。
+/// 工作流步骤草稿值 → WorkflowStep（保存读回的纯映射）。
+pub(crate) fn workflow_step_from_values(
+    kind: WorkflowDraftKind,
+    expect: &str,
+    content: &str,
+) -> laterterm_config::WorkflowStep {
+    let expect = expect.trim();
+    let expect = (!expect.is_empty()).then(|| expect.to_owned());
+    let content = content.trim().to_owned();
+    match kind {
+        WorkflowDraftKind::Connect => laterterm_config::WorkflowStep::Connect { server: content },
+        WorkflowDraftKind::Totp => laterterm_config::WorkflowStep::Totp {
+            expect,
+            account: content,
+        },
+        WorkflowDraftKind::Text => laterterm_config::WorkflowStep::Text {
+            expect,
+            text: content,
+        },
+        WorkflowDraftKind::Command => laterterm_config::WorkflowStep::Command {
+            expect,
+            name: content,
+        },
+    }
+}
+
+/// 右面板「工作流」页签：新建 + 条目列表（名称/步骤摘要/运行/编辑/删除）。
+fn render_workflow_section(
+    workspace: &mut WorkspaceView,
+    panel: gpui::Div,
+    ui: &UiPalette,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let delete_confirm = workspace.workflow_delete_confirm.clone();
+    panel
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(div().flex_1().min_w(px(0.0)).child(setting_button(
+                    ui,
+                    "+ 新建工作流",
+                    true,
+                    cx.listener(|this, _event, window, cx| this.edit_workflow(None, window, cx)),
+                ))),
+        )
+        .child(panel_caption("组合服务器/动态码/命令，一键自动执行", ui))
+        .when_some(workspace.workflow_error.clone(), |panel, error| {
+            panel.child(div().text_color(ui.danger).child(error))
+        })
+        .when(workspace.settings.workflows.is_empty(), |panel| {
+            panel.child(sidebar_empty(
+                "还没有工作流",
+                "新建后一键连跳板机并自动应答验证码",
+                ui,
+            ))
+        })
+        .children(workspace.settings.workflows.iter().map(|workflow| {
+            workflow_entry_row(
+                workflow,
+                delete_confirm.as_deref() == Some(workflow.name.as_str()),
+                ui,
+                cx,
+            )
+        }))
+}
+
+/// 工作流列表行：名称 + 步骤摘要 + 运行/编辑/删除。
+fn workflow_entry_row(
+    workflow: &laterterm_config::WorkflowEntry,
+    pending_delete: bool,
+    ui: &UiPalette,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let summary = workflow
+        .steps
+        .iter()
+        .map(|step| step.summary())
+        .collect::<Vec<_>>()
+        .join(" → ");
+    let name = workflow.name.clone();
+    server_list_item(ui)
+        .debug_selector(move || format!("workflow-card-{name}"))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_color(ui.text)
+                        .child(workflow.name.clone()),
+                )
+                .child(ui_button(
+                    format!("workflow-run-{}", workflow.name),
+                    "运行",
+                    ButtonKind::Primary,
+                    ui,
+                    false,
+                    cx.listener({
+                        let name = workflow.name.clone();
+                        move |this, _event, _window, cx| this.run_workflow(&name, cx)
+                    }),
+                ))
+                .child(
+                    sidebar_icon_button(
+                        format!("workflow-edit-{}", workflow.name),
+                        "icons/settings.svg",
+                        ui.text_secondary,
+                        Some("workflow-edit"),
+                        ui,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener({
+                            let name = workflow.name.clone();
+                            move |this, _event, window, cx| {
+                                if let Some(entry) = this
+                                    .settings
+                                    .workflows
+                                    .iter()
+                                    .find(|item| item.name == name)
+                                {
+                                    let entry = entry.clone();
+                                    this.edit_workflow(Some(&entry), window, cx)
+                                }
+                            }
+                        }),
+                    ),
+                )
+                .child(if pending_delete {
+                    ui_button(
+                        format!("workflow-delete-confirm-{}", workflow.name),
+                        "确认删除",
+                        ButtonKind::Secondary,
+                        ui,
+                        false,
+                        cx.listener({
+                            let name = workflow.name.clone();
+                            move |this, _event, _window, cx| {
+                                this.workflow_delete_confirm = None;
+                                this.settings.remove_workflow(&name);
+                                let _ = this.persist_settings();
+                                cx.notify();
+                            }
+                        }),
+                    )
+                } else {
+                    ui_button(
+                        format!("workflow-delete-{}", workflow.name),
+                        "删除",
+                        ButtonKind::Secondary,
+                        ui,
+                        false,
+                        cx.listener({
+                            let name = workflow.name.clone();
+                            move |this, _event, _window, cx| {
+                                this.workflow_delete_confirm = Some(name.clone());
+                                cx.notify();
+                            }
+                        }),
+                    )
+                }),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(ui.text_secondary)
+                .truncate()
+                .child(summary),
+        )
+}
+
+/// 工作流编辑弹窗内的步骤编辑区：kind 四选 + expect/引用输入框。
+fn workflow_steps_editor(
+    workspace: &WorkspaceView,
+    ui: &UiPalette,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let drafts = workspace.workflow_step_drafts.clone();
+    div()
+        .pt_3()
+        .flex()
+        .flex_col()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_color(ui.text_secondary)
+                        .child("步骤（按序自动执行）"),
+                )
+                .child(div().flex_1())
+                .child(setting_button(
+                    ui,
+                    "JumpServer 预设",
+                    false,
+                    cx.listener(|this, _, _, cx| this.apply_jumpserver_workflow_preset(cx)),
+                ))
+                .child(setting_button(
+                    ui,
+                    "+ 添加步骤",
+                    false,
+                    cx.listener(|this, _, _, cx| this.add_workflow_step(cx)),
+                )),
+        )
+        .child(
+            div()
+                .text_size(px(11.0))
+                .text_color(ui.text_secondary)
+                .child("expect 命中（对屏幕可见文本匹配，忽略大小写与颜色码）后发送动作；留空 = 等下一个提示符。单步超时后该步转人工，其余继续。"),
+        )
+        .children(
+            drafts
+                .into_iter()
+                .enumerate()
+                .map(|(index, draft)| workflow_draft_row(index, draft, ui, cx)),
+        )
+}
+
+/// 单条工作流步骤草稿行。
+fn workflow_draft_row(
+    index: usize,
+    draft: WorkflowDraft,
+    ui: &UiPalette,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let kind = draft.kind;
+    let (content_label, _) = kind.content_hint();
+    div()
+        .mt_2()
+        .p_2()
+        .rounded_sm()
+        .border_1()
+        .border_color(ui.border_strong)
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .children(WorkflowDraftKind::ALL.into_iter().map(|candidate| {
+                    setting_button_keyed(
+                        ui,
+                        format!("wf-{index}-{}", candidate.label()),
+                        candidate.label(),
+                        kind == candidate,
+                        cx.listener(move |this, _, _, cx| {
+                            this.set_workflow_kind(index, candidate, cx)
+                        }),
+                    )
+                }))
+                .child(div().flex_1())
+                .child(setting_button_keyed(
+                    ui,
+                    format!("wf-{index}-delete"),
+                    "删除",
+                    false,
+                    cx.listener(move |this, _, _, cx| this.remove_workflow_step(index, cx)),
+                )),
+        )
+        // connect 步只填服务器名，expect 输入框隐藏
+        .when(kind != WorkflowDraftKind::Connect, |row| {
+            row.child(draft.expect)
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(ui.text_secondary)
+                        .child(content_label),
+                )
+                .child(draft.content),
+        )
+}
+
+/// 工作流编辑弹窗（窗口级模态）。
+fn workflow_edit_modal(
+    workspace: &WorkspaceView,
+    ui: &UiPalette,
+    original: Option<String>,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    let title = match &original {
+        Some(name) => format!("编辑工作流 {name}"),
+        None => "新建工作流".into(),
+    };
+    let fields = workspace.workflow_fields.clone();
+    let error = workspace.workflow_error.clone();
+    let timeout = workspace.workflow_timeout.clone();
+    let mut body = div()
+        .p_4()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .when_some(error, |body, error| {
+            body.child(dialog_error_line(ui, error))
+        })
+        .children(
+            fields
+                .into_iter()
+                .map(|(name, field)| dialog_field_row(ui, &name, field)),
+        )
+        .child(workflow_steps_editor(workspace, ui, cx));
+    if let Some(timeout) = timeout {
+        body = body.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(ui.text_secondary)
+                        .child("单步超时（秒）"),
+                )
+                .child(timeout),
+        );
+    }
+    let body = body.child(dialog_footer(vec![
+        setting_button(
+            ui,
+            "取消",
+            false,
+            cx.listener(|this, _, _, cx| this.close_workflow_dialog(cx)),
+        ),
+        setting_button(
+            ui,
+            "保存",
+            true,
+            cx.listener(|this, _, _, cx| this.save_edit_workflow(cx)),
+        ),
+    ]));
+    modal_dialog(
+        ui,
+        &title,
+        body,
+        dismiss_listener(cx, |this, _window, cx| this.close_workflow_dialog(cx)),
+    )
+}
+
 fn render_server_section(
     workspace: &mut WorkspaceView,
     panel: gpui::Div,
@@ -13531,40 +13905,44 @@ fn wrap_session(
 /// 指明步号，连接照常——与载入期「宁弃流不丢条目」口径一致）。
 fn wrap_flow_session(
     session: Arc<dyn TerminalSession>,
-    entry: &ServerEntry,
+    workflow: &WorkflowEntry,
 ) -> (Arc<dyn TerminalSession>, Option<PaneFlowState>) {
-    let Some(flow) = entry.flow.as_ref() else {
-        return (session, None);
-    };
-    let total = flow.steps.len();
-    let steps: Vec<crate::flow::FlowStep> = flow
+    // connect 步骤不进引擎（连接已由请求管道完成）；纯步骤流（无 connect）
+    // 不经此函数——走焦点窗格 tap 注入
+    let steps: Vec<crate::flow::FlowStep> = workflow
         .steps
         .iter()
+        .skip_while(|step| matches!(step, WorkflowStep::Connect { .. }))
         .map(|step| crate::flow::FlowStep {
             expect: step.expect().map(str::to_owned),
             action: match step {
-                laterterm_config::FlowStep::Totp { account, .. } => crate::flow::FlowAction::Totp {
+                WorkflowStep::Totp { account, .. } => crate::flow::FlowAction::Totp {
                     account: account.clone(),
                 },
-                laterterm_config::FlowStep::Text { text, .. } => {
+                WorkflowStep::Text { text, .. } => {
                     crate::flow::FlowAction::Text { text: text.clone() }
                 }
-                laterterm_config::FlowStep::Command { name, .. } => {
+                WorkflowStep::Command { name, .. } => {
                     crate::flow::FlowAction::Command { name: name.clone() }
                 }
+                WorkflowStep::Connect { .. } => unreachable!("skip_while 已跳过首步 connect"),
             },
         })
         .collect();
+    let total = steps.len();
+    if steps.is_empty() {
+        return (session, None);
+    }
     let runner = match crate::flow::FlowRunner::new(
         steps,
-        std::time::Duration::from_secs(flow.step_timeout_secs),
+        std::time::Duration::from_secs(workflow.step_timeout_secs),
         std::time::Instant::now(),
     ) {
         Ok(runner) => Arc::new(Mutex::new(runner)),
         Err(error) => {
             eprintln!(
-                "服务器 {:?} 登录流未启动：第 {} 步正则不合法（{}）",
-                entry.name,
+                "工作流 {:?} 未启动：第 {} 步正则不合法（{}）",
+                workflow.name,
                 error.step + 1,
                 error.source
             );
@@ -13580,7 +13958,7 @@ fn wrap_flow_session(
     (
         wrapped,
         Some(PaneFlowState {
-            server: entry.name.clone(),
+            server: workflow.name.clone(),
             runner,
             rx,
             current: 0,
@@ -14635,6 +15013,7 @@ mod exit_regression_tests {
                 entry: laterterm_config::ServerEntry::default(),
                 jump: Vec::new(),
                 dest: super::ConnectDest::Shell,
+                workflow: None,
                 active: connect.clone(),
                 running: true,
             });
@@ -14936,6 +15315,7 @@ mod exit_regression_tests {
                 entry: entry.clone(),
                 jump: Vec::new(),
                 dest: super::ConnectDest::Shell,
+                workflow: None,
                 active: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 running: true,
             });
@@ -14944,6 +15324,7 @@ mod exit_regression_tests {
             view.finish_ssh_connect(
                 9,
                 entry,
+                None,
                 Ok(super::ConnectionOutcome::Prompt {
                     kind: super::CredentialKind::Login,
                     warning: None,
@@ -15065,6 +15446,7 @@ mod exit_regression_tests {
             view.finish_ssh_connect(
                 99,
                 laterterm_config::ServerEntry::default(),
+                None,
                 Ok(super::ConnectionOutcome::Connected {
                     session: session.clone(),
                     warning: None,
@@ -18132,6 +18514,7 @@ mod ssh_split_tests {
                 id: 7,
                 entry,
                 jump: Vec::new(),
+                workflow: None,
                 dest: ConnectDest::SplitPane {
                     from,
                     direction: SplitDirection::Horizontal,
@@ -18160,6 +18543,7 @@ mod ssh_split_tests {
         view.finish_ssh_connect(
             7,
             entry,
+            None,
             Ok(ConnectionOutcome::Connected {
                 session: Arc::new(DeadSession::new()),
                 warning: None,
@@ -18291,6 +18675,7 @@ mod ssh_split_tests {
             view.pending_ssh_results.push((
                 request.id,
                 request.entry.clone(),
+                None,
                 Ok(ConnectionOutcome::Connected {
                     session: Arc::new(DeadSession::new()),
                     warning: None,
@@ -18703,6 +19088,7 @@ mod reconnect_tests {
         SshLink {
             entry: test_entry(),
             jump: Vec::new(),
+            workflow: None,
         }
     }
 

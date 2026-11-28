@@ -159,6 +159,8 @@ M0 骨架 ✅ → M1 交互完善 🚧(验收期) → M2 快捷命令 🚧(待�
 
 **验收**：真实跳板机登录流程（密码 + 动态码）全程不碰键盘手输验证码（待实机走查）。
 
+> 登录流 → 工作流设计修订（2026-11-28，用户否决内嵌方案）：自动化编排升级为**独立实体**——右面板第 4 页签「工作流」（与命令/动态码/服务器并列），步骤四类动作（connect/totp/text/command）经**引用名**组合三类面板资源，真值不进 TOML。config 新增 workflows 模块（WorkflowEntry 持久化 + sanitize + validate：connect 至多一个且必须第一步），ServerEntry.flow 全套删除（v0.1.1 未发布零迁移）。运行 = connect 步走既有连接流程（认证层 OtpAnswerer 从工作流 totp 账户构造，随请求管道带出）→ 连接成功后剩余步骤由 FlowSession 装饰器在字节流上推进；断线重连经 SshLink.workflow 重新装配。expect 引擎（FlowRunner）不变。服务器编辑弹窗的登录流编辑区随之移除，JumpServer 预设挪入工作流弹窗。快捷键绑定（BindingOwner::Workflow + WorkspaceShortcut）待接统一注册表，条目 shortcut 字段已预留。
+
 ---
 
 ## M3 · 远程与传输 🚧

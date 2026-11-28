@@ -18,6 +18,7 @@ pub mod sync;
 pub mod theme;
 pub mod totp;
 pub mod triggers;
+pub mod workflows;
 
 pub use commands::{CommandTemplate, normalize_shortcut, shortcut_conflicts};
 pub use importers::{
@@ -25,14 +26,15 @@ pub use importers::{
     load_xshell_sessions,
 };
 pub use servers::{
-    FlowStep, LoginFlow, ServerAuthKind, ServerEntry, ServerTunnel, ServersFile, TunnelKind,
-    clear_broken_jump_refs, normalize_group, resolve_jump_chain, servers_referencing_jump,
+    ServerAuthKind, ServerEntry, ServerTunnel, ServersFile, TunnelKind, clear_broken_jump_refs,
+    normalize_group, resolve_jump_chain, servers_referencing_jump,
 };
 // WebDAV 同步元数据类型最常用，随手 re-export；其余走 sync:: 路径。
 pub use sync::WebdavSyncSettings;
 pub use theme::{DEFAULT_THEME, Theme, ThemeRegistry, themes_dir};
 pub use totp::{TotpAlgorithm, TotpConfig, TotpEntry, generate_code, parse_secret_input};
 pub use triggers::{TriggerAction, TriggerRule};
+pub use workflows::{WorkflowEntry, WorkflowStep};
 
 pub const APP_DIR: &str = "laterterm";
 pub const SETTINGS_FILE: &str = "settings.toml";
@@ -54,6 +56,10 @@ pub struct Settings {
     /// 服务器连接元数据；凭据同样只在密钥环。
     #[serde(default)]
     pub servers: Vec<servers::ServerEntry>,
+    /// 工作流：独立于服务器的自动化编排（引用服务器/命令/动态码名组合），
+    /// 右面板第 4 页签 CRUD 与运行。
+    #[serde(default)]
+    pub workflows: Vec<workflows::WorkflowEntry>,
     /// 输出触发器规则（正则命中 → 通知/高亮）；正则语法在 app 侧编译期校验，
     /// 本 crate 保持零 regex 依赖（见 triggers.rs 模块头注记）。
     #[serde(default)]
@@ -450,6 +456,33 @@ impl Settings {
         });
     }
 
+    /// 工作流条目载入期归一化（trim/钳制/坏步骤丢步骤/坏条目丢条目），
+    /// 见 workflows::sanitize_workflow。
+    fn sanitize_workflows(&mut self) {
+        self.workflows.retain_mut(workflows::sanitize_workflow);
+    }
+
+    /// 新增或按名称替换工作流条目。
+    pub fn upsert_workflow(&mut self, workflow: workflows::WorkflowEntry) -> Result<()> {
+        workflow.validate()?;
+        if let Some(existing) = self
+            .workflows
+            .iter_mut()
+            .find(|item| item.name == workflow.name)
+        {
+            *existing = workflow;
+        } else {
+            self.workflows.push(workflow);
+        }
+        Ok(())
+    }
+
+    pub fn remove_workflow(&mut self, name: &str) -> bool {
+        let before = self.workflows.len();
+        self.workflows.retain(|workflow| workflow.name != name);
+        before != self.workflows.len()
+    }
+
     /// 新增或按名称替换服务器条目。
     pub fn upsert_server(&mut self, server: servers::ServerEntry) -> Result<()> {
         server.validate()?;
@@ -501,8 +534,6 @@ impl Settings {
             server.group = servers::normalize_group(server.group.as_deref());
             // 隧道值级归一化：坏隧道具名 eprintln 丢弃，条目保留
             servers::normalize_tunnels(server);
-            // 登录流值级归一化：坏步骤具名 eprintln 丢弃，条目保留
-            servers::normalize_flow(server);
             if let Some(key_path) = &server.key_path {
                 let trimmed = key_path.trim().to_string();
                 server.key_path = (!trimmed.is_empty()).then_some(trimmed);
@@ -546,6 +577,7 @@ impl Settings {
         settings.quake.sanitize();
         settings.reconnect.sanitize();
         settings.sanitize_totp();
+        settings.sanitize_workflows();
         let cleared_jumps = settings.sanitize_servers();
         // 载入期可见回报：措辞与导入侧（workspace「无效跳板引用已清除 N（…）」）
         // 一致。启动早于 UI、无通知通道，沿用 eprintln 先例（解析失败告警、

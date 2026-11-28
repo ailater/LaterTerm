@@ -99,6 +99,7 @@ pub(crate) enum SftpOutcome {
 /// 远程 shell 启动读到的就是最终列宽——占位 110×30 起步再靠首帧 resize
 /// 变窄时，远端 zsh `PROMPT_SP` 的擦除标记会折行，首行残留裸 `%`（与本地
 /// 分屏同因，见 workspace `new_pane_grid` 注记）。
+#[allow(clippy::too_many_arguments)] // 装配入口：显式传参与 connect_with 同口径
 pub(crate) fn connect(
     entry: &ServerEntry,
     jump_entries: Vec<ServerEntry>,
@@ -107,15 +108,14 @@ pub(crate) fn connect(
     store: Arc<dyn SecretStore>,
     active: Arc<AtomicBool>,
     initial_size: (u16, u16),
+    // 工作流发起的连接带应答器（工作流 totp 步骤引用的账户）；手动连接 None
+    otp_answerer: Option<laterterm_ssh::OtpAnswerer>,
 ) -> Result<ConnectionOutcome> {
     // typed 句柄暂存槽：establish 闭包在 connect_with 内部构造 SshSession，
     // 无法经 `Arc<dyn TerminalSession>` 透出具体类型——闭包把 typed Arc 存
     // 槽，Connected 返回时随行（窗格 watcher 据此拉隧道事件流）。
     let typed_slot: Arc<Mutex<Option<Arc<SshSession>>>> = Arc::default();
     let slot = Arc::clone(&typed_slot);
-    // 登录流认证层：flow 引用了动态码时自动应答 KI 验证码提示（构造在
-    // move store 之前；Arc 闭包内克隆）
-    let otp_answerer = otp_answerer_for(entry, &store);
     let outcome = connect_with(
         entry,
         jump_entries,
@@ -305,27 +305,20 @@ fn ki_prompt_looks_like_otp(prompt: &str) -> bool {
         .any(|keyword| lowered.contains(keyword))
 }
 
-/// 登录流认证层应答器（登录流 D4a）：条目登录流引用了动态码时构造——
-/// keyboard-interactive 提示命中 [`ki_prompt_looks_like_otp`] 时读密钥环
-/// 算码应答。密钥环操作发生在连接后台线程（设计定稿纪律）；算法参数取
-/// RFC 6238 默认（SHA1/6 位/30s，JumpServer 即此配置）。密钥缺失/算码失败
-/// 一律返回 None → 回退固定口令（SshAuth::KeyboardInteractive 语义），认证
-/// 照常可手动补输，不炸连接流程。
-fn otp_answerer_for(
-    entry: &ServerEntry,
+/// 认证层应答器（工作流 R2）：调用方给定动态码账户名（工作流 totp 步骤的
+/// 引用）时构造——keyboard-interactive 提示命中 [`ki_prompt_looks_like_otp`]
+/// 时读密钥环算码应答。密钥环操作发生在连接后台线程（设计纪律）；算法参数
+/// 取 RFC 6238 默认（SHA1/6 位/30s，JumpServer 即此配置）。密钥缺失/算码
+/// 失败一律返回 None → 回退固定口令（SshAuth::KeyboardInteractive 语义），
+/// 认证照常可手动补输，不炸连接流程。
+pub(crate) fn otp_answerer_for(
+    account: &str,
     store: &Arc<dyn SecretStore>,
 ) -> Option<laterterm_ssh::OtpAnswerer> {
-    // 多个动态码步骤时取第一个（认证层只有一个 KI 阶段；会话层每步
-    // account 由 FlowRunner 精确下发）
-    let account = entry
-        .flow
-        .as_ref()?
-        .steps
-        .iter()
-        .find_map(|step| match step {
-            laterterm_config::FlowStep::Totp { account, .. } => Some(account.clone()),
-            _ => None,
-        })?;
+    if account.trim().is_empty() {
+        return None;
+    }
+    let account = account.to_owned();
     let store = Arc::clone(store);
     Some(Arc::new(move |prompt: &str| {
         if !ki_prompt_looks_like_otp(prompt) {
@@ -890,38 +883,15 @@ mod tests {
         }
     }
 
-    /// 条目登录流引用动态码时才构造应答器；纯命令/文本流不注入。
+    /// 工作流引用动态码账户时才构造应答器；空账户/纯空白不注入。
     #[test]
-    fn otp_answerer_built_only_when_flow_references_totp() {
+    fn otp_answerer_built_only_when_account_given() {
         let store: Arc<dyn SecretStore> = Arc::new(MemoryStore::default());
-        let mut entry = ServerEntry {
-            name: "堡垒机".into(),
-            host: "bastion.example.com".into(),
-            username: "ops".into(),
-            ..Default::default()
-        };
-        assert!(otp_answerer_for(&entry, &store).is_none(), "无登录流不注入");
-        entry.flow = Some(laterterm_config::LoginFlow {
-            steps: vec![laterterm_config::FlowStep::Command {
-                expect: None,
-                name: "cd /data".into(),
-            }],
-            step_timeout_secs: 30,
-        });
+        assert!(otp_answerer_for("", &store).is_none(), "空账户不注入");
+        assert!(otp_answerer_for("  ", &store).is_none(), "纯空白不注入");
         assert!(
-            otp_answerer_for(&entry, &store).is_none(),
-            "纯命令流不需要认证层应答"
-        );
-        entry.flow.as_mut().unwrap().steps.insert(
-            0,
-            laterterm_config::FlowStep::Totp {
-                expect: Some("Opt token:".into()),
-                account: "bastion".into(),
-            },
-        );
-        assert!(
-            otp_answerer_for(&entry, &store).is_some(),
-            "引用动态码即注入"
+            otp_answerer_for("bastion", &store).is_some(),
+            "给定账户即注入"
         );
     }
 
