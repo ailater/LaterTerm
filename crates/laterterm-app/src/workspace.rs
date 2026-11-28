@@ -1325,8 +1325,8 @@ pub struct WorkspaceView {
     /// 工作流单步超时输入框（保存 parse 失败按 0 交 validate 报错）。
     workflow_timeout: Option<Entity<CommandTextField>>,
     workflow_error: Option<String>,
-    /// 展开中的引用下拉（步骤 index；同时只开一个，点选/再点收起）。
-    workflow_dropdown_open: Option<usize>,
+    /// 展开中的引用下拉（步骤 index + 触发点窗口坐标；浮层 anchored 用）。
+    workflow_dropdown_open: Option<(usize, Point<Pixels>)>,
     command_target: Option<PaneId>,
     command_fields: Vec<(String, Entity<CommandTextField>)>,
     command_field_subscriptions: Vec<gpui::Subscription>,
@@ -4977,13 +4977,77 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    /// 展开/收起引用下拉（同时只开一个）。
-    fn toggle_workflow_dropdown(&mut self, index: usize, cx: &mut Context<Self>) {
+    /// 展开/收起引用下拉（同时只开一个；浮层锚定触发点窗口坐标）。
+    fn toggle_workflow_dropdown(
+        &mut self,
+        index: usize,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
         self.workflow_dropdown_open = match self.workflow_dropdown_open {
-            Some(open) if open == index => None,
-            _ => Some(index),
+            Some((open, _)) if open == index => None,
+            _ => Some((index, position)),
         };
         cx.notify();
+    }
+
+    /// 引用下拉浮层（复用右键菜单基建：anchored + snap_to_window + 外点
+    /// 收起 + 菜单内点击防穿透；deferred 保证绘制在模态弹窗之上）。
+    fn workflow_reference_dropdown(
+        &self,
+        index: usize,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let ui = self.ui_colors();
+        let Some(draft) = self.workflow_step_drafts.get(index) else {
+            return div().into_any_element();
+        };
+        let candidates = self.workflow_candidates(draft.kind);
+        let selected = draft.selected.clone();
+        deferred(
+            anchored().position(position).snap_to_window().child(
+                div()
+                    .id(gpui::SharedString::from(format!("wf-dropdown-{index}")))
+                    .min_w(px(220.0))
+                    .max_h(px(220.0))
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .bg(ui.card_bg)
+                    .border_1()
+                    .border_color(ui.border_strong)
+                    .rounded_md()
+                    .shadow(overlay_shadow())
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.workflow_dropdown_open = None;
+                        cx.notify();
+                    }))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .children(candidates.iter().map(|name| {
+                        let name = name.clone();
+                        let is_selected = *name == selected;
+                        div()
+                            .px_3()
+                            .py_1()
+                            .text_size(px(12.0))
+                            .text_color(if is_selected { ui.accent } else { ui.text })
+                            .when(is_selected, |item| item.bg(ui.hover_bg))
+                            .hover(|item| item.bg(ui.hover_bg))
+                            .cursor_pointer()
+                            .child(name.clone())
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _, _, cx| {
+                                    this.set_workflow_reference(index, name.clone(), cx)
+                                }),
+                            )
+                    })),
+            ),
+        )
+        .with_priority(1)
+        .into_any_element()
     }
 
     /// 选定引用（下拉点选）：写入草稿并收起。
@@ -9969,6 +10033,12 @@ impl Render for WorkspaceView {
                     .map(|menu| self.tab_context_menu(menu, cx)),
                 |root, menu_overlay| root.child(menu_overlay),
             )
+            // 工作流引用下拉：anchored 浮层（模态弹窗之上，deferred 保证层序）
+            .when_some(
+                self.workflow_dropdown_open
+                    .map(|(index, position)| self.workflow_reference_dropdown(index, position, cx)),
+                |root, dropdown| root.child(dropdown),
+            )
             // 一次性 toast（复制提示/服务器操作结果/失败告警）：窗口右下角
             // 短暂浮层。不 occlude、不挂鼠标事件，纯展示（挂 workspace 层
             // 而非窗格层——分屏下窗格右下角≠窗口右下角）。放在模态弹窗之后：
@@ -13141,8 +13211,8 @@ fn workflow_draft_row(
                         .cursor_pointer()
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
-                                this.toggle_workflow_dropdown(index, cx)
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                this.toggle_workflow_dropdown(index, event.position, cx)
                             }),
                         )
                         .child(
@@ -13161,44 +13231,6 @@ fn workflow_draft_row(
                                 .child("▾"),
                         ),
                 ),
-        )
-        // 展开的候选列表（内联下拉，点选收起；toggle 互斥保证同帧至多一个）
-        .when(
-            workspace
-                .workflow_dropdown_open
-                .is_some_and(|open| open == index),
-            |row| {
-                row.child(
-                    div()
-                        .id(gpui::SharedString::from(format!("wf-dropdown-{index}")))
-                        .mt_1()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(ui.border_strong)
-                        .bg(ui.card_bg)
-                        .max_h(px(180.0))
-                        .overflow_y_scroll()
-                        .children(candidates.iter().map(|name| {
-                            let name = name.clone();
-                            let selected = *name == draft.selected;
-                            div()
-                                .px_2()
-                                .py_1()
-                                .text_size(px(12.0))
-                                .text_color(if selected { ui.accent } else { ui.text })
-                                .when(selected, |item| item.bg(ui.hover_bg))
-                                .hover(|item| item.bg(ui.hover_bg))
-                                .cursor_pointer()
-                                .child(name.clone())
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _, _, cx| {
-                                        this.set_workflow_reference(index, name.clone(), cx)
-                                    }),
-                                )
-                        })),
-                )
-            },
         )
 }
 
