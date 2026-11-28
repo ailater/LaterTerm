@@ -76,7 +76,9 @@ pub(crate) enum SettingsSection {
     /// 配置同步（WebDAV 手动备份/合并，见 webdav_sync.rs）。
     ConfigSync,
     /// macOS 权限（辅助功能/监听事件/完全磁盘访问；仅 macOS 进导航，见
-    /// ALL 的 cfg 与 settings_permissions_body）。
+    /// ALL 的 cfg 与 settings_permissions_body）。非 macOS 下变体永不构造
+    ///（match 臂仍需覆盖），标记免 dead_code。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Permissions,
     /// 关于（品牌卡 + 仓库/许可信息）。
     About,

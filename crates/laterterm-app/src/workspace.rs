@@ -1416,7 +1416,9 @@ pub struct WorkspaceView {
     pending_ssh_results: Vec<PendingSshResult>,
     /// 启动探测：Data 卷（/Volumes/Data）被 macOS TCC 隐私保护拦截
     /// （EPERM）。true 时已 toast 引导并自动打开「完全磁盘访问」设置面板；
-    /// 授权后重启应用自然通过（探测进程级一次）。
+    /// 授权后重启应用自然通过（探测进程级一次）。非 macOS 无 TCC，
+    /// 读写方全在 macOS cfg 块里，标记免 dead_code（Linux CI clippy -D warnings）。
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     volume_access_denied: bool,
     /// SFTP 连接结果（与 shell 分管道，见 PendingSftpResult 注记）。
     pending_sftp_results: Vec<PendingSftpResult>,
@@ -12982,12 +12984,16 @@ pub(crate) fn workflow_step_from_values(
     }
 }
 
-/// Data 卷访问被 macOS 隐私保护拦截的引导文案（启动 toast）。
+/// Data 卷访问被 macOS 隐私保护拦截的引导文案（启动 toast）。调用方与
+/// 探测全在 macOS cfg 块里；非 macOS 标记免 dead_code，分类纯函数与其
+/// 单测保持全平台编译（Linux CI 语义回归）。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const VOLUME_ACCESS_NOTICE: &str = "无法访问 Data 卷（macOS 隐私保护，终端命令会报 Operation not permitted）。已打开系统设置：请在「完全磁盘访问」中勾选 LaterTerm，然后重启应用";
 
 /// 探测 Data 卷（/Volumes/Data）的可访问性。TCC 拦截时 readdir 返回
 /// EPERM（std 映射 PermissionDenied）；卷未挂载（NotFound）不是授权问题，
 /// 不弹引导。独立函数便于单测分类口径。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn probe_data_volume_access() -> bool {
     classify_volume_probe(
         std::fs::read_dir("/Volumes/Data")
@@ -12997,6 +13003,7 @@ fn probe_data_volume_access() -> bool {
 }
 
 /// 探测结果分类：EPERM → 被拦截（true）；成功/未挂载/其余 → false。
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn classify_volume_probe(result: Result<(), std::io::ErrorKind>) -> bool {
     matches!(result, Err(std::io::ErrorKind::PermissionDenied))
 }
