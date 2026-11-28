@@ -139,6 +139,40 @@ def install_linux(args: argparse.Namespace) -> None:
     print(f"桌面资源已安装: {datadir}；可执行文件: {bindir / 'laterterm'}")
 
 
+# Mach-O 首四字节魔数（32/64 位、双端序、fat 胖包）——签名只对真二进制
+# 有意义，测试的文本 fixture 跳过（codesign 对非 Mach-O 必报错）。
+MACHO_MAGICS = {
+    b"\xcf\xfa\xed\xfe",  # MH_MAGIC_64（arm64/x86_64 常见形态）
+    b"\xfe\xed\fa\xcf",  # MH_CIGAM_64
+    b"\xce\xfa\xed\xfe",  # MH_MAGIC（32 位）
+    b"\xfe\xed\fa\xce",  # MH_CIGAM
+    b"\xca\xfe\ba\xbe",  # FAT_MAGIC（universal2 胖包）
+}
+
+
+def sign_macos_bundle(app: Path, binary: Path) -> None:
+    """签名 .app（LATERTERM_SIGN_IDENTITY 有值走真证书——TCC 按签名身份
+    记账，跨版本升级不用重新授权辅助功能/完全磁盘访问；未配置退回
+    ad-hoc，升级授权失效）。先签内部二进制、再签 bundle（密封 Info.plist
+    与资源）——不密封的 bundle 进程身份校验会失败，授权后仍反复弹窗
+    （LaterScreen 真机踩过）；最后 verify 兜底。"""
+    if binary.read_bytes()[:4] not in MACHO_MAGICS:
+        print("跳过签名（二进制非 Mach-O）")
+        return
+    identity = os.environ.get("LATERTERM_SIGN_IDENTITY", "")
+    if identity:
+        cmd = ["codesign", "--force", "--timestamp=none", "-s", identity]
+        keychain = os.environ.get("LATERTERM_SIGN_KEYCHAIN", "")
+        if keychain:
+            cmd += ["--keychain", keychain]
+    else:
+        cmd = ["codesign", "--force", "-s", "-"]
+    subprocess.run(cmd + [str(app / "Contents/MacOS/laterterm")], check=True)
+    subprocess.run(cmd + [str(app)], check=True)
+    subprocess.run(["codesign", "--verify", str(app)], check=True)
+    print(f"签名完成（{identity or 'ad-hoc'}）")
+
+
 def package_macos(args: argparse.Namespace) -> None:
     binary = binary_path(args.binary)
     output = absolute_path(args.output)
@@ -157,7 +191,8 @@ def package_macos(args: argparse.Namespace) -> None:
         app / "Contents/Resources/laterterm.icns": (icns_bytes(ROOT / "assets/icons/laterterm.icns"), 0o644),
     }
     write_new_files(files)
-    print(f"已组装未签名 bundle: {app}（未验证二进制架构或动态库可分发性）")
+    sign_macos_bundle(app, binary)
+    print(f"已组装 bundle: {app}（未验证二进制架构或动态库可分发性）")
 
 
 def package_deb(args: argparse.Namespace) -> None:

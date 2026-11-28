@@ -74,7 +74,7 @@ class WorkflowYamlTests(unittest.TestCase):
 
     def test_release_macos_uses_stepwise_hdiutil_and_plist_app(self):
         steps = load_workflow("release.yml")["jobs"]["build-macos"]["steps"]
-        app = next(step for step in steps if step.get("name") == "组装 .app（Info.plist @VERSION@ 注入 + icns）")
+        app = next(step for step in steps if step.get("name") == "组装 .app（Info.plist @VERSION@ 注入 + icns + 签名）")
         self.assertIn("script/package-macos.sh", app["run"])
         dmg = next(step for step in steps if step.get("name") == "分步组装 dmg")
         # 分步：固定大小建空镜像 → 挂载 → ditto → 卸载 → convert；一步式 -srcfolder 不允许回归
@@ -97,7 +97,7 @@ class WorkflowYamlTests(unittest.TestCase):
         self.assertIn('--linuxdeploy "$PWD/linuxdeploy.AppImage"', appimage["run"])
         lipo = next(step for step in macos_steps if step.get("name") == "lipo 合一")
         self.assertIn('-output "$PWD/laterterm-universal"', lipo["run"])
-        app = next(step for step in macos_steps if step.get("name") == "组装 .app（Info.plist @VERSION@ 注入 + icns）")
+        app = next(step for step in macos_steps if step.get("name") == "组装 .app（Info.plist @VERSION@ 注入 + icns + 签名）")
         self.assertIn('--binary "$PWD/laterterm-universal"', app["run"])
         # 相对形态不得回归（扫描全部 run 步）
         for bad in ("--binary target/", "--binary laterterm-universal", "--output packaging-staging/"):

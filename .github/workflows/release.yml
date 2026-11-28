@@ -212,6 +212,36 @@ jobs:
         with:
           key: release-macos
 
+      # 自签名证书（配方照抄 LaterKey release.yml）：secrets 放 key/cert PEM
+      # 的 base64，导入临时 keychain + 信任根，LATERTERM_SIGN_IDENTITY 传给
+      # package-assets.py——TCC 按签名身份记账，跨版本升级不用重新授权
+      # 辅助功能/完全磁盘访问。未配置 secret 时 warning 退回 ad-hoc。
+      - name: 导入签名证书（自签名，跨版本稳定 TCC 身份）
+        env:
+          LATERTERM_SIGN_KEY_PEM_B64: ${{ secrets.LATERTERM_SIGN_KEY_PEM_B64 }}
+          LATERTERM_SIGN_CERT_PEM_B64: ${{ secrets.LATERTERM_SIGN_CERT_PEM_B64 }}
+        run: |
+          if [ -z "$LATERTERM_SIGN_KEY_PEM_B64" ]; then
+            echo "::warning::未配置签名证书 secret，退回 ad-hoc 签名（升级需重新授权一次）"
+            exit 0
+          fi
+          echo "$LATERTERM_SIGN_KEY_PEM_B64" | base64 -d > "$RUNNER_TEMP/laterterm-key.pem"
+          echo "$LATERTERM_SIGN_CERT_PEM_B64" | base64 -d > "$RUNNER_TEMP/laterterm-cert.pem"
+          security create-keychain -p laterterm-build build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p laterterm-build build.keychain
+          security import "$RUNNER_TEMP/laterterm-key.pem" -k build.keychain -T /usr/bin/codesign
+          security import "$RUNNER_TEMP/laterterm-cert.pem" -k build.keychain -T /usr/bin/codesign
+          # 构建（fat LTO）可能超过 keychain 默认 5 分钟自动上锁，禁用兜底
+          security set-keychain-settings -t 43200 build.keychain
+          # 自签名根必须进信任域，codesign 才认这个身份
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k build.keychain "$RUNNER_TEMP/laterterm-cert.pem"
+          security set-key-partition-list -S apple-tool:,apple: -k laterterm-build build.keychain
+          rm -f "$RUNNER_TEMP/laterterm-key.pem"
+          echo "LATERTERM_SIGN_IDENTITY=LaterTerm" >> "$GITHUB_ENV"
+          echo "LATERTERM_SIGN_KEYCHAIN=$HOME/Library/Keychains/build.keychain" >> "$GITHUB_ENV"
+
       - name: 构建双架构
         run: |
           cargo build --release -p laterterm-app --bin laterterm --target aarch64-apple-darwin
@@ -233,10 +263,12 @@ jobs:
           rm -rf target/x86_64-apple-darwin/release
           df -h /
 
-      - name: 组装 .app（Info.plist @VERSION@ 注入 + icns）
-        # script/package-macos.sh 是 packaging.yml 已验证的组装配方（plutil -lint 同款）；
-        # --binary 传绝对路径（package-assets.py 的 absolute_path 拒绝相对路径）
+      - name: 组装 .app（Info.plist @VERSION@ 注入 + icns + 签名）
+        # script/package-macos.sh → package-assets.py：按 LATERTERM_SIGN_IDENTITY
+        # 签名（未配置证书时 ad-hoc）；--binary 传绝对路径（absolute_path 拒绝相对路径）
         run: |
+          [ -z "${LATERTERM_SIGN_KEYCHAIN:-}" ] || \
+            security unlock-keychain -p laterterm-build "$LATERTERM_SIGN_KEYCHAIN"
           bash script/package-macos.sh --binary "$PWD/laterterm-universal" --output "$RUNNER_TEMP/bundle"
           plutil -lint "$RUNNER_TEMP/bundle/LaterTerm.app/Contents/Info.plist"
 
@@ -260,9 +292,9 @@ jobs:
           hdiutil detach "/Volumes/LaterTerm"
           hdiutil convert "${RUNNER_TEMP}/laterterm-staging.dmg" \
             -format UDZO -o "$DMG"
-          # 签名/公证占位（不在本任务范围）：接入 Apple Developer ID 后在组 .app 步后加
-          #   codesign --deep --force --options runtime -s "Developer ID Application: <ID>" <.app>
-          # 与 xcrun notarytool submit + stapler staple。
+          # 代码签名已在「组装 .app」步完成（自签名证书，见证书导入步注记）；
+          # Apple 公证（notarytool + stapler）仍待定——需 Apple Developer 账号，
+          # 与自签名跨版本 TCC 稳定是两条独立路径。
           shasum -a 256 "$DMG" > "$DMG.sha256"
 
       - uses: actions/upload-artifact@v4
@@ -316,3 +348,70 @@ jobs:
             --title "LaterTerm ${TAG}" \
             --notes-file release-notes.md \
             release-assets/*
+  # 自动更新 homebrew-ailater 的 Casks/laterterm.rb（version + dmg sha256），
+  # 配方照抄 LaterKey（secrets.AILATER_TAP_TOKEN = crazykun/homebrew-ailater
+  # 写权限 token）；未配置时告警跳过，不算失败。产物 hash 取本 Release 的
+  # laterterm-v<版本>-universal2-apple-darwin.dmg.sha256（单文件而非 LaterKey
+  # 的 SHA256SUMS 汇总——release 收集口径维持 *.sha256 逐件输出）。
+  bump-cask:
+    needs: release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: 检查 tap token（未配置则警告并跳过）
+        id: tap-token
+        env:
+          AILATER_TAP_TOKEN: ${{ secrets.AILATER_TAP_TOKEN }}
+        run: |
+          if [ -z "$AILATER_TAP_TOKEN" ]; then
+            echo "::warning::未配置 secrets.AILATER_TAP_TOKEN，跳过 homebrew-ailater 的 cask 自动更新（需手工改 Casks/laterterm.rb）"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 检出 homebrew-ailater
+        if: steps.tap-token.outputs.skip != 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: crazykun/homebrew-ailater
+          token: ${{ secrets.AILATER_TAP_TOKEN }}
+          ref: master
+          path: homebrew-ailater
+
+      - name: 按 Release 的 dmg sha256 更新 cask 并推送
+        if: steps.tap-token.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          curl -fsSL --retry 3 -o dmg.sha256 \
+            "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/laterterm-v${VERSION}-universal2-apple-darwin.dmg.sha256"
+          # sha256 文件内容形如「<hash>  laterterm-v...dmg」，取第一列
+          DMG_SHA=$(awk '{ print $1; exit }' dmg.sha256)
+          if ! printf '%s\n' "$DMG_SHA" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "::error::dmg.sha256 里没有合法哈希，内容："
+            cat dmg.sha256
+            exit 1
+          fi
+          cd homebrew-ailater
+          sed -i "s|^  version \".*\"|  version \"${VERSION}\"|" Casks/laterterm.rb
+          sed -i "s|^  sha256 \".*\"|  sha256 \"${DMG_SHA}\"|" Casks/laterterm.rb
+          # sed 没匹配上不会报错，兜底校验两行确实变成了目标值
+          if ! grep -qxF "  version \"${VERSION}\"" Casks/laterterm.rb; then
+            echo "::error::sed 后 version 行不是 ${VERSION}，cask 格式可能变了"
+            exit 1
+          fi
+          if ! grep -qxF "  sha256 \"${DMG_SHA}\"" Casks/laterterm.rb; then
+            echo "::error::sed 后 sha256 行不是 ${DMG_SHA}，cask 格式可能变了"
+            exit 1
+          fi
+          # 注意：diff --quiet 无改动时返回 1，只能放在 if 条件里，不能裸做收尾
+          if git diff --quiet -- Casks/laterterm.rb; then
+            echo "cask 已是 ${VERSION}，无实际改动，跳过提交（可能重复发同一 tag）"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/laterterm.rb
+          git commit -m "laterterm ${VERSION}"
+          git push origin master
