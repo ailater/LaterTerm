@@ -173,13 +173,15 @@ jobs:
         shell: bash
         # 配方 = wxs 头注释接线三步；wix 钉具体版本（追 latest 会在上游换
         # 行为时静默翻车，同 linuxdeploy 口径）。runner 预装 .NET SDK，
-        # wix 工具全局安装后进 PATH。
+        # wix 工具全局安装后进 PATH。注意 -d 必须与变量名空格分隔：
+        # 连写 `-dName=Value` 在 5.0.2 被当位置参数报 WIX0118
+        #（BuildCommand case "d" 只从下一个独立参数取值，2026-11-28 实跑踩坑）。
         run: |
           dotnet tool install --global wix --version 5.0.2
           wix build -arch x64 \
-            -dLaterTermVersion="$VERSION" \
-            -dLaterTermExe="$PWD/target/release/laterterm.exe" \
-            -dLaterTermIco="$PWD/assets/icons/laterterm.ico" \
+            -d LaterTermVersion="$VERSION" \
+            -d LaterTermExe="$PWD/target/release/laterterm.exe" \
+            -d LaterTermIco="$PWD/assets/icons/laterterm.ico" \
             -o "laterterm_${VERSION}_x64.msi" packaging/windows/laterterm.wxs
           sha256sum laterterm_${VERSION}_x64.msi > laterterm_${VERSION}_x64.msi.sha256
 

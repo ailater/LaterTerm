@@ -13,7 +13,7 @@
     1. dotnet tool install（全局安装 wix 工具并锁定具体版本号；v4+ CLI，
        .NET SDK runner 预装。runner 镜像仍预装 WiX 3.14 candle/light，
        但按全新未验链处理、不依赖预装）
-    2. wix build -arch x64 -dLaterTermVersion=<tag 剥 v> \
+    2. wix build -arch x64 -d LaterTermVersion=<tag 剥 v> \
          -dLaterTermExe=<target/release/laterterm.exe 路径> \
          -dLaterTermIco=assets/icons/laterterm.ico \
          -o laterterm_<版本>_x64.msi packaging/windows/laterterm.wxs
