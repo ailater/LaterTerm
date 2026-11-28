@@ -75,6 +75,9 @@ pub(crate) enum SettingsSection {
     Servers,
     /// 配置同步（WebDAV 手动备份/合并，见 webdav_sync.rs）。
     ConfigSync,
+    /// macOS 权限（辅助功能/监听事件/完全磁盘访问；仅 macOS 进导航，见
+    /// ALL 的 cfg 与 settings_permissions_body）。
+    Permissions,
     /// 关于（品牌卡 + 仓库/许可信息）。
     About,
     /// 检查更新（手动触发，见 update_check.rs）。
@@ -84,6 +87,24 @@ pub(crate) enum SettingsSection {
 impl SettingsSection {
     /// 导航/内容顺序即滚动容器直接子元素顺序；label / anchor_title /
     /// debug_key 的 match 均不带通配分支，新增变体漏加任一处都会编译失败。
+    /// 权限节仅 macOS 进导航（非 macOS 无需授权，Linux CI 断言也按 ALL 长度
+    /// 动态对位）。
+    #[cfg(target_os = "macos")]
+    pub(crate) const ALL: [Self; 10] = [
+        Self::Appearance,
+        Self::Font,
+        Self::Scrolling,
+        Self::Shortcuts,
+        Self::Terminal,
+        Self::Servers,
+        Self::ConfigSync,
+        Self::Permissions,
+        Self::About,
+        Self::UpdateCheck,
+    ];
+
+    /// 非 macOS 的导航列表：无权限节。
+    #[cfg(not(target_os = "macos"))]
     pub(crate) const ALL: [Self; 9] = [
         Self::Appearance,
         Self::Font,
@@ -106,6 +127,7 @@ impl SettingsSection {
             Self::Terminal => "终端",
             Self::Servers => "服务器",
             Self::ConfigSync => "同步",
+            Self::Permissions => "权限",
             Self::About => "关于",
             Self::UpdateCheck => "更新",
         }
@@ -121,6 +143,7 @@ impl SettingsSection {
             Self::Terminal => "终端",
             Self::Servers => "服务器",
             Self::ConfigSync => "配置同步",
+            Self::Permissions => "macOS 权限",
             Self::About => "关于",
             Self::UpdateCheck => "检查更新",
         }
@@ -136,6 +159,7 @@ impl SettingsSection {
             Self::Terminal => "terminal",
             Self::Servers => "servers",
             Self::ConfigSync => "config-sync",
+            Self::Permissions => "permissions",
             Self::About => "about",
             Self::UpdateCheck => "update",
         }
@@ -439,6 +463,20 @@ pub(crate) fn settings_content(
                 .into_iter()
                 .map(IntoElement::into_any_element)
                 .collect(),
+            SettingsSection::Permissions => {
+                // 非 macOS 不进 ALL，此臂恒不渲染；变体存在故 match 仍需覆盖
+                #[cfg(target_os = "macos")]
+                {
+                    settings_permissions_body(workspace, ui, cx)
+                        .into_iter()
+                        .map(IntoElement::into_any_element)
+                        .collect()
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    Vec::new()
+                }
+            }
             SettingsSection::About => settings_about_body(ui, cx)
                 .into_iter()
                 .map(IntoElement::into_any_element)
@@ -1455,6 +1493,129 @@ fn settings_about_body(ui: &UiPalette, cx: &mut Context<WorkspaceView>) -> Vec<D
             )
             .child(info_row(ui, "许可", "MIT OR Apache-2.0")),
     ]
+}
+
+/// 「macOS 权限」节：辅助功能 / 监听事件 / 完全磁盘访问三行，状态点即查即显
+/// （AX 与 ListenEvent 是廉价系统查询，每次渲染现查；磁盘访问沿用启动探测的
+/// `volume_access_denied` 字段，「重新检测」重跑探测）。「去授权」只深链到
+/// 对应系统设置面板，由用户手动勾选——申请/授权动作绝不代办。
+/// 仅 macOS 渲染（ALL 的 cfg 隔离），探测实现见 macos_permissions.rs。
+#[cfg(target_os = "macos")]
+fn settings_permissions_body(
+    workspace: &mut WorkspaceView,
+    ui: &UiPalette,
+    cx: &mut Context<WorkspaceView>,
+) -> Vec<Div> {
+    use crate::macos_permissions as perms;
+    let ax = perms::accessibility_trusted();
+    let listen = perms::listen_event_access();
+    vec![
+        setting_card(ui)
+            .child(perm_row(
+                ui,
+                "辅助功能",
+                "全局热键、读窗口等自动化能力的门槛",
+                Some(ax),
+                perms::ACCESSIBILITY_PANE,
+            ))
+            .child(perm_row(
+                ui,
+                "监听事件",
+                "被动监听键盘事件（macOS 15+ 的独立权限项）",
+                listen,
+                perms::LISTEN_EVENT_PANE,
+            ))
+            .child(perm_row(
+                ui,
+                "完全磁盘访问",
+                "访问 /Volumes 等受保护目录（跨卷文件操作、SFTP 本地面板）",
+                Some(!workspace.volume_access_denied),
+                perms::ALL_FILES_PANE,
+            ))
+            .child(div().flex().justify_end().child(setting_button(
+                ui,
+                "重新检测",
+                false,
+                cx.listener(|_workspace, _event, _window, cx| {
+                    // AX/监听是即查即显的，通知一帧刷新即可；磁盘访问
+                    // 要读真文件系统，后台线程探测完写回（同启动探测口径）
+                    let (tx, rx) = flume::bounded(1);
+                    std::thread::spawn(move || {
+                        let _ = tx.send(super::probe_data_volume_access());
+                    });
+                    cx.spawn(async move |this, cx| {
+                        if let Ok(denied) = rx.recv_async().await {
+                            this.update(cx, |workspace, cx| {
+                                workspace.volume_access_denied = denied;
+                                cx.notify();
+                            })
+                            .ok();
+                        }
+                    })
+                    .detach();
+                    cx.notify();
+                }),
+            ))),
+    ]
+}
+
+/// 权限行：状态点 + 名称/说明（左），状态文字 + 「去授权」按钮（右）。
+/// `granted` 为 `None` = 本系统没有这项权限（如 <macOS 15 的监听事件），
+/// 显示「不适用」中性色，不算未授权。
+#[cfg(target_os = "macos")]
+fn perm_row(ui: &UiPalette, name: &str, desc: &str, granted: Option<bool>, pane: &str) -> Div {
+    use crate::macos_permissions as perms;
+    let (dot, status) = match granted {
+        Some(true) => (ui.success, "已授权"),
+        Some(false) => (ui.warning, "未授权"),
+        None => (ui.text_muted, "不适用"),
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .py_2()
+        .child(
+            div()
+                .w(px(8.0))
+                .h(px(8.0))
+                .flex_shrink_0()
+                .rounded_full()
+                .bg(dot),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(div().text_color(ui.text).child(name.to_string()))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(ui.text_muted)
+                        .child(desc.to_string()),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(11.5))
+                .text_color(dot)
+                .child(status.to_string()),
+        )
+        // 三行同 label「去授权」：按 setting_button 注记必须带行唯一键，
+        // 否则共享元素 id、按压态跨行串扰
+        .child(setting_button_keyed(
+            ui,
+            format!("perm-{name}-grant"),
+            "去授权",
+            false,
+            {
+                let pane = pane.to_string();
+                move |_, _window, _cx| perms::open_privacy(&pane)
+            },
+        ))
 }
 
 /// 「检查更新」节：结果横幅 + 按钮 + 状态行三态（Idle / 已是最新 / 未能确认）。

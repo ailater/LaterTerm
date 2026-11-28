@@ -16905,6 +16905,29 @@ mod settings_panel_tests {
         });
     }
 
+    /// macOS 权限节渲染：锚点在场（ALL 的 macOS 分支含 permissions），且
+    /// 默认高亮仍是首节「外观」——权限节插在「同步」与「关于」之间，不抢首节。
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn settings_permissions_section_renders(cx: &mut TestAppContext) {
+        let (workspace, cx) = open_settings_panel(cx);
+        assert!(
+            cx.debug_bounds("settings-section-permissions")
+                .is_some_and(|bounds| bounds.size.height > px(0.0)),
+            "权限节锚点必须渲染"
+        );
+        workspace.read_with(cx, |view, _| {
+            assert_eq!(
+                view.settings_section,
+                SettingsSection::Appearance,
+                "权限节不改变默认首节"
+            );
+            for pane in &view.panes {
+                pane.session.close();
+            }
+        });
+    }
+
     /// 检查更新三态渲染（离线注入，零真实网络）：Idle 只报当前版本；
     /// 注入 Newer 结果横幅与「去下载」按钮在场；注入 Err 出「未能确认」
     /// 静默行且无任何弹窗元素——失败绝不呈现为「已是最新」（update_check.rs

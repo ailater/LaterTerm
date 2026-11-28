@@ -5,6 +5,8 @@ mod branding;
 mod command_text_field;
 mod flow;
 mod import;
+#[cfg(target_os = "macos")]
+mod macos_permissions;
 mod onboarding;
 mod pane_navigation;
 mod paste_text_area;
