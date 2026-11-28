@@ -1325,6 +1325,8 @@ pub struct WorkspaceView {
     /// 工作流单步超时输入框（保存 parse 失败按 0 交 validate 报错）。
     workflow_timeout: Option<Entity<CommandTextField>>,
     workflow_error: Option<String>,
+    /// 展开中的引用下拉（步骤 index；同时只开一个，点选/再点收起）。
+    workflow_dropdown_open: Option<usize>,
     command_target: Option<PaneId>,
     command_fields: Vec<(String, Entity<CommandTextField>)>,
     command_field_subscriptions: Vec<gpui::Subscription>,
@@ -1538,6 +1540,7 @@ impl WorkspaceView {
             workflow_step_drafts: Vec::new(),
             workflow_timeout: None,
             workflow_error: None,
+            workflow_dropdown_open: None,
             command_field_subscriptions: Vec::new(),
             command_delete_confirm: None,
             command_error: None,
@@ -4970,6 +4973,25 @@ impl WorkspaceView {
         self.workflow_step_drafts.clear();
         self.workflow_timeout = None;
         self.workflow_error = None;
+        self.workflow_dropdown_open = None;
+        cx.notify();
+    }
+
+    /// 展开/收起引用下拉（同时只开一个）。
+    fn toggle_workflow_dropdown(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.workflow_dropdown_open = match self.workflow_dropdown_open {
+            Some(open) if open == index => None,
+            _ => Some(index),
+        };
+        cx.notify();
+    }
+
+    /// 选定引用（下拉点选）：写入草稿并收起。
+    fn set_workflow_reference(&mut self, index: usize, name: String, cx: &mut Context<Self>) {
+        if let Some(draft) = self.workflow_step_drafts.get_mut(index) {
+            draft.selected = name;
+        }
+        self.workflow_dropdown_open = None;
         cx.notify();
     }
 
@@ -5002,29 +5024,6 @@ impl WorkspaceView {
             draft.selected = fallback.unwrap_or_default();
             cx.notify();
         }
-    }
-
-    /// 引用选择器循环切换（‹ › 箭头）；候选为空不动作（UI 已提示先添加）。
-    fn cycle_workflow_reference(&mut self, index: usize, direction: i32, cx: &mut Context<Self>) {
-        let candidates = {
-            let Some(draft) = self.workflow_step_drafts.get(index) else {
-                return;
-            };
-            self.workflow_candidates(draft.kind)
-        };
-        if candidates.is_empty() {
-            return;
-        }
-        let current = {
-            let draft = &self.workflow_step_drafts[index];
-            candidates
-                .iter()
-                .position(|name| *name == draft.selected)
-                .unwrap_or(0)
-        };
-        let next = (current as i64 + direction as i64).rem_euclid(candidates.len() as i64) as usize;
-        self.workflow_step_drafts[index].selected = candidates[next].clone();
-        cx.notify();
     }
 
     /// JumpServer 预设一键起步：连接服务器（留空待填）→ 等验证码提示发
@@ -13125,30 +13124,81 @@ fn workflow_draft_row(
                         .text_color(ui.text_secondary)
                         .child(content_label),
                 )
-                // 引用下拉选择器：‹ › 循环切换候选（面板为空时提示先添加）
-                .child(setting_button_keyed(
-                    ui,
-                    format!("wf-{index}-prev"),
-                    "‹",
-                    false,
-                    cx.listener(move |this, _, _, cx| this.cycle_workflow_reference(index, -1, cx)),
-                ))
                 .child(
+                    // 下拉触发区：当前选中值 + ▾；点击展开/收起候选列表
                     div()
                         .flex_1()
                         .min_w(px(0.0))
-                        .truncate()
-                        .text_size(px(12.0))
-                        .text_color(reference_view.1)
-                        .child(reference_view.0),
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(ui.border_strong)
+                        .bg(ui.card_bg)
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.toggle_workflow_dropdown(index, cx)
+                            }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(12.0))
+                                .text_color(reference_view.1)
+                                .child(reference_view.0),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(ui.text_secondary)
+                                .child("▾"),
+                        ),
+                ),
+        )
+        // 展开的候选列表（内联下拉，点选收起；toggle 互斥保证同帧至多一个）
+        .when(
+            workspace
+                .workflow_dropdown_open
+                .is_some_and(|open| open == index),
+            |row| {
+                row.child(
+                    div()
+                        .id(gpui::SharedString::from(format!("wf-dropdown-{index}")))
+                        .mt_1()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(ui.border_strong)
+                        .bg(ui.card_bg)
+                        .max_h(px(180.0))
+                        .overflow_y_scroll()
+                        .children(candidates.iter().map(|name| {
+                            let name = name.clone();
+                            let selected = *name == draft.selected;
+                            div()
+                                .px_2()
+                                .py_1()
+                                .text_size(px(12.0))
+                                .text_color(if selected { ui.accent } else { ui.text })
+                                .when(selected, |item| item.bg(ui.hover_bg))
+                                .hover(|item| item.bg(ui.hover_bg))
+                                .cursor_pointer()
+                                .child(name.clone())
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.set_workflow_reference(index, name.clone(), cx)
+                                    }),
+                                )
+                        })),
                 )
-                .child(setting_button_keyed(
-                    ui,
-                    format!("wf-{index}-next"),
-                    "›",
-                    false,
-                    cx.listener(move |this, _, _, cx| this.cycle_workflow_reference(index, 1, cx)),
-                )),
+            },
         )
 }
 
