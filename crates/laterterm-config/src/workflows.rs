@@ -27,6 +27,9 @@ pub const STEP_TIMEOUT_RANGE: (u64, u64) = (1, 600);
 /// expect 正则长度上限。
 pub const MAX_EXPECT_LEN: usize = 256;
 
+/// 等待步骤的秒数上下限。
+pub const WAIT_SECS_RANGE: (u64, u64) = (1, 3600);
+
 /// 工作流单步（`[[workflows.steps]]`，`kind` 拍平区分动作）。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -37,6 +40,12 @@ pub enum WorkflowStep {
     Connect {
         /// 服务器条目名（服务器面板的唯一键）。
         server: String,
+    },
+    /// 无条件等待 N 秒后推进下一步（无 expect、无发送）——发送类步骤
+    /// 之后的定时缓冲（如发完命令等服务端就绪）。
+    Wait {
+        /// 等待秒数（1..=3600）。
+        secs: u64,
     },
     /// expect 命中后发送 TOTP 动态码（密钥环 totp_account 别名引用）。
     Totp {
@@ -65,13 +74,13 @@ pub enum WorkflowStep {
 }
 
 impl WorkflowStep {
-    /// 步骤的 expect 正则（None = 等提示符锚点）。
+    /// 步骤的 expect 正则（None = 等提示符锚点；wait 步恒 None）。
     pub fn expect(&self) -> Option<&str> {
         match self {
             WorkflowStep::Totp { expect, .. }
             | WorkflowStep::Text { expect, .. }
             | WorkflowStep::Command { expect, .. } => expect.as_deref(),
-            WorkflowStep::Connect { .. } => None,
+            WorkflowStep::Connect { .. } | WorkflowStep::Wait { .. } => None,
         }
     }
 
@@ -82,16 +91,18 @@ impl WorkflowStep {
             WorkflowStep::Totp { account, .. } => account,
             WorkflowStep::Text { text, .. } => text,
             WorkflowStep::Command { name, .. } => name,
+            WorkflowStep::Wait { .. } => "",
         }
     }
 
-    /// 引用名的可变访问（归一化写回用）。
-    fn reference_mut(&mut self) -> &mut String {
+    /// 引用名的可变访问（归一化写回用）；wait 步无引用返回 None。
+    fn reference_mut(&mut self) -> Option<&mut String> {
         match self {
-            WorkflowStep::Connect { server } => server,
-            WorkflowStep::Totp { account, .. } => account,
-            WorkflowStep::Text { text, .. } => text,
-            WorkflowStep::Command { name, .. } => name,
+            WorkflowStep::Connect { server } => Some(server),
+            WorkflowStep::Totp { account, .. } => Some(account),
+            WorkflowStep::Text { text, .. } => Some(text),
+            WorkflowStep::Command { name, .. } => Some(name),
+            WorkflowStep::Wait { .. } => None,
         }
     }
 
@@ -99,6 +110,7 @@ impl WorkflowStep {
     pub fn summary(&self) -> String {
         let body = match self {
             WorkflowStep::Connect { server } => format!("连接 {server}"),
+            WorkflowStep::Wait { secs } => format!("等待 {secs} 秒"),
             WorkflowStep::Totp { account, .. } => format!("发动态码 {account}"),
             WorkflowStep::Text { text, .. } => format!("发送 {text}"),
             WorkflowStep::Command { name, .. } => format!("执行命令 {name}"),
@@ -182,6 +194,16 @@ impl WorkflowEntry {
                         bail!("第 {} 步的服务器名不能为空", index + 1);
                     }
                 }
+                WorkflowStep::Wait { secs } => {
+                    if !(WAIT_SECS_RANGE.0..=WAIT_SECS_RANGE.1).contains(secs) {
+                        bail!(
+                            "第 {} 步等待秒数须在 {}..={}",
+                            index + 1,
+                            WAIT_SECS_RANGE.0,
+                            WAIT_SECS_RANGE.1
+                        );
+                    }
+                }
                 _ => {
                     if step.reference().trim().is_empty() {
                         bail!(
@@ -225,9 +247,18 @@ pub(crate) fn sanitize_workflow(entry: &mut WorkflowEntry) -> bool {
             WorkflowStep::Totp { expect, .. }
             | WorkflowStep::Text { expect, .. }
             | WorkflowStep::Command { expect, .. } => *expect = trimmed_expect,
-            WorkflowStep::Connect { .. } => {}
+            WorkflowStep::Connect { .. } | WorkflowStep::Wait { .. } => {}
         }
-        *step.reference_mut() = step.reference().trim().to_string();
+        match step.reference_mut() {
+            Some(reference) => *reference = reference.trim().to_string(),
+            // wait 步无引用，只做秒数钳制
+            None => {
+                if let WorkflowStep::Wait { secs } = step {
+                    *secs = (*secs).clamp(WAIT_SECS_RANGE.0, WAIT_SECS_RANGE.1);
+                }
+                return true;
+            }
+        }
         if step.reference().trim().is_empty() {
             eprintln!("工作流 {:?} 的空引用步骤已忽略", entry.name);
             return false;
@@ -267,6 +298,10 @@ expect = "Opt token:"
 account = "bastion"
 
 [[workflows.steps]]
+kind = "wait"
+secs = 5
+
+[[workflows.steps]]
 kind = "command"
 name = "cd /data"
 "#;
@@ -277,8 +312,9 @@ name = "cd /data"
         assert_eq!(flow.step_timeout_secs, 45);
         assert_eq!(flow.connect_server(), Some("堡垒机"));
         assert_eq!(flow.steps[1], totp_step(Some("Opt token:"), "bastion"));
+        assert_eq!(flow.steps[2], WorkflowStep::Wait { secs: 5 });
         assert_eq!(
-            flow.steps[2],
+            flow.steps[3],
             WorkflowStep::Command {
                 expect: None,
                 name: "cd /data".into(),

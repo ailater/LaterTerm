@@ -41,6 +41,9 @@ pub(crate) enum FlowAction {
     Text { text: String },
     /// 发送快捷命令（命令名引用，外层展开模板）。
     Command { name: String },
+    /// 无条件等待 N 秒后推进下一步（无发送动作）——发送类步骤之后的
+    /// 定时缓冲（如发完命令等服务端就绪）。
+    Wait { secs: u64 },
 }
 
 /// 流步骤。`expect=None` 表示等下一个提示符锚点（OSC 133 A）而非正则。
@@ -67,9 +70,16 @@ pub(crate) struct FlowInitError {
     pub source: regex::Error,
 }
 
+/// 步骤推进门控：正则命中 / 提示符锚点 / 纯定时（Wait 步）。
+enum StepGate {
+    Regex(Regex),
+    PromptAnchor,
+    Timer(Duration),
+}
+
 /// 编译后的步骤。
 struct CompiledStep {
-    expect: Option<Regex>,
+    gate: StepGate,
     action: FlowAction,
 }
 
@@ -112,13 +122,15 @@ impl FlowRunner {
     ) -> Result<Self, FlowInitError> {
         let mut compiled = Vec::with_capacity(steps.len());
         for (index, step) in steps.into_iter().enumerate() {
-            let expect = match step.expect {
-                None => None,
-                Some(pattern) => {
+            // Wait 步纯定时推进（不等锚点/正则）；其余按 expect 编译
+            let gate = match (&step.action, step.expect) {
+                (FlowAction::Wait { secs }, _) => StepGate::Timer(Duration::from_secs(*secs)),
+                (_, None) => StepGate::PromptAnchor,
+                (_, Some(pattern)) => {
                     // 登录提示词大小写不定（Password/PASSWORD/password），统一
                     // 大小写不敏感——expect 工具通行默认；高级用户可在模式内
                     // 用 (?-i) 关回敏感匹配
-                    Some(Regex::new(&format!(r"(?i){pattern}")).map_err(|source| {
+                    StepGate::Regex(Regex::new(&format!(r"(?i){pattern}")).map_err(|source| {
                         FlowInitError {
                             step: index,
                             source,
@@ -127,10 +139,17 @@ impl FlowRunner {
                 }
             };
             compiled.push(CompiledStep {
-                expect,
+                gate,
                 action: step.action,
             });
         }
+        let first_deadline = match compiled.first() {
+            Some(CompiledStep {
+                gate: StepGate::Timer(secs),
+                ..
+            }) => now + *secs,
+            _ => now + step_timeout,
+        };
         Ok(Self {
             steps: compiled,
             current: 0,
@@ -140,7 +159,7 @@ impl FlowRunner {
             text_window: Vec::new(),
             scanned: 0,
             step_timeout,
-            step_deadline: Some(now + step_timeout),
+            step_deadline: Some(first_deadline),
         })
     }
 
@@ -159,10 +178,11 @@ impl FlowRunner {
         }
         self.text_window.extend_from_slice(&visible);
 
-        // 有序推进：prompt 步消费锚点计数，regex 步扫文本窗口
+        // 有序推进：timer 步等 tick，prompt 步消费锚点计数，regex 步扫文本窗口
         while !self.done {
-            match self.steps[self.current].expect.as_ref() {
-                None => {
+            match &self.steps[self.current].gate {
+                StepGate::Timer(_) => break,
+                StepGate::PromptAnchor => {
                     if anchors == 0 {
                         break;
                     }
@@ -177,7 +197,7 @@ impl FlowRunner {
                     self.scanned = 0;
                     self.advance(now, &mut events);
                 }
-                Some(regex) => {
+                StepGate::Regex(regex) => {
                     let start = self.scanned.saturating_sub(SCAN_OVERLAP);
                     let Some(hit) = regex.find(&self.text_window[start..]) else {
                         self.scanned = self.text_window.len();
@@ -201,7 +221,8 @@ impl FlowRunner {
         events
     }
 
-    /// 超时驱动（外层定时器）。当前步过期 → 放弃回人工，继续等后续步。
+    /// 超时驱动（外层定时器）：普通步过期 → 放弃回人工继续后续步；
+    /// Wait 步到期 → 等待完成，直接推进（非失败，无超时事件）。
     pub(crate) fn tick(&mut self, now: Instant) -> Vec<FlowEvent> {
         let mut events = Vec::new();
         if self.done {
@@ -210,11 +231,16 @@ impl FlowRunner {
         if let Some(deadline) = self.step_deadline
             && now >= deadline
         {
-            events.push(FlowEvent::StepTimeout { step: self.current });
-            // 人工接管：此前未匹配上的输出整体作废，防旧文本误触发后续正则
-            self.text_window.clear();
-            self.scanned = 0;
-            self.advance(now, &mut events);
+            let wait_completed = matches!(self.steps[self.current].gate, StepGate::Timer(_));
+            if wait_completed {
+                self.advance(now, &mut events);
+            } else {
+                events.push(FlowEvent::StepTimeout { step: self.current });
+                // 人工接管：此前未匹配上的输出整体作废，防旧文本误触发后续正则
+                self.text_window.clear();
+                self.scanned = 0;
+                self.advance(now, &mut events);
+            }
         }
         events
     }
@@ -234,7 +260,8 @@ impl FlowRunner {
         if self.done { None } else { Some(self.current) }
     }
 
-    /// 推进到下一步并重置 deadline；走到头发 Done。
+    /// 推进到下一步并重置 deadline（Wait 步按其秒数、其余按单步超时）；
+    /// 走到头发 Done。
     fn advance(&mut self, now: Instant, events: &mut Vec<FlowEvent>) {
         self.current += 1;
         if self.current >= self.steps.len() {
@@ -242,7 +269,11 @@ impl FlowRunner {
             self.step_deadline = None;
             events.push(FlowEvent::Done);
         } else {
-            self.step_deadline = Some(now + self.step_timeout);
+            let deadline = match &self.steps[self.current].gate {
+                StepGate::Timer(secs) => now + *secs,
+                _ => now + self.step_timeout,
+            };
+            self.step_deadline = Some(deadline);
         }
     }
 
@@ -609,6 +640,44 @@ mod tests {
         assert!(flow.is_done());
         assert!(flow.feed(b"token: ", Instant::now()).is_empty());
         assert!(flow.tick(Instant::now()).is_empty());
+    }
+
+    /// Wait 步纯定时推进：不等锚点/正则，到时直接进入下一步（无超时
+    /// 事件、无动作发送）；首步为 Wait 时 deadline 按其秒数。
+    #[test]
+    fn wait_step_advances_by_timer_without_action() {
+        let t0 = Instant::now();
+        let mut flow = FlowRunner::new(
+            vec![
+                FlowStep {
+                    expect: None,
+                    action: FlowAction::Wait { secs: 5 },
+                },
+                FlowStep {
+                    expect: Some("token:".into()),
+                    action: FlowAction::Totp {
+                        account: "bastion".into(),
+                    },
+                },
+            ],
+            Duration::from_secs(30),
+            t0,
+        )
+        .expect("构造");
+        // 5s 内输出再喂也不推进（等定时，不等锚点）
+        assert!(
+            flow.feed(b"\x1b]133;A\x07token: ", t0 + Duration::from_secs(1))
+                .is_empty()
+        );
+        assert!(flow.tick(t0 + Duration::from_secs(1)).is_empty());
+        // 5s 到 → 推进到 totp 步（无 StepTimeout、无 Action）
+        let events = flow.tick(t0 + Duration::from_secs(5));
+        assert!(events.is_empty(), "等待完成不是超时: {events:?}");
+        assert_eq!(flow.current_step(), Some(1));
+        // 后续步照常正则命中
+        let events = flow.feed(b"token: ", t0 + Duration::from_secs(6));
+        assert!(matches!(events[0], FlowEvent::Action { step: 1, .. }));
+        assert!(events.last().is_some_and(|e| matches!(e, FlowEvent::Done)));
     }
 
     /// 非法正则报错并指明步序号。

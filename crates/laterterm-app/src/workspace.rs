@@ -503,6 +503,7 @@ enum TriggerDialog {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorkflowDraftKind {
     Connect,
+    Wait,
     Totp,
     Text,
     Command,
@@ -512,6 +513,7 @@ impl WorkflowDraftKind {
     fn label(self) -> &'static str {
         match self {
             Self::Connect => "连接",
+            Self::Wait => "等待",
             Self::Totp => "动态码",
             Self::Text => "文本",
             Self::Command => "命令",
@@ -522,13 +524,20 @@ impl WorkflowDraftKind {
     fn content_hint(self) -> (&'static str, &'static str) {
         match self {
             Self::Connect => ("服务器", "服务器面板条目名"),
+            Self::Wait => ("等待秒数", "如 5"),
             Self::Totp => ("动态码账户", "动态码面板条目名"),
             Self::Text => ("文本", "菜单序号等非敏感文本"),
             Self::Command => ("命令名", "命令面板条目名"),
         }
     }
 
-    const ALL: [Self; 4] = [Self::Connect, Self::Totp, Self::Text, Self::Command];
+    const ALL: [Self; 5] = [
+        Self::Connect,
+        Self::Wait,
+        Self::Totp,
+        Self::Text,
+        Self::Command,
+    ];
 }
 
 /// 工作流编辑弹窗的单步草稿：kind 四选 + expect + 引用**下拉选中值**。
@@ -538,6 +547,8 @@ impl WorkflowDraftKind {
 struct WorkflowDraft {
     kind: WorkflowDraftKind,
     expect: Entity<CommandTextField>,
+    /// Wait 步的秒数输入框（其余 kind 恒 None；引用下拉不适用数字输入）。
+    wait_secs: Option<Entity<CommandTextField>>,
     selected: String,
 }
 
@@ -4795,6 +4806,9 @@ impl WorkspaceView {
             laterterm_config::WorkflowStep::Connect { server } => {
                 (WorkflowDraftKind::Connect, server.clone())
             }
+            laterterm_config::WorkflowStep::Wait { secs } => {
+                (WorkflowDraftKind::Wait, secs.to_string())
+            }
             laterterm_config::WorkflowStep::Totp { account, .. } => {
                 (WorkflowDraftKind::Totp, account.clone())
             }
@@ -4814,6 +4828,13 @@ impl WorkspaceView {
                     cx,
                 )
             }),
+            wait_secs: (kind == WorkflowDraftKind::Wait).then(|| {
+                let secs = match step {
+                    laterterm_config::WorkflowStep::Wait { secs } => secs.to_string(),
+                    _ => String::new(),
+                };
+                cx.new(|cx| CommandTextField::new(secs, "如 5", cx))
+            }),
             selected: content_value,
         }
     }
@@ -4828,6 +4849,8 @@ impl WorkspaceView {
             kind,
             expect: cx
                 .new(|cx| CommandTextField::new(String::new(), "expect 正则（留空等提示符）", cx)),
+            wait_secs: (kind == WorkflowDraftKind::Wait)
+                .then(|| cx.new(|cx| CommandTextField::new(String::new(), "如 5", cx))),
             selected: self
                 .workflow_candidates(kind)
                 .first()
@@ -4857,7 +4880,7 @@ impl WorkspaceView {
                 .iter()
                 .map(|item| item.name.clone())
                 .collect(),
-            WorkflowDraftKind::Text => Vec::new(),
+            WorkflowDraftKind::Text | WorkflowDraftKind::Wait => Vec::new(),
         }
     }
 
@@ -4914,11 +4937,12 @@ impl WorkspaceView {
             .workflow_step_drafts
             .iter()
             .map(|draft| {
-                workflow_step_from_values(
-                    draft.kind,
-                    draft.expect.read(cx).value(),
-                    &draft.selected,
-                )
+                // Wait 步读秒数输入框；其余读下拉选中值
+                let content = match &draft.wait_secs {
+                    Some(field) => field.read(cx).value().to_owned(),
+                    None => draft.selected.clone(),
+                };
+                workflow_step_from_values(draft.kind, draft.expect.read(cx).value(), &content)
             })
             .collect();
         let meta = laterterm_config::WorkflowEntry {
@@ -7677,6 +7701,8 @@ impl WorkspaceView {
         cx: &mut Context<Self>,
     ) {
         match action {
+            // Wait 由引擎 tick 定时推进（不产生 Action 事件），此分支防御不可达
+            crate::flow::FlowAction::Wait { .. } => {}
             crate::flow::FlowAction::Text { text } => {
                 self.flow_send_text(pane_id, &text, cx);
             }
@@ -12894,6 +12920,9 @@ pub(crate) fn workflow_step_from_values(
     let content = content.trim().to_owned();
     match kind {
         WorkflowDraftKind::Connect => laterterm_config::WorkflowStep::Connect { server: content },
+        WorkflowDraftKind::Wait => laterterm_config::WorkflowStep::Wait {
+            secs: content.parse().unwrap_or(0),
+        },
         WorkflowDraftKind::Totp => laterterm_config::WorkflowStep::Totp {
             expect,
             account: content,
@@ -13140,11 +13169,29 @@ fn workflow_draft_row(
                     WorkflowDraftKind::Totp => "动态码",
                     WorkflowDraftKind::Command => "命令",
                     WorkflowDraftKind::Text => "文本",
+                    WorkflowDraftKind::Wait => "等待",
                 }
             ),
             ui.text_secondary,
         )
     };
+    // Wait 步引用区 = 秒数输入框；其余 = 下拉选择器
+    let reference_control: gpui::AnyElement = if let Some(field) = draft.wait_secs.clone() {
+        div()
+            .flex_1()
+            .min_w(px(0.0))
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .border_1()
+            .border_color(ui.border_strong)
+            .bg(ui.card_bg)
+            .child(field)
+            .into_any_element()
+    } else {
+        dropdown_control(workspace, index, &draft, reference_view, ui, cx).into_any_element()
+    };
+
     div()
         .mt_2()
         .p_2()
@@ -13194,43 +13241,56 @@ fn workflow_draft_row(
                         .text_color(ui.text_secondary)
                         .child(content_label),
                 )
-                .child(
-                    // 下拉触发区：当前选中值 + ▾；点击展开/收起候选列表
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .px_2()
-                        .py_1()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(ui.border_strong)
-                        .bg(ui.card_bg)
-                        .cursor_pointer()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                this.toggle_workflow_dropdown(index, event.position, cx)
-                            }),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .truncate()
-                                .text_size(px(12.0))
-                                .text_color(reference_view.1)
-                                .child(reference_view.0),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(9.0))
-                                .text_color(ui.text_secondary)
-                                .child("▾"),
-                        ),
-                ),
+                .child(reference_control),
+        )
+}
+
+/// 引用下拉触发区（当前选中值 + ▾；点击展开浮层候选列表）。
+fn dropdown_control(
+    _workspace: &WorkspaceView,
+    index: usize,
+    draft: &WorkflowDraft,
+    reference_view: (String, gpui::Hsla),
+    ui: &UiPalette,
+    cx: &mut Context<WorkspaceView>,
+) -> gpui::Div {
+    div()
+        .flex_1()
+        .min_w(px(0.0))
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(ui.border_strong)
+        .bg(ui.card_bg)
+        .cursor_pointer()
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                this.toggle_workflow_dropdown(index, event.position, cx)
+            }),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(12.0))
+                .text_color(reference_view.1)
+                .child(reference_view.0),
+        )
+        .child(
+            div()
+                .text_size(px(9.0))
+                .text_color(ui.text_secondary)
+                .child(if draft.selected.is_empty() {
+                    "▾ 无候选"
+                } else {
+                    "▾"
+                }),
         )
 }
 
@@ -14107,6 +14167,7 @@ fn wrap_flow_session(
         .map(|step| crate::flow::FlowStep {
             expect: step.expect().map(str::to_owned),
             action: match step {
+                WorkflowStep::Wait { secs } => crate::flow::FlowAction::Wait { secs: *secs },
                 WorkflowStep::Totp { account, .. } => crate::flow::FlowAction::Totp {
                     account: account.clone(),
                 },
