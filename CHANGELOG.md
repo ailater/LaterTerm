@@ -4,6 +4,23 @@
 发版时把 `Cargo.toml` 的 `workspace.package.version` 提到新版本号，并在顶部追加
 `## v<版本> - <日期>` 小节（两者同 PR 提交，合入后 auto-tag 自动打 tag 发布）。
 
+## v0.1.2 - 2026-11-28
+
+### 终端启动
+
+- **支持外部指定启动目录**：`laterterm --working-directory <dir>` / `--working-directory=<dir>` /
+  目录位置参数 / `LATERTERM_OPEN_DIR` 环境变量（argv 优先于 env），首窗格落在该目录；
+  目标必须真实存在，无效参数一律忽略、照常默认启动。配套 LaterKey 访达
+  「在此处打开终端」（`open -na LaterTerm --args <dir>` 拉起新实例），此前本地 shell 恒落主目录
+
+### 设置面板（macOS）
+
+- **新增「权限」分区**：辅助功能 / 监听事件 / 完全磁盘访问三行，状态即查即显
+  （绿已授权 / 橙未授权 / 灰不适用），每行「去授权」深链对应系统设置面板，底部
+  「重新检测」即时刷新（磁盘访问后台重跑卷探测）。监听事件 API（macOS 15+ 独立
+  权限项）经 dlsym 弱探测——旧 macOS 无此符号直接 extern 会让 dyld 启动即崩，
+  取不到按「不适用」处理不误报
+
 ## v0.1.1 - 2026-11-28
 
 ### 登录流（跳板机自动化）
