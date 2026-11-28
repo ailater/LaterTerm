@@ -531,13 +531,14 @@ impl WorkflowDraftKind {
     const ALL: [Self; 4] = [Self::Connect, Self::Totp, Self::Text, Self::Command];
 }
 
-/// 工作流编辑弹窗的单步草稿：kind 四选 + expect + 引用输入框
-/// （connect 步只填服务器名，expect 输入框隐藏）。
+/// 工作流编辑弹窗的单步草稿：kind 四选 + expect + 引用**下拉选中值**。
+/// 引用不走自由文本——从对应面板的条目名单里选（‹ › 循环切换），候选为
+/// 空时提示先去该面板添加；保留已存引用原值（引用资源被删后仍可见可改）。
 #[derive(Clone)]
 struct WorkflowDraft {
     kind: WorkflowDraftKind,
     expect: Entity<CommandTextField>,
-    content: Entity<CommandTextField>,
+    selected: String,
 }
 
 /// 工作流编辑弹窗（右面板「工作流」页签的新建/编辑入口）。
@@ -4810,11 +4811,13 @@ impl WorkspaceView {
                     cx,
                 )
             }),
-            content: cx.new(|cx| CommandTextField::new(content_value, kind.content_hint().1, cx)),
+            selected: content_value,
         }
     }
 
+    /// 空步骤草稿：引用预选候选第一项（无候选留空，保存期 validate 拦截）。
     fn empty_workflow_draft(
+        &self,
         kind: WorkflowDraftKind,
         cx: &mut Context<WorkspaceView>,
     ) -> WorkflowDraft {
@@ -4822,7 +4825,36 @@ impl WorkspaceView {
             kind,
             expect: cx
                 .new(|cx| CommandTextField::new(String::new(), "expect 正则（留空等提示符）", cx)),
-            content: cx.new(|cx| CommandTextField::new(String::new(), kind.content_hint().1, cx)),
+            selected: self
+                .workflow_candidates(kind)
+                .first()
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// 引用候选名单（按 kind 从对应面板取条目名，保持面板内顺序）。
+    fn workflow_candidates(&self, kind: WorkflowDraftKind) -> Vec<String> {
+        match kind {
+            WorkflowDraftKind::Connect => self
+                .settings
+                .servers
+                .iter()
+                .map(|item| item.name.clone())
+                .collect(),
+            WorkflowDraftKind::Totp => self
+                .settings
+                .totp
+                .iter()
+                .map(|item| item.name.clone())
+                .collect(),
+            WorkflowDraftKind::Command => self
+                .settings
+                .commands
+                .iter()
+                .map(|item| item.name.clone())
+                .collect(),
+            WorkflowDraftKind::Text => Vec::new(),
         }
     }
 
@@ -4850,9 +4882,9 @@ impl WorkspaceView {
         if self.workflow_step_drafts.is_empty() {
             // 新建起步：首步 connect（v1 运行口径）+ 一步命令占位
             self.workflow_step_drafts
-                .push(Self::empty_workflow_draft(WorkflowDraftKind::Connect, cx));
+                .push(self.empty_workflow_draft(WorkflowDraftKind::Connect, cx));
             self.workflow_step_drafts
-                .push(Self::empty_workflow_draft(WorkflowDraftKind::Command, cx));
+                .push(self.empty_workflow_draft(WorkflowDraftKind::Command, cx));
         }
         self.workflow_timeout =
             Some(cx.new(|cx| CommandTextField::new(draft.step_timeout_secs.to_string(), "秒", cx)));
@@ -4882,7 +4914,7 @@ impl WorkspaceView {
                 workflow_step_from_values(
                     draft.kind,
                     draft.expect.read(cx).value(),
-                    draft.content.read(cx).value(),
+                    &draft.selected,
                 )
             })
             .collect();
@@ -4952,7 +4984,7 @@ impl WorkspaceView {
         }
         // 新步骤默认命令（首步 connect 由新建起步保证，编辑旧流时用户自调）
         self.workflow_step_drafts
-            .push(Self::empty_workflow_draft(WorkflowDraftKind::Command, cx));
+            .push(self.empty_workflow_draft(WorkflowDraftKind::Command, cx));
         cx.notify();
     }
 
@@ -4962,20 +4994,47 @@ impl WorkspaceView {
     }
 
     fn set_workflow_kind(&mut self, index: usize, kind: WorkflowDraftKind, cx: &mut Context<Self>) {
+        // 先取候选（切换后重置为新面板第一项；避免与草稿可变借用冲突）
+        let fallback = self.workflow_candidates(kind).first().cloned();
         if let Some(draft) = self.workflow_step_drafts.get_mut(index) {
             draft.kind = kind;
+            // 跨面板名字无意义：切 kind 后重置为新面板候选第一项
+            draft.selected = fallback.unwrap_or_default();
             cx.notify();
         }
+    }
+
+    /// 引用选择器循环切换（‹ › 箭头）；候选为空不动作（UI 已提示先添加）。
+    fn cycle_workflow_reference(&mut self, index: usize, direction: i32, cx: &mut Context<Self>) {
+        let candidates = {
+            let Some(draft) = self.workflow_step_drafts.get(index) else {
+                return;
+            };
+            self.workflow_candidates(draft.kind)
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let current = {
+            let draft = &self.workflow_step_drafts[index];
+            candidates
+                .iter()
+                .position(|name| *name == draft.selected)
+                .unwrap_or(0)
+        };
+        let next = (current as i64 + direction as i64).rem_euclid(candidates.len() as i64) as usize;
+        self.workflow_step_drafts[index].selected = candidates[next].clone();
+        cx.notify();
     }
 
     /// JumpServer 预设一键起步：连接服务器（留空待填）→ 等验证码提示发
     /// 动态码 → 等提示符执行命令；内容留空由用户补填（validate 拦截）。
     fn apply_jumpserver_workflow_preset(&mut self, cx: &mut Context<Self>) {
-        let connect = Self::empty_workflow_draft(WorkflowDraftKind::Connect, cx);
-        let totp = Self::empty_workflow_draft(WorkflowDraftKind::Totp, cx);
+        let connect = self.empty_workflow_draft(WorkflowDraftKind::Connect, cx);
+        let totp = self.empty_workflow_draft(WorkflowDraftKind::Totp, cx);
         totp.expect
             .update(cx, |field, cx| field.set_value("Opt token:", cx));
-        let command = Self::empty_workflow_draft(WorkflowDraftKind::Command, cx);
+        let command = self.empty_workflow_draft(WorkflowDraftKind::Command, cx);
         self.workflow_step_drafts = vec![connect, totp, command];
         self.workflow_error =
             Some("已填入 JumpServer 预设：请补服务器名、动态码账户与命令名后保存".into());
@@ -12977,12 +13036,13 @@ fn workflow_steps_editor(
             drafts
                 .into_iter()
                 .enumerate()
-                .map(|(index, draft)| workflow_draft_row(index, draft, ui, cx)),
+                .map(|(index, draft)| workflow_draft_row(workspace, index, draft, ui, cx)),
         )
 }
 
 /// 单条工作流步骤草稿行。
 fn workflow_draft_row(
+    workspace: &WorkspaceView,
     index: usize,
     draft: WorkflowDraft,
     ui: &UiPalette,
@@ -12990,6 +13050,32 @@ fn workflow_draft_row(
 ) -> gpui::Div {
     let kind = draft.kind;
     let (content_label, _) = kind.content_hint();
+    // 引用候选与存在性（实时读面板：他处增删条目即反映）
+    let candidates = workspace.workflow_candidates(kind);
+    let has_candidate = !candidates.is_empty();
+    let reference_exists = candidates.contains(&draft.selected);
+    // 引用展示：有候选显示选中名；选中的引用被删后仍显示原值但标红提示；
+    // 面板空则提示先去添加（保存期 validate 会拦空引用）
+    let reference_view = if has_candidate {
+        if reference_exists {
+            (draft.selected.clone(), ui.text)
+        } else {
+            (format!("{}（已不存在，请重选）", draft.selected), ui.danger)
+        }
+    } else {
+        (
+            format!(
+                "请先在「{}」面板添加",
+                match kind {
+                    WorkflowDraftKind::Connect => "服务器",
+                    WorkflowDraftKind::Totp => "动态码",
+                    WorkflowDraftKind::Command => "命令",
+                    WorkflowDraftKind::Text => "文本",
+                }
+            ),
+            ui.text_secondary,
+        )
+    };
     div()
         .mt_2()
         .p_2()
@@ -13039,7 +13125,30 @@ fn workflow_draft_row(
                         .text_color(ui.text_secondary)
                         .child(content_label),
                 )
-                .child(draft.content),
+                // 引用下拉选择器：‹ › 循环切换候选（面板为空时提示先添加）
+                .child(setting_button_keyed(
+                    ui,
+                    format!("wf-{index}-prev"),
+                    "‹",
+                    false,
+                    cx.listener(move |this, _, _, cx| this.cycle_workflow_reference(index, -1, cx)),
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(12.0))
+                        .text_color(reference_view.1)
+                        .child(reference_view.0),
+                )
+                .child(setting_button_keyed(
+                    ui,
+                    format!("wf-{index}-next"),
+                    "›",
+                    false,
+                    cx.listener(move |this, _, _, cx| this.cycle_workflow_reference(index, 1, cx)),
+                )),
         )
 }
 
