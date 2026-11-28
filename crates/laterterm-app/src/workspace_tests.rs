@@ -789,3 +789,23 @@ fn workflow_step_values_keep_empty_content_for_validate() {
         "空内容照常落值，交给 validate 按步号报错"
     );
 }
+
+// ───────── Data 卷访问探测（TCC 拦截 → 引导授权） ─────────
+
+use std::io::ErrorKind;
+
+/// 分类口径：EPERM（std 映射 PermissionDenied）= 被隐私保护拦截 → 弹引导；
+/// 成功/卷未挂载/其余错误不弹（授权问题只认 EPERM，防误打扰）。
+#[test]
+fn volume_probe_classifies_eperm_only() {
+    assert!(super::workspace::classify_volume_probe(Err(
+        ErrorKind::PermissionDenied
+    )));
+    assert!(!super::workspace::classify_volume_probe(Ok(())));
+    assert!(!super::workspace::classify_volume_probe(Err(
+        ErrorKind::NotFound
+    )));
+    assert!(!super::workspace::classify_volume_probe(Err(
+        ErrorKind::Other
+    )));
+}

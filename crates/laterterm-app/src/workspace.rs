@@ -1414,6 +1414,10 @@ pub struct WorkspaceView {
     next_ssh_request_id: u64,
     /// 后台结果按请求标识校验，过期成功会话立即关闭。
     pending_ssh_results: Vec<PendingSshResult>,
+    /// 启动探测：Data 卷（/Volumes/Data）被 macOS TCC 隐私保护拦截
+    /// （EPERM）。true 时已 toast 引导并自动打开「完全磁盘访问」设置面板；
+    /// 授权后重启应用自然通过（探测进程级一次）。
+    volume_access_denied: bool,
     /// SFTP 连接结果（与 shell 分管道，见 PendingSftpResult 注记）。
     pending_sftp_results: Vec<PendingSftpResult>,
     /// SFTP 双栏面板状态（None = 关闭；同一时刻至多一个面板）。
@@ -1597,6 +1601,7 @@ impl WorkspaceView {
             ssh_request: None,
             next_ssh_request_id: 1,
             pending_ssh_results: Vec::new(),
+            volume_access_denied: false,
             pending_sftp_results: Vec::new(),
             sftp_panel: None,
             sftp_events_tx,
@@ -1704,6 +1709,37 @@ impl WorkspaceView {
             std::thread::spawn(move || {
                 let _ = onboarding_tx.send(onboarding::probe());
             });
+        }
+        // 卷访问自检（macOS TCC）：独立卷（如 /Volumes/Data）的读写需要
+        // 「完全磁盘访问/可移除卷」授权——宿主 app 换版本授权即失效，用户
+        // 从终端跑 brew/rsync 等会集体报 Operation not permitted。启动探测
+        // 一次，被拦则 toast 引导并直接打开系统设置面板（cfg(not(test))：
+        // gpui 测试不碰真文件系统，同 onboarding 探测口径）。
+        #[cfg(target_os = "macos")]
+        {
+            let (volume_tx, volume_rx) = flume::bounded(1);
+            std::thread::spawn(move || {
+                let _ = volume_tx.send(probe_data_volume_access());
+            });
+            cx.spawn(async move |this, cx| {
+                if let Ok(denied) = volume_rx.recv_async().await
+                    && denied
+                    && this
+                        .update(cx, |workspace, cx| {
+                            workspace.volume_access_denied = true;
+                            workspace.show_server_notice_toast(VOLUME_ACCESS_NOTICE, cx);
+                            cx.notify();
+                        })
+                        .is_ok()
+                {
+                    // 引导用户到「完全磁盘访问」面板（授权对象 = LaterTerm
+                    // 所在条目；dev bundle 随重新构建失效，正式 bundle 长期有效）
+                    let _ = std::process::Command::new("open")
+                        .arg("x-apple.systempreferences:com.apple.settings.privacy?Privacy_AllFiles_AllFiles")
+                        .spawn();
+                }
+            })
+            .detach();
         }
         // 启动时已持久化启用 Quake：重启后必须重新拉起 portal worker 并同步
         // 状态机启用门（直接 spawn 会绕过 SetEnabled(true)，热键静默失效——
@@ -12936,6 +12972,25 @@ pub(crate) fn workflow_step_from_values(
             name: content,
         },
     }
+}
+
+/// Data 卷访问被 macOS 隐私保护拦截的引导文案（启动 toast）。
+const VOLUME_ACCESS_NOTICE: &str = "无法访问 Data 卷（macOS 隐私保护，终端命令会报 Operation not permitted）。已打开系统设置：请在「完全磁盘访问」中勾选 LaterTerm，然后重启应用";
+
+/// 探测 Data 卷（/Volumes/Data）的可访问性。TCC 拦截时 readdir 返回
+/// EPERM（std 映射 PermissionDenied）；卷未挂载（NotFound）不是授权问题，
+/// 不弹引导。独立函数便于单测分类口径。
+fn probe_data_volume_access() -> bool {
+    classify_volume_probe(
+        std::fs::read_dir("/Volumes/Data")
+            .map(|_| ())
+            .map_err(|error| error.kind()),
+    )
+}
+
+/// 探测结果分类：EPERM → 被拦截（true）；成功/未挂载/其余 → false。
+pub(crate) fn classify_volume_probe(result: Result<(), std::io::ErrorKind>) -> bool {
+    matches!(result, Err(std::io::ErrorKind::PermissionDenied))
 }
 
 /// 右面板「工作流」页签：新建 + 条目列表（名称/步骤摘要/运行/编辑/删除）。
