@@ -1483,6 +1483,13 @@ impl WorkspaceView {
         } else {
             Settings::load_or_default()
         };
+        // 外部指定的启动目录（main 从 argv/env 解析，如访达「在此处打开终端」）：
+        // 有则首窗格落在这个目录；同样取走即清，直连构造路径无此全局。
+        let startup_dir = if cx.has_global::<crate::StartupDir>() {
+            cx.remove_global::<crate::StartupDir>().0
+        } else {
+            None
+        };
         if !settings.legacy_servers_migrated
             && settings.migrate_legacy_servers(laterterm_config::servers::ServerStore::load())
         {
@@ -1522,9 +1529,10 @@ impl WorkspaceView {
             initial_cols,
             initial_rows,
             resolve_shell(settings.shell.as_deref()),
-            // 首窗格无焦点窗格可继承（工作区刚建、panes 为空），恒 None；
-            // 后续新入口（如 quake 独立窗）可在此传来源窗格 cwd
-            None,
+            // 首窗格优先用外部指定的启动目录（StartupDir）；没有就无来源窗格
+            // 可继承（工作区刚建、panes 为空），恒 None；后续新入口（如 quake
+            // 独立窗）可在此传来源窗格 cwd
+            startup_dir,
             // 审计 label 与下方 Pane.title 同源同值
             "本地终端",
         );
