@@ -336,6 +336,12 @@ jobs:
           if [ ! -s release-notes.md ]; then
             echo "LaterTerm ${TAG}" > release-notes.md
           fi
+          # 统一标题头（v0.1.2 手动补过一次，此后自动带）
+          {
+            echo "# LaterTerm ${TAG}"
+            echo
+            cat release-notes.md
+          } > release-notes.tmp && mv release-notes.tmp release-notes.md
 
       # gh release create 对已存在 tag 的 Release 会失败（无 --clobber 语义）：
       # 预演/重跑前先 `gh release delete <tag> --yes`；头部注释有完整预演口径。
